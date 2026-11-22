@@ -1,0 +1,1395 @@
+/* SwiftPili — 简体中文 */
+
+"%@ danmaku" = "%@弹幕";
+"%@ plays" = "%@播放";
+"%@ reads" = "%@阅读";
+"%@ watching" = "%@人在看";
+"+ Follow" = "+ 关注";
+"2 coins added" = "已投2枚硬币";
+"2x" = "2x";
+"Accent Color" = "主题色";
+"Accounts" = "账号管理";
+"Add Account" = "添加账号";
+"Add to Favorites" = "添加到收藏夹";
+"A description is required for this report type." = "选择“其他”时需要填写举报说明。";
+"All" = "全部";
+"All Tags" = "全部标签";
+"Already gave the maximum coins" = "已达投币上限";
+"Anime" = "番剧";
+"Appearance" = "外观";
+"Articles" = "专栏";
+"Articles from people you follow will appear here." = "你关注的人的专栏会显示在这里。";
+"Aspect Mode" = "画面比例";
+"Be the first to comment on this episode." = "本集还没有评论，快来抢沙发～";
+"Be the first to comment." = "还没有评论，快来抢沙发～";
+"Blacklist" = "黑名单";
+"Block PCDN" = "屏蔽 PCDN";
+"Blocked" = "已拉黑";
+"Blocked %@" = "拉黑于 %@";
+"Blocked Users" = "黑名单用户";
+"CDN Settings" = "CDN 设置";
+"Cached Data" = "缓存数据";
+"Cancel" = "取消";
+"Cellular Quality" = "蜂窝网络画质";
+"Chat messages will appear here" = "弹幕消息会显示在这里";
+"Clear Cache" = "清除缓存";
+"Clear all cached images and data?" = "清除所有缓存图片和数据？";
+"Coin" = "投币";
+"Coin added" = "投币成功";
+"Coin failed" = "投币失败";
+"Coin failed (%lld): %@" = "投币失败（%lld）：%@";
+"Coin this video" = "投币";
+"Color" = "颜色";
+"Comment Check" = "评论检测";
+"Comment is hidden for others (shadow ban)" = "评论已被隐藏（仅自己可见）";
+"Comment is publicly visible" = "评论对所有人可见";
+"Comment is unavailable" = "评论不可用";
+"Comment deleted" = "评论已删除";
+"Comment posted" = "评论已发布";
+"Comment posted — verifying visibility…" = "评论已发布 — 正在检测可见性…";
+"Comment was not accepted" = "评论未被接受";
+"Comments" = "评论";
+"Comments are turned off" = "评论区已关闭";
+"Comments%@" = "评论%@";
+"Cookie Import" = "导入 Cookie";
+"Copy AV ID" = "复制AV号";
+"Copy BV ID" = "复制BV号";
+"Copy Link" = "复制链接";
+"Copy Description" = "复制简介";
+"Description copied" = "已复制简介";
+"Link copied" = "已复制链接";
+"Open" = "打开";
+"Copy Text" = "复制文字";
+"Copy" = "复制";
+"Could not load stickers" = "表情加载失败";
+"No stickers available" = "暂无可用表情";
+"Close and reopen stickers to continue." = "请关闭并重新打开表情选择器以继续。";
+"Could not load the live category list." = "无法加载直播分区列表。";
+"Could not load your favorite folders. Check the log for details." = "无法加载收藏夹，请查看日志。";
+"Couldn't Load" = "加载失败";
+"Couldn't Load Feed" = "动态加载失败";
+"Dark" = "深色";
+"Appearance Mode" = "外观模式";
+"Delete Comment" = "删除评论";
+"Delete failed: %@" = "删除失败：%@";
+"Describe the problem" = "描述问题";
+"Details" = "详情";
+"Video sections" = "视频分区";
+"Done" = "完成";
+"Empty Folder" = "空收藏夹";
+"Enable Blocking" = "启用屏蔽";
+"Episode unavailable" = "本集不可用";
+"Episodes" = "选集";
+"Failed to load" = "加载失败";
+"Failed to post: %@" = "发布失败：%@";
+"Favorite" = "收藏";
+"Favorites" = "收藏";
+"Fit" = "适应";
+"Flooding" = "刷屏";
+"Follow" = "关注";
+"Follow System" = "跟随系统";
+"Follow failed" = "关注操作失败";
+"Follow failed (%lld): %@" = "关注操作失败（%lld）：%@";
+"Follow some anime and their updates will appear here." = "追番后，番剧更新会显示在这里。";
+"Followers" = "粉丝";
+"Following" = "已关注";
+"Give 1 Coin" = "投1枚硬币";
+"Give 2 Coins" = "投2枚硬币";
+"Grid" = "网格";
+"Hardware Decoding" = "硬件解码";
+"Show Network Speed" = "显示网络速度";
+"History" = "历史记录";
+"Home" = "首页";
+"Homepage Layout" = "首页布局";
+"Layout" = "布局";
+"Import" = "导入";
+"Import Cookies" = "导入 Cookie";
+"Irrelevant" = "内容不相关";
+"LIVE" = "直播中";
+"Latest" = "最新";
+"Light" = "浅色";
+"Like" = "点赞";
+"List" = "列表";
+"Live" = "直播";
+"Live Chat" = "实时互动";
+"Streamer" = "主播";
+"Load Failed" = "加载失败";
+"Login" = "登录";
+"Login required to post comments" = "登录后才能发表评论";
+"Login successful!" = "登录成功！";
+"Logout" = "退出登录";
+"Loop Current" = "单集循环";
+"Max Cache Size" = "缓存上限";
+"Mention" = "提及";
+"Messages" = "消息";
+"Mine" = "我的";
+"My Content" = "我的内容";
+"Moment" = "动态";
+"Moments" = "动态";
+"Movies" = "影视";
+"My Anime" = "我的追番";
+"My Follows" = "我的关注";
+"My Shows" = "我的追剧";
+"Network" = "网络";
+"New Moment" = "发布动态";
+"No Anime Updates" = "暂无番剧动态";
+"No Articles" = "暂无专栏";
+"No Blocked Users" = "黑名单为空";
+"No Blocked Users." = "黑名单为空";
+"No Categories" = "暂无分区";
+"No Comments" = "暂无评论";
+"No Favorites" = "暂无收藏";
+"No Folders" = "没有收藏夹";
+"No Followed Streamers" = "还没有关注的主播";
+"No Likes" = "暂无收到的赞";
+"No Mentions" = "暂无@我的";
+"No Moments" = "暂无动态";
+"No Notifications" = "暂无通知";
+"No Replies" = "暂无回复";
+"No Videos" = "暂无视频";
+"No watch history" = "暂无观看历史";
+"OFFLINE" = "未开播";
+"OK" = "好";
+"Off" = "关闭";
+"Other" = "其他";
+"Parts" = "分P";
+"Password" = "密码";
+"Password Login" = "密码登录";
+"Pause at End" = "播完暂停";
+"Personal attack" = "人身攻击";
+"Play Next Part" = "自动连播";
+"Playback" = "播放";
+"Playback Info" = "播放信息";
+"Playing P%lld…" = "正在播放 P%lld…";
+"Popular" = "热门";
+"Pornography" = "色情";
+"Post" = "发布";
+"Post & Check" = "发布并检测";
+"Post a test comment and check if it's visible when logged out (shadow ban detection)." = "发布测试评论并检查未登录状态下是否可见（检测是否被夹）。";
+"Posted, but visibility check failed" = "已发布，但可见性检测失败";
+"Posts from people you follow will appear here." = "你关注的人的动态会显示在这里。";
+"Provocation" = "引战";
+"QR Code" = "扫码登录";
+"QR Code expired" = "二维码已过期";
+"Ranking" = "排行榜";
+"Recent History" = "最近观看";
+"Recommend" = "推荐";
+"Recommended" = "推荐";
+"Regenerate" = "重新生成";
+"Region" = "地区";
+"Related" = "相关推荐";
+"Replies" = "回复我的";
+"Thread Replies" = "回复";
+"Reply" = "回复";
+"Report" = "举报";
+"Report Video" = "举报视频";
+"Report failed" = "举报失败";
+"Report failed: %@" = "举报失败：%@";
+"Report submitted" = "举报已提交";
+"Repost" = "转发";
+"Reposts" = "转发";
+"Post Likes" = "点赞";
+"No reposts yet" = "还没有转发";
+"No likes yet" = "还没有点赞";
+"Repost failed — try again" = "转发失败，请重试";
+"Reposts accept 1 coin max" = "转载视频最多投1枚硬币";
+"Resume Last Position" = "从上次位置继续播放";
+"Retry" = "重试";
+"SMS" = "短信";
+"SMS Login" = "短信登录";
+"Say something... (optional)" = "说点什么…（可选）";
+"Scan with BiliBili app" = "使用哔哩哔哩 App 扫码";
+"Scanned! Confirm on your phone." = "已扫码！请在手机上确认。";
+"Search" = "搜索";
+"Select Region" = "选择地区";
+"Send" = "发送";
+"Session expired" = "登录已失效";
+"Session expired — log in again" = "登录已失效，请重新登录";
+"%@'s login is no longer valid. Log in again via Add Account." = "%@ 的登录已失效，请通过“添加账号”重新登录。";
+"Send Code" = "发送验证码";
+"Settings" = "设置";
+"Share" = "分享";
+"Share what's on your mind..." = "分享新鲜事…";
+"Show Less" = "收起";
+"Show More" = "展开";
+"See More" = "查看更多";
+"Skip Intro/Outro" = "跳过片头片尾";
+"Skipped intro" = "已跳过片头";
+"Playing from beginning" = "已从头开始播放";
+"Skipped outro" = "已跳过片尾";
+"Spam" = "垃圾广告";
+"Spoiler" = "剧透";
+"Storage" = "存储";
+"Streamers you follow show up here." = "你关注的主播会显示在这里。";
+"Stretch" = "拉伸";
+"SwiftPili" = "SwiftPili";
+"Synopsis" = "简介";
+"System Share" = "系统分享";
+"Test CDN Speed" = "CDN 测速";
+"This post does not expose a comment thread." = "该动态没有可用的评论区。";
+"This usually means the account isn't following any anime yet." = "这通常表示该账号还没有追番。";
+"Thread" = "评论详情";
+"Total Likes" = "获赞";
+"Hidden" = "已隐藏";
+"This user's following list is private." = "该用户已设置隐私，关注列表不可见。";
+"This user's followers list is private." = "该用户已设置隐私，粉丝列表不可见。";
+"Top" = "最热";
+"Top Comments" = "热门评论";
+"Trending" = "热搜";
+"UP" = "UP";
+"Unblock" = "取消拉黑";
+"Unlimited" = "不限制";
+"User" = "用户";
+"Users" = "用户";
+"Users you block on BiliBili appear here." = "你在 B 站拉黑的用户会显示在这里。";
+"Verify" = "验证";
+"Verify Comments After Posting" = "发布后检测评论可见性";
+"Show Comment Ornaments" = "显示评论装扮";
+"Video" = "视频";
+"Videos" = "视频";
+"Submissions" = "投稿";
+"New Group" = "新建分组";
+"Group Name" = "分组名称";
+"Create" = "创建";
+"Save" = "保存";
+"Set Group" = "设置分组";
+"Edit Profile" = "编辑资料";
+"Avatar" = "头像";
+"Change Avatar" = "更换头像";
+"Bio" = "个性签名";
+"Bio updated" = "签名已更新";
+"Username" = "昵称";
+"Renaming costs 6 coins. Continue?" = "修改昵称将扣除 6 枚硬币，确定继续？";
+"Rename (6 coins)" = "修改（扣 6 硬币）";
+"Username updated — 6 coins deducted" = "昵称已修改——已扣除 6 枚硬币";
+"Avatar submitted — it may take a while to pass review" = "头像已提交——审核通过前可能暂不生效";
+"Could not read the selected image" = "无法读取所选图片";
+"Special Follow" = "特别关注";
+"Default Group" = "默认分组";
+"Recent Coins" = "最近投币";
+"Recent Likes" = "最近点赞";
+"No coined videos yet" = "还没有投币的视频";
+"No liked videos yet" = "还没有点赞的视频";
+"1 reply" = "共 1 条回复";
+"%lld replies" = "共 %lld 条回复";
+"Watch History" = "观看历史";
+"Watch Later" = "稍后再看";
+"Remove Watched" = "移除已观看";
+"Clear All" = "清空全部";
+"Remove from Watch Later" = "从稍后再看移除";
+"Remove all watched videos from Watch Later?" = "移除稍后再看中所有已观看的视频？";
+"Clear the entire Watch Later list?" = "清空整个稍后再看列表？";
+"Watch" = "稍后";
+"Added to Watch Later" = "已添加到稍后再看";
+"Removed from Watch Later" = "已从稍后再看移除";
+"Watch Later failed: %@" = "稍后再看操作失败：%@";
+"When Playback Ends" = "播放结束时";
+"Wi-Fi Quality" = "Wi-Fi 画质";
+"Write a comment..." = "发条友善的评论…";
+"Zoom to Fill" = "裁剪填充";
+"just now" = "刚刚";
+
+/* Messaging & chat */
+"Mentions" = "@我的";
+"Likes" = "收到的赞";
+"System" = "系统";
+"Chats" = "私信";
+"[Image]" = "[图片]";
+"[Share]" = "[分享]";
+"[Message recalled]" = "[消息已撤回]";
+"[Unsupported message]" = "[暂不支持的消息]";
+"replied to you" = "回复了你";
+"mentioned you" = "@了你";
+"liked your %@" = "赞了你的%@";
+"content" = "内容";
+"User %lld" = "用户%lld";
+"Message..." = "发个消息…";
+"Send failed" = "发送失败";
+"Load earlier messages" = "查看更早的消息";
+"No messages yet" = "还没有消息";
+"Say hi to start the conversation." = "打个招呼，开始聊天吧。";
+
+/* User space */
+"Loading..." = "加载中…";
+"Total views: %@" = "总播放：%@";
+
+/* Accent theme names */
+"Pink" = "粉色";
+"Blue" = "蓝色";
+"Purple" = "紫色";
+"Green" = "绿色";
+"Orange" = "橙色";
+"Red" = "红色";
+"Teal" = "青色";
+"Indigo" = "靛蓝";
+
+/* Localization audit (2026-07): player, live room, login, CDN, errors */
+"Article" = "专栏";
+"Reply to %@..." = "回复 %@…";
+"Replying to %@" = "正在回复 %@";
+"This season has no playable episodes." = "本季没有可播放的剧集。";
+"Episode unavailable (%@)" = "本集不可用（%@）";
+"%lld items" = "%lld 个内容";
+"Search videos, users, live rooms" = "搜索视频、用户、直播间";
+"Default" = "默认";
+"Preview" = "预览";
+"Video AID" = "视频 AV 号";
+"Comment text to post" = "要发布的评论内容";
+"Please enter a positive video AID and comment before posting." = "发布前请输入有效的正整数视频 AV 号和评论内容。";
+"Please enter a positive video AID before posting." = "发布前请输入有效的正整数视频 AV 号。";
+"Please enter comment text before posting." = "发布前请输入评论内容。";
+"Result" = "检测结果";
+"Generating QR Code..." = "正在生成二维码…";
+"Login failed: %@" = "登录失败：%@";
+"Paste your cookie string" = "粘贴 Cookie 字符串";
+"Phone / Email" = "手机号 / 邮箱";
+"Phone number" = "手机号";
+"Verification code" = "验证码";
+"Resend (%llds)" = "重新发送（%lld 秒）";
+"Search country" = "搜索国家/地区";
+"Captcha verification failed" = "人机验证失败";
+"Password encryption failed" = "密码加密失败";
+"Login succeeded but cookies not found" = "登录成功但未找到 Cookie";
+"Missing credentials in cookies" = "Cookie 中缺少登录凭据";
+"Please enter the verification code" = "请输入验证码";
+"Invalid login response" = "登录响应无效";
+"Missing credentials in response" = "响应中缺少登录凭据";
+"Requires VIP" = "需要大会员";
+"Requires login" = "需要登录";
+"Free" = "免费";
+"Comments Unavailable" = "评论不可用";
+"Comments (%@)" = "评论（%@）";
+"No Comments Yet" = "暂无评论";
+"Couldn't Load Moment" = "动态加载失败";
+"This moment is unavailable." = "该动态不可用。";
+"Search following" = "搜索关注的人";
+"Image upload failed: %@" = "图片上传失败：%@";
+"Auto" = "自动";
+"Say something..." = "发个弹幕…";
+"Original" = "原画";
+"Blu-ray" = "蓝光";
+"HD" = "高清";
+"SD" = "流畅";
+"System (live)" = "系统";
+"Switched to %@" = "已切换至%@";
+"Send failed: %@" = "发送失败：%@";
+"Chat connected" = "弹幕已连接";
+"Chat connection failed" = "弹幕连接失败";
+"Codec" = "编码";
+"Decoder" = "解码器";
+"Resolution" = "分辨率";
+"Quality" = "画质";
+"Video Bitrate" = "视频码率";
+"Audio" = "音频";
+"Stream" = "流类型";
+"Video Host" = "视频节点";
+"Audio Host" = "音频节点";
+"Dropped" = "丢帧";
+"Buffer" = "缓冲";
+"Playback error: %@" = "播放错误：%@";
+"The player does not support this video's format." = "播放器不支持此视频的格式。";
+"Decoding failed. Tap Retry." = "解码失败，请点击重试。";
+"The video stream could not be loaded. Tap Retry." = "视频流加载失败，请点击重试。";
+"VideoToolbox (HW)" = "VideoToolbox（硬解）";
+"Software (dav1d)" = "软解（dav1d）";
+"Software (FFmpeg)" = "软解（FFmpeg）";
+"No live stream URL found" = "未找到直播流地址";
+"Playback timed out. Try again." = "播放超时，请重试。";
+"Loading was interrupted. Tap Retry." = "加载被中断，请点击重试。";
+"Video decoder failed. Tap Retry." = "视频解码失败，请点击重试。";
+"Audio decoder failed. Tap Retry." = "音频解码失败，请点击重试。";
+"This video stream could not be read. Tap Retry." = "无法读取该视频流，请点击重试。";
+"Video output failed. Tap Retry." = "视频输出失败，请点击重试。";
+"Video could not be restored. Tap Retry to reload." = "无法恢复画面，请点击重试重新加载。";
+"Audio output failed. Tap Retry." = "音频输出失败，请点击重试。";
+"Could not start playing from that position. Tap Retry." = "无法从该位置开始播放，请点击重试。";
+"Dolby Vision" = "杜比视界";
+"Network error: %@" = "网络错误：%@";
+"HTTP error: %lld" = "HTTP 错误：%lld";
+"API error %lld: %@" = "接口错误 %lld：%@";
+"Login required" = "需要登录";
+"Poll" = "投票";
+"Vote" = "投票";
+"Poll ended" = "投票已结束";
+"Couldn't load poll" = "投票加载失败";
+"Vote failed: %@" = "投票失败：%@";
+"%lld joined" = "%lld 人参与";
+"Choose up to %lld" = "最多选 %lld 项";
+"Decoding failed: %@" = "数据解析失败：%@";
+"Data decode failed" = "数据解析失败";
+"Base URL" = "默认地址";
+"Backup URL" = "备用地址";
+"Alibaba Cloud" = "阿里云";
+"Alibaba Cloud B" = "阿里云 B";
+"Alibaba Cloud O1" = "阿里云 O1";
+"Tencent Cloud" = "腾讯云";
+"Tencent Cloud VOD" = "腾讯云点播";
+"Tencent Cloud O1" = "腾讯云 O1";
+"Huawei Cloud" = "华为云";
+"Huawei Cloud B" = "华为云 B";
+"Huawei Cloud O1" = "华为云 O1";
+"Huawei 08c" = "华为 08c";
+"Huawei 08h" = "华为 08h";
+"Huawei 08ct" = "华为 08ct";
+"Huawei (TF)" = "华为（TF）";
+"Tencent (TF)" = "腾讯（TF）";
+"Alibaba Overseas" = "阿里云海外";
+"Tencent Overseas" = "腾讯云海外";
+"Huawei Overseas" = "华为云海外";
+"Equinix Hong Kong" = "Equinix 香港";
+"Overseas" = "海外";
+"Invalid URL" = "无效地址";
+"No data" = "无数据";
+"Timeout" = "超时";
+"Unreachable" = "无法连接";
+"Failed" = "失败";
+"Unable to get test video stream" = "无法获取测速视频流";
+
+/* Live category browser + shared player options (2026-07) */
+"Search categories" = "搜索分区";
+"All of %@" = "全部%@";
+
+/* Smart CDN Selection (2026-07) */
+"Smart CDN Selection" = "智能CDN选择";
+"Smart CDN" = "智能CDN";
+"My Network" = "我的网络";
+"Selected Node" = "已选节点";
+"Same ISP" = "同运营商";
+"Same Province" = "同省份";
+"No node selected yet" = "尚未选择节点";
+"Re-test Nodes" = "重新测试节点";
+"%lld ms" = "%lld ms";
+"Fake-IP DNS server detected" = "检测到 Fake-IP DNS 服务器";
+"Provider Priority" = "服务商优先级";
+"%lld nodes" = "%lld 个节点";
+"Reset" = "重置";
+"Probe Data Budget" = "探测数据用量";
+"Scale Probe on Cellular" = "蜂窝网络下加大探测";
+"HTTP/2 Probe" = "HTTP/2 探测";
+
+/* CDN expansion + category groups (2026-07) */
+"Tencent OSS" = "腾讯云 OSS";
+"Tencent COS" = "腾讯云 COS";
+"Huawei ESTG" = "华为云 ESTG";
+"Baidu Cloud" = "百度云";
+"UPOS Mirror BD" = "UPOS 镜像 BD";
+"UPOS Mirror BDB" = "UPOS 镜像 BDB";
+"UPOS Mirror 14B" = "UPOS 镜像 14B";
+"UPOS Mirror ZOS" = "UPOS 镜像 ZOS";
+"UPOS Mirror BOS" = "UPOS 镜像 BOS";
+"CN-TJ-CU Node 01-02" = "CN-TJ-CU 节点 01-02";
+"CN-TJ-CU Node 01-03" = "CN-TJ-CU 节点 01-03";
+"CDN Nodes" = "CDN 节点";
+"Pinned" = "置顶";
+"Playing %@…" = "正在播放 %@…";
+
+/* Favorites folder management */
+"Manage Folders" = "管理收藏夹";
+"New Folder" = "新建收藏夹";
+"Folder name" = "收藏夹名称";
+"Create Private" = "创建为私密";
+"Delete Folder" = "删除收藏夹";
+"Delete “%@”?" = "要删除“%@”吗？";
+"The folder and its saved list are removed from your account." = "该收藏夹及其收藏列表将从你的账号中移除。";
+"Remove from Folder" = "移出收藏夹";
+"Operation Failed" = "操作失败";
+"Operation failed: %@" = "操作失败：%@";
+"Debug Logging" = "调试日志";
+"set_time Seek" = "set_time 跳转";
+"Prefetch Filter" = "预取过滤器";
+"Pin Live Engine" = "锁定直播引擎";
+"Playback Report" = "播放报告";
+"View Playback Report" = "查看播放报告";
+"Copy All" = "全部复制";
+"Copied" = "已复制";
+"Refresh" = "刷新";
+"View App Reports" = "查看应用报告";
+"App Reports" = "应用报告";
+"No hang, crash, or exit reports recorded." = "暂无卡顿、崩溃或退出报告。";
+// Playback report viewer
+"Live Tail" = "实时跟随";
+"Search report" = "搜索报告";
+"No events captured." = "暂无捕获的事件。";
+"No matching events." = "没有匹配的事件。";
+"%lld events · %lld dropped" = "%lld 条事件 · 丢弃 %lld 条";
+"Capture started %@" = "捕获开始于 %@";
+"Preload Video Decoder" = "预加载视频解码器";
+"Audio-Output Speed Engine" = "音频输出变速引擎";
+"Demand Pitch Correction" = "自研引擎变速不变调";
+"Preload" = "预加载";
+"Minimal (15s)" = "最小（15秒）";
+"Standard (30s)" = "标准（30秒）";
+"Extended (60s)" = "增强（60秒）";
+"Maximum (120s)" = "最大（120秒）";
+
+/* Comment rich media, badges, and blacklist */
+"Liked by UP" = "UP主觉得很赞";
+"View Full Note" = "查看完整笔记";
+"Long Image" = "长图";
+"Blocked user @%@ — comment hidden" = "已拉黑用户 @%@ — 评论已折叠";
+"Show Anyway" = "仍然显示";
+"Comment from a blocked user" = "已拉黑用户的评论";
+"Block User" = "加入黑名单";
+"Unblock User" = "移出黑名单";
+"Block this user?" = "要拉黑该用户吗？";
+"Blocking unfollows them and collapses their comments across the app." = "拉黑后将自动取消关注，其评论将在应用内折叠隐藏。";
+"You've blocked this user" = "你已拉黑该用户";
+
+/* SponsorBlock */
+"SponsorBlock" = "SponsorBlock";
+"Enable SponsorBlock" = "启用 SponsorBlock";
+"SponsorBlock Settings" = "SponsorBlock 设置";
+"Categories" = "类别";
+"Category" = "类别";
+"Display" = "显示";
+"Show Segments on Progress Bar" = "在进度条上显示片段";
+"Show Skip Notifications" = "显示跳过提示";
+"Statistics" = "统计";
+"Segments Skipped" = "已跳过片段数";
+"Time Saved" = "节省时间";
+"Reset Statistics" = "重置统计";
+"Reset skip statistics?" = "要重置跳过统计吗？";
+"Contribution" = "贡献";
+"User ID" = "用户 ID";
+"Auto-generated" = "自动生成";
+"Custom Server" = "自定义服务器";
+"Server" = "服务器";
+"https://bsbsb.top" = "https://bsbsb.top";
+"Segments" = "片段";
+"No segments for this video yet." = "该视频暂无标记片段。";
+"Loading…" = "加载中…";
+"Start" = "开始";
+"End" = "结束";
+"Set" = "设为当前";
+"Submit" = "提交";
+"Submit Segment" = "提交片段";
+"Submit a Segment" = "提交片段";
+"Submit this segment to the public SponsorBlock database?" = "要将此片段提交到公共 SponsorBlock 数据库吗？";
+"Skipped %@" = "已跳过%@";
+"Skip %@" = "跳过%@";
+"Mute Audio" = "静音";
+"Muted %@" = "已静音%@";
+"Behavior" = "行为";
+"Filtering" = "筛选";
+"Segment Score" = "片段评分";
+"Include Down-voted" = "包含被踩片段";
+"Hide Down-voted" = "隐藏被踩片段";
+"Only Up-voted" = "仅顶过的片段";
+"Skip" = "跳过";
+"Mute" = "静音";
+"Full Video" = "整个视频";
+"Chapter" = "章节";
+"Sponsor" = "赞助广告";
+"Unpaid/Self Promotion" = "自我推广";
+"Interaction Reminder" = "互动提醒";
+"Intro/Intermission" = "过场/片头";
+"Endcards/Credits" = "片尾/致谢";
+"Preview/Recap" = "预告/回顾";
+"Non-Music Section" = "非音乐部分";
+"Filler Tangent" = "无关填充";
+"Highlight" = "精彩片段";
+"Exclusive Access" = "专属提示";
+"Disabled" = "关闭";
+"Skip Automatically" = "自动跳过";
+"Show Skip Button" = "显示跳过按钮";
+"Set a User ID in SponsorBlock settings first." = "请先在 SponsorBlock 设置中填写用户 ID。";
+"The SponsorBlock server returned an unexpected response." = "SponsorBlock 服务器返回了异常响应。";
+"SponsorBlock server error (%lld)." = "SponsorBlock 服务器错误（%lld）。";
+"The submission was rejected." = "提交被拒绝。";
+"This segment has already been submitted." = "该片段已提交过。";
+"Too many submissions — please slow down." = "提交过于频繁，请稍后再试。";
+
+// Non-logged-in UX
+"Log In" = "登录";
+"Access history, favorites, and more." = "查看历史记录、收藏夹等更多内容。";
+
+// Bangumi Continue-Watching banner
+"Continue Watching" = "继续观看";
+
+// Offline downloads
+"Downloads" = "下载";
+"Download" = "下载";
+"Downloading" = "下载中";
+"No Downloads" = "暂无下载";
+"No Matches" = "无匹配结果";
+"Videos you download for offline viewing appear here." = "你下载用于离线观看的视频会显示在这里。";
+"No downloads match your search." = "没有符合搜索条件的下载。";
+"Download actions" = "下载操作";
+"Re-download" = "重新下载";
+"Search downloads" = "搜索下载";
+"Preparing…" = "准备中…";
+"Validating…" = "正在校验…";
+"Saving…" = "正在保存…";
+"Not Available" = "无法播放";
+"Download unavailable" = "下载不可用";
+"Downloaded files are missing or corrupt." = "下载文件缺失或已损坏。";
+"Already downloaded" = "已下载";
+"Download in progress" = "正在下载";
+"No downloadable stream" = "无可下载的视频流";
+"Download started" = "已开始下载";
+"Download Quality" = "下载清晰度";
+// Section header: two-end aligned instead of joined by an interpunct.
+"%d videos" = "%d 个视频";
+"%@ used" = "已用 %@";
+"No downloadable stream for this quality." = "该清晰度没有可下载的视频流。";
+"Download storage is not ready. Try again." = "下载存储尚未就绪，请重试。";
+"Could not prepare the download: %@" = "无法准备下载：%@";
+"Downloaded media is invalid: %@" = "下载的媒体无效：%@";
+"Could not save the download: %@" = "无法保存下载：%@";
+"The download URL is invalid." = "下载地址无效。";
+"The download server returned an invalid response." = "下载服务器返回了无效响应。";
+"Download server %@ returned HTTP %lld." = "下载服务器 %@ 返回 HTTP %lld。";
+"Download server %@ returned an empty file." = "下载服务器 %@ 返回了空文件。";
+"The download ended before a file was produced." = "下载结束但未生成文件。";
+"video file is missing" = "视频文件缺失";
+"video file is empty" = "视频文件为空";
+"audio file is missing" = "音频文件缺失";
+"audio file is empty" = "音频文件为空";
+"Downloaded" = "已下载";
+"Delete" = "删除";
+"Missing files" = "文件缺失";
+
+// Share card
+"Scan to watch" = "扫码观看";
+
+"Speed" = "倍速";
+
+// Accessibility labels (live room, player chrome)
+"Open %@'s profile" = "打开 %@ 的个人空间";
+"Video quality %@" = "视频画质 %@";
+"%@ viewers" = "%@人在看";
+"Exit fullscreen" = "退出全屏";
+"Enter fullscreen" = "进入全屏";
+"Back" = "返回";
+"More" = "更多";
+
+"Close" = "关闭";
+
+"Last Seek" = "最近跳转";
+
+// The app-wide download capsule, plus a key DownloadsView already asked for
+// and neither catalog had — so a Chinese build showed the English literal.
+"Retrying…" = "重试中…";
+"Open Downloads" = "打开下载";
+"%@, and %lld more downloading" = "%@，另有 %lld 个下载中";
+
+// The capsule's collapse/expand pair: the ✕ that used to hide it entirely
+// now shrinks it to a small progress ring instead.
+"Collapse" = "收起";
+"Show a smaller progress indicator" = "显示为较小的进度指示器";
+"Show the full download progress" = "显示完整下载进度";
+
+// Resumable downloads
+"Download server %@ could not resume this file." = "下载服务器 %@ 无法续传此文件。";
+"Could not write the partial download: %@" = "无法写入下载中的文件：%@";
+"Download interrupted at %@ of %@. Resume to continue." = "下载中断于 %@ / %@，可继续下载。";
+"Paused" = "已暂停";
+"Resume" = "继续";
+"Resume download" = "继续下载";
+"Pause download" = "暂停下载";
+
+// Download network policy and disk capacity
+"Downloads are set to Wi-Fi only. Turn on Download over Cellular." = "下载已限制为仅 Wi-Fi。请开启“蜂窝网络下载”。";
+"Low Data Mode is on. Turn it off in iOS Settings to download." = "当前网络已开启低数据模式。请在 iOS 设置中关闭后再下载。";
+"This network is metered, so the download was not started." = "当前网络按流量计费，已取消本次下载。";
+"The device ran out of space during the download." = "下载过程中设备存储空间不足。";
+"Not enough space: %@ needed, %@ free." = "存储空间不足：需要 %@，可用 %@。";
+"Download over Cellular" = "蜂窝网络下载";
+
+// Live rendition names (live qn scale, not VOD)
+"Ultra HD" = "超清";
+
+// Unavailable video states
+"This video is no longer available." = "该视频已不存在。";
+"This video is private." = "该视频不可见。";
+"This video is being reviewed and cannot be played yet." = "该稿件审核中，暂时无法播放。";
+"This video is not available in your region." = "该视频在您所在地区不可观看。";
+"This video requires a purchase or subscription." = "该视频需要购买或开通会员。";
+"Sign in to watch this video." = "请登录后观看该视频。";
+"No playable stream is available for this video." = "没有可播放的视频流。";
+"This account cannot watch this video." = "当前账号无法观看该视频。";
+
+// Live round/carousel play
+"ROUND" = "轮播";
+"Round play — no stream available" = "轮播中 — 暂无可播放的流";
+"The streamer is away and this room's carousel is not available to play." = "主播不在，该房间的轮播内容当前无法播放。";
+
+// Playback diagnostics section
+"Playback Diagnostics" = "播放诊断";
+"Also shows timing counters in Playback Info" = "同时在播放信息中显示计时数据";
+
+// Clipboard link detection
+"Automatically Detect Bilibili Links from Clipboard" = "自动识别剪贴板中的哔哩哔哩链接";
+"Video from your clipboard" = "剪贴板中的视频";
+"Live room from your clipboard" = "剪贴板中的直播间";
+"Profile from your clipboard" = "剪贴板中的用户主页";
+"Moment from your clipboard" = "剪贴板中的动态";
+"Article from your clipboard" = "剪贴板中的专栏";
+"Dismiss" = "忽略";
+
+// Accent colour scope
+"Apply Color To" = "应用范围";
+"Bottom Navigation Only" = "仅底部导航栏";
+
+// Playback continuation (were missing from both catalogues)
+"Background Audio" = "后台播放";
+"Picture in Picture" = "画中画";
+"VOD Engine" = "视频播放引擎";
+
+// Playback engine names
+"libVLC" = "libVLC";
+"In-house engine" = "自研引擎";
+
+// playback failure / retry (was hard-coded in PlayerViewModel)
+"Playback failed. Tap Retry." = "播放失败，请点击重试。";
+
+// player transport accessibility labels
+"Play" = "播放";
+"Pause" = "暂停";
+"Player Window" = "播放窗口";
+
+// cache size choices
+"100 MB" = "100 MB";
+"250 MB" = "250 MB";
+"500 MB" = "500 MB";
+"1 GB" = "1 GB";
+
+// Image performance diagnostics (Settings -> Image Diagnostics)
+"Image Diagnostics" = "图像诊断";
+"Image Performance Diagnostics" = "图像性能诊断";
+"Show Counter Overlay" = "显示计数浮层";
+"Freeze Loading Indicators" = "冻结加载指示器";
+"A/B Arms" = "A/B 对照项";
+"Suppress Image Instrumentation" = "关闭图像埋点";
+"Async Image Decode" = "异步图像解码";
+"Stabilize Request Geometry" = "统一请求尺寸";
+"Instant Image Transition" = "图像瞬时显示";
+"Split Layout Probes" = "拆分布局探针";
+"Capture" = "采集";
+"Start Capture" = "开始采集";
+"Stop Capture" = "停止采集";
+"View Image Report" = "查看图像报告";
+"Image Report" = "图像报告";
+"Clear Image Log" = "清除图像日志";
+"Discard the captured image events?" = "要丢弃已采集的图像事件吗？";
+
+// Accent colour scope (semantic roles)
+
+// Accent scope
+"System (accent)" = "系统";
+"Controls" = "控件";
+"Accent Elements" = "强调色元素";
+"Bilibili Pink" = "哔哩哔哩粉";
+"Could not reach the video server. Check your connection and try again." = "无法连接视频服务器，请检查网络后重试。";
+
+// Cover presentation
+"Cover Aspect" = "封面比例";
+"Cover Display" = "封面显示";
+"Fill" = "填充";
+"Show Entire Image" = "显示完整图片";
+
+// Demand live selection refusals (one message per classified cause — the old
+// single message named the requested qn for every failure)
+"This live room is not offering a stream this player can open." = "该直播间没有提供本播放器可以打开的直播流。";
+"This live room streams only %@, which this player cannot open." = "该直播间只提供 %@ 流，本播放器无法打开。";
+"This live room's video codec (%@) is not supported." = "该直播间的视频编码（%@）不受支持。";
+"This device cannot decode this live room's video (%@)." = "本设备无法解码该直播间的视频（%@）。";
+"No stream this player can open offers %@." = "本播放器可打开的直播流中没有%@。";
+"quality %lld" = "清晰度 %lld";
+"%1$@ is unavailable — playing %2$@ instead" = "%1$@ 不可用，已改为播放 %2$@";
+
+// Danmaku send failures
+"Couldn't send danmaku" = "弹幕发送失败";
+"Sign in to send danmaku" = "登录后才能发送弹幕";
+"Danmaku was rejected" = "弹幕被拒绝";
+"Send danmaku" = "发弹幕";
+"Danmaku sent" = "弹幕已发送";
+"Sending…" = "发送中…";
+// Accessibility value of the danmaku on/off buttons ("Off" is shared).
+"On" = "开启";
+
+// Danmaku drawing. "Top" stays 最热 for comment sort.
+"Danmaku" = "弹幕";
+"Show Danmaku" = "显示弹幕";
+"Danmaku Settings" = "弹幕设置";
+"Danmaku Speed" = "弹幕速度";
+"Opacity" = "不透明度";
+"Font Size" = "字号";
+"Fullscreen Font Size" = "全屏字号";
+"Log in to send danmaku" = "登录后发弹幕";
+"Scroll Duration" = "滚动时长";
+"Display Area" = "占屏比例";
+"Scroll" = "滚动";
+"Top Position" = "顶部";
+"Bottom" = "底部";
+"Smart Anti-Occlusion" = "智能防挡";
+"Keep Subtitles Clear" = "防挡字幕";
+"Blocked Keywords" = "屏蔽词";
+"Add" = "添加";
+"Audio Quality" = "音质";
+"Wi-Fi Audio Quality" = "Wi-Fi 音质";
+"Cellular Audio Quality" = "蜂窝网络音质";
+"Hi-Res Lossless" = "Hi-Res 无损";
+
+"Multi-connection" = "多连接";
+"Parallel Connections" = "多线程连接";
+
+"Use on Cellular" = "蜂窝网络下使用";
+
+// Multi-connection playback status
+"Unavailable for this source" = "当前播放源不支持";
+"Disabled by playback configuration" = "播放配置已禁用";
+"Waiting for Wi-Fi" = "等待 Wi-Fi";
+"Applies to the next video" = "下次打开视频生效";
+"Checking download status" = "正在查询下载状态";
+"Unavailable for this video" = "当前视频无法使用多连接";
+"Standby" = "待命";
+"Paused for CDN measurement" = "CDN 测速期间暂停";
+"Playback inactive" = "播放未激活";
+"Paused after memory pressure" = "内存压力后暂停";
+"Playback paused" = "播放已暂停";
+"Download details" = "下载详情";
+"Active helper requests: %lld" = "活跃辅助请求：%lld";
+"Candidate hosts: %lld" = "候选节点：%lld";
+"Completed fragments: %lld" = "已完成分片：%lld";
+"Staged data: %@" = "暂存数据：%@";
+"Discarded staged data: %@" = "丢弃暂存数据：%@";
+"Completed payload rate excludes data still downloading." = "速率按已完成的下载数据统计，不含下载中的数据。";
+"%lld req" = "%lld 请求";
+"Done %@/s" = "完成 %@/s";
+"Unavailable" = "不可用";
+"Checking" = "查询中";
+"CDN measurement" = "CDN 测速";
+"Memory pressure" = "内存压力";
+"Inactive" = "未激活";
+"Nodes cooling down" = "节点冷却中";
+"Cooling down" = "冷却中";
+"Network restricted" = "网络受限";
+
+// CDN multi-connection sources
+"Completed download data: %@" = "已完成下载数据：%@";
+"Completed download rate: %@/s" = "已完成下载速率：%@/s";
+"Active download node: %@" = "当前下载节点：%@";
+"Primary Video" = "主视频节点";
+"Primary Audio" = "主音频节点";
+"Helpers" = "辅助节点";
+"Total Receive" = "总接收速率";
+
+// Eight-request CDN display
+"Helper State" = "辅助状态";
+"Concurrency" = "并发请求";
+"Helper Rate" = "辅助下载";
+"Main A/V" = "主音视频";
+"Ali" = "阿里云";
+"TX" = "腾讯云";
+"HW" = "华为云";
+"Concurrent requests: %@" = "并发请求：%@";
+"Helper download: %@" = "辅助下载：%@";
+"Speed counts completed helper downloads, excluding data still transferring." = "速率按已完成的辅助下载数据统计，不含传输中的数据。";
+
+// Compact playback diagnostics
+"Decode" = "解码";
+"Timing" = "耗时";
+"Frames" = "帧率/掉帧";
+"Main Video" = "主视频";
+"Main Audio" = "主音频";
+
+"Previously loaded recommendations" = "之前加载的推荐";
+
+// Player equalizer
+"Equalizer" = "均衡器";
+"Enable Equalizer" = "开启均衡器";
+"Status" = "状态";
+"Preset" = "预设";
+"Custom" = "自定义";
+"Frequency Bands" = "频段";
+"Preamp" = "预放大";
+"Automatic Headroom" = "自动音量余量";
+"Manual Attenuation" = "手动衰减";
+"Effective Preamp" = "最终预放大";
+"Restore Defaults" = "恢复默认";
+"Bass" = "低音";
+"Vocal" = "人声";
+"Treble" = "高音";
+"Flat" = "平直";
+"Saved for Playback" = "已保存，等待播放";
+"Pending Audio Update" = "等待音频更新";
+"Configured" = "已配置";
+"Bypassed" = "已旁路";
+"Equalizer Unavailable" = "均衡器不可用";
+"Audio Update Failed" = "音频更新失败";
+
+// Experimental and advanced settings
+"General" = "通用";
+"Reports" = "报告";
+"Automatic Selection Status" = "自动选择状态";
+"Automatic CDN Configuration" = "自动 CDN 配置";
+"Manual CDN Selection" = "手动 CDN 选择";
+"Manual CDN Fallback" = "手动 CDN 备用选择";
+"Saved Selection" = "已保存的选择";
+"Automatically Selected Node" = "自动选中的节点";
+"Automatic CDN Fallback" = "CDN 故障自动切换";
+"Experimental Features" = "实验功能";
+"Enable Experimental Features" = "启用实验功能";
+"Advanced Settings" = "高级设置";
+"Equalizer Feature" = "均衡器功能";
+"Ambient Mode" = "氛围模式";
+"Multi-connection Feature" = "多连接功能";
+"Comment Verification Tools" = "评论检测工具";
+"Diagnostic Features" = "诊断功能";
+"Diagnostic Tools" = "诊断工具";
+"Playback Experiments" = "播放实验选项";
+"Experimental settings could not be saved." = "无法保存实验功能设置。";
+"Experimental settings could not be read. Saved data has been preserved." = "无法读取实验功能设置，已保留保存的数据。";
+"AI Comment Auto-Filter" = "AI 评论自动过滤";
+"AI Comment Filter" = "AI 评论过滤";
+"Filter Mode" = "过滤模式";
+"Filter Sensitivity" = "过滤灵敏度";
+"Badge Only" = "仅标记";
+"Auto-Collapse" = "自动折叠";
+"Hide Completely" = "完全隐藏";
+"Show a subtle AI suspicion badge next to the author name." = "在评论作者旁显示疑似 AI 标记。";
+"Collapse suspected AI comments into a compact bar you can expand." = "将疑似 AI 评论自动折叠为可点击展开的提示条。";
+"Hide suspected AI comments from the feed without breaking pagination." = "在评论列表中完全隐藏疑似 AI 评论，不影响翻页加载。";
+"Lenient" = "宽松";
+"Standard" = "标准";
+"Strict" = "严格";
+"On-Device Model Refiner" = "端侧模型复核";
+"On-device Apple Intelligence model is available for borderline comments." = "Apple Intelligence 端侧模型可用，将对边界分数评论进行二次复核。";
+"This device does not support Apple Intelligence. Using local heuristic rules only." = "当前设备不支持 Apple Intelligence，仅使用本地规则评分。";
+"Apple Intelligence is turned off in System Settings. Using local heuristic rules only." = "系统设置中未开启 Apple Intelligence，仅使用本地规则评分。";
+"On-device language model is still preparing. Falling back to local heuristic rules." = "端侧语言模型尚未就绪，当前回退至本地规则评分。";
+"Requires iOS 26 or later with Apple Intelligence. Using local heuristic rules only." = "需要 iOS 26 及支持 Apple Intelligence 的设备，当前仅使用本地规则评分。";
+"Author Whitelist" = "作者白名单";
+"No Whitelisted Authors" = "暂无白名单作者";
+"Tap an AI filter badge or collapsed bar on any comment to add its author here." = "点击评论上的疑似 AI 标记或折叠条详情，即可将作者加入白名单。";
+"%lld Whitelisted Authors" = "已添加 %lld 位白名单作者";
+"Swipe left on an author to remove them from the local whitelist." = "左滑作者条目可将其移出本地白名单。";
+"Clear Whitelist" = "清空白名单";
+"Clear all whitelisted authors?" = "清空所有白名单作者？";
+"Collapsed suspected AI comment · %lld%%" = "已折叠疑似 AI 评论 · %lld%%";
+"Expand" = "展开";
+"Expands the original comment" = "展开查看原始评论";
+"View AI filter details" = "查看 AI 过滤详情";
+"Suspected AI %lld%%" = "疑似 AI %lld%%";
+"Shows matched reasons and author whitelist option" = "查看命中原因及加入白名单选项";
+"Detection Result" = "检测结果";
+"Suspicion Score" = "疑似评分";
+"Detection Stage" = "检测阶段";
+"Author" = "作者";
+"Matched Signals" = "命中原因";
+"Combined account and text heuristics exceeded threshold." = "账号与文本综合特征超过当前阈值。";
+"Add @%@ to Whitelist" = "将 @%@ 加入白名单";
+"Collapse Comment Again" = "重新折叠此评论";
+"Whitelisted authors are stored locally and never filtered on this device." = "白名单仅保存在本机，加入后该作者的评论将不再被过滤。";
+"Local Heuristic Rules" = "本地规则评分";
+"Local Rules + Apple Intelligence" = "本地规则 + Apple Intelligence 端侧复核";
+"On-device model: %@" = "端侧模型：%@";
+"Contains typical AI transition or summary phrasing" = "包含典型 AI 过渡或总结句式";
+"Uses repetitive generic praise or recap templates" = "高频机械夸赞或泛化总结模板";
+"Contains raw Markdown formatting artifacts" = "包含 Markdown 残留格式";
+"Rigid multi-point numbered list layout" = "高度结构化分点排版";
+"Uses AI-style emoji bullet markers" = "使用典型 AI 列表 Emoji 排版";
+"High density of parallel essay clauses" = "高频对仗或递进式模板句式";
+"Default or batch-style bot username" = "疑似默认或批量格式用户名";
+"Username matches AI bot or Dafeiyu pattern" = "昵称命中大肥鱼或 AI 机器人特征";
+"Username contains AI persona or bot markers" = "昵称包含 AI 人设或机器人标识";
+"Username contains whale/fish persona cue" = "昵称包含鲸鱼/鱼鱼人设线索";
+"Account bio discloses AI bot or automated agent" = "个人签名自曝 AI 代管或自动机器人";
+"Account bio contains AI persona or token cues" = "个人签名包含大模型或人设关键词";
+"Low-level account matching AI bot traits" = "低等级账号且命中 AI 机器人特征";
+"Uses AI bot or whale persona self-reference" = "正文包含本鲸/本鱼或 AI 自称话术";
+"Contains roleplay action stage directions" = "正文包含括号演戏动作描写";
+"Mentions linked owner account in top-level comment" = "主评论疑似 @ 关联主人账号";
+"Matches custom account keyword: %@" = "命中自定义账号关键词：%@";
+"Matches custom comment keyword: %@" = "命中自定义评论关键词：%@";
+"Avatar matches DeepSeek whale-blue palette (%lld%%)" = "头像命中大肥鱼标志性蓝调（%lld%%）";
+"Avatar has prominent whale-blue tone (%lld%%)" = "头像蓝色占比偏高（%lld%%）";
+"Detection Rules" = "检测规则与自定义词库";
+"Built-in Detection Dimensions" = "内置检测维度";
+"Account Name & Bio Rules" = "账号昵称与签名特征";
+"Whale-Blue Avatar Detection" = "头像鲸鱼蓝特征检测";
+"AI Persona & Essay Rules" = "评论人设与小作文特征";
+"Low-Level Account Boost" = "低等级账号加权";
+"Whale-blue avatar detection inspects a 32×32 local thumbnail of cached avatars to catch DeepSeek whale-style accounts without extra network requests." = "头像检测仅在本地分析已缓存头像的 32×32 缩略图色相占比，用于识别 DeepSeek 蓝鲸风格账号，不产生额外网络请求。";
+"Sensitivity Threshold" = "拦截阈值";
+"Custom Score Threshold" = "自定义拦截阈值";
+"Trigger Threshold" = "触发阈值";
+"Current effective threshold: %lld%%. Lower values catch more bots; higher values reduce false positives." = "当前生效阈值：%lld%%。阈值越低拦截越严格，越高误判越少。";
+"Custom Account Keywords" = "自定义账号拦截词（昵称 / 签名）";
+"Add username or bio keyword" = "输入昵称或签名关键词";
+"Comments whose author username or bio contains any keyword here are immediately flagged." = "发言者昵称或个人签名包含以下任意词时直接标记拦截。";
+"Custom Comment Keywords" = "自定义评论正文拦截词";
+"Add comment text keyword" = "输入评论正文关键词";
+"Comments whose text contains any keyword here are immediately flagged." = "评论正文包含以下任意词时直接标记拦截。";
+"Reset to Default Rules" = "恢复默认规则";
+"Reset all detection rules to default?" = "确定将所有检测规则与自定义词库恢复为默认吗？";
+"Reset Rules" = "恢复默认";
+"Low-level account posting long structured text" = "低等级账号发布长篇结构化评论";
+"Account bio contains promotional or bot keywords" = "账号简介含引流或营销关键词";
+"Low-level account with empty bio posting long essay" = "低等级且简介为空的长篇评论";
+"Long formal prose with no community interaction cues" = "长篇规范书面语且缺少社区互动特征";
+
+/* Download export */
+"Another export is still running." = "另一个导出仍在运行。";
+"Cancel export and continue" = "取消导出并继续";
+"Cancel export before changing this download?" = "先取消导出，再修改此下载？";
+"Dimensions" = "尺寸";
+"Discard" = "丢弃";
+"Discard exported file" = "丢弃导出文件";
+"Discard exported file?" = "丢弃导出文件？";
+"Download is being exported" = "此下载正在导出";
+"Downloaded files are unavailable." = "下载文件不可用。";
+"Enter a file name." = "请输入文件名。";
+"Export" = "导出";
+"Export cancelled" = "导出已取消";
+"Export cancelled." = "导出已取消。";
+"Export failed" = "导出失败";
+"Export interrupted" = "导出已中断";
+"Export video" = "导出视频";
+"Exporting" = "正在导出";
+"File" = "文件";
+"File name" = "文件名";
+"Fits within the selected resolution without enlarging the source." = "适配所选分辨率，不放大源视频。";
+"Include local audio" = "保留本地音轨";
+"Included audio becomes AAC and loses Dolby / Atmos information." = "音轨转为 AAC，将失去杜比／Atmos 信息。";
+"Keep export" = "Keep export";
+"Local source" = "本地源文件";
+"MP4 · Choose a location in Files after export finishes." = "MP4 · 导出完成后在“文件”中选择保存位置。";
+"Mode" = "模式";
+"No local audio track — silent export." = "没有本地音轨，将导出静音视频。";
+"No supported export recipe is available for these local tracks." = "这些本地轨道没有可用的导出配置。";
+"Original tracks" = "原轨封装";
+"Output" = "输出";
+"Preparing export" = "正在准备导出";
+"Preserves source video, audio and available HDR / Dolby information without re-encoding." = "不重新编码，保留源视频、音轨及已有 HDR／杜比信息。";
+"Reading local tracks…" = "Reading local tracks…";
+"Ready to save" = "可以保存";
+"Saved" = "已保存";
+"Saving" = "正在保存";
+"Source HDR" = "源 HDR";
+"Source size" = "Source size";
+"Stopping export" = "正在停止导出";
+"The downloaded files changed. Open export again." = "下载文件已变化，请重新打开导出。";
+"The export component is not ready." = "导出组件尚未就绪。";
+"The exported file could not be validated." = "导出文件未通过验证。";
+"There is not enough space for this export." = "空间不足，无法完成此次导出。";
+"This export configuration is unavailable." = "此导出配置不可用。";
+"Transcode MP4" = "转码为 MP4";
+"Transcoding removes Dolby Vision metadata." = "转码会移除 Dolby Vision 元数据。";
+"Unlock the device to access the export files." = "请解锁设备以访问导出文件。";
+"Waiting to start" = "等待开始";
+
+/* Dynamic post reading and actions */
+"Comment" = "评论";
+"View Full Text" = "查看全文";
+"View Post" = "查看动态";
+"Read Article" = "阅读专栏";
+"View profile: %@" = "查看 %@ 的主页";
+
+// Dynamics native controls
+"Moment Filters" = "动态筛选";
+"Moment Interactions" = "动态互动";
+"Photos" = "图片";
+"No images" = "暂无图片";
+
+/* Comment visibility checking */
+"Posts once, then checks anonymous public visibility. A missing result is not a moderation verdict." = "发送一次评论，随后匿名查询公开可见性。未查询到评论不代表平台已判定屏蔽。";
+"Comment being checked" = "本次检测的评论";
+"Posting comment…" = "正在发送评论…";
+"Stopping this check does not delete a posted comment." = "停止检测不会删除已经发送的评论。";
+"Retry visibility check" = "重新检测可见性";
+"Checks the same posted reply without sending another comment." = "只查询同一条已发送评论，不会重复发送。";
+"Not found in this check" = "本轮未找到";
+"Unable to determine visibility" = "无法判断可见性";
+"Comment submission failed" = "评论发送请求失败";
+"The posted reply was found in an anonymous public query." = "匿名公开查询已找到这条评论。";
+"Completed public queries did not find this reply. Delays or limited query results may explain this; it is not a moderation verdict." = "本轮公开查询已完成，但未找到这条评论；可能存在同步延迟或查询范围限制，不能据此判定平台屏蔽。";
+"A public query could not be completed. Visibility is unknown." = "公开查询未能完成，暂时无法判断可见性。";
+"The request failed. The server may still have received the comment; check before posting again." = "发送请求失败，但服务器可能已经收到评论；再次发送前请先查看评论区。";
+"Submission was accepted without a usable reply ID, so visibility cannot be checked. Do not resend just to retry verification." = "发送请求已成功返回，但未提供可用的评论 ID，无法查询可见性。请勿仅为重试检测而重复发送。";
+"Comment tools are unavailable for this session. Reopen this page after enabling them in settings." = "本次评论检测入口已失效。请在设置中启用评论工具后重新打开此页面。";
+
+/* Comment refresh and full panel */
+"Replies are unavailable" = "回复暂不可用";
+"Loading comments…" = "正在加载评论…";
+"Couldn't load comments." = "评论加载失败。";
+"Couldn't refresh comments. Previous results are still shown." = "评论刷新失败，已保留之前的结果。";
+"Couldn't load more comments." = "更多评论加载失败。";
+"Load comments" = "加载评论";
+"Refresh comments" = "刷新评论";
+"Comment Sort" = "评论排序";
+"Switch between Top and Latest" = "在最热和最新之间切换";
+
+/* Dynamic interaction participant lists */
+"Couldn't load likes." = "点赞列表加载失败。";
+"Couldn't load more likes." = "更多点赞加载失败。";
+"Couldn't load more reposts." = "更多转发加载失败。";
+"Couldn't load reposts." = "转发列表加载失败。";
+"Continue Loading" = "继续加载";
+"Likes Unavailable" = "点赞用户暂不可见";
+"Load More Reposts" = "加载更多转发";
+"No visible like participants were returned." = "服务器未返回可见的点赞用户。";
+"No visible repost participants were returned." = "服务器未返回可见的转发用户。";
+"Open reposted dynamic" = "打开这条转发动态";
+"Other interactions are not shown in this likes list." = "点赞列表仅显示已确认的点赞，其他互动未列出。";
+"Reposts Unavailable" = "转发用户暂不可见";
+"Sign In" = "登录";
+"Sign In Required" = "需要登录";
+"Sign in to view likes." = "登录后才能查看点赞用户。";
+"Unknown User" = "未知用户";
+
+/* Following people dynamics */
+"Following People" = "关注的人";
+"All Dynamics" = "全部动态";
+"More Following" = "更多关注";
+"Choose Following Person" = "选择关注的人";
+"All Followed Dynamics" = "全部关注动态";
+"Recent Updates" = "最近有更新";
+"No recent updates" = "暂无近期更新";
+"Load More Updates" = "加载更多更新";
+"Loading recent people" = "正在加载近期更新的人";
+"Retry recent people" = "重试加载近期动态";
+"All Following" = "所有关注";
+"No People You Follow" = "暂无关注的人";
+"Load More Following" = "加载更多关注";
+"Couldn't load recent people." = "近期关注用户加载失败。";
+"Couldn't load more recent people." = "更多近期关注用户加载失败。";
+"Couldn't load following people." = "关注列表加载失败。";
+"Couldn't load more following people." = "更多关注用户加载失败。";
+"Could not identify the current account." = "无法确认当前账号身份。";
+"No matches in loaded people." = "已加载的用户中没有匹配结果。";
+"Close and reopen Mention to continue." = "请关闭并重新打开“提及”以继续。";
+"Sign in to view dynamics." = "登录后查看动态。";
+"No dynamics from this person yet." = "此人暂无动态。";
+"Viewing %@'s dynamics" = "正在查看：%@ 的动态";
+"Selected" = "已选";
+
+/* Favorites folder actions */
+"Copy to Folder" = "复制到收藏夹";
+"Move to Folder" = "移动到收藏夹";
+"View Uploader" = "查看 UP 主";
+"More actions for %@" = "%@ 的更多操作";
+"Moved" = "已移动";
+"Removed" = "已移除";
+"Action Unavailable" = "操作不可用";
+"No Other Folders" = "没有其他收藏夹";
+
+/* Native music information */
+"Music" = "音乐";
+"Artists" = "艺术家";
+"Album" = "专辑";
+"Music Source" = "音乐来源";
+"Watch MV" = "观看 MV";
+"Open Official Page" = "打开官方页面";
+"Loading music information" = "正在加载音乐信息";
+"Web Page" = "网页";
+"Reload" = "重新加载";
+"Page Unavailable" = "网页无法加载";
+
+/* In-app link resolution */
+"Opening Link" = "正在打开链接";
+"Link Unavailable" = "无法在客户端打开此链接";
+"Open Original Page" = "打开原始页面";
+"Music from your clipboard" = "剪贴板中的音乐";
+
+/* Layout-shaped loading placeholders (VoiceOver labels) */
+"Loading %@" = "正在加载%@";
+"Loading moments" = "正在加载动态";
+"Loading profile" = "正在加载个人资料";
+
+/* About screen */
+"About" = "关于";
+"Developer" = "开发者";
+"Made by haikiseven. SwiftPili is a native BiliBili client inspired by PiliPlus." = "由 haikiseven 开发。SwiftPili 是一个受 PiliPlus 启发的原生哔哩哔哩客户端。";
+"Version" = "版本";
+"Build" = "构建号";
+"Commit" = "提交";
+"Build Date" = "构建日期";
+"Modified" = "有改动";
+"Unknown" = "未知";
+
+"No Live Streams" = "暂无直播";
+
+/* Setup Wizard */
+"Setup Wizard" = "设置向导";
+"Get Started" = "开始使用";
+"Next" = "下一步";
+"Skip" = "跳过";
+"Summary" = "配置概览";
+"Choose your preferred theme, accent color, and feed layout." = "选择您偏好的深浅外观、主题色与首页布局。";
+"Configure default streaming quality, background audio, and SponsorBlock." = "配置默认播放画质、后台播放/画中画与空降助手。";
+"Sign in to sync your Bilibili account or start browsing right away." = "登录哔哩哔哩账号以同步推荐与高画质，或直接开始浏览。";
+"4K Ultra HD" = "4K 超清";
+"1080P 60fps" = "1080P 60帧";
+"1080P+ High Bitrate" = "1080P 高码率";
+"1080P HD" = "1080P 高清";
+"720P" = "720P 清晰";
+"Signed in to Bilibili" = "已登录哔哩哔哩账号";
+"Sign in with QR code or web login to sync your recommendations, favorites, and 1080P60/4K streams." = "支持扫码或网页登录，同步个性化推荐、收藏夹与 1080P60/4K 超清画质。";
+
+/* Accessibility labels (UI acceptance round 2, 2026-11-12) */
+"Live chat message" = "直播间消息";
+"Send message" = "发送消息";
+"Cancel sending" = "取消发送";
+"Continue your comment" = "继续编辑评论";
+"Previous Episode" = "上一集";
+"Next Episode" = "下一集";
+"Manage Groups" = "管理分组";
+"Clear" = "清除";
+
+/* User Space redesign (2026-11-12) */
+"FollowingStat" = "关注";
+"Views" = "播放";
+"Copy UID" = "复制 UID";
+"Official Account" = "官方认证";
+
+/* Settings organization (2026-11-12) */
+"Appearance & Display" = "外观与显示";
+"Playback & Danmaku" = "播放与弹幕";
+"Browsing & Community" = "浏览与社区";
+"Downloads & Storage" = "下载与存储";
+"Advanced & About" = "高级与关于";
+
+/* Comment composer redesign (Round 13, 2026-11-14) */
+"Continue editing · Draft" = "继续编辑 · 草稿";
+"Continue editing comment draft" = "继续编辑评论草稿";
+"Write a comment" = "写评论";
+"Collapse editor and keep draft" = "收起编辑并保留草稿";
+"Dismiss keyboard" = "收起键盘";
+"Cancel reply" = "取消回复";
+"Stickers" = "表情";
+"Mention user" = "提及用户";
+"Add image" = "添加图片";
+"Remove image" = "移除图片";
+
+/* Round 22 UI & interaction feedback (2026-11-17) */
+"Edit" = "编辑";
+"View Personal Space" = "查看个人空间";
+"Like failed" = "点赞失败";
+"Like failed (%lld): %@" = "点赞失败（%lld）：%@";
+
+/* Search redesign (2026-11-19) */
+"SearchTabAll" = "综合";
+"Bangumi" = "番剧";
+"View more %@" = "查看更多%@";
+"%@ ratings" = "%@人评分";
+"Fill search term" = "填入搜索词";
+"SearchSortComprehensive" = "综合排序";
+"Most Played" = "最多播放";
+"Newest" = "最新发布";
+"Most Danmaku" = "最多弹幕";
+"Duration" = "时长";
+"All Durations" = "全部时长";
+"Under 10 min" = "10分钟以下";
+"10-30 min" = "10-30分钟";
+"30-60 min" = "30-60分钟";
+"Over 60 min" = "60分钟以上";
+"Filter by duration" = "按时长筛选";
+"SearchSortDefault" = "默认排序";
+"SearchSortFans" = "粉丝数";
+"Level" = "等级";
+"Most Read" = "最多阅读";
+"Most Liked" = "最多喜欢";
+"iPad Landscape Detail Layout" = "iPad 横屏详情页布局";
+"Hero First" = "先大屏预览";
+"Direct Stage" = "直接分栏";
+"Video and comments appear side by side as soon as a page opens." = "打开页面后视频与评论立即同屏显示。";
+"Pages open with a large preview; scroll down to reveal comments." = "打开页面先显示大屏预览，下滑展开评论。";
+
+"Select a conversation or notification" = "选择一个会话或通知查看";
+
+/* Video enhancement & AI comment filter UI polish (2026-11-20) */
+"Video Enhancement" = "画质增强";
+"Video Enhancement Settings" = "画质增强设置";
+"Default Super Resolution" = "默认超分辨率";
+"VideoToolbox ML" = "VideoToolbox ML";
+"MetalFX Spatial" = "MetalFX Spatial";
+"SDR Demand VOD only. Super resolution supports up to 1080p. Interpolation limits vary by device and iOS. High temperatures pause enhancement." = "超分适用于 1080p 及以下的 SDR Demand 点播。运动补帧也需要 SDR Demand 点播，支持范围取决于设备和 iOS 版本。设备温度过高时会暂停增强。";
+"Video enhancement is disabled in Experimental Features." = "实验功能中的画质增强已关闭。";
+"AI Comment Filter Settings" = "AI 评论过滤设置";
+"AI comment auto-filter is disabled in Experimental Features." = "实验功能中的 AI 评论自动过滤已关闭。";
+"AI %lld%%" = "AI %lld%%";
+"Video Enhancement (Demand VOD Only)" = "画质增强（仅 Demand 点播可用）";
+"Super Resolution" = "超分辨率";
+"Frame Interpolation" = "运动补帧";
+"Enhance" = "画质增强";
+
+/* Track B: Video enhancement, experimental settings & stats overlay */
+"Supported" = "已支持";
+"Supported (Vision)" = "已支持 (Vision)";
+"Requires iOS 26" = "需要 iOS 26";
+"Unsupported" = "不支持";
+"Simulator" = "模拟器";
+"VideoEnhancementBypassSimulator" = "模拟器不支持";
+">1080p" = "超过 1080p";
+"HDR" = "HDR";
+"Thermal" = "过热";
+"Interlaced" = "隔行源";
+"VOD only" = "仅支持点播";
+"Demand only" = "仅 Demand 引擎";
+"iOS 26+" = "需 iOS 26";
+"VideoEnhancementBypassTimeout" = "超时跳过";
+">30fps" = "超过 30fps";
+"Model downloading" = "模型下载中";
+"Model required" = "需下载模型";
+"Scene cut" = "转场跳过";
+"Skipped" = "已跳过";
+"Paused · %@" = "已暂停 · %@";
+"Paused (%@)" = "已暂停 (%@)";
+"Applies to SDR Demand VOD streams up to 1080p. High temperatures pause enhancement." = "适用于 1080p 及以下的 SDR Demand 点播，设备温度过高时会暂停增强。";
+"Default Frame Interpolation" = "默认开启运动补帧";
+"Applies to supported progressive SDR Demand VOD streams. High temperatures pause enhancement." = "适用于受支持的逐行 SDR Demand 点播，设备温度过高时会暂停增强。";
+"Maximum Scale" = "最大放大倍率";
+"Interpolation Rate" = "补帧帧率";
+"2× Source Frame Rate" = "源帧率的 2 倍";
+"Up to 60 fps" = "最高 60 fps";
+"Up to 90 fps" = "最高 90 fps";
+"Up to 120 fps" = "最高 120 fps";
+"Up to 2×" = "最高 2 倍";
+"Up to 3×" = "最高 3 倍";
+"Up to 4×" = "最高 4 倍";
+"Device Support" = "设备支持情况";
+"FRC" = "补帧";
+"Comment Verification" = "评论校验";
+"Diagnostics" = "诊断";
+"Enhanced" = "画质已增强";
+"Source Res" = "源分辨率";
+"DASH (split A/V)" = "DASH 音视频分离";
+"Track" = "音轨";
+"Bitrate" = "码率";
+"Enhancement" = "画质增强";
+"Output Res" = "输出分辨率";
+"Output FPS" = "输出帧率";
+"Latency" = "处理耗时";
+"Active" = "运行中";
+"Performance" = "性能";
+"Source FPS" = "源帧率";
+"FPS" = "帧率";
+"TTFF" = "首帧耗时";
+"Source" = "来源";
+"CDN" = "CDN";
+"State" = "状态";
+
+/* Track A: AI comment filter UX */
+"Current effective threshold: %lld%%" = "当前生效阈值：%lld%%";
+"Comments whose author username or bio contains any keyword here are immediately flagged. Swipe left on a keyword to remove it." = "发言者昵称或个人签名包含以下任意词时直接标记拦截。左滑关键词可删除。";
+"Comments whose text contains any keyword here are immediately flagged. Swipe left on a keyword to remove it." = "评论正文包含以下任意词时直接标记拦截。左滑关键词可删除。";
+"Expand a collapsed comment and tap its AI badge to inspect signals or add its author here." = "展开折叠评论后点击作者旁的疑似 AI 标记，即可查看命中原因并将作者加入白名单。";
+"Suspected AI reply collapsed" = "已折叠疑似 AI 回复";
+"MID" = "MID";
+
+/* Wave 3: Downloads, comments, system notifications, and IM message parsing */
+"Pause All" = "全部暂停";
+"Resume All" = "全部继续";
+"%d downloads have missing files" = "%d 个下载文件缺失";
+"Close comments" = "关闭评论";
+"[Sticker]" = "[表情]";
+"[Video]" = "[视频]";
+"[Article]" = "[专栏]";
+"[Notification]" = "[通知]";
+"[Notification Card]" = "[通知卡片]";
+"[Rich Message]" = "[富文本消息]";
+"Notification" = "通知";
+"Shared Content" = "分享内容";
+"View Details" = "查看详情";

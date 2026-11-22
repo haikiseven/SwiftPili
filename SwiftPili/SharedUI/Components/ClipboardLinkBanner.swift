@@ -1,0 +1,58 @@
+import SwiftUI
+
+/// The clipboard affordance: says what it found, offers to open it, and is
+/// dismissible. Deliberately not a toast — a toast disappears on its own, and an
+/// offer the user never got to accept is worse than not making it.
+struct ClipboardLinkBanner: View {
+    let suggestion: ClipboardLinkSuggestion
+    let accent: Color
+    /// False inside the tab bar's bottom accessory, which draws the glass.
+    var showsSurface = true
+    let open: () -> Void
+    let dismiss: () -> Void
+
+    private var describedTarget: String {
+        switch suggestion.target {
+        case .music: String(localized: "Music from your clipboard")
+        case .video: String(localized: "Video from your clipboard")
+        case .liveRoom: String(localized: "Live room from your clipboard")
+        case .userSpace: String(localized: "Profile from your clipboard")
+        case .moment: String(localized: "Moment from your clipboard")
+        case .article: String(localized: "Article from your clipboard")
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "link")
+                .foregroundStyle(accent)
+            Text(describedTarget)
+                .font(.footnote)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button(action: open) {
+                Text("Open")
+                    .font(.footnote.weight(.semibold))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(accent.opacity(0.18), in: Capsule())
+            }
+            .buttonStyle(.appControl)
+            .foregroundStyle(accent)
+            Button(action: dismiss) {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.secondary)
+                    // minWidth/minHeight so a large Dynamic Type glyph grows the
+                    // box instead of spilling out of it.
+                    .frame(minWidth: 28, minHeight: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.appControl)
+            .accessibilityLabel(Text("Dismiss"))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .floatingControlSurface(Capsule(), enabled: showsSurface)
+    }
+}
