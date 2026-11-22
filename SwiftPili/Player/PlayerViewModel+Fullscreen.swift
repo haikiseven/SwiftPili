@@ -1,0 +1,347 @@
+import AVFoundation
+import Foundation
+import SwiftUI
+import UIKit
+
+extension PlayerViewModel {
+
+    func showNotice(_ text: String) {
+        skipNotice = text
+        skipNoticeTask?.cancel()
+        skipNoticeTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2.5))
+            guard !Task.isCancelled else { return }
+            self?.skipNotice = nil
+        }
+    }
+
+    private func coalesceFullscreenTransitionRequest(
+        target: Bool,
+        transitionID: UInt64
+    ) -> FullscreenTransitionRequestDecision {
+        fullscreenTransition.request(
+            target: target,
+            currentState: isFullscreen,
+            transitionID: transitionID
+        )
+    }
+
+    private func settleFullscreenTransition(
+        actualState: Bool
+    ) -> FullscreenTransitionSettlement {
+        fullscreenTransition.settle(actualState: actualState)
+    }
+
+    private func settleFullscreenPresentation(actualState: Bool) {
+        FullscreenTransitionDiagnostics.recordSettlement(
+            settleFullscreenTransition(actualState: actualState),
+            actualState: actualState,
+            playerGeneration: playerGeneration,
+            hasURL: currentURL != nil,
+            surfaceSize: lastReportedSurfaceSize,
+            verticalSizeClass: lastReportedVerticalSizeClass
+        )
+        if !showControls { showControls = true }
+        scheduleHideControls()
+    }
+
+    func noteSurfaceGeometry(size: CGSize, verticalSizeClass: String) {
+        lastReportedSurfaceSize = size
+        lastReportedVerticalSizeClass = verticalSizeClass
+    }
+
+    func scheduleHideControls() {
+        hideControlsTask?.cancel()
+        guard showControls, !danmakuSettingsHold else { return }
+        hideControlsTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled, let self else { return }
+            withAnimation(.easeInOut(duration: 0.2)) {
+                self.showControls = false
+            }
+        }
+    }
+
+    func setDanmakuSettingsHold(_ hold: Bool) {
+        let wasHeld = danmakuSettingsHold
+        danmakuSettingsHold = hold
+        if hold {
+            hideControlsTask?.cancel()
+            showControls = true
+        } else {
+            if wasHeld {
+                NotificationCenter.default.post(name: .danmakuPreferencesCommit, object: nil)
+            }
+            scheduleHideControls()
+        }
+    }
+
+    func enterFullscreen() {
+        guard !isFullscreen else { return }
+        guard let presentation = fullscreenPresentation,
+              let receipt = fullscreenPresentationReceipt,
+              isCurrentPresentation(presentation, receipt: receipt),
+              currentURL != nil, error == nil, !terminalOpenFailure,
+              presentation.reserveHost(receipt: receipt) else {
+            settleFullscreenPresentation(actualState: false)
+            return
+        }
+        refreshInlineVideoRect()
+        guard prepareSurfaceHandoff(ownerLease: receipt.context.ownerLease, to: .fullscreen) else {
+            presentation.cancelReservedHost(receipt: receipt)
+            settleFullscreenPresentation(actualState: false)
+            return
+        }
+        FullscreenLoginHandoff.shared.cancel()
+        if fullscreenPresentation != nil {
+            isFullscreen = true
+        } else {
+            withAnimation(AppMotionPreferences.current.animation(normal: .easeInOut(duration: 0.25))) {
+                isFullscreen = true
+            }
+        }
+        if UIDevice.current.userInterfaceIdiom == .phone {
+            applyOrientation(.landscape)
+        }
+        presentation.reconcile()
+        settleFullscreenPresentation(actualState: isFullscreen)
+    }
+
+    func exitFullscreen(
+        presentation: any PlayerFullscreenPresentation,
+        receipt: PlayerPresentationReceipt
+    ) {
+        guard isCurrentPresentation(presentation, receipt: receipt) else { return }
+        exitFullscreen()
+    }
+
+    func exitFullscreen() {
+        guard isFullscreen else { return }
+        setDanmakuSettingsHold(false)
+        fullscreenDanmakuComposerPresented = false
+        PlayerLog.log("[Fullscreen] exit: portrait=\(isPortraitContent) condensed=\(inlineCondensed) showControls=\(showControls)")
+        if let ownerLease = currentOwnerLease {
+            _ = handoffSurfaceSlot(ownerLease: ownerLease, to: .inline)
+        }
+        if fullscreenPresentation != nil {
+            isFullscreen = false
+        } else {
+            withAnimation(AppMotionPreferences.current.animation(normal: .easeInOut(duration: 0.25))) {
+                isFullscreen = false
+            }
+        }
+        if UIDevice.current.userInterfaceIdiom == .phone {
+            applyOrientation(.portrait)
+        }
+        settleFullscreenPresentation(actualState: false)
+    }
+
+    func requestLoginFromFullscreen() {
+        guard isFullscreen else { return }
+        let handoff = FullscreenLoginHandoff.shared
+        handoff.arm()
+        let waitsForHost = fullscreenPresentation?.hasPresentedHost == true
+        exitFullscreen()
+        if !waitsForHost { handoff.release() }
+    }
+
+    private func applyOrientation(_ mask: UIInterfaceOrientationMask) {
+        guard UIDevice.current.userInterfaceIdiom == .phone else { return }
+        if let presentation = fullscreenPresentation {
+            presentation.applyOrientation(
+                mask: mask,
+                label: Self.orientationMaskLabel(mask)
+            )
+            return
+        }
+        AppOrientation.shared.set(mask)
+        let window = AppWindowMetrics.current
+        window?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+        window?.windowScene?.requestGeometryUpdate(.iOS(interfaceOrientations: mask))
+        FullscreenTransitionDiagnostics.recordSceneGeometryRequest(
+            mask: Self.orientationMaskLabel(mask),
+            windowResolved: window != nil
+        )
+    }
+
+    private static func orientationMaskLabel(
+        _ mask: UIInterfaceOrientationMask
+    ) -> String {
+        switch mask {
+        case .landscape: "landscape"
+        case .portrait: "portrait"
+        case .all: "all"
+        default: "other"
+        }
+    }
+
+    func requestFullscreenTransition(target: Bool, source: FullscreenTransitionSource) {
+        let transitionID = FullscreenTransitionDiagnostics.nextTransitionID()
+        let currentState = isFullscreen
+        let decision = coalesceFullscreenTransitionRequest(
+            target: target,
+            transitionID: transitionID
+        )
+        FullscreenTransitionDiagnostics.recordRequest(
+            decision: decision,
+            source: source,
+            target: target,
+            currentState: currentState,
+            playerGeneration: playerGeneration,
+            hasURL: currentURL != nil,
+            surfaceSize: lastReportedSurfaceSize,
+            verticalSizeClass: lastReportedVerticalSizeClass
+        )
+
+        guard case .start = decision else { return }
+        if target {
+            enterFullscreen()
+        } else {
+            exitFullscreen()
+        }
+    }
+
+    func togglePortraitExpand() {
+        guard isPortraitContent, !isFullscreen else { return }
+        let was = inlineCondensed
+        inlineCondensed.toggle()
+        portraitCondenseLocked = true
+        PlayerLog.log(
+            "[condense] manual condensed=\(was)→\(inlineCondensed) "
+            + "locked=\(portraitCondenseLocked)"
+        )
+    }
+
+    @discardableResult
+    func beginPortraitPagingHandoff(lease: PlayerOwnerLease) -> Bool {
+        guard isCurrentOwner(lease), (mode == .vod || mode == .offline) else { return false }
+        error = nil
+        unavailability = nil
+        terminalOpenFailure = false
+        suspendPlayback()
+        return true
+    }
+}
+
+extension PlayerViewModel {
+
+    func presentationContext(
+        screenID: UUID,
+        lease: PlayerOwnerLease?,
+        route: PlayerScreenRoute,
+        position: PlayerRoutePosition?,
+        source: PlayerPresentationSource
+    ) -> PlayerScreenPresentationContext? {
+        guard let lease, let position, isCurrentOwner(lease) else { return nil }
+        switch (route, source) {
+        case (.video, .vod(_, _, .ugc)), (.bangumi, .vod(_, _, .pgc)), (.offline, .offline):
+            break
+        case (.live(let routeRoomID), .live(let sourceRoomID)) where routeRoomID == sourceRoomID:
+            break
+        default:
+            return nil
+        }
+        let context = PlayerScreenPresentationContext(
+            screenID: screenID, ownerLease: lease, route: route, position: position, source: source
+        )
+        return isCurrentPresentationContext(context) ? context : nil
+    }
+
+    func isCurrentPresentationContext(_ context: PlayerScreenPresentationContext) -> Bool {
+        isCurrentPresentationSource(lease: context.ownerLease, source: context.source)
+    }
+
+    func isCurrentPresentationSource(lease: PlayerOwnerLease?, source: PlayerPresentationSource) -> Bool {
+        guard let lease, isCurrentOwner(lease) else { return false }
+        switch source {
+        case .vod(let aid, let cid, let source):
+            return mode == .vod && currentAid == aid && currentCid == cid && currentSource == source
+        case .live(let roomID):
+            return mode == .live && currentRoomID == roomID
+        case .offline(let asset):
+            return mode == .offline && offlineAsset == asset
+        }
+    }
+
+    func isAlreadyLivePresentation(
+        lease: PlayerOwnerLease?,
+        source: PlayerPresentationSource
+    ) -> Bool {
+        guard let lease, isCurrentOwner(lease), currentURL != nil,
+              error == nil, unavailability == nil, !terminalOpenFailure else { return false }
+        switch source {
+        case .live(let roomID):
+            return mode == .live && currentRoomID == roomID && currentURL?.isFileURL == false
+        case .offline(let asset):
+            return mode == .offline && offlineAsset == asset && currentURL == asset.videoURL
+                && OfflinePlaybackAssetValidator.allows(videoURL: asset.videoURL, audioURL: asset.audioURL)
+        case .vod(let aid, let cid, let source):
+            return mode == .vod && currentAid == aid && currentCid == cid && currentSource == source
+        }
+    }
+
+    func registerFullscreenPresentation(
+        _ presentation: any PlayerFullscreenPresentation,
+        context: PlayerScreenPresentationContext
+    ) -> PlayerPresentationReceipt? {
+        guard presentation.routeIsActive, isCurrentPresentationContext(context) else { return nil }
+        if fullscreenPresentation === presentation,
+           let receipt = fullscreenPresentationReceipt, receipt.context == context {
+            return receipt
+        }
+        retireFullscreenPresentation()
+        let receipt = PlayerPresentationReceipt(id: UUID(), context: context)
+        fullscreenPresentation = presentation
+        fullscreenPresentationReceipt = receipt
+        return receipt
+    }
+
+    func isCurrentPresentationReceipt(
+        _ receipt: PlayerPresentationReceipt,
+        hostIdentity: UUID
+    ) -> Bool {
+        guard let presentation = fullscreenPresentation else { return false }
+        return isCurrentPresentation(presentation, receipt: receipt)
+            && presentation.isCurrentHost(hostIdentity)
+    }
+
+    func isCurrentPresentation(
+        _ presentation: any PlayerFullscreenPresentation,
+        receipt: PlayerPresentationReceipt
+    ) -> Bool {
+        fullscreenPresentation === presentation && fullscreenPresentationReceipt == receipt
+            && presentation.routeIsActive && isCurrentPresentationContext(receipt.context)
+    }
+
+    func unregisterFullscreenPresentation(
+        _ presentation: any PlayerFullscreenPresentation,
+        receipt: PlayerPresentationReceipt
+    ) {
+        guard fullscreenPresentation === presentation, fullscreenPresentationReceipt == receipt else { return }
+        retireFullscreenPresentation()
+    }
+
+    func playerRouteWillChange(from old: PlayerRouteDestination?, to new: PlayerRouteDestination?) {
+        guard old != new, let old,
+              let receipt = fullscreenPresentationReceipt,
+              receipt.context.route == old.route, receipt.context.position == old.position else { return }
+        let lease = receipt.context.ownerLease
+        retireFullscreenPresentation()
+        endOwnerPlayback(lease: lease)
+    }
+
+    func retirePresentation(screenID: UUID, lease: PlayerOwnerLease) {
+        guard let context = fullscreenPresentationReceipt?.context,
+              context.screenID == screenID, context.ownerLease == lease else { return }
+        retireFullscreenPresentation()
+        endOwnerPlayback(lease: lease)
+    }
+
+    func retireFullscreenPresentation() {
+        let previous = fullscreenPresentation
+        fullscreenPresentation = nil
+        fullscreenPresentationReceipt = nil
+        if isFullscreen { exitFullscreen() }
+        previous?.relinquishForOwnerReplacement()
+    }
+}
