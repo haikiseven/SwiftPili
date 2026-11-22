@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Required-reason API declarations.
+
+	  Each reason below is quoted from Apple's published list and matched to a
+	  real call site in this app. This file does NOT claim to be exhaustive: it
+	  covers the four categories whose APIs were found in this source tree, and
+	  a future API addition needs its own entry. An earlier revision of this
+	  comment asserted that three of these categories were unused, which was
+	  false for all three — do not restate that kind of completeness claim
+	  without re-grepping.
+
+	  DiskSpace — E174.1
+	    "…check whether there is sufficient disk space to write files… There is
+	    an exception that allows the app to avoid downloading files from a
+	    server when disk space is insufficient."
+	    Call site: DownloadStore.availableCapacityForImportantUsage(), read
+	    before a download starts. The observable difference the reason requires
+	    is DownloadError.insufficientStorage, which refuses the download and
+	    names the shortfall. Never sent off-device.
+
+	  SystemBootTime — 35F9.1
+	    "…measure the amount of time that has elapsed between events that
+	    occurred within the app or to perform calculations to enable timers."
+	    Call sites: ProcessInfo.systemUptime as a monotonic clock in the player
+	    and download diagnostics — DownloadProgress, PlaybackDebugRecorder,
+	    FreezeStackSampler, FreezeMarkerStore, FreezeWatchdog, UIHitchMonitor,
+	    MediaEngineSession, EngineAudioRenderer, PathAHLSFMP4Demuxer,
+	    ImageDiagnostics. Elapsed intervals only; boot time is never sent.
+
+	  FileTimestamp — C617.1
+	    "…access the timestamps, size, or other metadata of files inside the app
+	    container, app group container, or the app's CloudKit container."
+	    Call sites, both via FileManager.attributesOfItem(atPath:) on files this
+	    app wrote: PlaybackDebugRecorder reads .modificationDate to age out its
+	    own log files, and PathAHTTPMediaSource reads .size of a local media
+	    file. The second reads no timestamp, but it calls the same API the
+	    category is about, so it is named here rather than left to be
+	    rediscovered.
+
+	  UserDefaults — CA92.1
+	    "…read and write information that is only accessible to the app itself."
+	    Used throughout for settings this app writes and reads itself. No App
+	    Group is involved, so 1C8F.1 does not apply.
+	-->
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryDiskSpace</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>E174.1</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>35F9.1</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>C617.1</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>CA92.1</string>
+			</array>
+		</dict>
+	</array>
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array/>
+</dict>
+</plist>
