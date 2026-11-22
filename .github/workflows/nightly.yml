@@ -1,0 +1,271 @@
+name: Nightly Test IPA
+
+on:
+  push:
+    branches:
+      - develop
+    paths-ignore:
+      - '**/*.md'
+      - '.gitignore'
+      - '.github/workflows/build.yml'
+  schedule:
+    # Daily at 02:00 UTC+8 (18:00 UTC); only builds when develop has new commits.
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: 'Xcode build configuration'
+        required: false
+        type: choice
+        default: Release
+        options:
+          - Release
+          - Debug
+      publish_release:
+        description: 'Publish IPA to a rolling GitHub pre-release'
+        required: false
+        type: boolean
+        default: true
+      release_tag:
+        description: 'GitHub pre-release tag (keep separate from main nightly / v* tags)'
+        required: false
+        type: string
+        default: nightly-develop
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SWIFTVLC_REPO: https://github.com/haikiseven/SwiftVLC.git
+  SWIFTVLC_SHA: 2bc7995c1fd0f22735f70e1b1584979f151b503a
+
+jobs:
+  nightly-ipa:
+    name: Build Nightly Test IPA
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    steps:
+      - name: Resolve target ref
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            BUILD_CONFIG="${{ inputs.configuration }}"
+            RELEASE_TAG="${{ inputs.release_tag }}"
+            PUBLISH="${{ inputs.publish_release }}"
+          else
+            BUILD_CONFIG="Release"
+            RELEASE_TAG="nightly-develop"
+            PUBLISH="true"
+          fi
+
+          if [[ -z "$RELEASE_TAG" || "$RELEASE_TAG" == v* || "$RELEASE_TAG" == "nightly" || "$RELEASE_TAG" == *"/"* || "$RELEASE_TAG" =~ [[:space:]] ]]; then
+            echo "::error::Invalid or reserved release_tag '${RELEASE_TAG}'. Use a dedicated test tag such as nightly-develop."
+            exit 1
+          fi
+
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            TARGET_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/develop" --jq '.object.sha' 2>/dev/null || true)"
+            if [ -z "$TARGET_SHA" ]; then
+              echo "develop branch not found; skipping scheduled nightly build." >> "$GITHUB_STEP_SUMMARY"
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            CURRENT_TAG_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_TAG}" --jq '.sha' 2>/dev/null || true)"
+            if [ -n "$CURRENT_TAG_SHA" ] && [ "$CURRENT_TAG_SHA" = "$TARGET_SHA" ]; then
+              echo "No new commits on develop since ${RELEASE_TAG} (${TARGET_SHA:0:7}); skipping scheduled build." >> "$GITHUB_STEP_SUMMARY"
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "checkout_ref=develop" >> "$GITHUB_OUTPUT"
+            echo "branch_name=develop" >> "$GITHUB_OUTPUT"
+          else
+            echo "checkout_ref=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "branch_name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          echo "build_config=${BUILD_CONFIG}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "publish_release=${PUBLISH}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout SwiftPili
+        if: steps.target.outputs.should_build == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.target.outputs.checkout_ref }}
+          fetch-depth: 20
+
+      - name: Print runner toolchain
+        if: steps.target.outputs.should_build == 'true'
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - name: Checkout pinned sibling SwiftVLC and apply patches
+        if: steps.target.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          SWIFTVLC_DIR="${GITHUB_WORKSPACE}/../SwiftVLC"
+          rm -rf "$SWIFTVLC_DIR"
+          mkdir -p "$SWIFTVLC_DIR"
+          git -C "$SWIFTVLC_DIR" init -q
+          git -C "$SWIFTVLC_DIR" remote add origin "$SWIFTVLC_REPO"
+          git -C "$SWIFTVLC_DIR" fetch --depth 1 origin "$SWIFTVLC_SHA"
+          git -C "$SWIFTVLC_DIR" checkout -q FETCH_HEAD
+          ./patches/apply.sh "$SWIFTVLC_DIR"
+          echo "SWIFTVLC_DIR=$SWIFTVLC_DIR" >> "$GITHUB_ENV"
+
+      - name: Fetch and verify prebuilt native XCFrameworks
+        if: steps.target.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/fetch-prebuilt-deps.sh --swiftvlc "$SWIFTVLC_DIR"
+
+      - name: Install XcodeGen and generate project
+        if: steps.target.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+          fi
+          xcodegen generate
+
+      - name: Archive (iOS, unsigned)
+        if: steps.target.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          BUILD_CONFIG="${{ steps.target.outputs.build_config }}"
+          xcodebuild archive \
+            -project SwiftPili.xcodeproj \
+            -scheme SwiftPili \
+            -configuration "$BUILD_CONFIG" \
+            -derivedDataPath "build/DerivedData-${BUILD_CONFIG}" \
+            -archivePath build/SwiftPili.xcarchive \
+            -destination 'generic/platform=iOS' \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            VALIDATE_PRODUCT=NO \
+            -quiet
+
+      - name: Fix embedded framework bundle IDs
+        if: steps.target.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          find build/SwiftPili.xcarchive -name "*.framework" -type d | while IFS= read -r fw; do
+            plist="${fw}/Info.plist"
+            [ -f "$plist" ] || continue
+            bid=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$plist" 2>/dev/null || true)
+            [ -n "$bid" ] || continue
+            fixed=$(echo "$bid" | tr '_' '-')
+            if [ "$bid" != "$fixed" ]; then
+              /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $fixed" "$plist"
+              echo "Fixed: $bid -> $fixed"
+            fi
+          done
+
+      - name: Package test IPA and prepare metadata
+        if: steps.target.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          APP_BUNDLE="build/SwiftPili.xcarchive/Products/Applications/SwiftPili.app"
+          if [ ! -d "$APP_BUNDLE" ]; then
+            echo "::error::Archive did not produce $APP_BUNDLE"
+            exit 1
+          fi
+
+          FULL_SHA="$(git rev-parse HEAD)"
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          BRANCH_NAME="${{ steps.target.outputs.branch_name }}"
+          BUILD_CONFIG="${{ steps.target.outputs.build_config }}"
+          RELEASE_TAG="${{ steps.target.outputs.release_tag }}"
+          APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_BUNDLE/Info.plist" 2>/dev/null || echo '1.0.0')"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          XCODE_VER="$(xcodebuild -version | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+
+          CONFIG_SUFFIX=""
+          if [ "$BUILD_CONFIG" = "Debug" ]; then
+            CONFIG_SUFFIX="-debug"
+          fi
+          IPA_NAME="SwiftPili-${RELEASE_TAG}${CONFIG_SUFFIX}.ipa"
+
+          rm -rf build/Payload
+          mkdir -p build/Payload
+          cp -R "$APP_BUNDLE" build/Payload/
+          (cd build && zip -qr "$IPA_NAME" Payload && shasum -a 256 "$IPA_NAME" > "${IPA_NAME}.sha256")
+
+          IPA_SIZE="$(du -sh "build/${IPA_NAME}" | awk '{print $1}')"
+          IPA_SHA256="$(awk '{print $1}' "build/${IPA_NAME}.sha256")"
+          echo "Packaged build/${IPA_NAME} (${IPA_SIZE}, sha256=${IPA_SHA256})"
+
+          {
+            echo "### Nightly Test Build Info"
+            echo "- **Branch**: \`${BRANCH_NAME}\`"
+            echo "- **Configuration**: \`${BUILD_CONFIG}\`"
+            echo "- **Version**: \`${APP_VERSION}\`"
+            echo "- **Commit**: \`${SHORT_SHA}\` (\`${FULL_SHA}\`)"
+            echo "- **Built at**: \`${BUILD_DATE}\`"
+            echo "- **Toolchain**: \`${XCODE_VER}\`"
+            echo "- **Size**: \`${IPA_SIZE}\`"
+            echo "- **SHA-256** (\`${IPA_NAME}\`): \`${IPA_SHA256}\`"
+            echo ""
+            echo "> Unsigned ${BUILD_CONFIG} test IPA for sideloading (TrollStore, AltStore, SideStore, Sideloadly, etc.)."
+            echo ""
+            echo "### Recent Commits"
+            git log -n 15 --pretty=format:'- `%h` %s'
+            echo ""
+          } > build/release-notes.md
+
+          cat build/release-notes.md >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "FULL_SHA=${FULL_SHA}"
+            echo "SHORT_SHA=${SHORT_SHA}"
+            echo "IPA_NAME=${IPA_NAME}"
+          } >> "$GITHUB_ENV"
+
+      - name: Upload test IPA workflow artifact
+        if: steps.target.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: SwiftPili-${{ steps.target.outputs.release_tag }}-${{ env.SHORT_SHA }}
+          path: |
+            build/${{ env.IPA_NAME }}
+            build/${{ env.IPA_NAME }}.sha256
+          retention-days: 14
+
+      - name: Publish rolling test GitHub Release
+        if: steps.target.outputs.should_build == 'true' && steps.target.outputs.publish_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RELEASE_TAG="${{ steps.target.outputs.release_tag }}"
+          BUILD_CONFIG="${{ steps.target.outputs.build_config }}"
+          IPA_PATH="build/${IPA_NAME}"
+          SHA_PATH="build/${IPA_NAME}.sha256"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release delete "$RELEASE_TAG" --yes --cleanup-tag
+          else
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG}" >/dev/null 2>&1 || true
+          fi
+
+          gh release create "$RELEASE_TAG" "$IPA_PATH" "$SHA_PATH" \
+            --target "$FULL_SHA" \
+            --title "SwiftPili Test Nightly (${SHORT_SHA} · ${BUILD_CONFIG})" \
+            --notes-file build/release-notes.md \
+            --prerelease \
+            --latest=false
