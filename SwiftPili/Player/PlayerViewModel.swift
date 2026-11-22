@@ -114,6 +114,8 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         : false
     var videoInterpolationRate = ExperimentalSettingsStore.shared.videoEnhancementDefaultRate
     var videoSuperResolutionScale = ExperimentalSettingsStore.shared.videoEnhancementDefaultScale
+    /// Defaults last applied to the per-player choices above; tuning-only changes don't reset them.
+    @ObservationIgnored var appliedVideoEnhancementDefaults = VideoEnhancementDefaultsSnapshot.current
     var equalizerConfiguration = PlayerEqualizerPreferences.equalizerConfiguration
     @ObservationIgnored var currentEqualizerMaintenancePermit: AudioMaintenancePermit?
 

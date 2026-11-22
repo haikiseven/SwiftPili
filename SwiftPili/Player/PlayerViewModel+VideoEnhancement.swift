@@ -1,5 +1,26 @@
 import Foundation
 
+/// The settings that seed per-player enhancement choices. Changes to tuning settings (buffer
+/// memory, sensitivity, …) are synced without touching what the user picked in the player.
+struct VideoEnhancementDefaultsSnapshot: Equatable {
+    let allowed: Bool
+    let superResolutionMode: VideoSuperResolutionMode
+    let frameInterpolation: Bool
+    let interpolationRate: VideoInterpolationRate
+    let superResolutionScale: VideoSuperResolutionScale
+
+    @MainActor static var current: Self {
+        let store = ExperimentalSettingsStore.shared
+        return Self(
+            allowed: store.isAllowed(.videoEnhancement),
+            superResolutionMode: store.videoEnhancementDefaultSRMode,
+            frameInterpolation: store.videoEnhancementDefaultFrameInterpolation,
+            interpolationRate: store.videoEnhancementDefaultRate,
+            superResolutionScale: store.videoEnhancementDefaultScale
+        )
+    }
+}
+
 struct VideoEnhancementControlStatus: Equatable {
     let isActive: Bool
     let bypassReason: String?
@@ -104,6 +125,12 @@ extension PlayerViewModel {
     }
 
     func handleVideoEnhancementPolicyChange() {
+        let defaults = VideoEnhancementDefaultsSnapshot.current
+        guard defaults != appliedVideoEnhancementDefaults else {
+            syncVideoEnhancementToBackend()
+            return
+        }
+        appliedVideoEnhancementDefaults = defaults
         let experiments = ExperimentalSettingsStore.shared
         if experiments.isAllowed(.videoEnhancement) {
             videoSuperResolutionMode = experiments.videoEnhancementDefaultSRMode

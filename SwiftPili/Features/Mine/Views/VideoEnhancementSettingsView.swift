@@ -12,19 +12,6 @@ struct VideoEnhancementSettingsView: View {
         let capabilities = VideoEnhancementCapabilities.current
 
         List {
-            superResolutionDefaults
-            interpolationDefaults
-            adaptiveQualitySection
-            advancedSection
-
-            Section {
-                capabilityRow("VideoToolbox ML", status: capabilities.videoToolboxML)
-                capabilityRow("MetalFX Spatial", status: capabilities.metalFXSpatial)
-                capabilityRow("Frame Interpolation", status: capabilities.frameInterpolation)
-            } header: {
-                Text("Device Support")
-            }
-
             if let storageError = experiments.storageError {
                 Section {
                     Text(verbatim: storageError)
@@ -36,6 +23,19 @@ struct VideoEnhancementSettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+
+            superResolutionSection
+            interpolationSection
+            adaptiveQualitySection
+            resourcesSection
+
+            Section {
+                capabilityRow("VideoToolbox ML", status: capabilities.videoToolboxML)
+                capabilityRow("MetalFX Spatial", status: capabilities.metalFXSpatial)
+                capabilityRow("Frame Interpolation", status: capabilities.frameInterpolation)
+            } header: {
+                Text("Device Support")
+            }
         }
         .listRowBackground(AppFill.card)
         .readableFormWidth()
@@ -44,15 +44,11 @@ struct VideoEnhancementSettingsView: View {
         .navigationBarTitleDisplayMode(.inline)
     }
 
-    private var superResolutionDefaults: some View {
+    // MARK: Super resolution
+
+    private var superResolutionSection: some View {
         Section {
-            Picker(selection: Binding(
-                get: { experiments.videoEnhancementDefaultSRMode },
-                set: { mode in
-                    guard canMutate else { return }
-                    experiments.setVideoEnhancementDefaultSRMode(mode)
-                }
-            )) {
+            Picker(selection: binding(\.videoEnhancementDefaultSRMode, experiments.setVideoEnhancementDefaultSRMode)) {
                 ForEach(VideoSuperResolutionMode.allCases) { mode in
                     Text(mode.settingsLabel).tag(mode)
                 }
@@ -62,35 +58,38 @@ struct VideoEnhancementSettingsView: View {
             .pickerStyle(.inline)
             .labelsHidden()
 
-            Picker("Maximum Scale", selection: Binding(
-                get: { experiments.videoEnhancementDefaultScale },
-                set: { scale in
-                    guard canMutate else { return }
-                    experiments.setVideoEnhancementDefaultScale(scale)
-                }
-            )) {
+            Picker(
+                "Maximum Scale",
+                selection: binding(\.videoEnhancementDefaultScale, experiments.setVideoEnhancementDefaultScale)
+            ) {
                 ForEach(VideoSuperResolutionScale.allCases) { scale in
                     Text(scale.label).tag(scale)
                 }
             }
             .pickerStyle(.menu)
             .menuOrder(.fixed)
+
+            Toggle(isOn: binding(\.videoEnhancementLimitToScreen, experiments.setVideoEnhancementLimitToScreen)) {
+                Label {
+                    Text("Limit to Screen Resolution")
+                } icon: {
+                    SettingsIcon(symbol: "display")
+                }
+            }
         } header: {
-            Text("Default Super Resolution")
+            Text("Super Resolution")
         } footer: {
-            Text("Applies to SDR Demand VOD streams up to 1080p. High temperatures pause enhancement.")
+            Text("VideoEnhancementSRFooter", tableName: nil, comment: "Super resolution section footer")
         }
         .disabled(!canMutate)
     }
 
-    private var interpolationDefaults: some View {
+    // MARK: Frame interpolation
+
+    private var interpolationSection: some View {
         Section {
-            Toggle(isOn: Binding(
-                get: { experiments.videoEnhancementDefaultFrameInterpolation },
-                set: { enabled in
-                    guard canMutate else { return }
-                    experiments.setVideoEnhancementDefaultFrameInterpolation(enabled)
-                }
+            Toggle(isOn: binding(
+                \.videoEnhancementDefaultFrameInterpolation, experiments.setVideoEnhancementDefaultFrameInterpolation
             )) {
                 Label {
                     Text("Default Frame Interpolation")
@@ -99,13 +98,10 @@ struct VideoEnhancementSettingsView: View {
                 }
             }
 
-            Picker("Interpolation Rate", selection: Binding(
-                get: { experiments.videoEnhancementDefaultRate },
-                set: { rate in
-                    guard canMutate else { return }
-                    experiments.setVideoEnhancementDefaultRate(rate)
-                }
-            )) {
+            Picker(
+                "Interpolation Rate",
+                selection: binding(\.videoEnhancementDefaultRate, experiments.setVideoEnhancementDefaultRate)
+            ) {
                 ForEach(VideoInterpolationRate.allCases) { rate in
                     Text(rate.label).tag(rate)
                 }
@@ -120,20 +116,31 @@ struct VideoEnhancementSettingsView: View {
         .disabled(!canMutate)
     }
 
+    // MARK: Adaptive quality
+
     private var adaptiveQualitySection: some View {
         Section {
-            Toggle(isOn: Binding(
-                get: { experiments.videoEnhancementAdaptiveQuality },
-                set: { enabled in
-                    guard canMutate else { return }
-                    experiments.setVideoEnhancementAdaptiveQuality(enabled)
-                }
-            )) {
+            Toggle(isOn: binding(\.videoEnhancementAdaptiveQuality, experiments.setVideoEnhancementAdaptiveQuality)) {
                 Label {
                     Text("Adaptive Quality")
                 } icon: {
                     SettingsIcon(symbol: "gauge.with.dots.needle.33percent")
                 }
+            }
+
+            if experiments.videoEnhancementAdaptiveQuality {
+                Picker(
+                    "Degradation Sensitivity",
+                    selection: binding(
+                        \.videoEnhancementAdaptiveSensitivity, experiments.setVideoEnhancementAdaptiveSensitivity
+                    )
+                ) {
+                    ForEach(VideoEnhancementAdaptiveSensitivity.allCases) { value in
+                        Text(value.label).tag(value)
+                    }
+                }
+                .pickerStyle(.menu)
+                .menuOrder(.fixed)
             }
         } header: {
             Text("Performance")
@@ -143,29 +150,14 @@ struct VideoEnhancementSettingsView: View {
         .disabled(!canMutate)
     }
 
-    private var advancedSection: some View {
-        Section {
-            Toggle(isOn: Binding(
-                get: { experiments.videoEnhancementLimitToScreen },
-                set: { enabled in
-                    guard canMutate else { return }
-                    experiments.setVideoEnhancementLimitToScreen(enabled)
-                }
-            )) {
-                Label {
-                    Text("Limit to Screen Resolution")
-                } icon: {
-                    SettingsIcon(symbol: "iphone.gen3")
-                }
-            }
+    // MARK: Resources
 
-            Picker("Buffer Memory", selection: Binding(
-                get: { experiments.videoEnhancementBufferBudget },
-                set: { value in
-                    guard canMutate else { return }
-                    experiments.setVideoEnhancementBufferBudget(value)
-                }
-            )) {
+    private var resourcesSection: some View {
+        Section {
+            Picker(
+                "Buffer Memory",
+                selection: binding(\.videoEnhancementBufferBudget, experiments.setVideoEnhancementBufferBudget)
+            ) {
                 ForEach(VideoEnhancementBufferBudget.allCases) { value in
                     Text(value.label).tag(value)
                 }
@@ -173,40 +165,38 @@ struct VideoEnhancementSettingsView: View {
             .pickerStyle(.menu)
             .menuOrder(.fixed)
 
-            Picker("Lookahead", selection: Binding(
-                get: { experiments.videoEnhancementMaxLookahead },
-                set: { value in
-                    guard canMutate else { return }
-                    experiments.setVideoEnhancementMaxLookahead(value)
-                }
-            )) {
+            Picker(
+                "Lookahead",
+                selection: binding(\.videoEnhancementMaxLookahead, experiments.setVideoEnhancementMaxLookahead)
+            ) {
                 ForEach(VideoEnhancementLookahead.allCases) { value in
                     Text(value.label).tag(value)
                 }
             }
             .pickerStyle(.menu)
             .menuOrder(.fixed)
-
-            Picker("Degradation Sensitivity", selection: Binding(
-                get: { experiments.videoEnhancementAdaptiveSensitivity },
-                set: { value in
-                    guard canMutate else { return }
-                    experiments.setVideoEnhancementAdaptiveSensitivity(value)
-                }
-            )) {
-                ForEach(VideoEnhancementAdaptiveSensitivity.allCases) { value in
-                    Text(value.label).tag(value)
-                }
-            }
-            .pickerStyle(.menu)
-            .menuOrder(.fixed)
-            .disabled(!experiments.videoEnhancementAdaptiveQuality)
         } header: {
             Text("Advanced")
         } footer: {
-            Text("Limit to Screen Resolution: super resolution never outputs more pixels than the video occupies on screen, and is skipped when it would not be visible. Buffer Memory: memory for enhanced frames waiting to be shown; Automatic uses 25% of currently available memory (128 MB–1 GB) and halves after a memory warning. Larger values allow higher output frame rates and a deeper lookahead, but too large may get the app terminated by the system. Lookahead: how far ahead frames are enhanced; deeper absorbs occasional slow frames but uses more memory. Degradation Sensitivity: how quickly quality is reduced when frames are missed.")
+            Text("VideoEnhancementResourcesFooter", tableName: nil, comment: "Buffer memory / lookahead footer")
         }
         .disabled(!canMutate)
+    }
+
+    // MARK: Helpers
+
+    /// Binding that reads from the store and writes through its setter only while access is current.
+    private func binding<Value>(
+        _ keyPath: KeyPath<ExperimentalSettingsStore, Value>,
+        _ setter: @escaping @MainActor (Value) -> Bool
+    ) -> Binding<Value> {
+        Binding(
+            get: { experiments[keyPath: keyPath] },
+            set: { value in
+                guard canMutate else { return }
+                _ = setter(value)
+            }
+        )
     }
 
     private func capabilityRow(

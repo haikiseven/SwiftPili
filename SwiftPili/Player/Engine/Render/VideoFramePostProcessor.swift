@@ -359,6 +359,8 @@ final class VideoFramePostProcessor {
     private func resetBufferPlan() {
         lastUpscaledBytes = nil
         lastMidpointsPerSource = 0
+        automaticBudget = nil
+        structuralHoldUntil = .now
         applyBufferPlan(.default)
     }
 
