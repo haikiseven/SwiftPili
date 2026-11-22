@@ -348,7 +348,9 @@ private final class VTInterpolationSession {
         guard hasTimeRemaining() else { throw VTInterpolationFailure.deadline }
         let destination = try VTInterpolationPool(
             requirements: configuration.destination, role: "destination",
-            limit: VideoFrameInterpolationPlan.outputPoolLimit(phaseCount: key.phaseCount)
+            dynamicLimit: { [phaseCount = key.phaseCount] in
+                VideoFrameInterpolationPlan.outputPoolLimit(phaseCount: phaseCount)
+            }
         )
         let processor = VTFrameProcessor()
         guard hasTimeRemaining() else { throw VTInterpolationFailure.deadline }

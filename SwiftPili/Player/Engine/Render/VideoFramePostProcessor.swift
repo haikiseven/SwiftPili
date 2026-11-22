@@ -14,6 +14,20 @@ private struct VideoFrameEnhancementJob: Sendable {
     var isUpscaling: Bool { configuration.superResolutionMode != .off && upscalingBypassReason == nil }
 }
 
+private struct VideoFrameWarmJob: Sendable {
+    let frame: PostProcessFrameBox
+    let configuration: VideoEnhancementConfiguration
+    let upscale: Bool
+    /// Synthetic plan ending one frame before `frame`, so warm timestamps precede real ones.
+    let interpolationPlan: VideoFrameInterpolationPlan?
+}
+
+struct VideoFrameWarmReport: Sendable {
+    var superResolution = false
+    var interpolation = false
+    var elapsedMs: Double = 0
+}
+
 @MainActor
 final class VideoFramePostProcessor {
     private let worker = VideoFramePostProcessorWorker()
@@ -25,6 +39,18 @@ final class VideoFramePostProcessor {
     private var pendingOutcomeMissed: Bool?
     private var systemState = VideoEnhancementSystemState.current
     private var systemStateSampledAt = ContinuousClock.now
+    private(set) var bufferPlan = VideoEnhancementBufferPlan.default
+    private var lastUpscaledBytes: Int?
+    private var lastMidpointsPerSource = 0
+    private struct WarmKey: Equatable {
+        let configuration: VideoEnhancementConfiguration
+        let width: Int
+        let height: Int
+        let format: OSType
+    }
+    private var warmedKey: WarmKey?
+    private var warmTaskCancelled = false
+    private(set) var isWarming = false
 
     /// User-requested configuration. The governor may degrade it at runtime; see `effectiveConfiguration`.
     var configuration = VideoEnhancementConfiguration.disabled {
@@ -32,15 +58,28 @@ final class VideoFramePostProcessor {
             guard configuration != oldValue else { return }
             pendingOutcomeMissed = nil
             governor.reset(requested: configuration)
-            telemetry = configuration.isRequested && configuration.isLiveStream
+            telemetryWindow.reset()
+            warmedKey = nil
+            resetBufferPlan()
+            frameTelemetry = configuration.isRequested && configuration.isLiveStream
                 ? .bypassed(reason: "VOD only") : VideoEnhancementTelemetry()
         }
     }
-    private(set) var telemetry = VideoEnhancementTelemetry() {
-        didSet {
-            let note = governor.level > .none ? governor.reason : nil
-            if telemetry.degradationNote != note { telemetry.degradationNote = note }
-        }
+    /// State of the most recent frame only; noisy under partial load. UI reads `telemetry`.
+    private(set) var frameTelemetry = VideoEnhancementTelemetry()
+    private var telemetryWindow = VideoEnhancementTelemetryWindow()
+    private var lastProcessingMs: Double = 0
+    /// What the in-flight submission was expected to deliver, to detect partial failures.
+    private var pendingExpectation: (frame: EnhancementFrameIdentity, interpolation: Bool, upscale: Bool)?
+
+    /// Window-aggregated telemetry for the stats overlay / player menu.
+    var telemetry: VideoEnhancementTelemetry {
+        var value = telemetryWindow.summarize(
+            latest: frameTelemetry, configuration: effectiveConfiguration, interpolationLabel: interpolationLabel
+        ) ?? frameTelemetry
+        if value.smoothedProcessingMs <= 0.01 { value.smoothedProcessingMs = lastProcessingMs }
+        value.degradationNote = governor.level > .none ? governor.reason : nil
+        return value
     }
 
     /// Configuration actually executed, after performance / thermal / Low Power degradation.
@@ -49,6 +88,9 @@ final class VideoFramePostProcessor {
 
     var isBusy: Bool { activeTask != nil }
 
+    /// How far ahead of the display clock the engine should hand frames to the renderer.
+    var preferredPresentLeadSeconds: TimeInterval { bufferPlan.lead }
+
     var interpolationLabel: String {
         if #available(iOS 26.0, *) { return "VT FI" }
         return "Vision FI"
@@ -56,7 +98,7 @@ final class VideoFramePostProcessor {
 
     func canProcess(_ frame: MediaVideoFrame) -> Bool {
         guard configuration.isRequested, ExperimentalSettingsPolicy.videoEnhancementEnabled else {
-            telemetry = VideoEnhancementTelemetry()
+            frameTelemetry = VideoEnhancementTelemetry()
             return false
         }
         if let reason = VideoEnhancementGuardrails.commonBypassReason(
@@ -118,7 +160,7 @@ final class VideoFramePostProcessor {
     }
 
     func noteBypass(_ reason: String) {
-        telemetry = .bypassed(reason: reason)
+        frameTelemetry = .bypassed(reason: reason)
     }
 
     /// An enhancement-eligible frame could not be enhanced in time (late arrival, worker busy,
@@ -134,10 +176,14 @@ final class VideoFramePostProcessor {
     /// Seek / stream switch / renderer reset: keep the learned level but ignore transient lateness.
     func noteDiscontinuity() {
         pendingOutcomeMissed = nil
+        pendingExpectation = nil
+        telemetryWindow.reset()
+        warmedKey = nil
         governor.noteDiscontinuity()
     }
 
     private func finalizePendingOutcome() {
+        pendingExpectation = nil
         guard let missed = pendingOutcomeMissed else { return }
         pendingOutcomeMissed = nil
         governor.record(missed: missed)
@@ -147,7 +193,7 @@ final class VideoFramePostProcessor {
         _ midpoint: MediaVideoFrame, previous: MediaVideoFrame, original: MediaVideoFrame, acceptedCount: Int = 1
     ) {
         let sourceFPS = 1 / (original.pts - previous.pts)
-        telemetry = VideoEnhancementTelemetry(
+        frameTelemetry = VideoEnhancementTelemetry(
             activeModeLabel: interpolationLabel,
             inputWidth: CVPixelBufferGetWidth(original.pixelBuffer),
             inputHeight: CVPixelBufferGetHeight(original.pixelBuffer),
@@ -157,7 +203,7 @@ final class VideoFramePostProcessor {
         )
     }
 
-    func noteAccepted(_ result: VideoFrameEnhancementResult, midpointCount: Int, enhancedOriginal: Bool) {
+    private func noteAccepted(_ result: VideoFrameEnhancementResult, midpointCount: Int, enhancedOriginal: Bool) {
         var displayed = result.telemetry
         displayed.outputFPS = displayed.inputFPS * Double(midpointCount + 1)
         if midpointCount == 0 {
@@ -179,7 +225,161 @@ final class VideoFramePostProcessor {
         displayed.bypassReason = displayed.isActive ? nil : (
             displayed.bypassReason ?? result.interpolationBypassReason ?? "Enhancement not admitted"
         )
-        telemetry = displayed
+        frameTelemetry = displayed
+    }
+
+    /// Called once for every original frame the renderer presents while enhancement is requested.
+    func noteOriginalPresented(
+        _ original: MediaVideoFrame,
+        result: VideoFrameEnhancementResult?,
+        midpointCount: Int,
+        upscaled: MediaVideoFrame?
+    ) {
+        if let result {
+            noteAccepted(result, midpointCount: midpointCount, enhancedOriginal: upscaled != nil)
+            if result.telemetry.smoothedProcessingMs > 0.01 { lastProcessingMs = result.telemetry.smoothedProcessingMs }
+        }
+        guard configuration.isRequested, !configuration.isLiveStream else { return }
+
+        var missReason: String?
+        if let expectation = pendingExpectation, expectation.frame == EnhancementFrameIdentity(original) {
+            let interpolationMissed = expectation.interpolation && midpointCount == 0
+            let upscaleMissed = expectation.upscale && upscaled == nil
+            if interpolationMissed {
+                missReason = result?.interpolationBypassReason ?? "Interpolation deadline"
+            } else if upscaleMissed {
+                missReason = result?.originalSuperResolutionBypassReason ?? "Super resolution deadline"
+            }
+            let missed = (pendingOutcomeMissed ?? false) || interpolationMissed || upscaleMissed
+            pendingOutcomeMissed = nil
+            pendingExpectation = nil
+            governor.record(missed: missed)
+        } else if upscaled == nil, midpointCount == 0 {
+            missReason = frameTelemetry.bypassReason
+        }
+        let input = original.pixelBuffer
+        let output = upscaled?.pixelBuffer ?? input
+        telemetryWindow.record(.init(
+            at: .now, upscaled: upscaled != nil, midpoints: midpointCount, missReason: missReason,
+            inputWidth: CVPixelBufferGetWidth(input), inputHeight: CVPixelBufferGetHeight(input),
+            outputWidth: CVPixelBufferGetWidth(output), outputHeight: CVPixelBufferGetHeight(output)
+        ))
+        updateBufferPlan(original: original, upscaled: upscaled, midpointCount: midpointCount)
+    }
+
+    private func updateBufferPlan(original: MediaVideoFrame, upscaled: MediaVideoFrame?, midpointCount: Int) {
+        let effective = effectiveConfiguration
+        if effective.superResolutionMode == .off {
+            lastUpscaledBytes = nil
+        } else if let upscaled {
+            lastUpscaledBytes = upscaled.pixelBuffer.enhancementByteSize
+        }
+        if !effective.frameInterpolationEnabled {
+            lastMidpointsPerSource = 0
+        } else if midpointCount > 0 {
+            lastMidpointsPerSource = midpointCount
+        }
+        guard let fps = VideoFrameInterpolationTiming.sourceFPS(original),
+              lastUpscaledBytes != nil || lastMidpointsPerSource > 0 else {
+            if !effective.isRequested { resetBufferPlan() }
+            return
+        }
+        let plan = VideoEnhancementBufferPlan.make(
+            sourceFPS: fps, midpointsPerSource: lastMidpointsPerSource,
+            upscaledBytes: lastUpscaledBytes, interpolatedBytes: original.pixelBuffer.enhancementByteSize
+        )
+        applyBufferPlan(plan)
+    }
+
+    private func resetBufferPlan() {
+        lastUpscaledBytes = nil
+        lastMidpointsPerSource = 0
+        applyBufferPlan(.default)
+    }
+
+    private func applyBufferPlan(_ plan: VideoEnhancementBufferPlan) {
+        // Ignore sub-50ms lead jitter so the engine's present lead does not wobble every frame.
+        if plan.superResolutionFrames == bufferPlan.superResolutionFrames,
+           plan.interpolationFramesPerPhase == bufferPlan.interpolationFramesPerPhase,
+           abs(plan.lead - bufferPlan.lead) < 0.05 { return }
+        bufferPlan = plan
+        VideoEnhancementPoolLimits.apply(plan)
+        if PlayerLog.isCapturing {
+            PlayerLog.log(
+                "[PathA][enhancement] buffer plan lead=\(String(format: "%.2f", plan.lead))s " +
+                    "srFrames=\(plan.superResolutionFrames) fiFramesPerPhase=\(plan.interpolationFramesPerPhase)"
+            )
+        }
+    }
+
+    // MARK: Prewarm
+
+    /// Creates VT / MetalFX / FI sessions on a real decoded frame before playback reaches it, so
+    /// the first enhanced frames after start / seek / backend switch don't time out on session setup
+    /// or model load. Cheap no-op when already warm.
+    func prewarm(with frame: MediaVideoFrame) {
+        guard activeTask == nil, configuration.isRequested, !configuration.isLiveStream,
+              ExperimentalSettingsPolicy.videoEnhancementEnabled,
+              VideoEnhancementGuardrails.commonBypassReason(
+                  configuration: configuration, pixelBuffer: frame.pixelBuffer
+              ) == nil else { return }
+        let effective = effectiveConfiguration
+        guard effective.isRequested else { return }
+        let buffer = frame.pixelBuffer
+        let key = WarmKey(
+            configuration: effective, width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer),
+            format: CVPixelBufferGetPixelFormatType(buffer)
+        )
+        guard key != warmedKey else { return }
+        warmedKey = key
+
+        let upscale = canUpscale(frame)
+        var plan: VideoFrameInterpolationPlan?
+        let interval = frame.duration
+        if effective.frameInterpolationEnabled, interpolationInputBypassReason(frame) == nil,
+           interval.isFinite, interval > 0 {
+            plan = VideoFrameInterpolationPlan(
+                previousPTS: frame.pts - 2 * interval, currentPTS: frame.pts - interval, interval: interval,
+                rate: effective.interpolationRate
+            )
+            if #unavailable(iOS 26.0), !VisionFrameInterpolationBackend.acceptsPairDelta(interval) { plan = nil }
+        }
+        guard upscale || plan != nil else { return }
+
+        isWarming = true
+        warmTaskCancelled = false
+        governor.noteDiscontinuity()
+        let job = VideoFrameWarmJob(
+            frame: PostProcessFrameBox(frame: frame), configuration: effective, upscale: upscale,
+            interpolationPlan: plan
+        )
+        let worker = self.worker
+        activeTask = Task.detached(priority: .userInitiated) { [weak self] in
+            let report = await worker.prewarm(job)
+            await self?.finishPrewarm(report)
+        }
+    }
+
+    private func finishPrewarm(_ report: VideoFrameWarmReport) {
+        activeTask = nil
+        isWarming = false
+        if warmTaskCancelled { warmedKey = nil }
+        // Grace from the end of warm-up so the first real frames are not judged.
+        governor.noteDiscontinuity()
+        if PlayerLog.isCapturing {
+            PlayerLog.log(
+                "[PathA][enhancement] prewarm sr=\(report.superResolution) fi=\(report.interpolation) " +
+                    "elapsed=\(String(format: "%.1f", report.elapsedMs))ms cancelled=\(warmTaskCancelled)"
+            )
+        }
+        if needsTearDown {
+            needsTearDown = false
+            needsFlush = false
+            startTearDown()
+        } else if needsFlush {
+            needsFlush = false
+            worker.flush()
+        }
     }
 
     func submit(
@@ -200,6 +400,7 @@ final class VideoFramePostProcessor {
             deadlines: deadlines,
             upscalingBypassReason: VideoEnhancementGuardrails.superResolutionBypassReason(frame.pixelBuffer)
         )
+        pendingExpectation = (EnhancementFrameIdentity(frame), job.interpolationPlan != nil, job.isUpscaling)
         let worker = self.worker
         activeTask = Task.detached(priority: .userInitiated) { [weak self] in
             let result = await worker.process(job) { midpoints in
@@ -211,7 +412,10 @@ final class VideoFramePostProcessor {
 
     func flush() {
         finalizePendingOutcome()
-        if activeTask != nil {
+        if isWarming {
+            // Warm-up is independent of stream position; let it finish and flush afterwards.
+            needsFlush = true
+        } else if activeTask != nil {
             needsFlush = true
             activeTask?.cancel()
         } else {
@@ -221,8 +425,14 @@ final class VideoFramePostProcessor {
 
     func tearDown() {
         pendingOutcomeMissed = nil
+        pendingExpectation = nil
         governor.reset(requested: configuration)
-        telemetry = VideoEnhancementTelemetry()
+        telemetryWindow.reset()
+        lastProcessingMs = 0
+        warmedKey = nil
+        resetBufferPlan()
+        frameTelemetry = VideoEnhancementTelemetry()
+        if isWarming { warmTaskCancelled = true }
         if let activeTask {
             needsTearDown = true
             activeTask.cancel()
@@ -283,20 +493,97 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
     private var smoothedMs: Double = 0
     private var lastSuperResolutionMode = VideoSuperResolutionMode.off
     private var lastInterpolationEnabled = false
+    private struct SessionClock {
+        let width: Int
+        let height: Int
+        let detail: Int
+        var pts: TimeInterval
+    }
+    /// Last VT SR submission (raster + scale cap + pts); VT restarts the session on a new raster or
+    /// a PTS that goes backwards, so warm-up only runs when the next real frame would pay that.
+    private var superResolutionClock: SessionClock?
+    private var metalFXWarmRaster: SessionClock?
+    /// Last FI reference (raster + phase count + pts).
+    private var interpolationClock: SessionClock?
+
+    func prewarm(_ job: VideoFrameWarmJob) async -> VideoFrameWarmReport {
+        let start = ContinuousClock.now
+        var report = VideoFrameWarmReport()
+        releaseIdleBackends(for: job.configuration)
+        let frame = job.frame.frame
+        let width = CVPixelBufferGetWidth(frame.pixelBuffer)
+        let height = CVPixelBufferGetHeight(frame.pixelBuffer)
+        let untilCancelled: @Sendable () -> Bool = { !Task.isCancelled }
+
+        if job.upscale {
+            let scale = job.configuration.superResolutionScale
+            switch job.configuration.superResolutionMode {
+            case .off:
+                break
+            case .videoToolboxML:
+                let clock = superResolutionClock
+                if clock == nil || clock?.width != width || clock?.height != height
+                    || clock?.detail != scale.rawValue || frame.pts < (clock?.pts ?? 0) {
+                    let warmPTS = max(0, frame.pts - 1)
+                    _ = await vtSuperRes.upscale(
+                        pixelBuffer: frame.pixelBuffer, pts: CMTime(seconds: warmPTS, preferredTimescale: 600),
+                        maxScale: scale.factor, hasTimeRemaining: untilCancelled
+                    )
+                    vtSuperRes.flush()
+                    superResolutionClock = SessionClock(width: width, height: height, detail: scale.rawValue, pts: warmPTS)
+                    report.superResolution = true
+                }
+            case .metalFXSpatial:
+                if metalFXWarmRaster?.width != width || metalFXWarmRaster?.height != height
+                    || metalFXWarmRaster?.detail != scale.rawValue {
+                    _ = await metalFXSuperRes.upscale(pixelBuffer: frame.pixelBuffer, maxScale: scale.factor)
+                    metalFXWarmRaster = SessionClock(width: width, height: height, detail: scale.rawValue, pts: 0)
+                    report.superResolution = true
+                }
+            }
+        }
+
+        if let plan = job.interpolationPlan, !Task.isCancelled {
+            let clock = interpolationClock
+            if clock == nil || clock?.width != width || clock?.height != height
+                || clock?.detail != plan.phases.count || frame.pts < (clock?.pts ?? 0) {
+                var first = frame
+                first.displayCoverage = nil
+                first.pts = plan.pts.first.map { $0 - plan.sourceInterval * Double(plan.phases[0]) } ?? frame.pts
+                first.duration = plan.sourceInterval
+                var second = first
+                second.pts = first.pts + plan.sourceInterval
+                resetInterpolation()
+                _ = await interpolate(first, plan: nil, hasTimeRemaining: untilCancelled)
+                _ = await interpolate(second, plan: plan, hasTimeRemaining: untilCancelled)
+                resetInterpolation()
+                report.interpolation = true
+            }
+        }
+        report.elapsedMs = Double(start.duration(to: .now) / .microseconds(1)) / 1_000
+        return report
+    }
 
     /// The governor can switch backends at runtime; release sessions that are no longer used so a
     /// device already short on resources does not keep idle VT / Metal state resident.
     private func releaseIdleBackends(for configuration: VideoEnhancementConfiguration) {
         let mode = configuration.superResolutionMode
         if mode != lastSuperResolutionMode {
-            if lastSuperResolutionMode == .videoToolboxML { vtSuperRes.tearDown() }
-            if lastSuperResolutionMode == .metalFXSpatial { metalFXSuperRes.tearDown() }
+            if lastSuperResolutionMode == .videoToolboxML {
+                vtSuperRes.tearDown()
+                superResolutionClock = nil
+            }
+            if lastSuperResolutionMode == .metalFXSpatial {
+                metalFXSuperRes.tearDown()
+                metalFXWarmRaster = nil
+            }
             lastSuperResolutionMode = mode
         }
         if lastInterpolationEnabled, !configuration.frameInterpolationEnabled {
             vtFrameInterp.tearDown()
             visionFrameInterp.tearDown()
             interpolationReference = nil
+            interpolationClock = nil
         }
         lastInterpolationEnabled = configuration.frameInterpolationEnabled
     }
@@ -319,6 +606,9 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
         smoothedMs = 0
         lastSuperResolutionMode = .off
         lastInterpolationEnabled = false
+        superResolutionClock = nil
+        metalFXWarmRaster = nil
+        interpolationClock = nil
     }
 
     private struct InterpolationStage {
@@ -452,6 +742,10 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
         plan: VideoFrameInterpolationPlan?,
         hasTimeRemaining: @Sendable () -> Bool
     ) async -> VideoInterpolationBackendOutcome {
+        interpolationClock = SessionClock(
+            width: CVPixelBufferGetWidth(frame.pixelBuffer), height: CVPixelBufferGetHeight(frame.pixelBuffer),
+            detail: plan?.phases.count ?? interpolationClock?.detail ?? 0, pts: frame.pts
+        )
         if #available(iOS 26.0, *) {
             return await vtFrameInterp.process(frame, plan: plan, hasTimeRemaining: hasTimeRemaining)
         }
@@ -487,6 +781,10 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
             return .bypassed(reason: "Off")
         case .videoToolboxML:
             let pts = CMTime(seconds: max(0, frame.pts), preferredTimescale: 600)
+            superResolutionClock = SessionClock(
+                width: CVPixelBufferGetWidth(frame.pixelBuffer), height: CVPixelBufferGetHeight(frame.pixelBuffer),
+                detail: configuration.superResolutionScale.rawValue, pts: max(0, frame.pts)
+            )
             return await vtSuperRes.upscale(
                 pixelBuffer: frame.pixelBuffer, pts: pts, maxScale: maxScale, hasTimeRemaining: hasTimeRemaining
             )

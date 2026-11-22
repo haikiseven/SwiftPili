@@ -1265,6 +1265,7 @@
 "Paused · %@" = "Paused · %@";
 "Paused (%@)" = "Paused (%@)";
 "Low Power Mode" = "Low Power Mode";
+"Warming up" = "Warming up";
 "Performance limited" = "Performance limited";
 "(Reduced · %@)" = "(Reduced · %@)";
 "Adaptive Quality" = "Adaptive Quality";

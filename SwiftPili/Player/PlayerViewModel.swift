@@ -1520,6 +1520,7 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     var stressLogTick = 0
 
     var lastDropSample: (count: Int, at: CFTimeInterval)?
+    @ObservationIgnored var lastEnhancementTelemetryRefresh: CFTimeInterval = 0
     var pendingBufferHealth: TimeInterval?
     var cachedResolutionSize: CGSize = .zero
 

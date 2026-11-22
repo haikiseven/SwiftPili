@@ -98,5 +98,7 @@ struct VideoFrameInterpolationPlan: Sendable {
         return zip(pts, buffers).map { MediaVideoFrame(pts: $0, duration: duration, pixelBuffer: $1) }
     }
 
-    static func outputPoolLimit(phaseCount: Int) -> Int { 4 * phaseCount }
+    static func outputPoolLimit(phaseCount: Int) -> Int {
+        VideoEnhancementPoolLimits.interpolationFrames(phaseCount: phaseCount)
+    }
 }

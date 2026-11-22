@@ -341,7 +341,8 @@ private final class VTSRSession {
         try VTSRFailure.checkDeadline(hasTimeRemaining)
         let requirements = configuration.destination
         let pool = try destinationPool ?? VideoSuperResolutionPool(
-            attributes: requirements.poolAttributes, label: "VT SR destination", isCompatible: requirements.accepts
+            attributes: requirements.poolAttributes, label: "VT SR destination", followsDisplayLookahead: true,
+            isCompatible: requirements.accepts
         )
         destinationPool = pool
         try VTSRFailure.checkDeadline(hasTimeRemaining)

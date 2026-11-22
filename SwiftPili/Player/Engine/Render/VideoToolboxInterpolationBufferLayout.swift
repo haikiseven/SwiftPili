@@ -98,9 +98,14 @@ struct VTInterpolationPool {
     let requirements: VTInterpolationBufferRequirements
     private let role: String
     private let pool: CVPixelBufferPool
-    private let allocationAttributes: CFDictionary
+    private let limit: () -> Int
 
     init(requirements: VTInterpolationBufferRequirements, role: String, limit: Int) throws {
+        try self.init(requirements: requirements, role: role, dynamicLimit: { limit })
+    }
+
+    /// `dynamicLimit` is evaluated per allocation so output pools follow the display lookahead.
+    init(requirements: VTInterpolationBufferRequirements, role: String, dynamicLimit: @escaping () -> Int) throws {
         var pool: CVPixelBufferPool?
         let status = CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, requirements.poolAttributes, &pool)
         guard status == kCVReturnSuccess, let pool else {
@@ -109,10 +114,11 @@ struct VTInterpolationPool {
         self.requirements = requirements
         self.role = role
         self.pool = pool
-        allocationAttributes = [kCVPixelBufferPoolAllocationThresholdKey: limit] as CFDictionary
+        limit = dynamicLimit
     }
 
     func allocate() throws -> CVPixelBuffer {
+        let allocationAttributes = [kCVPixelBufferPoolAllocationThresholdKey: limit()] as CFDictionary
         var buffer: CVPixelBuffer?
         let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
             kCFAllocatorDefault, pool, allocationAttributes, &buffer

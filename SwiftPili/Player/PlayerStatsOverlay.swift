@@ -248,19 +248,24 @@ struct PlayerStatsOverlay: View {
 
     private func enhancementModeText(_ enhancement: VideoEnhancementTelemetry) -> String? {
         if enhancement.isActive {
-            return activeEnhancementModeText(enhancement.activeModeLabel)
+            return activeEnhancementModeText(enhancement)
         }
         guard snapshot == nil else { return nil }
         return requestedEnhancementModeText(player.effectiveVideoEnhancementConfiguration)
     }
 
-    private func activeEnhancementModeText(_ rawLabel: String) -> String? {
-        let parts = rawLabel.split(separator: "+").map { segment -> String in
+    private func activeEnhancementModeText(_ enhancement: VideoEnhancementTelemetry) -> String? {
+        func withShare(_ name: String, _ share: Double?) -> String {
+            guard let share, share < 0.995 else { return name }
+            return "\(name) \(Int((share * 100).rounded()))%"
+        }
+        let parts = enhancement.activeModeLabel.split(separator: "+").map { segment -> String in
             let token = segment.trimmingCharacters(in: .whitespaces)
             switch token {
-            case "VT ML SR": return String(localized: "VideoToolbox ML")
-            case "MetalFX SR": return "MetalFX"
-            case "VT FI", "Vision FI": return String(localized: "Frame Interpolation")
+            case "VT ML SR": return withShare(String(localized: "VideoToolbox ML"), enhancement.superResolutionShare)
+            case "MetalFX SR": return withShare("MetalFX", enhancement.superResolutionShare)
+            case "VT FI", "Vision FI":
+                return withShare(String(localized: "Frame Interpolation"), enhancement.interpolationShare)
             default: return token
             }
         }
@@ -283,7 +288,15 @@ struct PlayerStatsOverlay: View {
 
     private func enhancementStatusText(_ enhancement: VideoEnhancementTelemetry) -> String {
         if enhancement.isActive {
-            return String(localized: "Active")
+            var text = String(localized: "Active")
+            if let partial = enhancement.partialReason {
+                text += " · " + VideoEnhancementBypassDisplay.shortLabel(for: partial)
+            }
+            if let note = enhancement.degradationNote {
+                text += " " + String(format: String(localized: "(Reduced · %@)"),
+                                     VideoEnhancementBypassDisplay.shortLabel(for: note))
+            }
+            return text
         }
         if let reason = enhancement.bypassReason {
             return VideoEnhancementBypassDisplay.pausedStatsLabel(for: reason)

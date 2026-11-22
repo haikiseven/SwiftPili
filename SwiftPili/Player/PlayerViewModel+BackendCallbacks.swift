@@ -339,8 +339,14 @@ extension PlayerViewModel {
             self.autoSkipIfNeeded(at: currentTime)
             self.autoSkipSponsorIfNeeded(at: currentTime)
             UIHitchMonitor.endSpan(skipSpan)
-            if now - (self.lastDropSample?.at ?? 0) >= 1.0 {
+            // Faster cadence while the stats overlay is visible; enhancement telemetry is a cheap
+            // window summary, so it refreshes at 4 Hz there.
+            if now - (self.lastDropSample?.at ?? 0) >= (self.showStats ? 0.5 : 1.0) {
+                self.lastEnhancementTelemetryRefresh = now
                 self.updateDynamicStats()
+            } else if self.showStats, now - self.lastEnhancementTelemetryRefresh >= 0.25 {
+                self.lastEnhancementTelemetryRefresh = now
+                self.refreshVideoEnhancementTelemetry()
             }
         }
 

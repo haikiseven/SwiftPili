@@ -567,6 +567,17 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         postProcessor.telemetry
     }
 
+    /// Presentation lookahead requested by video enhancement (default 0.3 s).
+    var preferredPresentLeadSeconds: TimeInterval {
+        postProcessor.configuration.isRequested ? postProcessor.preferredPresentLeadSeconds
+            : VideoEnhancementBufferPlan.defaultLead
+    }
+
+    /// Called for decoded frames before they are due, so enhancement sessions can warm up early.
+    func prewarmEnhancementIfNeeded(with frame: MediaVideoFrame) {
+        postProcessor.prewarm(with: frame)
+    }
+
     func setDisplayPlayback(rate: Float, mediaTime: TimeInterval) {
         displayNative.removeAll { ($0.owner.interval?.upper.seconds ?? mediaTime) <= mediaTime }
         let native = displayView.sampleBufferLayer.sampleBufferRenderer
@@ -1773,7 +1784,7 @@ extension SampleBufferVideoRenderer {
         let canProcess = postProcessor.canProcess(frame)
         guard canProcess, let reference = enhancementReference else {
             if tracksSuperResolutionAdmissions {
-                let reason = canProcess ? "No accepted reference" : postProcessor.telemetry.bypassReason
+                let reason = canProcess ? "No accepted reference" : postProcessor.frameTelemetry.bypassReason
                 enhancementDiagnostics.superResolution.noteBypass(reason ?? "Enhancement disabled")
             }
             abandonEnhancementOutput()
@@ -1823,8 +1834,9 @@ extension SampleBufferVideoRenderer {
             if request.midpointDelay != nil {
                 enhancementDiagnostics.lastInterpolationBypass = "Interpolation worker busy"
             }
-            if request.canUpscale { enhancementDiagnostics.superResolution.noteBypass("Enhancement worker busy") }
-            postProcessor.noteBypass("Enhancement worker busy")
+            let busyReason = postProcessor.isWarming ? "Enhancement warming up" : "Enhancement worker busy"
+            if request.canUpscale { enhancementDiagnostics.superResolution.noteBypass(busyReason) }
+            postProcessor.noteBypass(busyReason)
             return nil
         }
         let now = ContinuousClock.now
@@ -1844,7 +1856,7 @@ extension SampleBufferVideoRenderer {
     private func enhancementDelay(pts: TimeInterval, clock: TimeInterval, rate: Double) -> TimeInterval? {
         guard clock.isFinite, rate.isFinite, rate > 0, displayRate > 0 else { return nil }
         let delay = (pts - clock) / rate - 0.008
-        return delay.isFinite && delay > 0 ? min(delay, 0.3) : nil
+        return delay.isFinite && delay > 0 ? min(delay, preferredPresentLeadSeconds) : nil
     }
 
     private func startEnhancement(
@@ -2152,9 +2164,7 @@ extension SampleBufferVideoRenderer {
         upscaled: MediaVideoFrame?
     ) {
         clearEnhancementAttempt()
-        if let result {
-            postProcessor.noteAccepted(result, midpointCount: midpointCount, enhancedOriginal: upscaled != nil)
-        }
+        postProcessor.noteOriginalPresented(original, result: result, midpointCount: midpointCount, upscaled: upscaled)
         guard tracksEnhancementAdmissions else { return }
         enhancementReference = original
         enhancementDiagnostics.originalsEnqueued += 1

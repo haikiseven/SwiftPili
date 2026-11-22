@@ -227,6 +227,7 @@ enum VideoEnhancementBypassDisplay {
         (["hdr", "10-bit", "log transfer"], { String(localized: "HDR") }),
         (["thermal"], { String(localized: "Thermal") }),
         (["low power"], { String(localized: "Low Power Mode") }),
+        (["warming"], { String(localized: "Warming up") }),
         (["performance", "worker busy"], { String(localized: "Performance limited") }),
         (["interlaced"], { String(localized: "Interlaced") }),
         (["vod only", "live unsupported"], { String(localized: "VOD only") }),
@@ -273,6 +274,12 @@ struct VideoEnhancementTelemetry: Equatable, Sendable {
     var isActive: Bool = false
     /// Set when the adaptive governor is running a reduced configuration (raw reason string).
     var degradationNote: String?
+    /// Share of recently presented originals that were actually upscaled / preceded by
+    /// interpolated frames (nil when that feature is not running).
+    var superResolutionShare: Double?
+    var interpolationShare: Double?
+    /// Dominant reason some recent frames were not fully enhanced while enhancement is active.
+    var partialReason: String?
 
     static func bypassed(reason: String) -> Self {
         Self(

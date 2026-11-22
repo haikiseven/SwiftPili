@@ -332,7 +332,9 @@ final class MetalFXSuperResolutionBackend {
             kCVPixelBufferMetalCompatibilityKey as String: true,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
         ]
-        return try? VideoSuperResolutionPool(attributes: attrs as CFDictionary, label: "MetalFX destination")
+        return try? VideoSuperResolutionPool(
+            attributes: attrs as CFDictionary, label: "MetalFX destination", followsDisplayLookahead: true
+        )
     }
     #endif
 }
@@ -359,11 +361,14 @@ struct VideoSuperResolutionPool {
 
     private let pool: CVPixelBufferPool
     private let label: String
-    private let allocationAttributes: CFDictionary
+    private let limit: Int
+    private let followsDisplayLookahead: Bool
     private let isCompatible: (CVPixelBuffer) -> Bool
 
+    /// - Parameter followsDisplayLookahead: destination pools whose buffers wait in the display
+    ///   queue; their limit tracks `VideoEnhancementPoolLimits` so deeper lookahead doesn't starve them.
     init(
-        attributes: CFDictionary, label: String, limit: Int = 8,
+        attributes: CFDictionary, label: String, limit: Int = 8, followsDisplayLookahead: Bool = false,
         isCompatible: @escaping (CVPixelBuffer) -> Bool = { _ in true }
     ) throws(Failure) {
         var result: CVPixelBufferPool?
@@ -373,11 +378,14 @@ struct VideoSuperResolutionPool {
         }
         pool = result
         self.label = label
-        allocationAttributes = [kCVPixelBufferPoolAllocationThresholdKey: limit] as CFDictionary
+        self.limit = limit
+        self.followsDisplayLookahead = followsDisplayLookahead
         self.isCompatible = isCompatible
     }
 
     func allocate() throws(Failure) -> CVPixelBuffer {
+        let threshold = followsDisplayLookahead ? max(limit, VideoEnhancementPoolLimits.superResolutionFrames) : limit
+        let allocationAttributes = [kCVPixelBufferPoolAllocationThresholdKey: threshold] as CFDictionary
         var result: CVPixelBuffer?
         let status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
             kCFAllocatorDefault, pool, allocationAttributes, &result

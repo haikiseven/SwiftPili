@@ -106,8 +106,11 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         static let aacOutputQuantumSeconds: TimeInterval = 1024.0 / sampleRate
     }
 
-    private let videoPresentLeadSeconds: TimeInterval = 0.3
-    private let videoFrameQueueHighWater: TimeInterval = 0.4
+    /// 0.3 s normally; video enhancement may raise it (memory-bounded) so the worker has slack.
+    private var videoPresentLeadSeconds: TimeInterval {
+        (videoRender as? SampleBufferVideoRenderer)?.preferredPresentLeadSeconds ?? 0.3
+    }
+    private var videoFrameQueueHighWater: TimeInterval { max(0.4, videoPresentLeadSeconds + 0.15) }
     private let displayResyncEpsilonSeconds: TimeInterval = 0.25
     private let displayDriftResyncSeconds: TimeInterval = 0.08
     private var lastDisplayResyncPresentationTime: TimeInterval = -1
@@ -7636,6 +7639,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         }
         pendingVideoFrames.insert(frame, at: idx)
         pendingVideoContentSeconds += max(frame.duration, 0)
+        (videoRender as? SampleBufferVideoRenderer)?.prewarmEnhancementIfNeeded(with: frame)
     }
 
     private func resetOutputMediaFloor(to mediaTime: TimeInterval) {
