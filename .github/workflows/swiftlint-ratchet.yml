@@ -1,0 +1,158 @@
+name: SwiftLint ratchet
+
+# The repo enforces SwiftLint through a non-regressing ratchet rather than
+# has never been green (the repo holds real, un-fixed violations — 24 files
+# over the 1000-line file_length error threshold, 104 force_unwrapping sites,
+# and more) and was never wired into CI, so it was dropped as a claim nobody
+# could honour. Raising every threshold to "whatever the project holds today"
+# was rejected too — that blesses an 8,462-line file as compliant and still
+# leaves the force_unwrapping residual unfixed. Instead this workflow runs
+# scripts/check-swiftlint-ratchet.sh, which does not touch a single threshold:
+# it fails only when a rule's violation COUNT increases against the checked-in
+# baseline (scripts/swiftlint-ratchet-baseline.json). See that script's header
+# for the full "regression gate, not a correctness gate" framing.
+#
+# Why this is its OWN workflow file rather than a job added to
+# offline-gates.yml or player-package.yml: this gate's `paths:` has to include
+# `**/*.swift` — nearly every commit to this repo touches a Swift file — and
+# sharing a workflow file means sharing its triggers, so bolting this job onto
+# either of those would drag their unrelated gates (libVLC patch hygiene,
+# audio-clock ownership, the player-package boundary/build) into a run on
+# every single Swift-touching commit, and vice versa. A dedicated file keeps
+# each gate's trigger scope equal to what it actually needs.
+#
+# Why a hand-rolled download instead of a marketplace action: swiftlint is not
+# preinstalled on GitHub-hosted runners and there is no official Docker image
+# for Linux (only the Homebrew formula and the GitHub release assets are
+# upstream-official), and our convention of minimizing external
+# dependencies together with player-package.yml's precedent
+# (`actions/checkout@v4` is that workflow's ONLY non-first-party action) rule
+# out a third-party marketplace action for something as small as "download a
+# zip and check its hash".
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - '**/*.swift'
+      - '.swiftlint.yml'
+      - 'scripts/check-swiftlint-ratchet.sh'
+      - 'scripts/swiftlint-ratchet-baseline.json'
+      - 'scripts/check-design-tokens-ratchet.sh'
+      - 'scripts/design-tokens-ratchet-baseline.json'
+      - '.github/workflows/swiftlint-ratchet.yml'
+  pull_request:
+    # Duplicated rather than shared via a YAML anchor/alias: GitHub Actions'
+    # workflow parser does not support YAML anchors/aliases (unlike a full
+    # YAML implementation such as PyYAML) — an anchor here would parse locally
+    # and silently fail to do anything, or fail outright, on GitHub.
+    # offline-gates.yml and player-package.yml both already spell their
+    # push/pull_request paths lists out twice for exactly this reason; this
+    # list must be kept in sync with the one under `push:` above by hand.
+    paths:
+      - '**/*.swift'
+      - '.swiftlint.yml'
+      - 'scripts/check-swiftlint-ratchet.sh'
+      - 'scripts/swiftlint-ratchet-baseline.json'
+      - 'scripts/check-design-tokens-ratchet.sh'
+      - 'scripts/design-tokens-ratchet-baseline.json'
+      - '.github/workflows/swiftlint-ratchet.yml'
+  workflow_dispatch:
+
+# A same-repository pull request shares its source-branch group with push,
+# while the head repository keeps fork pull requests isolated. Manual tags and
+# branches remain distinct through ref_type. Copied from offline-gates.yml /
+# player-package.yml so all three hosted-runner workflows queue and cancel the
+# same way.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event_name == 'pull_request' && 'branch' || github.ref_type }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  swiftlint-ratchet:
+    name: swiftlint violation-count ratchet
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # No `container:` key on this job — unlike player-package.yml's
+    # package-build job, which runs inside `swift:6.0.3` and whose
+    # first CI run failed with `sh: 1: set: Illegal option -o pipefail`
+    # because GitHub resolved that containerized step's shell to the image's
+    # own /bin/sh (dash), not bash (see commit 67a88fe for the full account).
+    # That substitution is a property of running inside a `container:`; a
+    # plain `runs-on: ubuntu-latest` step with no `shell:` override uses
+    # GitHub's documented default, `bash --noprofile --norc -eo pipefail
+    # {0}`, on every step below — so `pipefail` is both available and already
+    # on by default here, and the multi-line `run:` blocks below rely on it
+    # deliberately (e.g. `sha256sum -c -` failing a piped verification).
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download & verify swiftlint (pinned)
+        run: |
+          set -euo pipefail
+
+          # This version pin is LOAD-BEARING, not a routine dependency pin:
+          # swiftlint's violation counts are rule-implementation- and
+          # threshold-dependent, so two different swiftlint versions can
+          # legitimately disagree about how many violations the SAME source
+          # tree has. scripts/check-swiftlint-ratchet.sh records the version
+          # inside scripts/swiftlint-ratchet-baseline.json and REFUSES to
+          # compare against a baseline recorded by a different version — so
+          # bumping this pin without regenerating the baseline (via
+          # `--update-baseline` under the NEW version, in the same commit)
+          # fails this job outright, on purpose, rather than silently
+          # comparing apples to oranges.
+          SWIFTLINT_VERSION="0.65.1"
+          ASSET="swiftlint_linux_amd64.zip"
+          URL="https://github.com/realm/SwiftLint/releases/download/${SWIFTLINT_VERSION}/${ASSET}"
+
+          # sha256 of swiftlint_linux_amd64.zip for release 0.65.1, taken from
+          # GitHub's own Releases API digest for this exact asset
+          # (`gh api repos/realm/SwiftLint/releases/tags/0.65.1`, the
+          # `assets[].digest` field for this file — GitHub computes this
+          # itself on upload). Stated honestly: SwiftLint does not publish a
+          # maintainer-signed checksum sidecar for the Linux zip the way it
+          # does for `bazel.tar.gz` (which ships a `bazel.tar.gz.sha256`
+          # alongside it) — this is GitHub's computed digest, not an
+          # upstream-signed one. It still catches a truncated download, a
+          # transparent MITM without TLS, or this pin drifting to a
+          # different, unreviewed asset; it is not proof the release itself
+          # is not compromised.
+          EXPECTED_SHA256="caeed6f4a679c35539ffaf124f6c4ab4a8416917f7d8796279dc52b74026059d"
+
+          dest="$RUNNER_TEMP/swiftlint-${SWIFTLINT_VERSION}"
+          mkdir -p "$dest"
+          curl --fail --location --silent --show-error --output "$dest/${ASSET}" "$URL"
+
+          echo "${EXPECTED_SHA256}  $dest/${ASSET}" | sha256sum -c -
+
+          unzip -q "$dest/${ASSET}" -d "$dest"
+
+          # The archive ships two Linux binaries: a dynamically-linked
+          # `swiftlint` and a statically-linked `swiftlint-static`. The
+          # static one is used deliberately — it links nothing from the
+          # runner image, so a future ubuntu-latest base-image bump cannot
+          # break it the way a glibc/libstdc++ version drift would break the
+          # dynamic binary. Verified directly on this project's own Linux dev
+          # box: its older glibc/libstdc++ makes the dynamic `swiftlint` fail
+          # to even start (`GLIBC_2.38'/`GLIBCXX_3.4.32' not found), while
+          # `swiftlint-static` runs unmodified. No observed downside to
+          # preferring it.
+          chmod +x "$dest/swiftlint-static"
+          "$dest/swiftlint-static" version
+
+          echo "SWIFTLINT_BIN=$dest/swiftlint-static" >> "$GITHUB_ENV"
+
+          # Residual, honestly-stated risk (same shape as player-package.yml's
+          # Docker Hub note): this pulls anonymously from github.com on every
+          # run. A network hiccup or an upstream outage fails this job loudly
+          # (`curl --fail`, and a checksum mismatch fails `sha256sum -c`
+          # explicitly) rather than silently passing untested — that is the
+          # acceptable failure mode, not a false green.
+
+      - name: Run swiftlint count ratchet
+        run: ./scripts/check-swiftlint-ratchet.sh
+
+      - name: Run design tokens ratchet
+        run: ./scripts/check-design-tokens-ratchet.sh

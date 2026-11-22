@@ -1,0 +1,108 @@
+name: Player package gates
+
+# Builds the in-repository PiliPlayerKit package and checks its App/source
+# boundary: forbidden imports, App-internal symbols, internal-target imports,
+# duplicate Swift basenames, and manifest shape.
+#
+# The package needs no libVLC binary or iOS app target, so a hosted runner can
+# build it with the Swift toolchain container. The generated Xcode project and
+# its App dependency membership remain the self-hosted build's responsibility.
+
+on:
+  workflow_dispatch:
+  push:
+    # Every branch, explicitly — same declared property as offline-gates.yml
+    # ("this job... runs in seconds whenever the patch set or this gate can
+    # change, on any branch or pull request"). Behaviourally a no-op (an
+    # absent `branches:` already means every branch) but stated for the same
+    # reason that workflow states it: this gate needs no libVLC, no iOS SDK
+    # and no simulator, so unlike full-build.yml (which restricts branches to
+    # `[main, 'feature/swiftvlc']` precisely because it DOES need those)
+    # there is no cost to running it everywhere.
+    branches: ['**']
+    paths:
+      - '.github/workflows/player-package.yml'
+      - 'Packages/PiliPlayerKit/**'
+      - 'scripts/check-player-package-boundaries.sh'
+      # Required, and not over-triggering: check_source_tree() in
+      # check-player-package-boundaries.sh runs two loops over
+      # `find "$app_sources" -type f -name '*.swift'` where $app_sources is
+      # this directory — an app-import check (App may import only the
+      # PiliPlayerEngine product, never PiliPlayerCore/Media/Apple directly)
+      # and a duplicate-source check (a Swift basename must not exist both in
+      # the package and anywhere under SwiftPili/). A commit that touches only
+      # SwiftPili/ can add a file that collides with a package basename or
+      # reach past the Engine product, and either failure mode is invisible
+      # unless this path is listed. The duplicate-source check in particular
+      # is exactly the guard the extraction migration depends on while
+      # sources move from the App target into the package one leaf cluster at
+      # a time: App sources are removed from SwiftPili/ as each cluster lands
+      # in PiliPlayerKit, so this path catches accidental duplicate files.
+      - 'SwiftPili/**'
+      # Deliberately NOT listed: root Package.swift. Neither job reads it —
+      # the boundary script only ever opens
+      # Packages/PiliPlayerKit/Package.swift, and `swift build
+      # --package-path Packages/PiliPlayerKit` resolves entirely inside that
+      # package path and never consults the root manifest. Listing it here
+      # would claim coverage this workflow does not have.
+  pull_request:
+    # Duplicated rather than shared via a YAML anchor/alias: GitHub Actions'
+    # workflow parser does not support YAML anchors/aliases (unlike a full
+    # YAML implementation such as PyYAML), so an anchor here would parse
+    # locally and silently fail to do anything — or fail outright — on
+    # GitHub. offline-gates.yml already spells its identical push/pull_request
+    # paths list out twice for the same reason; this list must be kept in
+    # sync with the one under `push:` above by hand.
+    paths:
+      - '.github/workflows/player-package.yml'
+      - 'Packages/PiliPlayerKit/**'
+      - 'scripts/check-player-package-boundaries.sh'
+      - 'SwiftPili/**'
+
+# A same-repository pull request shares its source-branch group with push,
+# while the head repository keeps fork pull requests isolated. Manual tags and
+# branches remain distinct through ref_type. Copied from offline-gates.yml so
+# both hosted-runner workflows queue and cancel the same way.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event_name == 'pull_request' && 'branch' || github.ref_type }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  boundary-gate:
+    name: App/package source boundary
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # The boundary scan uses bash, Perl, and standard command-line tools.
+      - name: check-player-package-boundaries
+        run: ./scripts/check-player-package-boundaries.sh
+
+  package-build:
+    name: PiliPlayerKit build
+    runs-on: ubuntu-latest
+    container: swift:6.0.3
+    timeout-minutes: 15
+
+    # Why a container instead of a third-party setup-swift action: we minimize
+    # external dependencies, and the official
+    # `swift:6.0.3` image pins the exact toolchain this package is developed
+    # and verified against on the Linux box (swiftc/swift --version there
+    # report 6.0.3 on x86_64-unknown-linux-gnu, matching this image's tag
+    # exactly) — no third-party action needed to install or select a
+    # toolchain. `actions/checkout@v4` is the one exception this whole
+    # workflow file uses, and it is First Party.
+    #
+    # Residual, honestly-stated risk: this pulls `swift:6.0.3` anonymously
+    # from Docker Hub on every run. An anonymous hosted-runner pull can hit
+    # Docker Hub's rate limit. If that happens the job fails loudly (the
+    # container step errors before any of our steps run) rather than
+    # silently — which is the acceptable failure mode; it is not a false
+    # green.
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: swift build --package-path Packages/PiliPlayerKit
+        run: swift build --package-path Packages/PiliPlayerKit

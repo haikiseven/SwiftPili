@@ -1,0 +1,99 @@
+name: Offline gates
+
+# Patch-hygiene gates that need NOTHING but this repository.
+#
+# Why this workflow is separate from the full build:
+#   ../SwiftVLC/Vendor/libvlc.xcframework is ~12 GB, gitignored and untracked, so
+#   a GitHub-hosted runner cannot compile the app, which imports SwiftVLC.
+#   Anything that needs a built libVLC lives in full-build.yml on a self-hosted
+#   runner.
+#
+#   What CAN run here is the check that matters most: patches/libvlc/*.patch must
+#   apply cleanly IN ORDER. build-libvlc.sh treats a failed git-apply as a
+#   non-fatal "Skipped" and keeps going, so a green binary can silently be
+#   missing whole patches. This job is the standing
+#   answer to that — it runs in seconds whenever the patch set or this gate can
+#   change, on any branch or pull request.
+#
+# Failure here means the PATCH SET is unshippable. It does not mean the app is
+# broken; it means a build from this tree would lie about which patches landed.
+
+on:
+  push:
+    branches: ['**']
+    paths:
+      - '.github/workflows/offline-gates.yml'
+      - 'patches/libvlc/*.patch'
+      - 'patches/libvlc/verify/check-apply-matrix.sh'
+      - 'patches/libvlc/verify/check-filters-rate-ownership.sh'
+      - 'scripts/check-audio-clock-ownership.sh'
+      - 'SwiftPili/Player/Engine/MediaEngineSession.swift'
+      - 'SwiftPili/Player/Engine/Render/EngineAudioRenderer.swift'
+      - 'SwiftPili/Player/Engine/Render/AudioRingFeeder.swift'
+      - 'SwiftPili/Player/Engine/Render/AudioFeederAdmission.swift'
+  pull_request:
+    paths:
+      - '.github/workflows/offline-gates.yml'
+      - 'patches/libvlc/*.patch'
+      - 'patches/libvlc/verify/check-apply-matrix.sh'
+      - 'patches/libvlc/verify/check-filters-rate-ownership.sh'
+      - 'scripts/check-audio-clock-ownership.sh'
+      - 'SwiftPili/Player/Engine/MediaEngineSession.swift'
+      - 'SwiftPili/Player/Engine/Render/EngineAudioRenderer.swift'
+      - 'SwiftPili/Player/Engine/Render/AudioRingFeeder.swift'
+      - 'SwiftPili/Player/Engine/Render/AudioFeederAdmission.swift'
+  workflow_dispatch:
+
+# A same-repository pull request shares its source-branch group with push, while
+# the head repository keeps fork pull requests isolated. Manual tags and
+# branches remain distinct through ref_type.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event_name == 'pull_request' && 'branch' || github.ref_type }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  patch-hygiene:
+    name: libVLC patch apply hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Static mode: patch inventory (0002–0015), P0.1 0011 ∩ 0012 discontinuity
+      # overlap, and the nested T2 filters_rate_ownership harness. No VLC tree
+      # and no --build-log are available on a hosted runner, so the tree/log
+      # modes stay for the self-hosted job and for local runs.
+      #
+      # NOTE: no `|| true` and no pipe into a formatter — the old build.yml
+      # swallowed xcodebuild's exit code that way and was green for a month
+      # while it could not have compiled at all.
+      # ⚠️ Static mode does NOT run the ordered-apply stages. Neither the
+      # scratch-tree stage nor the pinned-base stage (`git show c833c4be0:…`)
+      # can run without a VLC checkout, so CI green here does not mean the
+      # patch set applies. `0015` shipped un-appliable to `c833c4be0` for weeks
+      # and only the pinned-base stage caught it — run
+      # `./patches/libvlc/verify/check-apply-matrix.sh ../SwiftVLC/scripts/.build-libvlc/vlc`
+      # locally before trusting any rebuild.
+      - name: check-apply-matrix (static)
+        run: ./patches/libvlc/verify/check-apply-matrix.sh
+
+  audio-clock-ownership:
+    name: Path A media-clock ownership
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # A STRUCTURAL gate: it cannot tell you the clock is correct, only that
+      # nobody added a second thing that could move it. It belongs here rather
+      # than in the test suite because it needs no iOS SDK, no libVLC and no
+      # simulator — it is grep over source — and because the invariant it guards
+      # (one media-clock writer) was violated once already by a downcast that
+      # shipped with no coverage on the branch that ran.
+      #
+      # The PCM ring refill runs off MainActor, so a second clock writer is now
+      # one careless line away in code that only the device exercises.
+      - name: check-audio-clock-ownership
+        run: ./scripts/check-audio-clock-ownership.sh

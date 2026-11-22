@@ -1,0 +1,112 @@
+{
+  "generated": "2026-11-19",
+  "rules": {
+    "closure_parameter_position": {
+      "warning": 5
+    },
+    "control_statement": {
+      "warning": 11
+    },
+    "cyclomatic_complexity": {
+      "error": 30,
+      "warning": 68
+    },
+    "empty_count": {
+      "error": 4
+    },
+    "empty_enum_arguments": {
+      "warning": 8
+    },
+    "file_length": {
+      "error": 22,
+      "warning": 33
+    },
+    "force_try": {
+      "error": 3
+    },
+    "force_unwrapping": {
+      "warning": 43
+    },
+    "function_body_length": {
+      "error": 55,
+      "warning": 78
+    },
+    "function_parameter_count": {
+      "error": 11,
+      "warning": 33
+    },
+    "identifier_name": {
+      "error": 151,
+      "warning": 212
+    },
+    "implicit_optional_initialization": {
+      "warning": 20
+    },
+    "implicitly_unwrapped_optional": {
+      "warning": 2
+    },
+    "inclusive_language": {
+      "warning": 10
+    },
+    "large_tuple": {
+      "error": 2,
+      "warning": 12
+    },
+    "line_length": {
+      "error": 14,
+      "warning": 169
+    },
+    "multiple_closures_with_trailing_closure": {
+      "warning": 5
+    },
+    "nesting": {
+      "warning": 151
+    },
+    "optional_data_string_conversion": {
+      "warning": 4
+    },
+    "orphaned_doc_comment": {
+      "warning": 2
+    },
+    "redundant_discardable_let": {
+      "warning": 7
+    },
+    "redundant_string_enum_value": {
+      "warning": 1
+    },
+    "shorthand_operator": {
+      "error": 5
+    },
+    "statement_position": {
+      "warning": 1
+    },
+    "static_over_final_class": {
+      "warning": 2
+    },
+    "trailing_newline": {
+      "warning": 1
+    },
+    "type_body_length": {
+      "error": 24,
+      "warning": 15
+    },
+    "type_name": {
+      "warning": 2
+    },
+    "unneeded_synthesized_initializer": {
+      "warning": 7
+    },
+    "vertical_whitespace": {
+      "warning": 2
+    },
+    "void_function_in_ternary": {
+      "warning": 1
+    }
+  },
+  "swiftlint_version": "0.65.1",
+  "total": 1226,
+  "total_by_severity": {
+    "error": 321,
+    "warning": 905
+  }
+}
