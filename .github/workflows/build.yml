@@ -1,0 +1,246 @@
+name: Build & Release IPA
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+    paths-ignore:
+      - '**/*.md'
+      - '.gitignore'
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - '**/*.md'
+      - '.gitignore'
+  workflow_dispatch:
+    inputs:
+      run_debug_build:
+        description: 'Also run Debug iOS Simulator build'
+        required: false
+        type: boolean
+        default: false
+      publish_release:
+        description: 'Publish IPA to the nightly GitHub Release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  SWIFTVLC_REPO: https://github.com/haikiseven/SwiftVLC.git
+  SWIFTVLC_SHA: 2bc7995c1fd0f22735f70e1b1584979f151b503a
+
+jobs:
+  build-and-release:
+    name: Build & Release IPA
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout SwiftPili
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 20
+
+      - name: Print runner toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - name: Checkout pinned sibling SwiftVLC and apply patches
+        run: |
+          set -euo pipefail
+          SWIFTVLC_DIR="${GITHUB_WORKSPACE}/../SwiftVLC"
+          rm -rf "$SWIFTVLC_DIR"
+          mkdir -p "$SWIFTVLC_DIR"
+          git -C "$SWIFTVLC_DIR" init -q
+          git -C "$SWIFTVLC_DIR" remote add origin "$SWIFTVLC_REPO"
+          git -C "$SWIFTVLC_DIR" fetch --depth 1 origin "$SWIFTVLC_SHA"
+          git -C "$SWIFTVLC_DIR" checkout -q FETCH_HEAD
+          ./patches/apply.sh "$SWIFTVLC_DIR"
+          echo "SWIFTVLC_DIR=$SWIFTVLC_DIR" >> "$GITHUB_ENV"
+
+      - name: Fetch and verify prebuilt native XCFrameworks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/fetch-prebuilt-deps.sh --swiftvlc "$SWIFTVLC_DIR"
+
+      - name: Install XcodeGen and generate project
+        run: |
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+          fi
+          xcodegen generate
+
+      - name: Build (Debug Simulator, optional)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_debug_build }}
+        run: |
+          set -euo pipefail
+          DEVICE="$(./scripts/pick-simulator.sh)"
+          xcodebuild build \
+            -project SwiftPili.xcodeproj \
+            -scheme SwiftPili \
+            -configuration Debug \
+            -derivedDataPath build/DerivedData-Debug \
+            -destination "platform=iOS Simulator,name=$DEVICE" \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            -quiet
+
+      - name: Archive (Release iOS, unsigned)
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project SwiftPili.xcodeproj \
+            -scheme SwiftPili \
+            -configuration Release \
+            -derivedDataPath build/DerivedData-Release \
+            -archivePath build/SwiftPili.xcarchive \
+            -destination 'generic/platform=iOS' \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            VALIDATE_PRODUCT=NO \
+            -quiet
+
+      - name: Fix embedded framework bundle IDs
+        run: |
+          set -euo pipefail
+          find build/SwiftPili.xcarchive -name "*.framework" -type d | while IFS= read -r fw; do
+            plist="${fw}/Info.plist"
+            [ -f "$plist" ] || continue
+            bid=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$plist" 2>/dev/null || true)
+            [ -n "$bid" ] || continue
+            fixed=$(echo "$bid" | tr '_' '-')
+            if [ "$bid" != "$fixed" ]; then
+              /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $fixed" "$plist"
+              echo "Fixed: $bid -> $fixed"
+            fi
+          done
+
+      - name: Package IPA and prepare release metadata
+        run: |
+          set -euo pipefail
+          APP_BUNDLE="build/SwiftPili.xcarchive/Products/Applications/SwiftPili.app"
+          if [ ! -d "$APP_BUNDLE" ]; then
+            echo "::error::Archive did not produce $APP_BUNDLE"
+            exit 1
+          fi
+
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          APP_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_BUNDLE/Info.plist" 2>/dev/null || echo '1.0.0')"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          XCODE_VER="$(xcodebuild -version | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+
+          RELEASE_MODE="none"
+          RELEASE_TAG=""
+          IPA_NAME="SwiftPili.ipa"
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            RELEASE_MODE="tag"
+            RELEASE_TAG="${GITHUB_REF_NAME}"
+            IPA_NAME="SwiftPili-${RELEASE_TAG}.ipa"
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            RELEASE_MODE="nightly"
+            RELEASE_TAG="nightly"
+            IPA_NAME="SwiftPili.ipa"
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${{ inputs.publish_release }}" == "true" ]]; then
+            RELEASE_MODE="nightly"
+            RELEASE_TAG="nightly"
+            IPA_NAME="SwiftPili.ipa"
+          fi
+
+          rm -rf build/Payload
+          mkdir -p build/Payload
+          cp -R "$APP_BUNDLE" build/Payload/
+          (cd build && zip -qr "$IPA_NAME" Payload && shasum -a 256 "$IPA_NAME" > "${IPA_NAME}.sha256")
+
+          IPA_SIZE="$(du -sh "build/${IPA_NAME}" | awk '{print $1}')"
+          IPA_SHA256="$(awk '{print $1}' "build/${IPA_NAME}.sha256")"
+          echo "Packaged build/${IPA_NAME} (${IPA_SIZE}, sha256=${IPA_SHA256})"
+
+          {
+            echo "### Build Info"
+            echo "- **Version**: \`${APP_VERSION}\`"
+            echo "- **Commit**: \`${SHORT_SHA}\` (\`${GITHUB_SHA}\`)"
+            echo "- **Built at**: \`${BUILD_DATE}\`"
+            echo "- **Toolchain**: \`${XCODE_VER}\`"
+            echo "- **SHA-256** (\`${IPA_NAME}\`): \`${IPA_SHA256}\`"
+            echo ""
+            echo "> Unsigned Release IPA for sideloading (TrollStore, AltStore, SideStore, Sideloadly, etc.)."
+            if [ "$RELEASE_MODE" != "tag" ]; then
+              echo ""
+              echo "### Recent Commits"
+              git log -n 10 --pretty=format:'- `%h` %s'
+              echo ""
+            fi
+          } > build/release-notes.md
+
+          {
+            echo "SHORT_SHA=${SHORT_SHA}"
+            echo "RELEASE_MODE=${RELEASE_MODE}"
+            echo "RELEASE_TAG=${RELEASE_TAG}"
+            echo "IPA_NAME=${IPA_NAME}"
+          } >> "$GITHUB_ENV"
+
+      - name: Upload IPA workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: SwiftPili-${{ env.SHORT_SHA }}
+          path: |
+            build/${{ env.IPA_NAME }}
+            build/${{ env.IPA_NAME }}.sha256
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: env.RELEASE_MODE != 'none'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          IPA_PATH="build/${IPA_NAME}"
+          SHA_PATH="build/${IPA_NAME}.sha256"
+
+          if [ "$RELEASE_MODE" = "nightly" ]; then
+            if gh release view nightly >/dev/null 2>&1; then
+              gh release delete nightly --yes --cleanup-tag
+            else
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/nightly" >/dev/null 2>&1 || true
+            fi
+            gh release create nightly "$IPA_PATH" "$SHA_PATH" \
+              --target "$GITHUB_SHA" \
+              --title "SwiftPili Nightly (${SHORT_SHA})" \
+              --notes-file build/release-notes.md \
+              --prerelease \
+              --latest=false
+          elif [ "$RELEASE_MODE" = "tag" ]; then
+            PRERELEASE_ARGS=(--latest)
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              PRERELEASE_ARGS=(--prerelease --latest=false)
+            fi
+
+            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              gh release upload "$RELEASE_TAG" "$IPA_PATH" "$SHA_PATH" --clobber
+            else
+              gh release create "$RELEASE_TAG" "$IPA_PATH" "$SHA_PATH" \
+                --title "SwiftPili ${RELEASE_TAG}" \
+                --generate-notes \
+                --notes-file build/release-notes.md \
+                "${PRERELEASE_ARGS[@]}"
+            fi
+          fi

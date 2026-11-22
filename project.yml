@@ -1,0 +1,62 @@
+name: SwiftPili
+options:
+  bundleIdPrefix: com.swiftpili
+  deploymentTarget:
+    iOS: "18.0"
+  xcodeVersion: "16.0"
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+
+packages:
+  Kingfisher:
+    url: https://github.com/onevcat/Kingfisher.git
+    from: "8.1.0"
+  SwiftVLC:
+    path: ../SwiftVLC
+  PiliPlayerKit:
+    path: Packages/PiliPlayerKit
+  MediaExportNative:
+    path: Packages/MediaExportNative
+
+targets:
+  SwiftPili:
+    type: application
+    platform: iOS
+    sources:
+      - SwiftPili
+    configFiles:
+      Debug: Configuration/Signing.xcconfig
+      Release: Configuration/Signing.xcconfig
+    settings:
+      base:
+        INFOPLIST_FILE: SwiftPili/Resources/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        VALIDATE_PRODUCT: "NO"
+    dependencies:
+      - package: Kingfisher
+      - package: SwiftVLC
+      - package: PiliPlayerKit
+        product: PiliPlayerEngine
+      - package: MediaExportNative
+        product: MediaExportNative
+      - package: MediaExportNative
+        product: LiveMediaDemux
+    entitlements:
+      path: SwiftPili/Resources/SwiftPili.entitlements
+    postBuildScripts:
+      - name: Embed Build Info
+        script: '"$SRCROOT/scripts/embed-build-info.sh"'
+        inputFiles:
+          - $(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)
+        basedOnDependencyAnalysis: false
+
+schemes:
+  SwiftPili:
+    build:
+      targets:
+        SwiftPili: all

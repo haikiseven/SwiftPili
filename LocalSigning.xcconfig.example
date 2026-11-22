@@ -1,0 +1,6 @@
+// Copy this file to LocalSigning.xcconfig (gitignored) and fill in your Apple Team ID.
+// Then run `xcodegen generate` (or build directly if the project is already generated).
+CODE_SIGN_STYLE = Automatic
+DEVELOPMENT_TEAM = YOUR_TEAM_ID
+// Optional: override bundle identifier for personal device provisioning.
+// PRODUCT_BUNDLE_IDENTIFIER = com.yourname.swiftpili

@@ -1,0 +1,8 @@
+// Shared automatic signing defaults for SwiftPili.
+// Create a gitignored LocalSigning.xcconfig at the repository root to set
+// your personal Apple Development Team or bundle identifier without dirtying git.
+PRODUCT_BUNDLE_IDENTIFIER = com.swiftpili.app
+CODE_SIGN_STYLE = Automatic
+DEVELOPMENT_TEAM =
+
+#include? "../LocalSigning.xcconfig"

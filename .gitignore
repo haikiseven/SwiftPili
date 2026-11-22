@@ -1,0 +1,35 @@
+# Xcode
+*.xcodeproj
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
+DerivedData/
+device-build/
+build/
+*.moved-aside
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Local signing overrides (copy LocalSigning.xcconfig.example -> LocalSigning.xcconfig)
+LocalSigning.xcconfig
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Secrets
+*.env
+
+# Generated native export dependencies (see Packages/MediaExportNative/README.md)
+Packages/MediaExportNative/Vendor/*.xcframework/
+Packages/MediaExportNative/Vendor/.*.sha256
+
+# Local design/render output
+output/
