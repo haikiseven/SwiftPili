@@ -1,0 +1,192 @@
+From: SwiftPili <359733720+haikiseven@users.noreply.github.com>
+Subject: [PATCH] clock: apply the pause delay to every live context
+
+vlc_clock_main_ChangePause() shifted only main_clock->context on resume.
+
+Contexts are kept in main_clock->prev_contexts exactly as long as some clock
+is still attached to them (vlc_clock_remove_current_context() frees a context
+only once its using_clocks list is empty), and an output clock migrates to a
+newer context only when it *updates*: vlc_clock_ConvertToSystem() calls
+vlc_clock_get_context() with update=false precisely so that outputs holding
+frames do not switch under them. A video output whose clock is not the master
+therefore stays parked on a previous context for as long as that context
+remains the closest one for the timestamps it converts.
+
+A pause suspends the system clock for all of them. Shifting only the current
+context leaves such an output converting against a reference point that is
+`delay` too early: every picture it dates lands `delay` in the past and is
+discarded as "picture is too late to be displayed (missing <delay> ms)", until
+enough drops make the current context the closest one and the clock finally
+switches.
+
+This is trivially reachable with a DASH stream whose audio track is attached as
+a slave (libvlc_media_add_slave): SlaveSeek() seeks the slave to the master's
+DEMUX_GET_TIME, so after a seek the two demuxers sit on different fragments,
+input_clock sees stream_diff < 0, ES_OUT_RESET_PCR fires and
+vlc_clock_main_SetFirstPcr() forks a second context. Any pause after that seek
+freezes the video for the pause duration while audio plays on.
+
+Hoist the per-context part of the resume delay into a helper and apply it to
+the current context and to every context still in prev_contexts. The
+first_pcr fixup stays main-clock-wide. Behaviour is unchanged when only one
+context is alive.
+
+Add a contexts_pause test scenario: the suite already covered pause and
+covered context switching, but never a pause taken while a previous context
+was still in use.
+
+diff --git a/src/clock/clock.c b/src/clock/clock.c
+index bb137d6..104c43f 100644
+--- a/src/clock/clock.c
++++ b/src/clock/clock.c
+@@ -1047,6 +1047,25 @@ void vlc_clock_main_SetDejitter(vlc_clock_main_t *main_clock,
+     main_clock->output_dejitter = dejitter;
+ }
+ 
++static void context_apply_pause_delay(struct vlc_clock_context *ctx,
++                                      vlc_tick_t delay)
++{
++    /**
++     * Only apply a delay if the clock has a reference point to avoid
++     * messing up the timings if the stream was paused then seeked
++     */
++    if (ctx->last.system != VLC_TICK_INVALID)
++    {
++        ctx->last.system += delay;
++        if (ctx->start_time.system == VLC_TICK_INVALID)
++            ctx->offset += delay;
++    }
++    if (ctx->start_time.system != VLC_TICK_INVALID)
++        ctx->start_time.system += delay;
++    if (ctx->wait_sync_ref.system != VLC_TICK_INVALID)
++        ctx->wait_sync_ref.system += delay;
++}
++
+ void vlc_clock_main_ChangePause(vlc_clock_main_t *main_clock, vlc_tick_t now,
+                                 bool paused)
+ {
+@@ -1065,24 +1084,32 @@ void vlc_clock_main_ChangePause(vlc_clock_main_t *main_clock, vlc_tick_t now,
+     if (main_clock->pause_date == VLC_TICK_INVALID)
+         return;
+ 
+-    struct vlc_clock_context *ctx = main_clock->context;
+-    /**
+-     * Only apply a delay if the clock has a reference point to avoid
+-     * messing up the timings if the stream was paused then seeked
+-     */
+     const vlc_tick_t delay = now - main_clock->pause_date;
+-    if (ctx->last.system != VLC_TICK_INVALID)
+-    {
+-        ctx->last.system += delay;
+-        if (ctx->start_time.system == VLC_TICK_INVALID)
+-            ctx->offset += delay;
+-    }
++
++    /* A pause suspends the system clock for every context that is still
++     * alive, not just the current one. Contexts are kept in prev_contexts
++     * exactly as long as some clock is still attached to them (see
++     * vlc_clock_remove_current_context()), and an output clock only migrates
++     * to the newest context when it updates -- vlc_clock_ConvertToSystem()
++     * passes update=false, so an output that merely converts (a video output
++     * whose clock is not the master) can stay parked on a previous context
++     * indefinitely. Shifting only main_clock->context leaves such an output
++     * converting against a reference point that is `delay` too early: every
++     * picture then dates `delay` in the past and is dropped as "too late".
++     *
++     * This is reachable whenever a discontinuity created a second context
++     * before the user paused -- e.g. a DASH stream whose audio track is added
++     * as a slave, where each seek lands the two demuxers on different
++     * fragments and vlc_clock_main_SetFirstPcr() forks a new context. */
++    context_apply_pause_delay(main_clock->context, delay);
++
++    struct vlc_clock_context *ctx;
++    vlc_list_foreach(ctx, &main_clock->prev_contexts, node)
++        context_apply_pause_delay(ctx, delay);
++
+     if (main_clock->first_pcr.system != VLC_TICK_INVALID)
+         main_clock->first_pcr.system += delay;
+-    if (ctx->start_time.system != VLC_TICK_INVALID)
+-        ctx->start_time.system += delay;
+-    if (ctx->wait_sync_ref.system != VLC_TICK_INVALID)
+-        ctx->wait_sync_ref.system += delay;
++
+     main_clock->pause_date = VLC_TICK_INVALID;
+     vlc_cond_broadcast(&main_clock->cond);
+ }
+diff --git a/test/src/clock/clock.c b/test/src/clock/clock.c
+index d1c9644..ce145fc 100644
+--- a/test/src/clock/clock.c
++++ b/test/src/clock/clock.c
+@@ -851,6 +851,56 @@ static void contexts_run(const struct clock_ctx *ctx)
+     vlc_clock_main_Unlock(ctx->mainclk);
+ }
+ 
++static void contexts_pause_run(const struct clock_ctx *ctx)
++{
++    /* A pause suspends the system clock for every context that is still alive,
++     * not only the current one. An output clock that merely converts (it only
++     * switches context when it updates) can stay parked on a previous context
++     * across a pause; if the resume delay is not applied to that context, the
++     * output converts against a reference point that is `pause_duration` too
++     * early and every frame it dates looks late. */
++    const vlc_tick_t pause_duration = VLC_TICK_FROM_MS(20);
++    vlc_tick_t converted;
++    vlc_tick_t system = ctx->system_start;
++    vlc_tick_t stream_context0 = 1;
++    uint32_t clock_id;
++
++    vlc_clock_main_Lock(ctx->mainclk);
++
++    /* Initial SetFirstPcr, that will initialise the default and main context.
++     * Updating attaches the slave clock to context 0. */
++    vlc_clock_main_SetFirstPcr(ctx->mainclk, system, stream_context0);
++    vlc_clock_Update(ctx->slave, system, stream_context0, 1.0f);
++    const vlc_tick_t system_context0 = system;
++
++    /* Discontinuity from 1us to 30 sec: forks context 1. Context 0 stays alive
++     * because the slave clock is still attached to it. */
++    vlc_tick_t stream_context1 = VLC_TICK_FROM_SEC(30);
++    system += VLC_TICK_FROM_MS(100);
++    vlc_clock_main_SetFirstPcr(ctx->mainclk, system, stream_context1);
++
++    /* Pause and resume while the slave is still parked on context 0. */
++    system += VLC_TICK_FROM_MS(10);
++    vlc_clock_main_ChangePause(ctx->mainclk, system, true);
++    system += pause_duration;
++    vlc_clock_main_ChangePause(ctx->mainclk, system, false);
++    system += 1;
++
++    /* Converting a point that belongs to context 0 must be delayed by the
++     * pause duration, exactly as it would be on the current context. */
++    converted = vlc_clock_ConvertToSystem(ctx->slave, system,
++                                          VLC_TICK_FROM_MS(10) + stream_context0,
++                                          1.0f, &clock_id);
++    fprintf(stderr, "%s:%d: clock_id=%" PRIu32 " == 0\n", __func__, __LINE__, clock_id);
++    assert(clock_id == 0);
++    fprintf(stderr, "%s:%d: converted=%"PRId64 " == system=%" PRId64 "\n", __func__,
++            __LINE__, converted,
++            system_context0 + VLC_TICK_FROM_MS(10) + pause_duration);
++    assert(converted == system_context0 + VLC_TICK_FROM_MS(10) + pause_duration);
++
++    vlc_clock_main_Unlock(ctx->mainclk);
++}
++
+ #define VLC_TICK_12H VLC_TICK_FROM_SEC(12 * 60 * 60)
+ #define VLC_TICK_2H VLC_TICK_FROM_SEC(2 * 60 * 60)
+ #define DEFAULT_STREAM_INCREMENT VLC_TICK_FROM_MS(100)
+@@ -968,6 +1018,15 @@ static struct clock_scenario clock_scenarios[] = {
+     .system_start = VLC_TICK_FROM_MS(100),
+     .stream_start = VLC_TICK_FROM_MS(1000),
+ },
++{
++    .name = "contexts_pause",
++    .desc = "pause + resume is delaying conversions on every live context",
++    .type = CLOCK_SCENARIO_RUN,
++    .run = contexts_pause_run,
++    .disable_jitter = true,
++    .system_start = VLC_TICK_FROM_MS(100),
++    .stream_start = VLC_TICK_FROM_MS(1000),
++},
+ };
+ 
+ int main(int argc, const char *argv[])

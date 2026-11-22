@@ -1,0 +1,293 @@
+From: SwiftPili <359733720+haikiseven@users.noreply.github.com>
+Subject: [PATCH] input: seek slaves to the requested time, not the master's landing
+
+SlaveSeek() asked each slave to seek to DEMUX_GET_TIME of the master. For a
+fragmented stream that reports where the master LANDED -- the start of the
+fragment containing the request -- and not the request itself. That is wrong
+twice over.
+
+First, the slave lands on the fragment containing the master's fragment start.
+Whenever the two streams use different fragment durations, that is a whole
+fragment earlier than the master. DASH is the ordinary case: BiliBili's video
+fragments are exactly 5.000s while its audio fragments are AAC-frame aligned at
+5.01551s, so video boundaries 5.000n always fall just below audio boundaries
+5.01551n and the audio slave lands ~5s early for every n >= 1:
+
+  [seek to 22.5]
+  seeking to sidx moof pos ... 20000000     <- video lands at 20.000
+  seeking to sidx moof pos ...  15046530    <- audio lands at 15.047
+
+Audio is the clock master, so the video output holds its last frame while the
+clock climbs the gap, and libVLC eventually resynchronises by discarding the
+audio it just played ("losing 5015304 us of audio").
+
+Second, and worse: an accurate DEMUX_SET_TIME makes the mp4 demuxer publish its
+target as the es_out preroll point (ES_OUT_SET_NEXT_DISPLAY_TIME). That point is
+a single global (es_out_sys_t::i_preroll_end), and the slaves are seeked after
+the master, so the slave OVERWRITES the master's preroll with the master's own
+landing time. EsOutDecodersStopBuffering() then computes
+
+    i_preroll_duration = max(i_preroll_end - i_stream_start, 0)
+
+as zero. Nothing is ever marked BLOCK_FLAG_PREROLL. Instead of discarding the
+run-up at full speed during the buffering phase, playback resumes at the fragment
+boundary and crawls to the requested time at 1x -- up to one fragment duration of
+dead time on every seek, on every file, whether or not any slave landed early.
+Observed on a stream with 10s fragments: a seek to 83.3s resumed at 80.08s and
+took 3.2s of wall clock to arrive, with "Stream buffering done (5000 ms ...)"
+showing the buffering target was just the network caching, with no preroll term.
+
+Seek the slaves to the requested time instead. They then land no earlier than the
+master, and every demuxer publishes the same preroll point.
+
+When the request is unreachable for a slave -- it may be shorter than the master,
+and a seek past its end fails -- fall back to the master's landing time, which is
+what we used to pass unconditionally. Without that fallback a short slave would
+be marked b_eof and disabled for the rest of playback.
+
+Only ControlSetTime knows the requested time. ControlSetPosition has a position
+rather than a time, and recovering one would depend on how `val` was normalised
+against the master's length; it keeps the old DEMUX_GET_TIME behaviour, as does
+the seekpoint path.
+
+Generated with --function-context: ControlSetTime and ControlSetPosition end in
+byte-identical blocks, so a 3-line-context hunk matches either one and `git apply`
+will silently place them by proximity -- swapping them if the target file's line
+numbers differ from the one the diff was generated against.
+
+Generated with 12 lines of context. ControlSetTime and ControlSetPosition end in
+byte-identical blocks:
+
+        if( i_ret == VLC_SUCCESS )
+        {
+            if( priv->i_slave > 0 )
+                SlaveSeek( p_input );
+            priv->master->b_eof = false;
+        }
+        return i_ret;
+    }
+
+so a 3-line-context hunk matches either, and `git apply` places it by proximity.
+A diff generated against a tree whose line numbers differ therefore SWAPS the two
+hunks -- silently, and the result still compiles. Twelve lines of context reach
+each function's unique body, so the hunks cannot float; on a tree they no longer
+fit, the patch fails to apply instead of misapplying.
+
+Verify placement after applying (build-libvlc.sh treats a failed patch as
+non-fatal): patches/libvlc/verify/check-applied.sh
+
+diff --git a/src/input/input.c b/src/input/input.c
+index 0767bb2..cd61ead 100644
+--- a/src/input/input.c
++++ b/src/input/input.c
+@@ -84,25 +84,25 @@ static void UpdateTitleListfromDemux( input_thread_t * );
+ static void MRLSections( const char *, int *, int *, int *, int *);
+ 
+ static input_source_t *InputSourceNew( const char *psz_mrl );
+ static int InputSourceInit( input_source_t *in, input_thread_t *p_input,
+                             const char *psz_mrl,
+                             const char *psz_forced_demux, bool b_in_can_fail );
+ static void InputSourceDestroy( input_source_t * );
+ static void InputSourceMeta( input_thread_t *, input_source_t *, vlc_meta_t * );
+ 
+ /* TODO */
+ //static void InputGetAttachments( input_thread_t *, input_source_t * );
+ static void SlaveDemux( input_thread_t *p_input );
+-static void SlaveSeek( input_thread_t *p_input );
++static void SlaveSeek( input_thread_t *p_input, const vlc_tick_t * );
+ 
+ static void InputMetaUser( input_thread_t *p_input, vlc_meta_t *p_meta );
+ static void InputUpdateMeta( input_thread_t *p_input, demux_t *p_demux );
+ static void InputGetExtraFiles( input_thread_t *p_input,
+                                 int *pi_list, char ***pppsz_list,
+                                 const char **psz_access, const char *mrl );
+ 
+ static void AppendAttachment(input_thread_t* p_input,
+                               int i_new, input_attachment_t **pp_new);
+ 
+ #define SLAVE_ADD_NOFLAG    0
+ #define SLAVE_ADD_FORCED    (1<<0)
+@@ -1923,25 +1923,30 @@ static int ControlSetTime( input_thread_t *p_input, vlc_tick_t val,
+         /* Emulate it with a SET_POS */
+         if( i_length > 0 )
+         {
+             double f_pos = (double)(priv->i_start + val) / (double)i_length;
+             i_ret = demux_SetPosition( priv->master->p_demux, f_pos,
+                                        !fast_seek );
+         }
+     }
+ 
+     if( i_ret == VLC_SUCCESS )
+     {
+         if( priv->i_slave > 0 )
+-            SlaveSeek( p_input );
++        {
++            /* Seek the slaves to what was REQUESTED, not to where the master
++             * landed: see SlaveSeek(). */
++            const vlc_tick_t i_requested = priv->i_start + val;
++            SlaveSeek( p_input, &i_requested );
++        }
+         priv->master->b_eof = false;
+     }
+ 
+     return i_ret;
+ }
+ 
+ static int ControlSetPosition( input_thread_t *p_input, double val,
+                                bool fast_seek )
+ {
+     input_thread_private_t *priv = input_priv(p_input);
+ 
+     vlc_tick_t i_length = InputSourceGetLength(priv->master, priv->p_item, NULL);
+@@ -1950,25 +1955,32 @@ static int ControlSetPosition( input_thread_t *p_input, double val,
+         /* Calculate the updated position according to the current track duration */
+         if (priv->i_stop != 0)
+             val = (priv->i_start + val * (priv->i_stop - priv->i_start)) / i_length;
+         else
+             val = (priv->i_start + val * (i_length - priv->i_start)) / i_length;
+     }
+ 
+     int i_ret = demux_SetPosition( priv->master->p_demux, val, !fast_seek );
+ 
+     if( i_ret == VLC_SUCCESS )
+     {
+         if( priv->i_slave > 0 )
+-            SlaveSeek( p_input );
++        {
++            /* A position carries no time, and recovering one would depend on how
++             * `val` was normalised against the master's length -- which differs
++             * between revisions. Keep the old behaviour: the slaves follow the
++             * master's landing. ControlSetTime is the path that matters, and it
++             * knows exactly what was requested. */
++            SlaveSeek( p_input, NULL );
++        }
+         priv->master->b_eof = false;
+     }
+ 
+     return i_ret;
+ }
+ 
+ static void
+ ResetFramePrevious(input_thread_t *input)
+ {
+     input_thread_private_t *priv = input_priv(input);
+     priv->prev_frame.enabled = priv->prev_frame.end = false;
+ }
+@@ -2344,25 +2356,25 @@ static bool Control( input_thread_t *p_input,
+             else
+                 i_seekpoint = param.val.i_int;
+             if( i_seekpoint < 0
+              || i_seekpoint >= priv->master->title[i_title]->i_seekpoint )
+                 break;
+ 
+             es_out_Control(&priv->p_es_out->out, ES_OUT_RESET_PCR);
+             ResetFramePrevious( p_input );
+             demux_Control( priv->master->p_demux,
+                            DEMUX_SET_SEEKPOINT, i_seekpoint );
+             input_SendEventSeekpoint( p_input, i_title, i_seekpoint );
+             if( priv->i_slave > 0 )
+-                SlaveSeek( p_input );
++                SlaveSeek( p_input, NULL );
+             break;
+         }
+ 
+         case INPUT_CONTROL_RESET_POSITION:
+             ResetPosition( p_input );
+             break;
+ 
+         case INPUT_CONTROL_ADD_SLAVE:
+             if( param.val.p_address )
+             {
+                 input_item_slave_t *p_item_slave  = param.val.p_address;
+                 unsigned i_flags = SLAVE_ADD_CANFAIL | SLAVE_ADD_SET_TIME;
+@@ -3109,39 +3121,86 @@ static void SlaveDemux( input_thread_t *p_input )
+         {
+             i_ret = demux_Demux( in->p_demux );
+         }
+ 
+         if( i_ret <= 0 )
+         {
+             msg_Dbg(p_input, "slave %zu EOF", i);
+             in->b_eof = true;
+         }
+     }
+ }
+ 
+-static void SlaveSeek( input_thread_t *p_input )
++/**
++ * Seek every slave to the point the master was ASKED to seek to.
++ *
++ * @param pi_requested_time the time the master was asked for, or NULL when the
++ *        caller has no such time (a seekpoint, or a position-only seek). NULL
++ *        falls back to DEMUX_GET_TIME, i.e. to wherever the master landed.
++ *
++ * DEMUX_GET_TIME reports where the master *landed*, which for a fragmented
++ * stream is the start of the fragment containing the request, not the request
++ * itself. Handing that to the slaves is wrong twice over:
++ *
++ *  - The slave then lands on the fragment containing the MASTER's fragment
++ *    start. When the two streams use different fragment durations (DASH audio
++ *    is AAC-frame aligned, so its fragments run a few ms longer than video's),
++ *    that is a whole fragment earlier than the master -- seconds of audio played
++ *    before the first video frame is due.
++ *
++ *  - Worse, an accurate DEMUX_SET_TIME makes the demuxer publish its target as
++ *    the es_out preroll point (ES_OUT_SET_NEXT_DISPLAY_TIME). That point is
++ *    global, and the slaves run after the master, so the slave OVERWRITES the
++ *    master's preroll with the master's own landing time. i_preroll_duration
++ *    then computes as zero and nothing is prerolled: playback resumes at the
++ *    fragment boundary and crawls to the requested time at 1x, instead of
++ *    discarding the run-up at full speed during the buffering phase.
++ *
++ * Seeking the slaves to the requested time fixes both: they land no earlier than
++ * the master, and every demuxer publishes the same preroll point.
++ *
++ * Falling back to the landing time when the request is unreachable keeps the
++ * near-EOF behaviour: a slave shorter than the master must not be marked b_eof
++ * (which disables it for good) merely because the request lies past its end.
++ */
++static void SlaveSeek( input_thread_t *p_input, const vlc_tick_t *pi_requested_time )
+ {
+-    vlc_tick_t i_time;
++    vlc_tick_t i_landed_time;
++    bool b_have_landed_time =
++        demux_Control( input_priv(p_input)->master->p_demux, DEMUX_GET_TIME,
++                       &i_landed_time ) == VLC_SUCCESS;
+ 
+-    if( demux_Control( input_priv(p_input)->master->p_demux, DEMUX_GET_TIME, &i_time ) )
++    if( pi_requested_time == NULL && !b_have_landed_time )
+     {
+         msg_Err( p_input, "demux doesn't like DEMUX_GET_TIME" );
+         return;
+     }
+ 
+     for (size_t i = 0; i < input_priv(p_input)->i_slave; i++)
+     {
+         input_source_t *in = input_priv(p_input)->slave[i];
++        int i_ret = VLC_EGENERIC;
++
++        if( pi_requested_time != NULL )
++            i_ret = demux_Control( in->p_demux, DEMUX_SET_TIME,
++                                   *pi_requested_time, true );
++
++        /* The request may lie past this slave's end, or simply not be seekable
++         * there. Do not lose the slave over it: fall back to wherever the master
++         * landed, which is where we used to seek unconditionally. */
++        if( i_ret != VLC_SUCCESS && b_have_landed_time
++         && ( pi_requested_time == NULL || *pi_requested_time != i_landed_time ) )
++            i_ret = demux_Control( in->p_demux, DEMUX_SET_TIME, i_landed_time, true );
+ 
+-        if( demux_Control( in->p_demux, DEMUX_SET_TIME, i_time, true ) )
++        if( i_ret != VLC_SUCCESS )
+         {
+             if( !in->b_eof )
+                 msg_Err(p_input, "seek failed for slave %zu -> EOF", i);
+             in->b_eof = true;
+         }
+         else
+         {
+             in->b_eof = false;
+         }
+     }
+ }
+ 

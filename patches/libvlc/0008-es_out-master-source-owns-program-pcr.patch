@@ -1,0 +1,93 @@
+From: SwiftPili <359733720+haikiseven@users.noreply.github.com>
+Subject: [PATCH] es_out: the master source owns the program PCR
+
+BiliBili serves DASH as separate audio and video files. The video file is the
+input master; the audio track is attached as a slave via
+libvlc_media_add_slave(). Both demuxers feed ES_OUT_SET_PCR into the one program
+input_clock:
+
+  * es_out_source.c EsOutSourceControl() forwards the slave's control (including
+    ES_OUT_SET_PCR) to the main es_out, tagged with the slave source.
+  * EsOutVaControlLocked() / case ES_OUT_SET_PCR applies it to p_sys->p_pgrm --
+    the master program's input_clock -- regardless of which source sent it. It
+    updates p_pgrm->i_last_pcr and calls input_clock_Update().
+
+In steady state master and slave PCRs are close (diff < CR_MAX_GAP), so this is
+harmless. But at an in-place set_time seek the two demuxers snap to different
+fragment boundaries: the video lands on the 5.000s grid, the audio on an
+AAC-frame-aligned boundary a few ms later (documented in patch 0003). The slave
+PCR then perturbs the shared program clock, and the input_clock logs the
+signature triple at every seek:
+
+  clock gap ... stream_diff:  2781000   (+2.78s)  video master fragment
+  clock gap ... stream_diff: -2531000   (-2.53s)  audio slave fragment (earlier)
+  clock gap ... stream_diff:  2516000   (+2.52s)  back to master
+
+followed by chronic "picture is too late to be displayed (missing 20-59 ms)" and
+eventually "resetting master clock: coefficient too unstable: 0.708333". The
+clock never re-stabilises, so video sits 1-2 frames late and the audio runs
+ahead of the video -- permanently, with no self-correction.
+
+reopenForSeek (the historical VOD default) never hits this: :start-time opens
+both demuxers fresh at the target, so there is no in-place SlaveSeek and no
+fragment-boundary bounce. Patch 0003 already aligns the slave to the requested
+time, so the seek itself is clean, but the two demuxers still land on different
+fragment starts and both still drive the shared clock.
+
+Fix: the master (video) source owns the program PCR timeline. In case
+ES_OUT_SET_PCR, drop the PCR when it comes from a non-master source -- return
+VLC_SUCCESS without updating i_last_pcr or calling input_clock_Update(). This
+mirrors the master/slave idiom already used in this file (EsOutIsGroupSticky:
+source != input_priv(p_sys->p_input)->master).
+
+Why this is safe / narrowly scoped:
+  * Muxed single-file A+V is unaffected: one source (the master) emits PCR, so
+    the guard never trips.
+  * Only the DASH separate-slave case changes -- exactly the target.
+  * Buffering (EsOutDecodersStopBuffering) is driven by the master input_clock,
+    which the master demux still feeds regularly -- unaffected.
+  * The i_last_pcr fallback for undated blocks is irrelevant to audio: AAC slave
+    blocks carry PTS.
+  * ES data still flows: EsOutSourceSend() is untouched -- only the slave's clock
+    control is dropped.
+  * At a seek es_out already sets b_buffering + input_clock_Reset
+    (b_has_reference=false), so the master's first post-seek PCR resets cleanly
+    via the !b_has_reference path -- one reference, aligned A/V, no gap warning.
+
+ES_OUT_SET_GROUP_PCR (explicit multi-program muxes, not the slave case) is left
+untouched by guarding on i_query == ES_OUT_SET_PCR.
+
+diff --git a/src/input/es_out.c b/src/input/es_out.c
+index d341adac71..0641d36f44 100644
+--- a/src/input/es_out.c
++++ b/src/input/es_out.c
+@@ -3551,12 +3551,29 @@ static int EsOutVaControlLocked(es_out_sys_t *p_sys, input_source_t *source,
+         if( i_pcr == VLC_TICK_INVALID )
+         {
+             msg_Err( p_sys->p_input, "Invalid PCR value in ES_OUT_SET_(GROUP_)PCR !" );
+             return VLC_EGENERIC;
+         }
+
++        /* SwiftVLC 0008: the master source owns the program PCR timeline.
++         * BiliBili DASH serves audio as a slave demuxer (libvlc_media_add_slave);
++         * its ES_OUT_SET_PCR routes here (es_out_source.c) tagged with the slave
++         * source but is applied to p_sys->p_pgrm, the MASTER program's clock. In
++         * steady state master/slave PCRs are close and harmless, but at a set_time
++         * seek the two demuxers snap to different fragment boundaries (video on the
++         * 5.000s grid, audio AAC-frame-aligned -- see patch 0003). The slave PCR
++         * then perturbs the shared program input_clock, destabilising the master
++         * clock coefficient, and video sits 1-2 frames late -> audio ahead of
++         * video, permanently. Drop non-master PCR: the master (video) demux drives
++         * the clock. Mirrors the master/slave idiom used elsewhere in this file
++         * (EsOutIsGroupSticky). ES_OUT_SET_GROUP_PCR (explicit multi-program
++         * muxes) is unaffected. */
++        if( i_query == ES_OUT_SET_PCR &&
++            source != input_priv(p_sys->p_input)->master )
++            return VLC_SUCCESS;
++
+         p_pgrm->i_last_pcr = i_pcr;
+
+         struct vlc_tracer *tracer = vlc_object_get_tracer( &p_sys->p_input->obj );
+         if ( tracer != NULL )
+         {
+             vlc_tracer_TracePCR(tracer, "DEMUX", "PCR", i_pcr);

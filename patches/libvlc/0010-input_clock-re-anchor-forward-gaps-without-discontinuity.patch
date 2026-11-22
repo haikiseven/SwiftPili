@@ -1,0 +1,80 @@
+From 22074f41583e02760c67850c602918daecb1c77e Mon Sep 17 00:00:00 2001
+From: SwiftPili <359733720+haikiseven@users.noreply.github.com>
+Date: Thu, 16 Jul 2026 16:20:00 +0900
+Subject: [PATCH] input_clock: re-anchor forward stream gaps without a
+ discontinuity
+
+Near the end of a DASH/HLS video the demuxer can surface a large FORWARD
+jump in the program PCR -- a benign segment-timeline hole. In the F20 log:
+
+    clock gap, unexpected stream discontinuity: system_diff: 255728 stream_diff: 3975688
+
+The same hole exists in every ES of the program (audio + video share the
+manifest timeline), so A/V stay in sync across it; the official BiliBili
+player just re-anchors and keeps decoding. libVLC instead flags it as a
+`discontinuity` in input_clock_Update() whenever
+
+    diff = stream_diff - system_diff > CR_MAX_GAP   (== CR_MEAN_PTS_GAP, 300ms)
+
+That flag propagates to es_out, which drops the program clock and re-arms it
+via vlc_clock_main_SetFirstPcr() -- forking a NEW clock context ("new clock
+context(1)") and flushing the static audio filter chain (scaletempo /
+resampler). Near EOF the flushed audio cannot refill before the file ends,
+so the tail plays SILENT while the video (which has no such filter to flush)
+finishes normally.
+
+Fix: distinguish a forward gap from a backward one. A backward jump
+(stream_diff < 0 -- corruption, a real splice, a wrapped PCR) still needs
+the hard reset + `discontinuity`, so keep it. A forward gap only needs the
+reference re-anchored so the clock follows the new timeline; leave
+`discontinuity` false so no context fork / audio flush happens. The reference
+is re-anchored in both cases (b_reset_reference stays true), so the clock
+tracks the post-gap timeline either way -- only the destructive,
+audio-flushing notification is suppressed for the benign case.
+
+Verified on Linux with patches/libvlc/verify (scenario `clock_gap`,
+driver_f20.c): stock flags the forward gap (audio flush); patched re-anchors
+without it and still flags the backward jump.
+---
+ src/clock/input_clock.c | 24 ++++++++++++++++++++----
+ 1 file changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/src/clock/input_clock.c b/src/clock/input_clock.c
+index 01d873b..da6baaf 100644
+--- a/src/clock/input_clock.c
++++ b/src/clock/input_clock.c
+@@ -261,11 +261,27 @@ vlc_tick_t input_clock_Update( input_clock_t *cl,
+                      "system_diff: %"PRId64" stream_diff: %"PRId64,
+                      system_diff, stream_diff);
+ 
+-            /* */
+-            vlc_warning(cl->logger, "feeding synchro with a new reference point trying"
+-                     " to recover from clock gap");
++            /* F20: a large FORWARD stream gap (stream_diff > 0) is, for
++             * DASH/HLS delivery, a benign segment-timeline hole: the same
++             * hole exists in every ES of the program, so A/V stay in sync
++             * across it, and the official players simply re-anchor and keep
++             * decoding. We must NOT flag it as a `discontinuity`: that flag
++             * makes es_out drop the program clock and re-arm it via
++             * vlc_clock_main_SetFirstPcr(), which forks a NEW clock context
++             * and flushes the audio filter chain (scaletempo/resampler).
++             * Near EOF the flushed audio cannot refill before the file ends,
++             * so the tail plays silent. Re-anchor the reference so the clock
++             * follows the new timeline, but leave `discontinuity` false so no
++             * context fork / audio flush happens.
++             *
++             * Only a BACKWARD jump (stream_diff < 0 = corruption, a real
++             * splice, or a wrapped PCR) still needs the hard reset + flush. */
++            bool backward = stream_diff < 0;
++            if (backward)
++                vlc_warning(cl->logger, "feeding synchro with a new reference point"
++                         " trying to recover from clock gap");
+             b_reset_reference= true;
+-            discontinuity = true;
++            discontinuity = backward;
+         }
+     }
+     cl->b_origin_changed = false;
+-- 
+2.39.5
+

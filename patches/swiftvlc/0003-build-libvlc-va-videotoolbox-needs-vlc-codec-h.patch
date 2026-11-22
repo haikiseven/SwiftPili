@@ -1,0 +1,31 @@
+From: SwiftPili <359733720+haikiseven@users.noreply.github.com>
+Subject: [PATCH] build-libvlc: va_videotoolbox.c needs vlc_codec.h
+
+The generated VT-AV1 VA module dereferences cfg->dec_device->type and compares it
+to VLC_DECODER_DEVICE_VIDEOTOOLBOX, but only includes vlc_picture.h, which
+forward-declares struct vlc_decoder_device without defining it:
+
+  va_videotoolbox.c:173: error: incomplete definition of type 'vlc_decoder_device'
+  va_videotoolbox.c:173: error: use of undeclared identifier 'VLC_DECODER_DEVICE_VIDEOTOOLBOX'
+
+Both the full struct (vlc_codec.h:616) and the enum value (vlc_codec.h:601) live
+in vlc_codec.h. Add it. (vaapi.c avoids the include because it never dereferences
+the device directly; this module does.)
+
+This error was invisible until now: the module was never compiled — the
+patch_vlc_avcodec_vt guard skipped it on a half-patched reused checkout (see the
+Makefile-guard fix). With that fixed and a clean checkout, the module compiles
+for the first time and surfaces this.
+
+diff --git a/scripts/build-libvlc.sh b/scripts/build-libvlc.sh
+index 9e0fe74..177f7b4 100755
+--- a/scripts/build-libvlc.sh
++++ b/scripts/build-libvlc.sh
+@@ -1232,6 +1232,7 @@ PYEOF
+ #include <vlc_plugin.h>
+ #include <vlc_fourcc.h>
+ #include <vlc_picture.h>
++#include <vlc_codec.h>   /* full struct vlc_decoder_device + VLC_DECODER_DEVICE_VIDEOTOOLBOX */
+ 
+ #include <libavcodec/avcodec.h>
+ #include <libavutil/hwcontext.h>

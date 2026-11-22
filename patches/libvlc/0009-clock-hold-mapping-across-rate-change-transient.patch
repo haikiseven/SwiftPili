@@ -1,0 +1,133 @@
+From e356c8b678d39d1bbbfea38c02ca1fb9d0b9e349 Mon Sep 17 00:00:00 2001
+From: SwiftPili <359733720+haikiseven@users.noreply.github.com>
+Date: Thu, 16 Jul 2026 13:12:43 +0900
+Subject: [PATCH] clock: hold the mapping across the post-rate-change transient
+
+After a playback-rate change (press-and-hold 2x, and the release back to 1x)
+the audio output re-tempos its scaletempo filter. For ~1-2s during that
+re-fill it feeds the master clock a system/stream ratio that still reflects
+the OLD rate: vlc_clock_master_update_coeff() computes
+
+    instant_coeff = system_diff / (double) stream_diff * rate;
+
+which spikes to ~2.0 (or ~0.5), trips `coefficient too unstable`, and RESETS
+the clock -- again and again for the whole transient. Each reset re-anchors
+ctx->offset and emits `discontinuity`, so the video output is jerked with a
+run of `picture displayed late (missing N ms)`. The 2x itself is correct
+(rate engages, audio time-stretches); only the transition is ugly.
+
+The reset is the right response to a genuinely bad source, but right after a
+KNOWN rate change the bad samples are expected and temporary. So within a
+bounded RATE_SETTLE_WINDOW (1.5s) after a rate change, an unstable-coeff
+sample is HELD instead of reset: skip the reset, skip the offset recompute,
+drop the sample, keep the mapping. `decreasing_ts` (a real fault) is never
+graced, and once the window elapses a persistently bad source is reset
+normally -- so nothing can wedge (unlike the earlier reverted rate-flush
+attempt, this adds no unbounded suppression).
+
+Sits on top of 0002 (pause) and 0004 (rate), which re-anchor every live
+context; this fixes the CURRENT context's coeff churn they do not touch.
+
+Verified with patches/libvlc/verify (driver_f19): stock jerks a fixed ts's
+mapping by 500ms across the transient; patched holds it at 0. The pause and
+rate scenarios still pass.
+---
+ src/clock/clock.c | 43 +++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/src/clock/clock.c b/src/clock/clock.c
+index b84af25..eeff817 100644
+--- a/src/clock/clock.c
++++ b/src/clock/clock.c
+@@ -36,6 +36,16 @@
+ 
+ #define COEFF_THRESHOLD 0.2 /* between 0.8 and 1.2 */
+ 
++/* F19: after a playback-rate change the audio output re-tempos its scaletempo
++ * filter, and for up to ~1-2s it feeds the clock a system/stream ratio that
++ * still looks like the OLD rate -- instant_coeff spikes to ~2.0 (or ~0.5) and
++ * trips the "coefficient too unstable" reset over and over, each reset
++ * re-anchoring the offset and jerking the video ("picture displayed late").
++ * Within this bounded window after a rate change, hold the mapping instead of
++ * resetting; a genuinely bad source is still reset once the window passes, so
++ * nothing can wedge. */
++#define RATE_SETTLE_WINDOW VLC_TICK_FROM_MS(1500)
++
+ #define MAX_PCR_DELAY VLC_TICK_FROM_SEC(60)
+ 
+ struct vlc_clock_listener_id
+@@ -61,6 +71,10 @@ struct vlc_clock_context
+      * when one of them is driving the main_clock. */
+     clock_point_t start_time;
+ 
++    /* F19: system time of the last rate change, or VLC_TICK_INVALID. Opens the
++     * RATE_SETTLE_WINDOW grace for the aout re-tempo transient. */
++    vlc_tick_t rate_change_system;
++
+     struct vlc_list node;
+     struct vlc_list using_clocks;
+ };
+@@ -248,6 +262,7 @@ static void context_reset(struct vlc_clock_context *ctx)
+     ctx->wait_sync_ref = clock_point_Create(VLC_TICK_INVALID, VLC_TICK_INVALID);
+     ctx->last = clock_point_Create(VLC_TICK_INVALID, VLC_TICK_INVALID);
+     ctx->start_time = clock_point_Create(VLC_TICK_INVALID, VLC_TICK_INVALID);
++    ctx->rate_change_system = VLC_TICK_INVALID;
+ }
+ 
+ static void context_init(struct vlc_clock_context *ctx)
+@@ -440,6 +455,11 @@ static void vlc_clock_master_update_coeff(
+     vlc_clock_main_t *main_clock = clock->owner;
+     vlc_mutex_assert(&main_clock->lock);
+ 
++    /* F19: set when a post-rate-change transient sample is held (see below), so
++     * the unconditional offset recompute further down is skipped and the
++     * mapping stays put. */
++    bool hold = false;
++
+     if (ctx->last.system != VLC_TICK_INVALID
+      && ts != ctx->last.stream)
+     {
+@@ -457,7 +477,21 @@ static void vlc_clock_master_update_coeff(
+             bool coefficient_unstable = instant_coeff > 1.0 + COEFF_THRESHOLD
+                 || instant_coeff < 1.0 - COEFF_THRESHOLD;
+ 
+-            if (decreasing_ts || coefficient_unstable)
++            /* F19: an unstable coeff within the settle window after a rate
++             * change is the aout re-tempo transient, not a bad source. Hold
++             * the current mapping (skip the reset and the offset recompute)
++             * and drop the sample; the window is bounded so a persistently
++             * bad source still gets reset once it elapses. `decreasing_ts` is
++             * a real fault and is never graced. */
++            bool settling = coefficient_unstable && !decreasing_ts
++                && ctx->rate_change_system != VLC_TICK_INVALID
++                && system_now - ctx->rate_change_system < RATE_SETTLE_WINDOW;
++
++            if (settling)
++            {
++                hold = true;
++            }
++            else if (decreasing_ts || coefficient_unstable)
+             {
+                 if (main_clock->logger != NULL)
+                 {
+@@ -499,7 +533,9 @@ static void vlc_clock_master_update_coeff(
+         vlc_clock_SendEvent(main_clock, discontinuity);
+     }
+ 
+-    ctx->offset = ComputeOffset(main_clock, ctx, system_now, ts, rate);
++    /* F19: keep the mapping across a graced post-rate-change transient sample. */
++    if (!hold)
++        ctx->offset = ComputeOffset(main_clock, ctx, system_now, ts, rate);
+ 
+     if (main_clock->tracer != NULL && clock->track_str_id != NULL)
+         vlc_tracer_Trace(main_clock->tracer,
+@@ -519,6 +555,9 @@ static void vlc_clock_master_update_coeff(
+     vlc_list_foreach(prev_ctx, &main_clock->prev_contexts, node)
+         context_change_rate(prev_ctx, rate);
+ 
++    /* F19: open the settle window on the sample that carries the new rate. */
++    if (rate != ctx->rate)
++        ctx->rate_change_system = system_now;
+     ctx->rate = rate;
+     vlc_cond_broadcast(&main_clock->cond);
+ }

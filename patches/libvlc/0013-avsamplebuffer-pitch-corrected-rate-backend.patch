@@ -1,0 +1,1788 @@
+--- a/modules/audio_output/apple/avsamplebuffer.m
++++ b/modules/audio_output/apple/avsamplebuffer.m
+@@ -23,10 +23,13 @@
+ #import <TargetConditionals.h>
+ #import <Foundation/Foundation.h>
+ #import <AVFoundation/AVFoundation.h>
++#import <mach/mach_time.h>   /* VLCAudioEngine timing (render hostTime → vlc_tick) */
+ 
+ #import <vlc_common.h>
+ #import <vlc_plugin.h>
+ #import <vlc_aout.h>
++#import <vlc_filter.h>
++#import <vlc_modules.h>
+ 
+ #if TARGET_OS_IPHONE || TARGET_OS_TV || TARGET_OS_VISION
+ #define HAS_AVAUDIOSESSION
+@@ -78,6 +81,11 @@ API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS) VISIONOS_API_AVAILA
+     unsigned _sampleRate;
+     BOOL _stopped;
+     BOOL _dateReached;
++    /* F20: core falls back to a short drain_deadline when aout->drain is
++     * NULL and stops the input before AVSampleBuffer finishes the deep
++     * queue — silent last seconds. Real drain waits until the synchronizer
++     * has played every enqueued sample, then aout_DrainedReport. */
++    BOOL _draining;
+ }
+ @end
+ 
+@@ -99,6 +107,7 @@ API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS) VISIONOS_API_AVAILA
+ 
+     _outChain = NULL;
+     _outChainLast = &_outChain;
++    _draining = NO;
+ 
+     /* The first call to CMAudioFormatDescriptionCreate() might take some time
+      * (between 200 and 600ms) as it is initializing some static context/libs.
+@@ -234,6 +243,10 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+     _dateReached = NO;
+     _firstPts = VLC_TICK_INVALID;
+     _lastDate = VLC_TICK_INVALID;
++    /* drain is cancelled by flush (core contract). */
++    vlc_mutex_lock(&_bufferLock);
++    _draining = NO;
++    vlc_mutex_unlock(&_bufferLock);
+ }
+ 
+ - (void)pause:(BOOL)pause date:(vlc_tick_t)date
+@@ -254,6 +267,95 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+     vlc_tick_t pos_ticks = [VLCAVSample CMTimeTotick:time] + _firstPts;
+ 
+     aout_TimingReport(_aout, system_now, pos_ticks);
++    [self checkDrainedLocked:NO];
++}
++
++/* Report drained once every enqueued sample has been played. Called from the
++ * time observer (playback progress) and from drain() itself (already done /
++ * never started). Not under _bufferLock when locked==NO; takes the lock. */
++- (void)checkDrainedLocked:(BOOL)alreadyLocked
++{
++    if (!alreadyLocked)
++        vlc_mutex_lock(&_bufferLock);
++
++    if (!_draining)
++    {
++        if (!alreadyLocked)
++            vlc_mutex_unlock(&_bufferLock);
++        return;
++    }
++
++    /* Still moving module-side blocks into the renderer. */
++    if (_outChain != NULL)
++    {
++        if (!alreadyLocked)
++            vlc_mutex_unlock(&_bufferLock);
++        return;
++    }
++
++    /* Nothing was ever started — nothing to play out. */
++    if (_ptsSamples < 0 || !_dateReached || _stopped)
++    {
++        _draining = NO;
++        if (!alreadyLocked)
++            vlc_mutex_unlock(&_bufferLock);
++        aout_DrainedReport(_aout);
++        return;
++    }
++
++    const int64_t endSamples = _ptsSamples;
++    const unsigned sampleRate = _sampleRate;
++    AVSampleBufferRenderSynchronizer *sync = _sync;
++    if (!alreadyLocked)
++        vlc_mutex_unlock(&_bufferLock);
++
++    if (sync == nil)
++    {
++        vlc_mutex_lock(&_bufferLock);
++        _draining = NO;
++        vlc_mutex_unlock(&_bufferLock);
++        aout_DrainedReport(_aout);
++        return;
++    }
++
++    CMTime cur = sync.currentTime;
++    CMTime end = CMTimeMake(endSamples, sampleRate);
++    /* currentTime can briefly exceed end once the last buffer has rendered. */
++    if (CMTimeCompare(cur, end) < 0)
++        return;
++
++    vlc_mutex_lock(&_bufferLock);
++    if (!_draining)
++    {
++        vlc_mutex_unlock(&_bufferLock);
++        return;
++    }
++    _draining = NO;
++    vlc_mutex_unlock(&_bufferLock);
++    msg_Dbg(_aout, "avsamplebuffer: drain complete (played %"PRId64" samples)",
++            endSamples);
++    aout_DrainedReport(_aout);
++}
++
++- (void)drain
++{
++    /* libVLC aout->drain: wait until the deep AVSampleBuffer queue has
++     * actually rendered the tail, then aout_DrainedReport. Without this the
++     * core uses stream_GetDelay()+now as a deadline and stops the input
++     * early — F20 silent last seconds (docs/PLAYER_DESIGN.md,
++     * docs/AUDIO_RATE_REWORK.md §9). */
++    vlc_mutex_lock(&_bufferLock);
++    if (_ptsSamples < 0 || _stopped)
++    {
++        vlc_mutex_unlock(&_bufferLock);
++        aout_DrainedReport(_aout);
++        return;
++    }
++    _draining = YES;
++    vlc_mutex_unlock(&_bufferLock);
++
++    /* May already be past the end (tiny tail / already idle). */
++    [self checkDrainedLocked:NO];
+ }
+ 
+ - (void)startNow:(vlc_tick_t)delta
+@@ -343,7 +445,12 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+         CFRelease(buffer);
+     }
+ 
++    const BOOL maybeDrained = _draining && _outChain == NULL;
+     vlc_mutex_unlock(&_bufferLock);
++
++    /* Last module-side block just entered the renderer — re-check drain. */
++    if (maybeDrained)
++        [self checkDrainedLocked:NO];
+ }
+ 
+ - (void)play:(block_t *)block date:(vlc_tick_t)date
+@@ -387,6 +494,7 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+         [_sync removeTimeObserver:_observer];
+ 
+     _stopped = YES;
++    _draining = NO; /* stop/flush cancel an in-flight drain */
+ 
+     block_ChainRelease(_outChain);
+     _outChain = NULL;
+@@ -546,10 +654,1450 @@ error_avas:
+ 
+ @end
+ 
++#pragma mark Private — AVAudioEngine backend (module-owned rate, docs/AUDIO_RATE_REWORK.md)
++// ============================================================================
++// Architecture 2026-07-19 (post-K1 TimePitch audible failure + hist-r1 drop+live veto):
++//
++// ABANDONED permanently:
++//   A) drop+live / history restretch after baking rate into deep wall queue
++//   B) AVAudioUnitTimePitch as rate applicator (device: grit/失真; clock OK but ear fails)
++//
++// REQUIRED contract (JIT stretch, rate-agnostic reserve):
++//   core (aout-handles-rate / 0012) → RAW content PCM into this module
++//   DEEP raw reserve (rate-agnostic) — never bake rate into the long buffer
++//   JIT module scaletempo at CURRENT rate → SHALLOW wall schedule on PlayerNode
++//   changeRate = setTempoRate only (NO drop / NO restretch / NO TimePitch)
++//   Engage residual ≤ shallow wall (~250 ms), not multi-second stock queue
++//   TimingReport = content PTS consumed (not wall samples)
++//   play(date) for first start; flush only seek/discontinuity; real drain
++//   interruption / route / engine-config → pause or aout_RestartRequest
++//
++// K2.2 (2026-07-19, source-confirmed scaletempo.c @ c833c4be0):
++//   pitch-jit-stale-buffer — reopen tempo on unity↔non-unity changeRate
++//     (scaletempo retains buf_queue across scale changes; 1× bypass leaves
++//     stale 2× content that the 2nd+ hold would otherwise replay).
++//   pitch-jit-priming-offset — attribute non-unity wall content as
++//     wallFrames * rate (DoWork returns NULL while priming; those frames were
++//     never counted in _contentConsumed → fixed ~tens-ms 2× A/V offset).
++//
++// FEED-DIAG (2026-07-19, instrumentation retained):
++//   R2 ear veto: cyclic ~5s raw underrun + drop-newest holes.
++//   Logs [avae-feed] enqueue/drop/underrun edges + 500ms timeline to prove
++//   whether core stops play:, aout drains without refill, or drop digs holes.
++//
++// FEED-FIX K2.3 (2026-07-19) — raw bank covers full inter-arrival:
++//   Device FEED-DIAG proved ~5s demux/aout bursts into a 4s hard drop cap:
++//     accept ~4.25s → DROP newest ~0.75s/cycle → dEnq=0 ~4.5s → raw→0 →
++//     UNDERRUN_EDGE (lastEnqAgoMs~4300) → next burst. dropF += ~36k/cycle.
++//   Policy: kAVAEMaxRawSec=8s (design bank ≥ burst+margin; always accept);
++//           kAVAEHardRawSec=12s (emergency ceiling only; DROP reason=hard_ceiling).
++//   Between 8s and 12s: still ACCEPT + rate-limited RAW_HIGH (no holes).
++//   Shallow wall stays 0.25s (hold residual only) — do NOT deepen wall as fix.
++//   Not a 0007 standing decoder cap; not drop+live; not TimePitch-as-rate.
++//   No P4.3/F20 FIXED claim until R2 ear green.
++//
++// FEED-FIX K2.4 (2026-07-19) — post-hold A/V desync (release-into-empty):
++//   Device K2.3 soak: DROP=0 (good) but 3/4 of 2→1 releases land on rawF=0
++//   pendingW=0 after 2× underrun. During underrun dAud=0 while dSys advances;
++//   on REFILL ratio spikes (seen 19.3) → A/V desync at 1× after release.
++//   Dual fix (module only; hold remains rate-only):
++//     A) TimingReport honesty: do NOT aout_TimingReport while underrunning
++//        (frozen audio_ts + advancing system_ts poisons core A/V mapping).
++//        On underrun exit set _timingResume; next non-underrun report resets
++//        diag deltas and logs TIMING_RESUME then reports true content PTS.
++//        Never invent content PTS / never wall-clock into _contentConsumed.
++//     B) 2× bank headroom: MaxRaw 8→12s, HardRaw 12→18s (wall stays 250ms).
++//        Larger 1× prefill buys more content runway before 2× empties bank.
++//        changeRate into non-unity logs RATE_LOW_BANK if rawSec < 2s.
++//   Fingerprint: JIT-scaletempo K2.4 FEED-FIX / timing-hold raw=12s hard=18s.
++//   Residual: demux may still not feed 2× continuous — bank only buys time.
++//
++// FEED-FIX K2.5 (2026-07-19) — core NotifyTiming rewrite was still desync:
++//   Device K2.4 ear: TIMING_HOLD/RESUME live, DROP=0, but 2→1 still desync.
++//   Root: aout-handles-rate path in vlc_aout_stream_NotifyTiming REWROTE
++//   module content PTS as rate_audio_ts + dSys * rate, inventing progress
++//   across underrun silence. Module TIMING_HOLD alone cannot fix that.
++//   Core 0012: skip rewrite when change_rate != NULL; use module audio_ts.
++//   Fingerprint: JIT-scaletempo K2.5 FEED-FIX / content-pts-no-rewrite.
++//   No P4.3/F20 FIXED claim until R2 ear green.
++//
++// FEED-FIX K2.6 (2026-07-19) — residual-clear + 1→2-only tempo reopen:
++//   Device BC (K2.5 authority): hold 2× starts OK then "explodes"; release
++//   recovery takes time.
++//   Root A: ~250 ms shallow WALL residual keeps playing OLD scale across
++//     unity-cross changeRate; 2→1 also reopened tempo even though 1× raw-
++//     bypasses scaletempo → dirty recovery latency.
++//   Root B (unchanged class): steady 1× bank ≈ one demux burst; at 2× content
++//     drains ~2× wall with dEnq≈0 → mid-hold collapse when bank thins.
++//   Module fix (this rev):
++//     1) clearWallResidual on material rate change: attribute unplayed wall
++//        into _contentConsumed via prev*rate, bump _epoch (late completions
++//        no-op), player stop wall schedule only — raw chain / contentIn /
++//        firstPts / startDate untouched. Then JIT feedWall at NEW rate.
++//     2) openTempoFilter only on 1→2 (unityCross && !nextUnity) to kill stale
++//        scaletempo buf_queue; 2→1 is setTempoRate only (no reopen).
++//   Still NOT FIXED: mid-hold 2× bank drain is demux-bound; R2 ear required.
++//   Fingerprint: JIT-scaletempo K2.6 FEED-FIX / residual-clear /
++//     content-pts-no-rewrite / timing-hold.
++//   Forbidden still: drop+live deep raw, TimePitch-as-rate, 0007, hold seek,
++//     wall*rate NotifyTiming rewrite (K2.5 stays).
++//
++// Stock VLCAVSample when --no-avsb-pitch-engine (product default).
++// ============================================================================
++
++API_AVAILABLE(macos(10.13), ios(11.0), tvos(11.0))
++/* Shallow WALL schedule: already-stretched PCM on the player node. This is the
++ * only "old rate" residual on changeRate — keep short so hold feels instant. */
++static const double kAVAEMaxWallSec = 0.25;
++/* Wall buffers the player node can hold at once: 250 ms of wall at the
++ * smallest chunk the feed produces is far below this. Overflow drops the
++ * oldest entry, which the node has already played back. */
++enum { kAVAEWallRingCapacity = 256 };
++/* Deep RAW content reserve (rate-agnostic). Must cover full inter-arrival of
++ * bursty demux/aout (~5s measured) plus margin so 1× never drains to underrun
++ * between segment-cadence feeds. At 2×, content drains 2× into wall — bank
++ * still rate-agnostic (frames of content, not wall). Not a 0007 decoder cap.
++ * FEED-FIX K2.3: raised 2s→8s after FEED-DIAG cyclic underrun proof.
++ * FEED-FIX K2.4: raised 8s→12s so healthy 1× prefill has more 2× runway. */
++static const double kAVAEMaxRawSec = 12.00;
++/* Absolute safety ceiling only. Accept freely under MaxRaw; accept with
++ * RAW_HIGH warn between MaxRaw and HardRaw; DROP newest only above HardRaw
++ * (should be rare if 1× consume continues). Memory: stereo f32 @48k ≈
++ * 18s * 48000 * 8 ≈ 6.9 MiB — fine on device.
++ * FEED-FIX K2.4: raised 12s→18s with MaxRaw=12s. */
++static const double kAVAEHardRawSec = 18.00;
++static const float kAVAEHeadroom = 0.707f;
++static const float kAVAEUnityEpsilon = 0.001f;
++
++@interface VLCAudioEngine : NSObject
++{
++    audio_output_t     *_aout;
++    AVAudioEngine      *_engine;
++    AVAudioPlayerNode  *_player;
++    AVAudioFormat      *_format;
++    dispatch_queue_t    _queue;
++    filter_t           *_tempo;
++    audio_sample_format_t _fmtAudio;
++    BOOL                _fmtValid;
++    float               _playbackRate;
++    unsigned            _rate;
++    unsigned            _channels;
++    vlc_tick_t          _firstPts;
++    vlc_tick_t          _startDate;
++    BOOL                _started;
++    BOOL                _dateReached;
++    BOOL                _paused;
++    BOOL                _interrupted;
++    /* Wall (stretched) schedule accounting */
++    int64_t             _scheduledWallFrames;
++    int64_t             _playedWallFrames;
++    int32_t             _pendingWall;
++    /* Content accounting for TimingReport / feed */
++    int64_t             _contentIn;
++    int64_t             _contentConsumed;
++    int64_t             _rawQueuedFrames;
++    BOOL                _draining;
++    float               _volume;
++    BOOL                _muted;
++    uint64_t            _epoch;
++    int                 _diagTick;
++    vlc_tick_t          _diagPrevSys;
++    vlc_tick_t          _diagPrevAudio;
++    /* FEED-DIAG: enqueue / underrun continuity (queue-side only). */
++    int64_t             _enqueuedFrames;
++    int64_t             _enqueuedCalls;
++    int64_t             _droppedFrames;
++    int64_t             _dropEvents;
++    vlc_tick_t          _lastEnqueueTick;
++    BOOL                _feedUnderrunActive;
++    int64_t             _feedPrevEnqF;
++    int64_t             _feedPrevConsC;
++    vlc_tick_t          _feedPrevTick;
++    int                 _feedLineCount;
++    int                 _rawEmptyLogBudget;
++    vlc_tick_t          _feedBurstUntil; /* dense samples after rate/underrun */
++    vlc_tick_t          _rawHighLastWarnTick; /* rate-limit RAW_HIGH */
++    vlc_tick_t          _sessionStartTick;
++    /* K2.4: TimingReport hold across underrun (frozen audio_ts is poison). */
++    BOOL                _timingResume;       /* set on REFILL_EDGE; next report re-anchors diag */
++    vlc_tick_t          _timingHoldLastTick; /* rate-limit TIMING_HOLD log */
++    block_t            *_rawChain;      /* deep raw reserve */
++    block_t           **_rawChainLast;
++    /* K2.7 sample-accurate TimingReport: every wall buffer still owned by the
++     * player node, in schedule order, on the player timeline (which
++     * AVAudioPlayerNode.stop returns to sample 0 — every stop site resets
++     * this ring with it). reportTiming maps the RENDERED player sample to
++     * content through these entries instead of counting whole buffers at
++     * dataPlayedBack, whose one step per decoded block (21 ms AAC, 96 ms
++     * FLAC) read to the core clock as rate instability. */
++    struct {
++        int64_t  wallStart;
++        uint32_t wallFrames;
++        int64_t  contentStart;
++        uint32_t contentFrames;
++    }                   _wallRing[kAVAEWallRingCapacity];
++    unsigned            _wallRingHead;
++    unsigned            _wallRingCount;
++    int64_t             _contentScheduled; /* content cursor for the next wall buffer */
++    uint64_t            _leadHostTime;     /* deferred first-buffer host time, 0 = none */
++    int64_t             _leadFrames;       /* player-timeline silence before it */
++    BOOL                _leadResolved;
++    BOOL                _renderTimingLogged;
++    int64_t             _renderStarveTicks; /* reports that found the render head past the schedule */
++    dispatch_source_t   _timingTimer;
++    id                  _obsInterruption;
++    id                  _obsRoute;
++    id                  _obsEngineConfig;
++}
++- (instancetype)init:(audio_output_t *)aout;
++- (BOOL)start:(audio_sample_format_t *)fmt;
++- (void)stop;
++- (void)play:(block_t *)block date:(vlc_tick_t)date;
++- (void)changeRate:(float)rate;
++- (void)pause:(BOOL)pause date:(vlc_tick_t)date;
++- (void)flush;
++- (void)drain;
++- (void)setVolume:(float)volume;
++- (void)setMute:(BOOL)mute;
++@end
++
++@implementation VLCAudioEngine
++
++- (instancetype)init:(audio_output_t *)aout
++{
++    self = [super init];
++    if (self != nil) {
++        _aout = aout;
++        _queue = dispatch_queue_create("org.videolan.avaudioengine", DISPATCH_QUEUE_SERIAL);
++        _firstPts = VLC_TICK_INVALID;
++        _startDate = VLC_TICK_INVALID;
++        _volume = 1.f;
++        _muted = NO;
++        _playbackRate = 1.f;
++        _epoch = 1;
++        _rawChain = NULL;
++        _rawChainLast = &_rawChain;
++        _fmtValid = NO;
++        _enqueuedFrames = 0;
++        _enqueuedCalls = 0;
++        _droppedFrames = 0;
++        _dropEvents = 0;
++        _lastEnqueueTick = 0;
++        _feedUnderrunActive = NO;
++        _feedPrevEnqF = 0;
++        _feedPrevConsC = 0;
++        _feedPrevTick = 0;
++        _feedLineCount = 0;
++        _rawEmptyLogBudget = 0;
++        _feedBurstUntil = 0;
++        _rawHighLastWarnTick = 0;
++        _sessionStartTick = 0;
++        _timingResume = NO;
++        _timingHoldLastTick = 0;
++    }
++    return self;
++}
++
++#pragma mark helpers
++
++/* FEED-DIAG: last successful enqueue age in ms (0 if never enqueued). */
++- (int64_t)lastEnqueueAgoMsLocked
++{
++    if (_lastEnqueueTick == 0)
++        return -1;
++    vlc_tick_t ago = vlc_tick_now() - _lastEnqueueTick;
++    if (ago < 0)
++        ago = 0;
++    return (int64_t)(ago / 1000); /* vlc_tick is us */
++}
++
++- (BOOL)isFeedUnderrunLocked
++{
++    int64_t unplayedW = [self unplayedWallFramesLocked];
++    return (unplayedW == 0 && _pendingWall == 0 && _rawChain == NULL
++            && _started && !_paused && !_interrupted);
++}
++
++/* Event-driven underrun enter/leave. Call after enqueue/feed/timing. */
++- (void)observeFeedUnderrunLocked
++{
++    BOOL now = [self isFeedUnderrunLocked];
++    if (now && !_feedUnderrunActive) {
++        _feedUnderrunActive = YES;
++        _feedBurstUntil = vlc_tick_now() + 3000000; /* dense 3s after edge */
++        msg_Warn(_aout,
++                 "[avae-feed] UNDERRUN_EDGE lastEnqAgoMs=%lld enqF=%lld enqN=%lld "
++                 "consC=%lld contentIn=%lld dropped=%lld dropN=%lld rawF=%lld "
++                 "pendingW=%d unplayedW=%lld playRate=%.2f epoch=%llu FEED-DIAG",
++                 (long long)[self lastEnqueueAgoMsLocked],
++                 (long long)_enqueuedFrames, (long long)_enqueuedCalls,
++                 (long long)_contentConsumed, (long long)_contentIn,
++                 (long long)_droppedFrames, (long long)_dropEvents,
++                 (long long)_rawQueuedFrames, (int)_pendingWall,
++                 (long long)[self unplayedWallFramesLocked],
++                 _playbackRate, (unsigned long long)_epoch);
++    } else if (!now && _feedUnderrunActive) {
++        _feedUnderrunActive = NO;
++        /* K2.4: next non-underrun reportTiming must re-anchor diag deltas
++         * before aout_TimingReport so core does not see a mega ratio. */
++        _timingResume = YES;
++        _feedBurstUntil = vlc_tick_now() + 3000000;
++        msg_Warn(_aout,
++                 "[avae-feed] REFILL_EDGE lastEnqAgoMs=%lld enqF=%lld enqN=%lld "
++                 "consC=%lld contentIn=%lld dropped=%lld dropN=%lld rawF=%lld "
++                 "pendingW=%d unplayedW=%lld playRate=%.2f epoch=%llu FEED-DIAG",
++                 (long long)[self lastEnqueueAgoMsLocked],
++                 (long long)_enqueuedFrames, (long long)_enqueuedCalls,
++                 (long long)_contentConsumed, (long long)_contentIn,
++                 (long long)_droppedFrames, (long long)_dropEvents,
++                 (long long)_rawQueuedFrames, (int)_pendingWall,
++                 (long long)[self unplayedWallFramesLocked],
++                 _playbackRate, (unsigned long long)_epoch);
++    }
++}
++
++/* Periodic feed timeline: 500ms wall for first ~60s; always after rate/underrun. */
++- (void)maybeLogFeedTimelineLocked:(BOOL)force
++{
++    vlc_tick_t now = vlc_tick_now();
++    if (_sessionStartTick == 0)
++        _sessionStartTick = now;
++
++    BOOL inFirst60s = (now - _sessionStartTick) < 60000000; /* 60s */
++    BOOL inBurst = (_feedBurstUntil != 0 && now < _feedBurstUntil);
++    if (!force && !inFirst60s && !inBurst)
++        return;
++
++    if (!force && _feedPrevTick != 0 && (now - _feedPrevTick) < 500000)
++        return; /* ~500 ms */
++
++    int64_t dEnq = _enqueuedFrames - _feedPrevEnqF;
++    int64_t dCons = _contentConsumed - _feedPrevConsC;
++    int64_t unplayedW = [self unplayedWallFramesLocked];
++    BOOL underrun = [self isFeedUnderrunLocked];
++
++    msg_Warn(_aout,
++             "[avae-feed] t=%.1fs enqF=%lld enqN=%lld consC=%lld contentIn=%lld "
++             "dEnq=%lld dCons=%lld rawF=%lld pendingW=%d unplayedW=%lld "
++             "lastEnqAgoMs=%lld dropF=%lld dropN=%lld playRate=%.2f underrun=%d "
++             "epoch=%llu FEED-DIAG",
++             (double)(now - _sessionStartTick) / 1000000.0,
++             (long long)_enqueuedFrames, (long long)_enqueuedCalls,
++             (long long)_contentConsumed, (long long)_contentIn,
++             (long long)dEnq, (long long)dCons,
++             (long long)_rawQueuedFrames, (int)_pendingWall,
++             (long long)unplayedW,
++             (long long)[self lastEnqueueAgoMsLocked],
++             (long long)_droppedFrames, (long long)_dropEvents,
++             _playbackRate, underrun ? 1 : 0,
++             (unsigned long long)_epoch);
++
++    _feedPrevEnqF = _enqueuedFrames;
++    _feedPrevConsC = _contentConsumed;
++    _feedPrevTick = now;
++    _feedLineCount++;
++}
++
++- (void)dropRawLocked
++{
++    if (_rawChain != NULL) {
++        block_ChainRelease(_rawChain);
++        _rawChain = NULL;
++    }
++    _rawChainLast = &_rawChain;
++    _rawQueuedFrames = 0;
++}
++
++- (int64_t)unplayedWallFramesLocked
++{
++    int64_t u = _scheduledWallFrames - _playedWallFrames;
++    return u > 0 ? u : 0;
++}
++
++/* K2.8: the shallow window is wall scheduled AHEAD OF THE RENDER HEAD.
++ * Measured against dataPlayedBack (unplayedW) it silently shrank by the
++ * device output latency — 163 ms on Bluetooth left ~87 ms ahead of render,
++ * under one 96 ms FLAC block, and the node rendered silence between
++ * completions (device 2026-09-30: reported position pinned to the end of
++ * the schedule). Before the first render there is no render head: the
++ * played-back measure stands. */
++- (BOOL)wallHasRoomLocked
++{
++    if (_rate == 0) return YES;
++    int64_t rendered = 0;
++    if ([self renderedWallLocked:&rendered hostOffset:NULL]) {
++        int64_t ahead = _scheduledWallFrames - rendered;
++        if (ahead < 0) ahead = 0;
++        return ((double)ahead / (double)_rate) < kAVAEMaxWallSec;
++    }
++    return ((double)[self unplayedWallFramesLocked] / (double)_rate) < kAVAEMaxWallSec;
++}
++
++/* The player-timeline wall frame the node has rendered up to (deferred-start
++ * silence removed), with its render host time as a difference from now.
++ * NO when the node has no valid render time (not started, engine stopped). */
++- (BOOL)renderedWallLocked:(int64_t *)outWall hostOffset:(double *)outOffsetSec
++{
++    if (_player == nil || !_started)
++        return NO;
++    AVAudioTime *nodeTime = _player.lastRenderTime;
++    if (nodeTime == nil || !nodeTime.hostTimeValid)
++        return NO;
++    AVAudioTime *playerTime = [_player playerTimeForNodeTime:nodeTime];
++    if (playerTime == nil || !playerTime.sampleTimeValid)
++        return NO;
++    double offsetSec = [AVAudioTime secondsForHostTime:nodeTime.hostTime]
++                     - [AVAudioTime secondsForHostTime:mach_absolute_time()];
++    if (!(fabs(offsetSec) < 1.0))
++        return NO;
++    int64_t rendered = playerTime.sampleTime;
++    if (!_leadResolved) {
++        /* The timeline starts at play(); a deferred first buffer begins
++         * after that much silence. */
++        double zeroSec = [AVAudioTime secondsForHostTime:nodeTime.hostTime]
++                       - (double)rendered / playerTime.sampleRate;
++        double leadSec = [AVAudioTime secondsForHostTime:_leadHostTime] - zeroSec;
++        _leadFrames = leadSec > 0 ? (int64_t)llround(leadSec * _rate) : 0;
++        _leadResolved = YES;
++    }
++    rendered -= _leadFrames;
++    if (rendered < 0) rendered = 0;
++    *outWall = rendered;
++    if (outOffsetSec != NULL)
++        *outOffsetSec = offsetSec;
++    return YES;
++}
++
++- (BOOL)rawHasRoomLocked
++{
++    if (_rate == 0) return YES;
++    return ((double)_rawQueuedFrames / (double)_rate) < kAVAEMaxRawSec;
++}
++
++- (BOOL)canRunLocked
++{
++    return _player != nil && _engine != nil && _format != nil && _tempo != nil
++        && !_interrupted;
++}
++
++- (void)closeTempoLocked
++{
++    if (_tempo != NULL) {
++        if (_tempo->p_module != NULL)
++            module_unneed(_tempo, _tempo->p_module);
++        vlc_object_delete(_tempo);
++        _tempo = NULL;
++    }
++}
++
++- (BOOL)openTempoFilterLocked:(const audio_sample_format_t *)fmt
++{
++    [self closeTempoLocked];
++    filter_t *f = vlc_object_create(_aout, sizeof(*f));
++    if (f == NULL)
++        return NO;
++    f->fmt_in.i_codec = VLC_CODEC_FL32;
++    f->fmt_in.audio = *fmt;
++    f->fmt_in.audio.i_format = VLC_CODEC_FL32;
++    aout_FormatPrepare(&f->fmt_in.audio);
++    f->fmt_out = f->fmt_in;
++    f->p_cfg = NULL;
++    f->p_module = module_need(f, "audio filter", "scaletempo", true);
++    if (f->p_module == NULL || f->ops == NULL || f->ops->filter_audio == NULL) {
++        msg_Err(_aout, "[avae] scaletempo open failed");
++        if (f->p_module != NULL)
++            module_unneed(f, f->p_module);
++        vlc_object_delete(f);
++        return NO;
++    }
++    _tempo = f;
++    return YES;
++}
++
++- (void)setTempoRateLocked:(float)rate
++{
++    if (_tempo == NULL)
++        return;
++    if (rate < 0.25f) rate = 0.25f;
++    if (rate > 4.f) rate = 4.f;
++    if (fabsf(rate - 1.f) < kAVAEUnityEpsilon)
++        rate = 1.f;
++    _playbackRate = rate;
++    unsigned nominal = _rate ? _rate : _tempo->fmt_out.audio.i_rate;
++    /* Core rate_filter contract: fmt_in.i_rate = nominal * rate; out = nominal. */
++    _tempo->fmt_in.audio.i_rate = lroundf((float)nominal * rate);
++    _tempo->fmt_out.audio.i_rate = nominal;
++}
++
++- (block_t *)stretchBlockLocked:(block_t *)raw
++{
++    if (raw == NULL || _tempo == NULL || _tempo->ops == NULL
++        || _tempo->ops->filter_audio == NULL) {
++        if (raw != NULL)
++            block_Release(raw);
++        return NULL;
++    }
++    /* scaletempo owns/consumes input; may return NULL while buffering. */
++    return _tempo->ops->filter_audio(_tempo, raw);
++}
++
++- (AVAudioPCMBuffer *)pcmFromInterleaved:(const float *)src frames:(uint32_t)frames
++{
++    if (frames == 0 || _format == nil || src == NULL)
++        return nil;
++    AVAudioPCMBuffer *buf =
++        [[AVAudioPCMBuffer alloc] initWithPCMFormat:_format frameCapacity:frames];
++    if (buf == nil) return nil;
++    buf.frameLength = frames;
++    for (uint32_t f = 0; f < frames; f++) {
++        for (unsigned c = 0; c < _channels; c++) {
++            float s = src[f * _channels + c] * kAVAEHeadroom;
++            if (s > 1.f) s = 1.f;
++            else if (s < -1.f) s = -1.f;
++            buf.floatChannelData[c][f] = s;
++        }
++    }
++    return buf;
++}
++
++- (AVAudioTime *)startAtTimeLocked
++{
++    if (_dateReached || _startDate == VLC_TICK_INVALID || _rate == 0)
++        return nil;
++    vlc_tick_t now = vlc_tick_now();
++    vlc_tick_t delta = _startDate - now;
++    _dateReached = YES;
++    /* Cap deferral: core dates can be hundreds of ms–seconds ahead; scheduling
++     * the first buffer that far on hostTime leaves 1× silent then lurches.
++     * Stock ASBD also clamps practically; we start ASAP if late or >100ms. */
++    if (delta <= 0) {
++        msg_Info(_aout, "[avae] start now (late by %" PRId64 " us)", (int64_t)(-delta));
++        return nil;
++    }
++    if (delta > 100000 /* 100 ms */) {
++        msg_Info(_aout, "[avae] start ASAP (core date +%" PRId64 " us >100ms cap)",
++                 (int64_t)delta);
++        return nil;
++    }
++    uint64_t hostNow = mach_absolute_time();
++    mach_timebase_info_data_t tb;
++    mach_timebase_info(&tb);
++    uint64_t hostDelta = (uint64_t)((double)delta * 1000.0
++                                    * (double)tb.denom / (double)tb.numer);
++    msg_Dbg(_aout, "[avae] defer start (%" PRId64 " us)", (int64_t)delta);
++    _leadHostTime = hostNow + hostDelta;
++    _leadResolved = NO;
++    return [AVAudioTime timeWithHostTime:hostNow + hostDelta];
++}
++
++- (void)ensurePlayerRunningLocked
++{
++    if (_player == nil || _engine == nil || _interrupted || _paused)
++        return;
++    if (!_engine.isRunning) {
++        NSError *err = nil;
++        if (![_engine startAndReturnError:&err]) {
++            msg_Err(_aout, "[avae] engine restart failed: %s",
++                    err.localizedDescription.UTF8String ?: "?");
++            return;
++        }
++    }
++    if (!_started) {
++        [_player play];
++        _started = YES;
++    }
++}
++
++/* Player timeline returned to sample 0 (stop) or never started: no wall
++ * buffer is owned by the node any more. The next buffer's content starts
++ * where accounting stands now. */
++- (void)resetWallTimelineLocked
++{
++    _wallRingHead = 0;
++    _wallRingCount = 0;
++    _contentScheduled = _contentConsumed;
++    _leadHostTime = 0;
++    _leadFrames = 0;
++    _leadResolved = YES;
++}
++
++- (void)pushWallRingLocked:(uint32_t)wallFrames content:(uint32_t)contentFrames
++{
++    if (_wallRingCount == kAVAEWallRingCapacity) {
++        _wallRingHead = (_wallRingHead + 1) % kAVAEWallRingCapacity;
++        _wallRingCount--;
++    }
++    unsigned i = (_wallRingHead + _wallRingCount) % kAVAEWallRingCapacity;
++    _wallRing[i].wallStart = _scheduledWallFrames;
++    _wallRing[i].wallFrames = wallFrames;
++    _wallRing[i].contentStart = _contentScheduled;
++    _wallRing[i].contentFrames = contentFrames;
++    _wallRingCount++;
++    _contentScheduled += contentFrames;
++}
++
++/* Completions arrive in schedule order (same player node, same epoch). */
++- (void)popWallRingLocked
++{
++    if (_wallRingCount == 0)
++        return;
++    _wallRingHead = (_wallRingHead + 1) % kAVAEWallRingCapacity;
++    _wallRingCount--;
++}
++
++/* Content frame at a wall position on the player timeline: interpolated
++ * inside the buffer that holds it (content/wall is that buffer's own
++ * attribution — 1:1 at unity, wall*rate otherwise). Before the first owned
++ * buffer: its start; past the last (starved): the end of what was fed. */
++- (int64_t)contentAtWallLocked:(int64_t)wall
++{
++    if (_wallRingCount == 0)
++        return _contentConsumed;
++    for (unsigned n = 0; n < _wallRingCount; n++) {
++        unsigned i = (_wallRingHead + n) % kAVAEWallRingCapacity;
++        int64_t start = _wallRing[i].wallStart;
++        int64_t frames = _wallRing[i].wallFrames;
++        if (wall <= start)
++            return _wallRing[i].contentStart;
++        if (wall < start + frames)
++            return _wallRing[i].contentStart
++                 + (wall - start) * (int64_t)_wallRing[i].contentFrames / frames;
++    }
++    return _contentScheduled;
++}
++
++- (void)scheduleWall:(AVAudioPCMBuffer *)buf
++          wallFrames:(uint32_t)wallFrames
++       contentFrames:(uint32_t)contentFrames
++                 pts:(vlc_tick_t)pts
++{
++    if (buf == nil || wallFrames == 0 || _player == nil)
++        return;
++    if (_firstPts == VLC_TICK_INVALID)
++        _firstPts = pts;
++    [self pushWallRingLocked:wallFrames content:contentFrames];
++    _scheduledWallFrames += wallFrames;
++    _pendingWall++;
++    __weak typeof(self) weakSelf = self;
++    dispatch_queue_t queue = _queue;
++    const uint32_t w = wallFrames;
++    const uint32_t c = contentFrames;
++    const uint64_t epoch = _epoch;
++    AVAudioTime *when = [self startAtTimeLocked];
++    [_player scheduleBuffer:buf
++                     atTime:when
++                    options:0
++     completionCallbackType:AVAudioPlayerNodeCompletionDataPlayedBack
++          completionHandler:^(AVAudioPlayerNodeCompletionCallbackType t) {
++        (void)t;
++        dispatch_async(queue, ^{
++            VLCAudioEngine *s = weakSelf;
++            if (s == nil || s->_epoch != epoch)
++                return;
++            [s wallPlayedOut:w content:c];
++        });
++    }];
++    [self ensurePlayerRunningLocked];
++}
++
++- (void)wallPlayedOut:(uint32_t)wallFrames content:(uint32_t)contentFrames
++{
++    _playedWallFrames += wallFrames;
++    _contentConsumed += contentFrames;
++    [self popWallRingLocked];
++    if (_pendingWall > 0) _pendingWall--;
++    [self feedWallFromRawLocked];
++    [self observeFeedUnderrunLocked];
++    if (_draining && _pendingWall == 0 && _rawChain == NULL) {
++        _draining = NO;
++        aout_DrainedReport(_aout);
++    }
++}
++
++/* JIT: pull raw → (optional scaletempo at rate≠1) → shallow wall schedule. */
++- (void)feedWallFromRawLocked
++{
++    if (![self canRunLocked])
++        return;
++    while (_rawChain != NULL && [self wallHasRoomLocked]) {
++        block_t *raw = _rawChain;
++        _rawChain = raw->p_next;
++        raw->p_next = NULL;
++        if (_rawChain == NULL)
++            _rawChainLast = &_rawChain;
++
++        const uint32_t contentFrames = raw->i_nb_samples;
++        const vlc_tick_t pts = raw->i_pts;
++        if (_rawQueuedFrames >= (int64_t)contentFrames)
++            _rawQueuedFrames -= contentFrames;
++        else
++            _rawQueuedFrames = 0;
++
++        /* FEED-DIAG: raw emptied while wall still has residual (rate-limit). */
++        if (_rawChain == NULL && _rawQueuedFrames == 0
++            && [self unplayedWallFramesLocked] > 0 && _rawEmptyLogBudget > 0) {
++            _rawEmptyLogBudget--;
++            msg_Warn(_aout,
++                     "[avae-feed] RAW_EMPTY wallW=%lld pendingW=%d contentIn=%lld "
++                     "consC=%lld playRate=%.2f epoch=%llu FEED-DIAG",
++                     (long long)[self unplayedWallFramesLocked],
++                     (int)_pendingWall, (long long)_contentIn,
++                     (long long)_contentConsumed, _playbackRate,
++                     (unsigned long long)_epoch);
++        }
++
++        block_t *out = NULL;
++        uint32_t wallFrames = 0;
++        /* Content frames attributed to this wall chunk for TimingReport.
++         * At 1×: 1:1 with wall. At rate≠1: wallFrames * rate — scaletempo
++         * DoWork returns NULL while priming buf_queue; those input frames are
++         * later emitted inside subsequent outs, so counting only the producing
++         * block's i_nb_samples permanently under-reports audio_ts
++         * (pitch-jit-priming-offset). wall*rate matches the core rate_filter
++         * contract (fmt_in.i_rate = nominal * rate). */
++        uint32_t attrContent = contentFrames;
++        /* Unity: NEVER run scaletempo. Device 2026-07-19: 1× must be bit-clean
++         * raw path; scaletempo identity still risked format/open mismatch and
++         * made baseline playback unusable. */
++        if (fabsf(_playbackRate - 1.f) < kAVAEUnityEpsilon) {
++            out = raw; /* ownership moves to out */
++            wallFrames = contentFrames;
++            attrContent = contentFrames;
++        } else {
++            out = [self stretchBlockLocked:raw]; /* consumes raw */
++            if (out == NULL) {
++                /* scaletempo priming: input held in buf_queue, no wall yet.
++                 * Content will be folded into later outs via wall*rate. */
++                continue;
++            }
++            wallFrames = out->i_nb_samples;
++            if (wallFrames == 0) {
++                block_Release(out);
++                continue;
++            }
++            float rate = _playbackRate > 0.f ? _playbackRate : 1.f;
++            /* lroundf matches setTempoRateLocked; wall*rate ≈ content in. */
++            long est = lroundf((float)wallFrames * rate);
++            if (est < 0) est = 0;
++            if (est > (long)UINT32_MAX) est = (long)UINT32_MAX;
++            attrContent = (uint32_t)est;
++        }
++        AVAudioPCMBuffer *buf =
++            [self pcmFromInterleaved:(const float *)out->p_buffer frames:wallFrames];
++        block_Release(out);
++        if (buf != nil)
++            [self scheduleWall:buf wallFrames:wallFrames contentFrames:attrContent pts:pts];
++    }
++    [self observeFeedUnderrunLocked];
++}
++
++- (void)enqueueRawLocked:(block_t *)raw
++{
++    if (raw == NULL)
++        return;
++    /* FEED-FIX K2.4 raw policy (see architecture header):
++     *   ≤ MaxRaw (12s): always accept — never drop (covers ~5s burst + 2× runway).
++     *   MaxRaw..HardRaw (12–18s): still accept; rate-limited RAW_HIGH only.
++     *   > HardRaw (18s): emergency DROP newest (reason=hard_ceiling).
++     * Dropping in the normal band was the cyclic underrun root: burst ~5s into
++     * a 4s cap punched ~0.75s holes then silence until next segment. */
++    if (_rate > 0) {
++        const int64_t hardFrames = (int64_t)(_rate * kAVAEHardRawSec);
++        const int64_t maxFrames  = (int64_t)(_rate * kAVAEMaxRawSec);
++        if (_rawQueuedFrames > hardFrames) {
++            /* Emergency only — dishonest for content timeline; should be rare. */
++            uint32_t n = raw->i_nb_samples;
++            int64_t gapMs = [self lastEnqueueAgoMsLocked];
++            _droppedFrames += n;
++            _dropEvents++;
++            msg_Warn(_aout,
++                     "[avae-feed] DROP newest frames=%u rawF=%lld contentIn=%lld "
++                     "droppedTotal=%lld dropN=%lld gapMs=%lld playRate=%.2f "
++                     "reason=hard_ceiling hard=%.0fs epoch=%llu FEED-DIAG",
++                     n, (long long)_rawQueuedFrames, (long long)_contentIn,
++                     (long long)_droppedFrames, (long long)_dropEvents,
++                     (long long)gapMs, _playbackRate, kAVAEHardRawSec,
++                     (unsigned long long)_epoch);
++            msg_Warn(_aout,
++                     "[avae] raw reserve overflow — drop newest %u frames "
++                     "(hard_ceiling)", n);
++            block_Release(raw);
++            [self feedWallFromRawLocked];
++            [self observeFeedUnderrunLocked];
++            return;
++        }
++        if (_rawQueuedFrames > maxFrames) {
++            /* Burst pile-up band: accept, do not punch holes. */
++            vlc_tick_t now = vlc_tick_now();
++            if (_rawHighLastWarnTick == 0
++                || now - _rawHighLastWarnTick >= VLC_TICK_FROM_MS(1000)) {
++                _rawHighLastWarnTick = now;
++                msg_Warn(_aout,
++                         "[avae-feed] RAW_HIGH rawF=%lld maxF=%lld hardF=%lld "
++                         "sec=%.2f max=%.0fs hard=%.0fs playRate=%.2f "
++                         "epoch=%llu FEED-DIAG",
++                         (long long)_rawQueuedFrames,
++                         (long long)maxFrames, (long long)hardFrames,
++                         (double)_rawQueuedFrames / (double)_rate,
++                         kAVAEMaxRawSec, kAVAEHardRawSec, _playbackRate,
++                         (unsigned long long)_epoch);
++            }
++        }
++    }
++    uint32_t n = raw->i_nb_samples;
++    _rawQueuedFrames += n;
++    _contentIn += n;
++    _enqueuedFrames += n;
++    _enqueuedCalls++;
++    _lastEnqueueTick = vlc_tick_now();
++    block_ChainLastAppend(&_rawChainLast, raw);
++    [self feedWallFromRawLocked];
++    [self observeFeedUnderrunLocked];
++}
++
++#pragma mark session
++
++- (void)registerObservers
++{
++#ifdef HAS_AVAUDIOSESSION
++    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
++    __weak typeof(self) weakSelf = self;
++    _obsInterruption = [nc addObserverForName:AVAudioSessionInterruptionNotification
++                                       object:nil queue:nil
++                                   usingBlock:^(NSNotification *note) {
++        VLCAudioEngine *s = weakSelf;
++        if (s == nil) return;
++        NSUInteger type = [note.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
++        if (type == AVAudioSessionInterruptionTypeBegan) {
++            dispatch_async(s->_queue, ^{
++                s->_interrupted = YES;
++                if (s->_player != nil)
++                    [s->_player pause];
++                s->_started = NO;
++                msg_Warn(s->_aout, "[avae] session interruption began");
++            });
++        } else if (type == AVAudioSessionInterruptionTypeEnded) {
++            NSUInteger opts =
++                [note.userInfo[AVAudioSessionInterruptionOptionKey] unsignedIntegerValue];
++            dispatch_async(s->_queue, ^{
++                s->_interrupted = NO;
++                if ((opts & AVAudioSessionInterruptionOptionShouldResume) != 0
++                    && !s->_paused) {
++                    [s ensurePlayerRunningLocked];
++                    [s feedWallFromRawLocked];
++                    msg_Warn(s->_aout, "[avae] session interruption ended → resume");
++                }
++            });
++        }
++    }];
++    _obsRoute = [nc addObserverForName:AVAudioSessionRouteChangeNotification
++                                object:nil queue:nil
++                            usingBlock:^(NSNotification *note) {
++        VLCAudioEngine *s = weakSelf;
++        if (s == nil) return;
++        NSInteger reason =
++            [note.userInfo[AVAudioSessionRouteChangeReasonKey] integerValue];
++        if (reason == AVAudioSessionRouteChangeReasonNewDeviceAvailable
++         || reason == AVAudioSessionRouteChangeReasonOldDeviceUnavailable) {
++            msg_Warn(s->_aout, "[avae] route change %ld → aout restart", (long)reason);
++            aout_RestartRequest(s->_aout, false);
++        }
++    }];
++#endif
++    __weak typeof(self) weakSelf2 = self;
++    _obsEngineConfig =
++        [[NSNotificationCenter defaultCenter]
++            addObserverForName:AVAudioEngineConfigurationChangeNotification
++                        object:nil queue:nil
++                    usingBlock:^(NSNotification *note) {
++        VLCAudioEngine *s = weakSelf2;
++        if (s == nil) return;
++        if (note.object != nil && s->_engine != nil && note.object != s->_engine)
++            return;
++        msg_Warn(s->_aout, "[avae] engine configuration change → aout restart");
++        aout_RestartRequest(s->_aout, false);
++    }];
++}
++
++- (void)unregisterObservers
++{
++    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
++    if (_obsInterruption != nil) { [nc removeObserver:_obsInterruption]; _obsInterruption = nil; }
++    if (_obsRoute != nil) { [nc removeObserver:_obsRoute]; _obsRoute = nil; }
++    if (_obsEngineConfig != nil) { [nc removeObserver:_obsEngineConfig]; _obsEngineConfig = nil; }
++}
++
++#pragma mark start / stop
++
++- (BOOL)start:(audio_sample_format_t *)fmt
++{
++    if (aout_BitsPerSample(fmt->i_format) == 0)
++        return NO;
++    fmt->i_format = VLC_CODEC_FL32;
++
++#ifdef HAS_AVAUDIOSESSION
++    AVAudioSession *session = [AVAudioSession sharedInstance];
++    if (avas_SetActive(_aout, session, true, 0) != VLC_SUCCESS)
++        return NO;
++    avas_PrepareFormat(_aout, session, fmt, true);
++    enum port_type port_type;
++    if (avas_GetPortType(_aout, session, &port_type) == VLC_SUCCESS)
++        _aout->current_sink_info.headphones = port_type == PORT_TYPE_HEADPHONES;
++#endif
++
++    _rate = fmt->i_rate;
++    _channels = aout_FormatNbChannels(fmt);
++    _fmtAudio = *fmt;
++    _fmtAudio.i_format = VLC_CODEC_FL32;
++    aout_FormatPrepare(&_fmtAudio);
++    _fmtValid = YES;
++
++    _firstPts = VLC_TICK_INVALID;
++    _startDate = VLC_TICK_INVALID;
++    _started = NO;
++    _dateReached = NO;
++    _paused = NO;
++    _interrupted = NO;
++    _scheduledWallFrames = 0;
++    _playedWallFrames = 0;
++    _pendingWall = 0;
++    _contentIn = 0;
++    _contentConsumed = 0;
++    [self resetWallTimelineLocked];
++    _rawQueuedFrames = 0;
++    _draining = NO;
++    _playbackRate = 1.f;
++    _epoch++;
++    _diagTick = 0;
++    _diagPrevSys = 0;
++    _diagPrevAudio = 0;
++    _enqueuedFrames = 0;
++    _enqueuedCalls = 0;
++    _droppedFrames = 0;
++    _dropEvents = 0;
++    _lastEnqueueTick = 0;
++    _feedUnderrunActive = NO;
++    _feedPrevEnqF = 0;
++    _feedPrevConsC = 0;
++    _feedPrevTick = 0;
++    _feedLineCount = 0;
++    _rawEmptyLogBudget = 8;
++    _feedBurstUntil = 0;
++    _rawHighLastWarnTick = 0;
++    _sessionStartTick = vlc_tick_now();
++    _timingResume = NO;
++    _timingHoldLastTick = 0;
++    [self dropRawLocked];
++
++    if (![self openTempoFilterLocked:&_fmtAudio])
++        goto error;
++    [self setTempoRateLocked:1.f];
++
++    AudioChannelLayoutTag layoutTag =
++        (_channels == 1) ? kAudioChannelLayoutTag_Mono : kAudioChannelLayoutTag_Stereo;
++    _format = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32
++                                               sampleRate:_rate
++                                              interleaved:NO
++                                            channelLayout:[[AVAudioChannelLayout alloc]
++                                                initWithLayoutTag:layoutTag]];
++    if (_format == nil)
++        goto error;
++
++    _engine = [[AVAudioEngine alloc] init];
++    _player = [[AVAudioPlayerNode alloc] init];
++    if (_engine == nil || _player == nil)
++        goto error;
++
++    [_engine attachNode:_player];
++    /* player → mixer only. Rate is applied by JIT scaletempo before schedule. */
++    [_engine connect:_player to:_engine.mainMixerNode format:_format];
++    [_engine prepare];
++
++    {
++        NSError *err = nil;
++        if (![_engine startAndReturnError:&err]) {
++            msg_Err(_aout, "AVAudioEngine start failed: %s",
++                    err.localizedDescription.UTF8String);
++            goto error;
++        }
++    }
++    [self applyMixerGain];
++    [self registerObservers];
++
++    {
++        _timingTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
++        dispatch_source_set_timer(_timingTimer, DISPATCH_TIME_NOW,
++                                  NSEC_PER_SEC / 10, NSEC_PER_SEC / 50);
++        __weak typeof(self) weakSelf = self;
++        dispatch_source_set_event_handler(_timingTimer, ^{ [weakSelf reportTiming]; });
++        dispatch_resume(_timingTimer);
++    }
++
++    msg_Info(_aout,
++             "[avae] start JIT-scaletempo K2.6 FEED-FIX rate=%u ch=%u wall=%.0fms "
++             "raw=%.0fs hard=%.0fs no-drop-band residual-clear content-pts-no-rewrite "
++             "timing-hold (1x-raw-bypass, 1to2-tempo-reopen, wall*rate content, "
++             "no TimePitch; raw covers inter-arrival, DROP only hard_ceiling; "
++             "timing-hold raw=12s hard=18s; residual wall clear on rate change; "
++             "core uses module content PTS)",
++             _rate, _channels, kAVAEMaxWallSec * 1000.0,
++             kAVAEMaxRawSec, kAVAEHardRawSec);
++    return YES;
++
++error:
++#ifdef HAS_AVAUDIOSESSION
++    avas_SetActive(_aout, session, false,
++                   AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation);
++#endif
++    [self unregisterObservers];
++    [self closeTempoLocked];
++    _engine = nil; _player = nil; _format = nil;
++    return NO;
++}
++
++- (void)stop
++{
++    if (_timingTimer != nil) {
++        dispatch_source_cancel(_timingTimer);
++        _timingTimer = nil;
++    }
++    [self unregisterObservers];
++    dispatch_sync(_queue, ^{
++        self->_epoch++;
++        self->_started = NO;
++        self->_dateReached = NO;
++        self->_paused = NO;
++        self->_interrupted = NO;
++        self->_pendingWall = 0;
++        self->_draining = NO;
++        self->_firstPts = VLC_TICK_INVALID;
++        self->_startDate = VLC_TICK_INVALID;
++        self->_scheduledWallFrames = 0;
++        self->_playedWallFrames = 0;
++        self->_contentIn = 0;
++        self->_contentConsumed = 0;
++        [self resetWallTimelineLocked];
++        self->_playbackRate = 1.f;
++        [self dropRawLocked];
++        if (self->_player != nil)
++            [self->_player stop];
++        if (self->_engine != nil)
++            [self->_engine stop];
++        [self closeTempoLocked];
++        self->_player = nil;
++        self->_engine = nil;
++        self->_format = nil;
++        self->_fmtValid = NO;
++    });
++#ifdef HAS_AVAUDIOSESSION
++    avas_SetActive(_aout, [AVAudioSession sharedInstance], false,
++                   AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation);
++#endif
++}
++
++#pragma mark play / rate / timing
++
++- (void)play:(block_t *)block date:(vlc_tick_t)date
++{
++    if (block->i_nb_samples == 0) {
++        block_Release(block);
++        return;
++    }
++    dispatch_async(_queue, ^{
++        if (self->_startDate == VLC_TICK_INVALID && date != VLC_TICK_INVALID)
++            self->_startDate = date;
++        if (self->_player == nil && self->_engine == nil) {
++            block_Release(block);
++            return;
++        }
++        [self enqueueRawLocked:block];
++    });
++}
++
++/* K2.6 FEED-FIX: drop shallow WALL residual on material rate change so the
++ * old-scale tail (~250 ms unplayedW) cannot keep playing after changeRate.
++ * Attributes remaining wall into _contentConsumed at PREV rate (matches
++ * wall*rate scheduling), bumps _epoch so late scheduleBuffer completions
++ * no-op (critical — otherwise double-count contentConsumed), stops the
++ * player node for wall only. Does NOT drop raw / reset contentIn / firstPts /
++ * startDate / enqueue counters. Keeps _dateReached if already reached so we
++ * do not re-defer start. */
++- (void)clearWallResidualLockedForPrevRate:(float)prev nextRate:(float)next
++{
++    int64_t unplayedW = [self unplayedWallFramesLocked];
++    if (unplayedW == 0 && _pendingWall == 0)
++        return;
++
++    float p = prev;
++    if (p < 0.25f) p = 0.25f;
++    if (p > 4.f) p = 4.f;
++    if (fabsf(p - 1.f) < kAVAEUnityEpsilon)
++        p = 1.f;
++    long attr = lroundf((float)unplayedW * p);
++    if (attr < 0) attr = 0;
++    _contentConsumed += attr;
++
++    msg_Warn(_aout,
++             "[avae-feed] RESIDUAL_CLEAR unplayedW=%lld attrC=%ld prevRate=%.3f "
++             "nextRate=%.3f rawF=%lld pendingW=%d epoch=%llu FEED-DIAG",
++             (long long)unplayedW, attr, prev, next,
++             (long long)_rawQueuedFrames, (int)_pendingWall,
++             (unsigned long long)_epoch);
++
++    _epoch++;
++    if (_player != nil)
++        [_player stop];
++    _started = NO;
++    /* Keep _dateReached if already YES (avoid re-defer start). */
++    _pendingWall = 0;
++    _scheduledWallFrames = 0;
++    _playedWallFrames = 0;
++    [self resetWallTimelineLocked];
++}
++
++- (void)changeRate:(float)rate
++{
++    if (rate < 0.25f) rate = 0.25f;
++    if (rate > 4.f) rate = 4.f;
++    if (fabsf(rate - 1.f) < kAVAEUnityEpsilon)
++        rate = 1.f;
++    /* JIT contract: deep raw stays rate-agnostic. K2.6 clears shallow WALL
++     * residual on material rate change (old-scale tail + late completions).
++     * pitch-jit-stale-buffer: scaletempo retains buf_queue across scale
++     * changes (c833c4be0). 1× raw-bypasses tempo so we never drain that
++     * queue on 2→1 — reopen tempo ONLY on 1→2 (unityCross && !nextUnity).
++     * 2→1: setTempoRate only (no reopen) to avoid dirty release recovery. */
++    dispatch_async(_queue, ^{
++        float prev = self->_playbackRate;
++        if (fabsf(prev - rate) < kAVAEUnityEpsilon)
++            return;
++        const BOOL prevUnity = fabsf(prev - 1.f) < kAVAEUnityEpsilon;
++        const BOOL nextUnity = fabsf(rate - 1.f) < kAVAEUnityEpsilon;
++        const BOOL unityCross = (prevUnity != nextUnity);
++
++        /* Clear old-scale wall BEFORE applying new rate / reopening tempo. */
++        [self clearWallResidualLockedForPrevRate:prev nextRate:rate];
++
++        /* Tempo reopen only on 1→2 — kill stale scaletempo buf_queue. */
++        if (unityCross && !nextUnity && self->_fmtValid) {
++            if ([self openTempoFilterLocked:&self->_fmtAudio])
++                [self setTempoRateLocked:rate];
++            else
++                [self setTempoRateLocked:rate];
++        } else {
++            [self setTempoRateLocked:rate];
++        }
++        self->_diagTick = 0;
++        self->_diagPrevSys = 0;
++        self->_diagPrevAudio = 0;
++        self->_feedBurstUntil = vlc_tick_now() + 5000000; /* dense 5s after rate */
++        self->_rawEmptyLogBudget = 8;
++        /* JIT wall at NEW rate from preserved raw. */
++        [self feedWallFromRawLocked];
++        /* K2.4: warn when engaging non-unity with thin content bank — product
++         * hold may underrun mid-hold if demux stays ~1× fill. */
++        double rawSec = 0.0;
++        if (self->_rate > 0)
++            rawSec = (double)self->_rawQueuedFrames / (double)self->_rate;
++        if (!nextUnity && rawSec < 2.0) {
++            msg_Warn(self->_aout,
++                     "[avae-feed] RATE_LOW_BANK rawSec=%.2f rawF=%lld playRate=%.2f "
++                     "pendingW=%d unplayedW=%lld epoch=%llu FEED-DIAG",
++                     rawSec, (long long)self->_rawQueuedFrames, rate,
++                     (int)self->_pendingWall,
++                     (long long)[self unplayedWallFramesLocked],
++                     (unsigned long long)self->_epoch);
++        }
++        msg_Warn(self->_aout,
++                 "[avae] changeRate %.3f→%.3f JIT-scaletempo K2.6 FEED-FIX "
++                 "(unityCross=%d wall=%.0fms raw=%.0fs hard=%.0fs residual-clear "
++                 "content-pts-no-rewrite timing-hold pendingW=%d unplayedW=%lld "
++                 "rawF=%lld rawSec=%.2f enqF=%lld consC=%lld dropF=%lld epoch=%llu)",
++                 prev, rate, unityCross ? 1 : 0, kAVAEMaxWallSec * 1000.0,
++                 kAVAEMaxRawSec, kAVAEHardRawSec,
++                 (int)self->_pendingWall,
++                 (long long)[self unplayedWallFramesLocked],
++                 (long long)self->_rawQueuedFrames, rawSec,
++                 (long long)self->_enqueuedFrames,
++                 (long long)self->_contentConsumed,
++                 (long long)self->_droppedFrames,
++                 (unsigned long long)self->_epoch);
++        [self maybeLogFeedTimelineLocked:YES];
++    });
++}
++
++- (void)reportTiming
++{
++    if (_player == nil || _firstPts == VLC_TICK_INVALID || _rate == 0)
++        return;
++    if (_interrupted || _paused)
++        return;
++
++    /* K2.8: refill on the 10 Hz tick as well as on completions — a
++     * completion lands a device latency after the buffer rendered, the
++     * tick keeps the render-head window topped up in between. Starvation
++     * is sampled BEFORE the refill so the counter sees the gap. */
++    int64_t renderedWall = 0;
++    int64_t aheadWall = 0;
++    const BOOL aheadKnown = [self renderedWallLocked:&renderedWall hostOffset:NULL];
++    if (aheadKnown) {
++        aheadWall = _scheduledWallFrames - renderedWall;
++        /* Raw was waiting while the node ran dry: a feed gap, not supply. */
++        if (aheadWall < 0 && _rawChain != NULL)
++            _renderStarveTicks++;
++    }
++    [self feedWallFromRawLocked];
++
++    vlc_tick_t system_ts = vlc_tick_now();
++    AVAudioTime *nodeTime = _player.lastRenderTime;
++
++    /* Content PTS (scaletempo input), not wall. K2.7: sample-accurate, the
++     * way stock VLC (coreaudio_common ca_Render: rendered bytes at render end
++     * + device latency) and mpv (ao_audiounit: now + outputLatency + ts
++     * latency + frames) report — the RENDERED player sample, paired with its
++     * render host time plus output latency. Host times are only ever used
++     * as a DIFFERENCE from mach_absolute_time() applied to vlc_tick_now():
++     * the two clocks disagree across sleep (LIBVLC_ITERATION issue 5). */
++    int64_t contentSamples;
++    BOOL renderTiming = NO;
++    int64_t rendered = 0;
++    double offsetSec = 0;
++    if ([self renderedWallLocked:&rendered hostOffset:&offsetSec]) {
++        {
++            contentSamples = [self contentAtWallLocked:rendered];
++            vlc_tick_t latency = 0;
++#ifdef HAS_AVAUDIOSESSION
++            double outLat = [AVAudioSession sharedInstance].outputLatency;
++            if (outLat > 0 && outLat < 5.0)
++                latency = vlc_tick_from_sec(outLat);
++#endif
++            system_ts = vlc_tick_now() + (vlc_tick_t)(offsetSec * CLOCK_FREQ) + latency;
++            renderTiming = YES;
++            if (!_renderTimingLogged) {
++                _renderTimingLogged = YES;
++                msg_Info(_aout, "[avae] timing source=render-sample lead=%lld "
++                         "outLatency=%lld us", (long long)_leadFrames,
++                         (long long)latency);
++            }
++        }
++    }
++    if (!renderTiming) {
++        /* No render time yet (engine not running, before the first render):
++         * the played-back total, at report time. */
++        contentSamples = _contentConsumed;
++        vlc_tick_t fallback = vlc_tick_now();
++        if (nodeTime != nil && nodeTime.hostTimeValid) {
++            double ageSec = [AVAudioTime secondsForHostTime:mach_absolute_time()]
++                          - [AVAudioTime secondsForHostTime:nodeTime.hostTime];
++            if (ageSec > 0 && ageSec < 1.0)
++                fallback = vlc_tick_now() - (vlc_tick_t)(ageSec * CLOCK_FREQ);
++        }
++        system_ts = fallback;
++    }
++    if (contentSamples < 0) contentSamples = 0;
++    vlc_tick_t audio_ts = _firstPts + vlc_tick_from_samples(contentSamples, _rate);
++
++    int64_t unplayedW = [self unplayedWallFramesLocked];
++    BOOL underrun = [self isFeedUnderrunLocked];
++    [self observeFeedUnderrunLocked];
++    [self maybeLogFeedTimelineLocked:NO];
++
++    /* K2.4 TimingReport hold: while underrunning, content PTS freezes
++     * (dAud=0) but system keeps advancing. Reporting that pair poisons core
++     * A/V mapping; on refill ratio spikes (device K2.3: 19.3) → post-hold
++     * desync. Skip aout_TimingReport during underrun; never invent PTS. */
++    if (underrun) {
++        vlc_tick_t now = vlc_tick_now();
++        if (_timingHoldLastTick == 0 || (now - _timingHoldLastTick) >= 500000) {
++            _timingHoldLastTick = now;
++            msg_Warn(_aout,
++                     "[avae-feed] TIMING_HOLD lastEnqAgoMs=%lld rawF=%lld "
++                     "pendingW=%d unplayedW=%lld consC=%lld playRate=%.2f "
++                     "epoch=%llu FEED-DIAG",
++                     (long long)[self lastEnqueueAgoMsLocked],
++                     (long long)_rawQueuedFrames, (int)_pendingWall,
++                     (long long)unplayedW, (long long)_contentConsumed,
++                     _playbackRate, (unsigned long long)_epoch);
++        }
++        /* Still emit diag so silence gaps stay visible; do NOT update
++         * _diagPrev* while held — next RESUME re-anchors. */
++        if ((_diagTick % 5) == 0 && (_diagTick < 1200 || underrun || _feedBurstUntil != 0)) {
++            msg_Warn(_aout, "[avae-diag] now=%lld hostSys=%lld audio=%lld dSys=0 "
++                     "dAud=0 ratio=0.000 playRate=%.2f pendingW=%d unplayedW=%lld "
++                     "rawF=%lld consumedC=%lld contentIn=%lld enqF=%lld dropF=%lld "
++                     "lastEnqAgoMs=%lld underrun=1 timingHold=1 epoch=%llu rate=%u "
++                     "FEED-DIAG",
++                     (long long)vlc_tick_now(), (long long)system_ts, (long long)audio_ts,
++                     _playbackRate, (int)_pendingWall, (long long)unplayedW,
++                     (long long)_rawQueuedFrames, (long long)_contentConsumed,
++                     (long long)_contentIn, (long long)_enqueuedFrames,
++                     (long long)_droppedFrames,
++                     (long long)[self lastEnqueueAgoMsLocked],
++                     (unsigned long long)_epoch, _rate);
++        }
++        _diagTick++;
++        return; /* no aout_TimingReport while underrunning */
++    }
++
++    /* K2.4: first non-underrun report after REFILL re-anchors diag deltas so
++     * core does not see a mega dSys/dAud ratio from the silence gap. */
++    if (_timingResume) {
++        _timingResume = NO;
++        _diagPrevSys = 0;
++        _diagPrevAudio = 0;
++        _timingHoldLastTick = 0;
++        msg_Warn(_aout,
++                 "[avae-feed] TIMING_RESUME audio_ts=%lld consC=%lld rawF=%lld "
++                 "pendingW=%d unplayedW=%lld playRate=%.2f epoch=%llu FEED-DIAG",
++                 (long long)audio_ts, (long long)_contentConsumed,
++                 (long long)_rawQueuedFrames, (int)_pendingWall,
++                 (long long)unplayedW, _playbackRate,
++                 (unsigned long long)_epoch);
++    }
++
++    /* Keep legacy [avae-diag] for A/V clock ratio; extend past 200 ticks so
++     * multi-minute underrun cycles stay visible (every 5th ~500ms sample). */
++    if ((_diagTick % 5) == 0 && (_diagTick < 1200 || underrun || _feedBurstUntil != 0)) {
++        vlc_tick_t dSys = _diagPrevSys ? system_ts - _diagPrevSys : 0;
++        vlc_tick_t dAud = _diagPrevAudio ? audio_ts - _diagPrevAudio : 0;
++        msg_Warn(_aout, "[avae-diag] now=%lld hostSys=%lld audio=%lld dSys=%lld "
++                 "dAud=%lld ratio=%.3f playRate=%.2f pendingW=%d unplayedW=%lld "
++                 "rawF=%lld consumedC=%lld contentIn=%lld enqF=%lld dropF=%lld "
++                 "lastEnqAgoMs=%lld underrun=%d epoch=%llu rate=%u src=%s "
++                 "aheadMs=%lld%s starve=%lld FEED-DIAG",
++                 (long long)vlc_tick_now(), (long long)system_ts, (long long)audio_ts,
++                 (long long)dSys, (long long)dAud, dAud ? (double)dSys / dAud : 0.0,
++                 _playbackRate, (int)_pendingWall, (long long)unplayedW,
++                 (long long)_rawQueuedFrames, (long long)_contentConsumed,
++                 (long long)_contentIn, (long long)_enqueuedFrames,
++                 (long long)_droppedFrames,
++                 (long long)[self lastEnqueueAgoMsLocked],
++                 underrun ? 1 : 0, (unsigned long long)_epoch, _rate,
++                 renderTiming ? "render" : "consumed",
++                 aheadKnown ? (long long)(aheadWall * 1000 / (int64_t)_rate) : 0LL,
++                 aheadKnown ? "" : "(n/a)",
++                 (long long)_renderStarveTicks);
++        _diagPrevSys = system_ts;
++        _diagPrevAudio = audio_ts;
++    }
++    _diagTick++;
++    aout_TimingReport(_aout, system_ts, audio_ts);
++}
++
++#pragma mark pause / flush / drain / volume
++
++- (void)pause:(BOOL)pause date:(vlc_tick_t)date
++{
++    (void)date;
++    dispatch_async(_queue, ^{
++        self->_paused = pause;
++        if (self->_player == nil)
++            return;
++        if (pause) {
++            [self->_player pause];
++            self->_started = NO;
++        } else if (!self->_interrupted) {
++            [self ensurePlayerRunningLocked];
++            [self feedWallFromRawLocked];
++        }
++    });
++}
++
++- (void)flush
++{
++    dispatch_sync(_queue, ^{
++        /* Seek/discontinuity only — drop wall + raw; reopen scaletempo clean. */
++        self->_epoch++;
++        if (self->_player != nil)
++            [self->_player stop];
++        self->_started = NO;
++        self->_dateReached = NO;
++        self->_pendingWall = 0;
++        self->_draining = NO;
++        self->_firstPts = VLC_TICK_INVALID;
++        self->_startDate = VLC_TICK_INVALID;
++        self->_scheduledWallFrames = 0;
++        self->_playedWallFrames = 0;
++        self->_contentIn = 0;
++        self->_contentConsumed = 0;
++        [self resetWallTimelineLocked];
++        self->_diagTick = 0;
++        self->_diagPrevSys = 0;
++        self->_diagPrevAudio = 0;
++        self->_enqueuedFrames = 0;
++        self->_enqueuedCalls = 0;
++        self->_droppedFrames = 0;
++        self->_dropEvents = 0;
++        self->_lastEnqueueTick = 0;
++        self->_feedUnderrunActive = NO;
++        self->_feedPrevEnqF = 0;
++        self->_feedPrevConsC = 0;
++        self->_feedPrevTick = 0;
++        self->_feedLineCount = 0;
++        self->_rawEmptyLogBudget = 8;
++        self->_feedBurstUntil = 0;
++        self->_rawHighLastWarnTick = 0;
++        self->_sessionStartTick = vlc_tick_now();
++        self->_timingResume = NO;
++        self->_timingHoldLastTick = 0;
++        [self dropRawLocked];
++        float rate = self->_playbackRate;
++        if (self->_fmtValid) {
++            if ([self openTempoFilterLocked:&self->_fmtAudio])
++                [self setTempoRateLocked:rate];
++        } else {
++            [self setTempoRateLocked:rate];
++        }
++    });
++}
++
++- (void)drain
++{
++    dispatch_async(_queue, ^{
++        [self feedWallFromRawLocked];
++        if (self->_pendingWall == 0 && self->_rawChain == NULL)
++            aout_DrainedReport(self->_aout);
++        else
++            self->_draining = YES;
++    });
++}
++
++- (float)cubicGainForVolume:(float)volume
++{
++    float g = volume * volume * volume;
++    if (g < 0.f) return 0.f;
++    if (g > 1.f) return 1.f;
++    return g;
++}
++
++- (void)applyMixerGain
++{
++    if (_engine == nil) return;
++    _engine.mainMixerNode.outputVolume =
++        _muted ? 0.f : [self cubicGainForVolume:_volume];
++}
++
++- (void)setVolume:(float)volume
++{
++    _volume = volume;
++    dispatch_async(_queue, ^{ [self applyMixerGain]; });
++    aout_VolumeReport(_aout, volume);
++}
++
++- (void)setMute:(BOOL)mute
++{
++    _muted = mute;
++    dispatch_async(_queue, ^{ [self applyMixerGain]; });
++    aout_MuteReport(_aout, mute);
++}
++
++@end
++
++
+ static int API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS), watchos(MIN_WATCHOS) VISIONOS_API_AVAILABLE)
+ DeviceSelect(audio_output_t *aout, const char *name)
+ {
+-    VLCAVSample *sys = (__bridge VLCAVSample*)aout->sys;
++    id sys = (__bridge id)aout->sys;
+ 
+     [sys selectDevice:name];
+ 
+@@ -559,7 +2107,7 @@ DeviceSelect(audio_output_t *aout, const char *name)
+ static int API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS), watchos(MIN_WATCHOS) VISIONOS_API_AVAILABLE)
+ MuteSet(audio_output_t *aout, bool mute)
+ {
+-    VLCAVSample *sys = (__bridge VLCAVSample*)aout->sys;
++    id sys = (__bridge id)aout->sys;
+ 
+     [sys setMute:mute];
+ 
+@@ -569,7 +2117,7 @@ MuteSet(audio_output_t *aout, bool mute)
+ static int API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS), watchos(MIN_WATCHOS) VISIONOS_API_AVAILABLE)
+ VolumeSet(audio_output_t *aout, float volume)
+ {
+-    VLCAVSample *sys = (__bridge VLCAVSample*)aout->sys;
++    id sys = (__bridge id)aout->sys;
+ 
+     [sys setVolume:volume];
+ 
+@@ -579,7 +2127,7 @@ VolumeSet(audio_output_t *aout, float volume)
+ static void API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS), watchos(MIN_WATCHOS) VISIONOS_API_AVAILABLE)
+ Flush(audio_output_t *aout)
+ {
+-    VLCAVSample *sys = (__bridge VLCAVSample*)aout->sys;
++    id sys = (__bridge id)aout->sys;
+ 
+     [sys flush];
+ }
+@@ -587,7 +2135,7 @@ Flush(audio_output_t *aout)
+ static void API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS), watchos(MIN_WATCHOS) VISIONOS_API_AVAILABLE)
+ Pause(audio_output_t *aout, bool pause, vlc_tick_t date)
+ {
+-    VLCAVSample *sys = (__bridge VLCAVSample*)aout->sys;
++    id sys = (__bridge id)aout->sys;
+ 
+     [sys pause:pause date:date];
+ }
+@@ -595,7 +2143,7 @@ Pause(audio_output_t *aout, bool pause, vlc_tick_t date)
+ static void API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS), watchos(MIN_WATCHOS) VISIONOS_API_AVAILABLE)
+ Play(audio_output_t *aout, block_t *block, vlc_tick_t date)
+ {
+-    VLCAVSample *sys = (__bridge VLCAVSample*)aout->sys;
++    id sys = (__bridge id)aout->sys;
+ 
+     [sys play:block date:date];
+ }
+@@ -603,7 +2151,7 @@ Play(audio_output_t *aout, block_t *block, vlc_tick_t date)
+ static void API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS), watchos(MIN_WATCHOS) VISIONOS_API_AVAILABLE)
+ Stop(audio_output_t *aout)
+ {
+-    VLCAVSample *sys = (__bridge VLCAVSample*)aout->sys;
++    id sys = (__bridge id)aout->sys;
+ 
+     [sys stop];
+ }
+@@ -611,19 +2159,35 @@ Stop(audio_output_t *aout)
+ static int API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS), watchos(MIN_WATCHOS) VISIONOS_API_AVAILABLE)
+ Start(audio_output_t *aout, audio_sample_format_t *restrict fmt)
+ {
+-    VLCAVSample *sys = (__bridge VLCAVSample*)aout->sys;
++    id sys = (__bridge id)aout->sys;
+ 
+     return [sys start:fmt] ? VLC_SUCCESS : VLC_EGENERIC;
+ }
+ 
++/* Only wired for the VLCAudioEngine backend (see Open). */
++static void API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS), watchos(MIN_WATCHOS) VISIONOS_API_AVAILABLE)
++Drain(audio_output_t *aout)
++{
++    id sys = (__bridge id)aout->sys;
++    [sys drain];
++}
++
++static void API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS), watchos(MIN_WATCHOS) VISIONOS_API_AVAILABLE)
++ChangeRate(audio_output_t *aout, float rate)
++{
++    id sys = (__bridge id)aout->sys;
++    [sys changeRate:rate];
++}
++
+ static void
+ Close(vlc_object_t *obj)
+ {
+     if (@available(macOS MIN_MACOS, iOS MIN_IOS, tvOS MIN_TVOS, watchOS MIN_WATCHOS VISIONOS_AVAILABLE, *))
+     {
+         audio_output_t *aout = (audio_output_t *)obj;
+-        /* Transfer ownership back from VLC to ARC so that it can be released. */
+-        VLCAVSample *sys = (__bridge_transfer VLCAVSample*)aout->sys;
++        /* Transfer ownership back from VLC to ARC so that it can be released.
++         * id: sys is VLCAVSample or VLCAudioEngine depending on the backend. */
++        id sys = (__bridge_transfer id)aout->sys;
+         (void) sys;
+     }
+ }
+@@ -635,6 +2199,40 @@ Open(vlc_object_t *obj)
+ 
+     if (@available(macOS MIN_MACOS, iOS MIN_IOS, tvOS MIN_TVOS, watchOS MIN_WATCHOS VISIONOS_AVAILABLE, *))
+     {
++        /* Opt-in pitch-corrected AVAudioEngine backend (Settings → Pitch-
++         * Corrected Speed sets the "avsb-pitch-engine" var). Default path stays
++         * the proven AVSampleBufferAudioRenderer (VLCAVSample) — no regression.
++         * Both backends expose the same selectors, so the shared C glue routes
++         * to whichever `aout->sys` holds; the engine additionally gets drain +
++         * change_rate and declares "aout-handles-rate" (patch 0012, raw PCM). */
++        /* ALWAYS create "aout-handles-rate" on this aout. filters.c (patch 0012)
++         * does var_InheritBool(obj, "aout-handles-rate") for every aout; if the
++         * var is absent, inherit falls through to config_GetInt which NULL-derefs
++         * under NDEBUG when the name is not a registered config. Engine path =
++         * true (raw PCM, module owns rate); stock path = false (core scaletempo). */
++        var_Create(aout, "aout-handles-rate", VLC_VAR_BOOL);
++
++        if (var_InheritBool(aout, "avsb-pitch-engine"))
++        {
++            aout->sys = (__bridge_retained void*) [[VLCAudioEngine alloc] init:aout];
++            if (aout->sys == nil)
++                return VLC_EGENERIC;
++
++            aout->start = Start;
++            aout->stop = Stop;
++            aout->play = Play;
++            aout->pause = Pause;
++            aout->flush = Flush;
++            aout->drain = Drain;
++            aout->change_rate = ChangeRate;
++            aout->volume_set = VolumeSet;
++            aout->mute_set = MuteSet;
++
++            var_SetBool(aout, "aout-handles-rate", true);
++
++            return VLC_SUCCESS;
++        }
++
+         aout->sys = (__bridge_retained void*) [[VLCAVSample alloc] init:aout];
+         if (aout->sys == nil)
+             return VLC_EGENERIC;
+@@ -644,19 +2242,37 @@ Open(vlc_object_t *obj)
+         aout->play = Play;
+         aout->pause = Pause;
+         aout->flush = Flush;
++        /* Real drain on the stock path (F20). Same C Drain glue as the
++         * engine backend — VLCAVSample implements -drain and reports when
++         * the synchronizer has played every enqueued sample. Without this
++         * the core uses a short GetDelay deadline and cuts the silent tail. */
++        aout->drain = Drain;
+         aout->volume_set = VolumeSet;
+         aout->mute_set = MuteSet;
+         aout->device_select = DeviceSelect;
+ 
++        var_SetBool(aout, "aout-handles-rate", false);
++
+         return VLC_SUCCESS;
+     }
+     return VLC_EGENERIC;
+ }
+ 
++#define AVSB_PITCH_ENGINE_TEXT N_("Pitch-corrected rate engine")
++#define AVSB_PITCH_ENGINE_LONGTEXT N_( \
++    "Use AVAudioEngine + AVAudioUnitTimePitch (render-time rate) instead of " \
++    "AVSampleBufferAudioRenderer. Instant pitch-corrected rate changes " \
++    "(hold-2×). Off by default — the stock renderer is the safe path.")
++
+ vlc_module_begin ()
+     set_shortname("avsample")
+     set_description(N_("AVSampleBufferAudioRenderer output"))
+     set_capability("audio output", 100)
+     set_subcategory(SUBCAT_AUDIO_AOUT)
+     set_callbacks(Open, Close)
++    /* MUST be registered: var_InheritBool → config_GetInt asserts/derefs
++     * NULL when the name is unknown (NDEBUG builds just SIGSEGV). The app
++     * sets :avsb-pitch-engine=0/1 per media; default off = stock path. */
++    add_bool("avsb-pitch-engine", false, AVSB_PITCH_ENGINE_TEXT,
++             AVSB_PITCH_ENGINE_LONGTEXT)
+ vlc_module_end ()

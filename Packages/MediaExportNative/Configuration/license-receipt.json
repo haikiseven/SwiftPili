@@ -1,0 +1,67 @@
+[
+  {
+    "source": "build/export-media/sources/ffmpeg/LICENSE.md",
+    "file": "Packages/MediaExportNative/Configuration/Licenses/ffmpeg-LICENSE.md",
+    "sha256": "e6dc72d5665a1ebd6dcc841de59278dad4ca77ecc47b03f1064a55c3e9ea8bb8"
+  },
+  {
+    "source": "build/export-media/sources/ffmpeg/COPYING.LGPLv2.1",
+    "file": "Packages/MediaExportNative/Configuration/Licenses/ffmpeg-COPYING.LGPLv2.1",
+    "sha256": "246041b6ecf9bc32d718a62c57877c78b5eb397b6467e74ed7ae2626ab189c30"
+  },
+  {
+    "source": "build/export-media/sources/ffmpeg/COPYING.GPLv2",
+    "file": "Packages/MediaExportNative/Configuration/Licenses/ffmpeg-COPYING.GPLv2",
+    "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
+  },
+  {
+    "source": "build/export-media/sources/ffmpeg/COPYING.GPLv3",
+    "file": "Packages/MediaExportNative/Configuration/Licenses/ffmpeg-COPYING.GPLv3",
+    "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
+  },
+  {
+    "source": "build/export-media/sources/ffmpeg/COPYING.LGPLv3",
+    "file": "Packages/MediaExportNative/Configuration/Licenses/ffmpeg-COPYING.LGPLv3",
+    "sha256": "da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768"
+  },
+  {
+    "source": "build/export-media/sources/dav1d/COPYING",
+    "file": "Packages/MediaExportNative/Configuration/Licenses/dav1d-COPYING",
+    "sha256": "dd92c3c2247c5651606fc23a5e2d6a1ebc5ace9a3e49cbde0e12f05ad1cb1ee5"
+  },
+  {
+    "source": "build/export-media/sources/libplacebo/LICENSE",
+    "file": "Packages/MediaExportNative/Configuration/Licenses/libplacebo-LICENSE",
+    "sha256": "b3aa400aca6d2ba1f0bd03bd98d03d1fe7489a3bbb26969d72016360af8a5c9d"
+  },
+  {
+    "source": "build/export-media/sources/moltenvk/LICENSE",
+    "file": "Packages/MediaExportNative/Configuration/Licenses/moltenvk-LICENSE",
+    "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+  },
+  {
+    "source": "build/export-media/sources/glslang/LICENSE.txt",
+    "file": "Packages/MediaExportNative/Configuration/Licenses/glslang-LICENSE.txt",
+    "sha256": "17e70c676e1521ff3e4686f04a2053d93a7e28a33be8de7ec37ab0ff72feb677"
+  },
+  {
+    "source": "build/export-media/sources/spirv-cross/LICENSE",
+    "file": "Packages/MediaExportNative/Configuration/Licenses/spirv-cross-LICENSE",
+    "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+  },
+  {
+    "source": "build/export-media/sources/fast-float/LICENSE-APACHE",
+    "file": "Packages/MediaExportNative/Configuration/Licenses/fast-float-LICENSE-APACHE",
+    "sha256": "097a889aa954d04e088b790b10a4014d6189561d0a6013935a73ce3d4ddaaf06"
+  },
+  {
+    "source": "build/export-media/sources/fast-float/LICENSE-BOOST",
+    "file": "Packages/MediaExportNative/Configuration/Licenses/fast-float-LICENSE-BOOST",
+    "sha256": "8d8291caf1cee26d23acf3eb67c9f9a2d58f1c681b16a4fbe8cbfb9e3c0b5a9b"
+  },
+  {
+    "source": "build/export-media/sources/fast-float/LICENSE-MIT",
+    "file": "Packages/MediaExportNative/Configuration/Licenses/fast-float-LICENSE-MIT",
+    "sha256": "e562f3f974ced7e69dd1db77b820b36bcf8f30377f1aa105723fba449c53c4e6"
+  }
+]
