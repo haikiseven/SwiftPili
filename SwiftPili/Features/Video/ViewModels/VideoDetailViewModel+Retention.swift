@@ -1,0 +1,347 @@
+import Foundation
+
+/// Whether a repeated activation of a detail screen is a load at all.
+///
+/// **The defect this exists for.** `VideoDetailView`'s `.task` is replayed by
+/// SwiftUI every time the screen reappears, and `activateIfNeeded`
+/// made only the LEASE claim conditional — `activate` →
+/// `load(id:owner:lease:)` ran unconditionally. That was invisible while the
+/// only way back onto this screen was a fresh push. A UIKit `.fullScreen`
+/// presentation of ours removes the presenter's view and later puts it back, so
+/// the replay now lands on a screen whose player never stopped: the device
+/// capture recorded a session live at `mt=46.85` torn down by
+/// `stop(reason=internalReload)` and reopened at 0, because the load path takes
+/// its start position from the watch-history resume setting and never asks the
+/// running session (`.trellis/tasks/09-05-fullscreen-presentation-host/`
+/// `research/evidence/stage-2a-verified-live-playback-2026-09-05.txt`).
+///
+/// **Why the cure is not "carry the position across the reload".** Reopening a
+/// session that never stopped is pointless work at any position — the reload
+/// itself is the defect, not the position it resumes at.
+///
+/// **Every fact is asked at the decision point.** Nothing here is a remembered
+/// "already loaded" flag: that is the failure shape `PlayerPresentationHostPresence`
+/// documents (a bool that is set and cleared goes stale on the one path nobody
+/// tested). The default answer is LOAD — a spurious reload costs a reopen, while
+/// a wrongly skipped load leaves a screen with no content and no second chance,
+/// since `.task` does not replay again on its own.
+enum VideoDetailReactivationPolicy {
+    enum Decision {
+        case alreadyLive
+        case dataRetained
+        case fullLoad
+    }
+
+    static let retainsScreenData = ProcessInfo.processInfo.environment["DETAIL_RETAIN_SCREEN_DATA"] != "0"
+    static let screenDataMaxAge: Duration = .seconds(600)
+
+    static func decision(alreadyLive: Bool, dataRetained: Bool) -> Decision {
+        if alreadyLive { return .alreadyLive }
+        return dataRetained ? .dataRetained : .fullLoad
+    }
+
+    /// The complete input, read in one turn. Every `nil` means "not known", and
+    /// not-known always resolves to "load".
+    struct Facts: Equatable, Sendable {
+        /// What this activation asks for, against what the screen last loaded.
+        let requestedID: VideoID
+        let loadedID: VideoID?
+        /// The screen already holds the metadata a load would fetch
+        /// (`videoInfo`) — without it there is nothing on screen to keep.
+        let hasLoadedMetadata: Bool
+        /// The media identity the screen believes it is showing.
+        let screenAid: Int?
+        let screenCid: Int?
+        /// A settled refusal or a failed load on the screen's own side. The
+        /// `.task` replay is the retry, so it must reach a real load.
+        let screenReportedFailure: Bool
+        /// Ownership, exactly as `load(id:owner:lease:)` already checks it: a
+        /// retained lease is only worth something while it is still the
+        /// player's current one.
+        let requestedOwner: String
+        let retainedLeaseOwner: String?
+        let retainedLeaseIsCurrentOwner: Bool
+        /// What this screen would load.
+        let targetMode: PlayerMode
+        let targetSource: PlayerViewModel.StreamSource
+        /// What the player is running right now.
+        let playerMode: PlayerMode
+        let playerAid: Int?
+        let playerCid: Int?
+        let playerSource: PlayerViewModel.StreamSource
+        /// `currentURL != nil`. It is the live witness that a source is open,
+        /// because `stop()` clears it — whereas `currentAid`/`currentCid`
+        /// deliberately survive a stop, so they identify content but can never
+        /// prove it is running.
+        let playerHasSource: Bool
+        /// The player surfaced an error or a settled unavailability. Same rule
+        /// as `screenReportedFailure`: a failure must stay retryable.
+        let playerReportedFailure: Bool
+    }
+
+    static func isAlreadyLive(_ facts: Facts) -> Bool {
+        let targetMatchesLoadedContent = facts.loadedID == facts.requestedID
+            && facts.loadedID != nil
+        return PlayerDetailReactivationPolicy.isAlreadyLive(
+            .init(
+                targetMatchesLoadedContent: targetMatchesLoadedContent,
+                hasLoadedMetadata: facts.hasLoadedMetadata,
+                screenAid: facts.screenAid,
+                screenCid: facts.screenCid,
+                screenReportedFailure: facts.screenReportedFailure,
+                requestedOwner: facts.requestedOwner,
+                retainedLeaseOwner: facts.retainedLeaseOwner,
+                retainedLeaseIsCurrentOwner: facts.retainedLeaseIsCurrentOwner,
+                targetMode: facts.targetMode,
+                targetSource: facts.targetSource,
+                playerMode: facts.playerMode,
+                playerAid: facts.playerAid,
+                playerCid: facts.playerCid,
+                playerSource: facts.playerSource,
+                playerHasSource: facts.playerHasSource,
+                playerReportedFailure: facts.playerReportedFailure
+            )
+        )
+    }
+}
+
+extension VideoDetailViewModel {
+    /// Evidence of a completed page, independent of the lease used to play it.
+    struct CompletedScreenDataReceipt: Equatable {
+        let id: VideoID
+        let aid: Int
+        let cid: Int
+        let dataRequest: UInt64
+        let accountSession: UUID
+        let fetchedAt: ContinuousClock.Instant
+
+        func replacingPart(_ cid: Int) -> Self {
+            .init(id: id, aid: aid, cid: cid, dataRequest: dataRequest,
+                  accountSession: accountSession, fetchedAt: fetchedAt)
+        }
+    }
+
+    struct RetainedPlaybackRequest {
+        let serial: UInt64
+        let data: CompletedScreenDataReceipt
+        let lease: PlayerOwnerLease
+        let traceToken: StartupTrace.Token
+    }
+
+    struct InteractionStateReceipt: Equatable {
+        let dataRequest: UInt64
+        let aid: Int
+        let accountSession: UUID
+    }
+
+    func invalidateRetainedScreenData() {
+        if let source = currentCommentSource, let accountSession = metadataAccountSession {
+            VideoDetailScreenDataCache.remove(id: source.videoID, accountSession: accountSession)
+        }
+        retainedScreenData = nil
+        retireRetainedPlayback(reason: "screen-data-invalidated")
+    }
+
+    func eligibleRetainedScreenData(for id: VideoID) -> CompletedScreenDataReceipt? {
+        guard VideoDetailReactivationPolicy.retainsScreenData,
+              let data = retainedScreenData, data.id == id,
+              data.fetchedAt.duration(to: .now) <= VideoDetailReactivationPolicy.screenDataMaxAge,
+              matchesRetainedScreenData(data), !isLoading,
+              error == nil, unavailability == nil,
+              let info = videoInfo,
+              info.pages?.contains(where: { $0.cid == data.cid }) == true
+                || ((info.pages?.isEmpty ?? true) && data.cid == info.cid)
+        else { return nil }
+        return data
+    }
+
+    private func matchesRetainedScreenData(_ data: CompletedScreenDataReceipt) -> Bool {
+        data.accountSession == AuthManager.shared.sessionGeneration
+            && metadataAccountSession == data.accountSession
+            && currentCommentSource?.videoID == data.id
+            && currentCommentSource?.aid == data.aid
+            && commentSourceGeneration == data.dataRequest
+            && videoInfo?.aid == data.aid && currentCid == data.cid
+    }
+
+    func retainCompletedScreenData(
+        _ data: CompletedScreenDataReceipt, relatedLoaded: Bool, partSwitchPending: Bool
+    ) {
+        guard !Task.isCancelled, relatedLoaded, !partSwitchPending,
+              matchesRetainedScreenData(data), commentsReadyForNavigation,
+              error == nil, unavailability == nil,
+              PlayerViewModel.shared.error == nil, PlayerViewModel.shared.unavailability == nil else { return }
+        retainedScreenData = data
+        cacheCompletedScreenData()
+    }
+
+    func retainCompletedPart(cid: Int) {
+        guard !Task.isCancelled, let data = retainedScreenData,
+              matchesRetainedScreenData(data.replacingPart(cid)),
+              PlayerViewModel.shared.error == nil, PlayerViewModel.shared.unavailability == nil else { return }
+        retainedScreenData = data.replacingPart(cid)
+    }
+
+    /// Only playback work is retired. Completed comments, drafts and metadata
+    /// keep their original request/source and remain valid for business actions.
+    func retireRetainedPlayback(reason: String) {
+        retainedPlaybackAdmission.revoke()
+        guard let request = retainedPlaybackRequest else { return }
+        retainedPlaybackRequest = nil
+        StartupTrace.abort(reason, token: request.traceToken)
+        if startupTraceToken == request.traceToken { startupTraceToken = nil }
+    }
+
+    private func ownsRetainedPlayback(_ request: RetainedPlaybackRequest) -> Bool {
+        retainedPlaybackAdmission.admits(request.serial)
+            && retainedScreenData == request.data && matchesRetainedScreenData(request.data)
+            && playerLease == request.lease && PlayerViewModel.shared.isCurrentOwner(request.lease)
+    }
+
+    func resumeRetainedPlayback(
+        data: CompletedScreenDataReceipt, owner: String, lease retainedLease: PlayerOwnerLease?
+    ) async -> Bool {
+        guard !Task.isCancelled, matchesRetainedScreenData(data), let info = videoInfo else { return false }
+        let player = PlayerViewModel.shared
+        let lease: PlayerOwnerLease
+        if let retainedLease {
+            guard retainedLease.owner == owner, player.isCurrentOwner(retainedLease) else { return false }
+            lease = retainedLease
+        } else {
+            lease = player.claimOwnerLease(owner: owner)
+        }
+        adoptPlayerLease(lease)
+        retireRetainedPlayback(reason: "playback-replaced")
+        let request = RetainedPlaybackRequest(
+            serial: retainedPlaybackAdmission.begin(), data: data, lease: lease,
+            traceToken: StartupTrace.begin("vod-detail-retained")
+        )
+        retainedPlaybackRequest = request
+        startupTraceToken = request.traceToken
+        var succeeded = false
+        defer { finishRetainedPlayback(request, succeeded: succeeded) }
+        let page = info.pages?.first(where: { $0.cid == data.cid })
+        let resumeLookup = await PlayerViewModel.serverResumePoint(
+            aid: data.aid, cid: data.cid,
+            duration: TimeInterval(page?.duration ?? info.duration), ownerLease: lease
+        )
+        guard !Task.isCancelled, ownsRetainedPlayback(request),
+              case .load(let resumeAt) = resumeLookup.loadDecision() else { return false }
+        StartupTrace.mark("resume-point-ready", token: request.traceToken)
+        player.setAmbientCoverURL(info.pic, ownerLease: lease)
+        await player.loadVOD(
+            aid: data.aid, cid: data.cid, bvid: info.bvid, resumeAt: resumeAt,
+            portraitHint: page?.dimension?.isPortrait ?? info.dimension?.isPortrait,
+            owner: owner, ownerLease: lease, startupTraceToken: request.traceToken,
+            requestAdmission: { [weak self] in self?.ownsRetainedPlayback(request) == true }
+        )
+        guard !Task.isCancelled, ownsRetainedPlayback(request) else { return false }
+        guard player.error == nil, player.unavailability == nil else {
+            retainedScreenData = nil
+            return false
+        }
+        player.setNowPlaying(
+            title: info.title,
+            artist: page.flatMap { $0.part.isEmpty ? nil : "P\($0.page) \($0.part)" } ?? info.owner.name,
+            cover: info.pic
+        )
+        installNextPartHandler()
+        restoreRetainedSideWork(request, info: info)
+        PlayerLog.log("[VideoDetailVM] retained page resumed aid=\(data.aid) cid=\(data.cid) owner=\(owner)")
+        succeeded = true
+        return true
+    }
+
+    private func finishRetainedPlayback(_ request: RetainedPlaybackRequest, succeeded: Bool) {
+        guard retainedPlaybackRequest?.serial == request.serial else { return }
+        retainedPlaybackRequest = nil
+        if !succeeded {
+            StartupTrace.abort("retained-playback-withdrawn", token: request.traceToken)
+            if startupTraceToken == request.traceToken { startupTraceToken = nil }
+        }
+    }
+
+    private func restoreRetainedSideWork(_ request: RetainedPlaybackRequest, info: VideoInfo) {
+        let data = request.data
+        if currentTagSource == nil {
+            let tags = prepareTags(aid: data.aid, cid: data.cid) { [weak self] in
+                self?.ownsRetainedPlayback(request) == true
+            }
+            Task { await self.loadTags(tags) }
+        }
+        if onlineCount == nil { refreshOnlineCount(request: data.dataRequest, lease: request.lease) }
+        let interactionReceipt = InteractionStateReceipt(
+            dataRequest: data.dataRequest, aid: data.aid, accountSession: data.accountSession
+        )
+        if AuthManager.shared.isLoggedIn, interactionStateReceipt != interactionReceipt {
+            Task { [weak self] in
+                guard let self, self.ownsRetainedPlayback(request) else { return }
+                await self.loadInteractionState(
+                    aid: data.aid, request: data.dataRequest, lease: request.lease,
+                    accountSession: data.accountSession
+                )
+            }
+        }
+        let sponsorBlock = SponsorBlockManager.shared
+        if sponsorBlock.loadedVideoID != info.bvid || sponsorBlock.loadedCID != data.cid {
+            Task { [weak self] in
+                guard self?.ownsRetainedPlayback(request) == true else { return }
+                await sponsorBlock.load(videoID: info.bvid, cid: data.cid)
+            }
+        }
+    }
+}
+
+extension VideoDetailViewModel {
+    struct InitialScreenMetadata {
+        let info: VideoInfo
+        let fetchedAt: ContinuousClock.Instant
+        let readyMark: String
+    }
+
+    /// Only a fresh model may hydrate a snapshot. Retry, expiry and an existing
+    /// model's incomplete page still take their original full-fetch path.
+    func initialScreenDataCandidate(for id: VideoID) -> VideoDetailScreenDataSnapshot? {
+        guard VideoDetailReactivationPolicy.retainsScreenData,
+              videoInfo == nil, currentCommentSource == nil,
+              error == nil, unavailability == nil else { return nil }
+        return VideoDetailScreenDataCache.snapshot(for: id)
+    }
+
+    func initialScreenMetadata(
+        id: VideoID, cached: VideoDetailScreenDataSnapshot?
+    ) async throws -> InitialScreenMetadata {
+        if let cached {
+            return .init(info: cached.info, fetchedAt: cached.fetchedAt, readyMark: "video-info-cache-hit")
+        }
+        let info = try await VideoAPI.getVideoInfo(id: id)
+        return .init(info: info, fetchedAt: .now, readyMark: "video-info-ready")
+    }
+
+    func initialRelatedVideos(aid: Int, cached: VideoDetailScreenDataSnapshot?) async throws -> [VideoCard] {
+        if let cached { return cached.related }
+        return try await VideoAPI.getRelated(aid: aid)
+    }
+
+    func loadInitialTags(_ request: TagRequest, cached: VideoDetailScreenDataSnapshot?) {
+        if let cached, let tags = cached.tags, tags.cid == request.source.cid,
+           cached.accountSession == AuthManager.shared.sessionGeneration, request.admits() {
+            tagPublication = TagPublication(source: request.source, tags: tags.values)
+            return
+        }
+        Task { await self.loadTags(request) }
+    }
+
+    func cacheCompletedScreenData() {
+        guard VideoDetailReactivationPolicy.retainsScreenData,
+              let data = retainedScreenData, matchesRetainedScreenData(data), let info = videoInfo,
+              error == nil, unavailability == nil else { return }
+        let tags = currentTagSource.flatMap { source in
+            tagPublication.map { VideoDetailScreenDataSnapshot.Tags(cid: source.cid, values: $0.tags) }
+        }
+        VideoDetailScreenDataCache.store(.init(
+            id: data.id, accountSession: data.accountSession, fetchedAt: data.fetchedAt,
+            info: info, related: relatedVideos, tags: tags
+        ))
+    }
+}
