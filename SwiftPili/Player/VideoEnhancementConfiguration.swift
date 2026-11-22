@@ -122,6 +122,70 @@ enum VideoSuperResolutionScale: Int, CaseIterable, Identifiable, Sendable {
     }
 }
 
+enum VideoEnhancementBufferBudget: String, CaseIterable, Identifiable, Sendable {
+    case automatic
+    case mb256
+    case mb512
+    case gb1
+    case gb2
+
+    var id: Self { self }
+
+    /// nil = automatic (25% of currently available memory, 128 MB–1 GB).
+    var fixedBytes: Int? {
+        switch self {
+        case .automatic: nil
+        case .mb256: 256 << 20
+        case .mb512: 512 << 20
+        case .gb1: 1 << 30
+        case .gb2: 2 << 30
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .automatic: String(localized: "Automatic")
+        case .mb256: "256 MB"
+        case .mb512: "512 MB"
+        case .gb1: "1 GB"
+        case .gb2: "2 GB"
+        }
+    }
+}
+
+enum VideoEnhancementLookahead: Int, CaseIterable, Identifiable, Sendable {
+    case halfSecond = 500
+    case oneSecond = 1000
+    case twoSeconds = 2000
+
+    var id: Self { self }
+    var seconds: TimeInterval { Double(rawValue) / 1000 }
+
+    var label: String {
+        switch self {
+        case .halfSecond: String(localized: "Up to 0.5 s")
+        case .oneSecond: String(localized: "Up to 1 s")
+        case .twoSeconds: String(localized: "Up to 2 s")
+        }
+    }
+}
+
+enum VideoEnhancementAdaptiveSensitivity: String, CaseIterable, Identifiable, Sendable {
+    case sensitive
+    case standard
+    case relaxed
+
+    var id: Self { self }
+
+    var label: String {
+        switch self {
+        case .sensitive: String(localized: "Sensitive")
+        case .standard: String(localized: "Standard")
+        case .relaxed: String(localized: "Relaxed")
+        }
+    }
+}
+
 struct VideoEnhancementConfiguration: Equatable, Sendable {
     var superResolutionMode: VideoSuperResolutionMode = .off
     var frameInterpolationEnabled: Bool = false
@@ -131,6 +195,12 @@ struct VideoEnhancementConfiguration: Equatable, Sendable {
     /// When enabled, the runtime governor may reduce quality if the device cannot keep up,
     /// runs warm, or is in Low Power Mode. Serious thermal state always pauses enhancement.
     var adaptiveQualityEnabled: Bool = true
+    var adaptiveSensitivity: VideoEnhancementAdaptiveSensitivity = .standard
+    /// Memory allowed for enhancement output buffers waiting in the display queue.
+    var bufferBudget: VideoEnhancementBufferBudget = .automatic
+    var maxLookahead: VideoEnhancementLookahead = .oneSecond
+    /// Cap SR output to the on-screen pixel size (and skip SR when it would not be visible).
+    var limitToScreenResolution: Bool = true
 
     static let disabled = Self()
 
@@ -382,6 +452,37 @@ enum VideoEnhancementPreferences {
             return VideoSuperResolutionScale(rawValue: raw) ?? .two
         }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: superResolutionScaleKey) }
+    }
+
+    private static let adaptiveSensitivityKey = "experimental_video_enhancement_adaptive_sensitivity"
+    private static let bufferBudgetKey = "experimental_video_enhancement_buffer_budget"
+    private static let maxLookaheadKey = "experimental_video_enhancement_max_lookahead_ms"
+    private static let limitToScreenKey = "experimental_video_enhancement_limit_to_screen"
+
+    static var adaptiveSensitivity: VideoEnhancementAdaptiveSensitivity {
+        get {
+            UserDefaults.standard.string(forKey: adaptiveSensitivityKey)
+                .flatMap(VideoEnhancementAdaptiveSensitivity.init(rawValue:)) ?? .standard
+        }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: adaptiveSensitivityKey) }
+    }
+
+    static var bufferBudget: VideoEnhancementBufferBudget {
+        get {
+            UserDefaults.standard.string(forKey: bufferBudgetKey)
+                .flatMap(VideoEnhancementBufferBudget.init(rawValue:)) ?? .automatic
+        }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: bufferBudgetKey) }
+    }
+
+    static var maxLookahead: VideoEnhancementLookahead {
+        get { VideoEnhancementLookahead(rawValue: UserDefaults.standard.integer(forKey: maxLookaheadKey)) ?? .oneSecond }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: maxLookaheadKey) }
+    }
+
+    static var limitToScreenResolution: Bool {
+        get { UserDefaults.standard.object(forKey: limitToScreenKey) as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: limitToScreenKey) }
     }
 
     private static let adaptiveQualityKey = "experimental_video_enhancement_adaptive_quality"

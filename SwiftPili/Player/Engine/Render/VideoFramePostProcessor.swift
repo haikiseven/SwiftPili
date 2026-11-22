@@ -1,6 +1,7 @@
 import CoreMedia
 import CoreVideo
 import Foundation
+import os
 
 private struct VideoFrameEnhancementJob: Sendable {
     let current: PostProcessFrameBox
@@ -54,6 +55,7 @@ final class VideoFramePostProcessor {
     private var warmTaskCancelled = false
     private(set) var isWarming = false
     private var structuralHoldUntil = ContinuousClock.now
+    private var automaticBudget: (bytes: Int, sampledAt: ContinuousClock.Instant)?
     private var lastInputSize: (width: Int, height: Int)?
 
     /// User-requested configuration. The governor may degrade it at runtime; see `effectiveConfiguration`.
@@ -106,7 +108,7 @@ final class VideoFramePostProcessor {
         let effective = effectiveConfiguration
         let requested = effective.superResolutionScale.factor
         guard effective.superResolutionMode != .off else { return nil }
-        guard let displaySurface else { return requested }
+        guard configuration.limitToScreenResolution, let displaySurface else { return requested }
         return displaySurface.superResolutionCap(
             inputWidth: CVPixelBufferGetWidth(frame.pixelBuffer), inputHeight: CVPixelBufferGetHeight(frame.pixelBuffer),
             requested: requested, mode: effective.superResolutionMode
@@ -316,11 +318,12 @@ final class VideoFramePostProcessor {
             if !effective.isRequested { resetBufferPlan() }
             return
         }
+        let now = ContinuousClock.now
         let plan = VideoEnhancementBufferPlan.make(
             sourceFPS: fps, midpointsPerSource: lastMidpointsPerSource,
-            upscaledBytes: lastUpscaledBytes, interpolatedBytes: original.pixelBuffer.enhancementByteSize
+            upscaledBytes: lastUpscaledBytes, interpolatedBytes: original.pixelBuffer.enhancementByteSize,
+            budgetBytes: bufferBudgetBytes(now: now), maximumLead: configuration.maxLookahead.seconds
         )
-        let now = ContinuousClock.now
         if plan.isMemoryBound, now >= structuralHoldUntil, governor.raiseStructuralFloor(now: now) {
             // Re-measure at the new level before judging again.
             structuralHoldUntil = now.advanced(by: .milliseconds(1500))
@@ -330,12 +333,27 @@ final class VideoFramePostProcessor {
                 PlayerLog.log(
                     "[PathA][enhancement] memory-bound fps=\(String(format: "%.0f", fps)) " +
                         "midpoints=\(midpointCount) srBytes=\(upscaled?.pixelBuffer.enhancementByteSize ?? 0) " +
-                        "budget=\(VideoEnhancementBufferPlan.memoryBudgetBytes >> 20)MB → level=\(governor.level)"
+                        "budget=\(plan.budgetBytes >> 20)MB → level=\(governor.level)"
                 )
             }
             return
         }
         applyBufferPlan(plan)
+    }
+
+    /// User-selected or automatic budget; halved for a minute after a system memory warning.
+    private func bufferBudgetBytes(now: ContinuousClock.Instant) -> Int {
+        var bytes: Int
+        if let fixed = configuration.bufferBudget.fixedBytes {
+            bytes = fixed
+        } else if let cached = automaticBudget, cached.sampledAt.duration(to: now) < .seconds(5) {
+            bytes = cached.bytes
+        } else {
+            bytes = VideoEnhancementBufferPlan.automaticBudget(currentUsageBytes: bufferPlan.estimatedBytes)
+            automaticBudget = (bytes, now)
+        }
+        if VideoEnhancementMemoryPressure.isUnderPressure { bytes /= 2 }
+        return bytes
     }
 
     private func resetBufferPlan() {
@@ -354,7 +372,9 @@ final class VideoFramePostProcessor {
         if PlayerLog.isCapturing {
             PlayerLog.log(
                 "[PathA][enhancement] buffer plan lead=\(String(format: "%.2f", plan.lead))s " +
-                    "srFrames=\(plan.superResolutionFrames) fiFramesPerPhase=\(plan.interpolationFramesPerPhase)"
+                    "srFrames=\(plan.superResolutionFrames) fiFramesPerPhase=\(plan.interpolationFramesPerPhase) " +
+                    "estimated=\(plan.estimatedBytes >> 20)MB budget=\(plan.budgetBytes >> 20)MB " +
+                    "memAvail=\(Int(os_proc_available_memory()) >> 20)MB"
             )
         }
     }

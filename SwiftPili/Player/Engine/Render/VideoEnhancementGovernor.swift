@@ -96,6 +96,25 @@ struct VideoEnhancementGovernor: Sendable {
         var probeFailureWindow: Duration = .seconds(10)
         /// Samples are ignored for this long after a seek / configuration change / flush storm.
         var discontinuityGrace: Duration = .milliseconds(1500)
+
+        static func preset(_ sensitivity: VideoEnhancementAdaptiveSensitivity) -> Self {
+            var tuning = Self()
+            switch sensitivity {
+            case .sensitive:
+                tuning.missRatio = 0.08
+                tuning.severeMissRatio = 0.25
+                tuning.overloadRatio = 0.9
+                tuning.baseCooldown = .seconds(15)
+            case .standard:
+                break
+            case .relaxed:
+                tuning.missRatio = 0.25
+                tuning.severeMissRatio = 0.6
+                tuning.overloadRatio = 1.2
+                tuning.baseCooldown = .seconds(6)
+            }
+            return tuning
+        }
     }
 
     private struct Window {
@@ -129,12 +148,12 @@ struct VideoEnhancementGovernor: Sendable {
 
     init(
         requested: VideoEnhancementConfiguration = .disabled,
-        tuning: Tuning = Tuning(),
+        tuning: Tuning? = nil,
         metalFXAvailable: Bool = Self.metalFXAvailable,
         now: ContinuousClock.Instant = .now
     ) {
         self.requested = requested
-        self.tuning = tuning
+        self.tuning = tuning ?? .preset(requested.adaptiveSensitivity)
         self.metalFXAvailable = metalFXAvailable
         window = Window(start: now)
         lastChange = now
@@ -163,7 +182,7 @@ struct VideoEnhancementGovernor: Sendable {
 
     /// Full reset: the user changed the configuration explicitly, so give it a fresh chance.
     mutating func reset(requested: VideoEnhancementConfiguration, now: ContinuousClock.Instant = .now) {
-        self = Self(requested: requested, tuning: tuning, metalFXAvailable: metalFXAvailable, now: now)
+        self = Self(requested: requested, metalFXAvailable: metalFXAvailable, now: now)
     }
 
     /// Steps the structural floor one effective rung below the current level. Never suspends

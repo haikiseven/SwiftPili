@@ -1267,6 +1267,18 @@
 "Low Power Mode" = "低电量模式";
 "Warming up" = "预热中";
 "Memory limited" = "内存限制";
+"Automatic" = "自动";
+"Up to 0.5 s" = "最多 0.5 秒";
+"Up to 1 s" = "最多 1 秒";
+"Up to 2 s" = "最多 2 秒";
+"Sensitive" = "灵敏";
+"Relaxed" = "宽松";
+"Limit to Screen Resolution" = "限制在屏幕分辨率";
+"Buffer Memory" = "缓冲内存";
+"Lookahead" = "预处理时长";
+"Degradation Sensitivity" = "降级灵敏度";
+"Advanced" = "高级";
+"Limit to Screen Resolution: super resolution never outputs more pixels than the video occupies on screen, and is skipped when it would not be visible. Buffer Memory: memory for enhanced frames waiting to be shown; Automatic uses 25% of currently available memory (128 MB–1 GB) and halves after a memory warning. Larger values allow higher output frame rates and a deeper lookahead, but too large may get the app terminated by the system. Lookahead: how far ahead frames are enhanced; deeper absorbs occasional slow frames but uses more memory. Degradation Sensitivity: how quickly quality is reduced when frames are missed." = "限制在屏幕分辨率：超分输出不超过视频在屏幕上实际占用的像素，放大后看不出差别时直接跳过超分。缓冲内存：等待显示的增强帧可占用的内存；自动 = 当前剩余可用内存的 25%（128 MB–1 GB），收到内存警告后减半。调大可支持更高输出帧率和更长预处理，但过大可能被系统强制退出。预处理时长：提前多久开始增强，越长越能吸收偶发的慢帧，但更占内存。降级灵敏度：漏帧后多快降低画质。";
 "Screen resolution reached" = "已达屏幕分辨率";
 "Performance limited" = "性能不足";
 "(Reduced · %@)" = "(已降级 · %@)";

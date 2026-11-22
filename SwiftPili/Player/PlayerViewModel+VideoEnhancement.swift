@@ -39,7 +39,11 @@ extension PlayerViewModel {
             interpolationRate: videoInterpolationRate,
             superResolutionScale: videoSuperResolutionScale,
             isLiveStream: mode == .live,
-            adaptiveQualityEnabled: ExperimentalSettingsStore.shared.videoEnhancementAdaptiveQuality
+            adaptiveQualityEnabled: ExperimentalSettingsStore.shared.videoEnhancementAdaptiveQuality,
+            adaptiveSensitivity: ExperimentalSettingsStore.shared.videoEnhancementAdaptiveSensitivity,
+            bufferBudget: ExperimentalSettingsStore.shared.videoEnhancementBufferBudget,
+            maxLookahead: ExperimentalSettingsStore.shared.videoEnhancementMaxLookahead,
+            limitToScreenResolution: ExperimentalSettingsStore.shared.videoEnhancementLimitToScreen
         )
     }
 
