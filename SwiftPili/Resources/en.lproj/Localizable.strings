@@ -1266,6 +1266,8 @@
 "Paused (%@)" = "Paused (%@)";
 "Low Power Mode" = "Low Power Mode";
 "Warming up" = "Warming up";
+"Memory limited" = "Memory limited";
+"Screen resolution reached" = "Screen resolution reached";
 "Performance limited" = "Performance limited";
 "(Reduced · %@)" = "(Reduced · %@)";
 "Adaptive Quality" = "Adaptive Quality";

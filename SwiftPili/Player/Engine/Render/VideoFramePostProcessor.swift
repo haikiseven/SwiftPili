@@ -10,6 +10,7 @@ private struct VideoFrameEnhancementJob: Sendable {
     let interpolationPlan: VideoFrameInterpolationPlan?
     let deadlines: VideoEnhancementDeadlines
     let upscalingBypassReason: String?
+    let superResolutionCap: Float
 
     var isUpscaling: Bool { configuration.superResolutionMode != .off && upscalingBypassReason == nil }
 }
@@ -18,6 +19,7 @@ private struct VideoFrameWarmJob: Sendable {
     let frame: PostProcessFrameBox
     let configuration: VideoEnhancementConfiguration
     let upscale: Bool
+    let superResolutionCap: Float
     /// Synthetic plan ending one frame before `frame`, so warm timestamps precede real ones.
     let interpolationPlan: VideoFrameInterpolationPlan?
 }
@@ -51,6 +53,8 @@ final class VideoFramePostProcessor {
     private var warmedKey: WarmKey?
     private var warmTaskCancelled = false
     private(set) var isWarming = false
+    private var structuralHoldUntil = ContinuousClock.now
+    private var lastInputSize: (width: Int, height: Int)?
 
     /// User-requested configuration. The governor may degrade it at runtime; see `effectiveConfiguration`.
     var configuration = VideoEnhancementConfiguration.disabled {
@@ -88,6 +92,32 @@ final class VideoFramePostProcessor {
 
     var isBusy: Bool { activeTask != nil }
 
+    /// Set by the renderer on layout / scale-mode changes.
+    var displaySurface: VideoEnhancementDisplaySurface? {
+        didSet {
+            guard displaySurface != oldValue else { return }
+            governor.resetStructuralFloor()
+            warmedKey = nil
+        }
+    }
+
+    /// Effective SR scale cap for this frame, or nil when SR would not be visible on screen.
+    func superResolutionCap(for frame: MediaVideoFrame) -> Float? {
+        let effective = effectiveConfiguration
+        let requested = effective.superResolutionScale.factor
+        guard effective.superResolutionMode != .off else { return nil }
+        guard let displaySurface else { return requested }
+        return displaySurface.superResolutionCap(
+            inputWidth: CVPixelBufferGetWidth(frame.pixelBuffer), inputHeight: CVPixelBufferGetHeight(frame.pixelBuffer),
+            requested: requested, mode: effective.superResolutionMode
+        )
+    }
+
+    private func superResolutionBypassReason(_ frame: MediaVideoFrame) -> String? {
+        VideoEnhancementGuardrails.superResolutionBypassReason(frame.pixelBuffer)
+            ?? (superResolutionCap(for: frame) == nil ? "Display resolution reached" : nil)
+    }
+
     /// How far ahead of the display clock the engine should hand frames to the renderer.
     var preferredPresentLeadSeconds: TimeInterval { bufferPlan.lead }
 
@@ -122,15 +152,14 @@ final class VideoFramePostProcessor {
         if effective.frameInterpolationEnabled {
             guard let reason = interpolationInputBypassReason(frame) else { return true }
             noteBypass(reason)
-        } else if let reason = VideoEnhancementGuardrails.superResolutionBypassReason(frame.pixelBuffer) {
+        } else if let reason = superResolutionBypassReason(frame) {
             noteBypass(reason)
         }
         return false
     }
 
     func canUpscale(_ frame: MediaVideoFrame) -> Bool {
-        effectiveConfiguration.superResolutionMode != .off
-            && VideoEnhancementGuardrails.superResolutionBypassReason(frame.pixelBuffer) == nil
+        effectiveConfiguration.superResolutionMode != .off && superResolutionBypassReason(frame) == nil
     }
 
     func interpolationPlan(previous: MediaVideoFrame, current: MediaVideoFrame) -> VideoFrameInterpolationPlan? {
@@ -279,6 +308,9 @@ final class VideoFramePostProcessor {
         } else if midpointCount > 0 {
             lastMidpointsPerSource = midpointCount
         }
+        let inputSize = (CVPixelBufferGetWidth(original.pixelBuffer), CVPixelBufferGetHeight(original.pixelBuffer))
+        if lastInputSize.map({ $0 != inputSize }) ?? false { governor.resetStructuralFloor() }
+        lastInputSize = inputSize
         guard let fps = VideoFrameInterpolationTiming.sourceFPS(original),
               lastUpscaledBytes != nil || lastMidpointsPerSource > 0 else {
             if !effective.isRequested { resetBufferPlan() }
@@ -288,6 +320,21 @@ final class VideoFramePostProcessor {
             sourceFPS: fps, midpointsPerSource: lastMidpointsPerSource,
             upscaledBytes: lastUpscaledBytes, interpolatedBytes: original.pixelBuffer.enhancementByteSize
         )
+        let now = ContinuousClock.now
+        if plan.isMemoryBound, now >= structuralHoldUntil, governor.raiseStructuralFloor(now: now) {
+            // Re-measure at the new level before judging again.
+            structuralHoldUntil = now.advanced(by: .milliseconds(1500))
+            lastUpscaledBytes = nil
+            lastMidpointsPerSource = 0
+            if PlayerLog.isCapturing {
+                PlayerLog.log(
+                    "[PathA][enhancement] memory-bound fps=\(String(format: "%.0f", fps)) " +
+                        "midpoints=\(midpointCount) srBytes=\(upscaled?.pixelBuffer.enhancementByteSize ?? 0) " +
+                        "budget=\(VideoEnhancementBufferPlan.memoryBudgetBytes >> 20)MB → level=\(governor.level)"
+                )
+            }
+            return
+        }
         applyBufferPlan(plan)
     }
 
@@ -351,6 +398,7 @@ final class VideoFramePostProcessor {
         governor.noteDiscontinuity()
         let job = VideoFrameWarmJob(
             frame: PostProcessFrameBox(frame: frame), configuration: effective, upscale: upscale,
+            superResolutionCap: superResolutionCap(for: frame) ?? effective.superResolutionScale.factor,
             interpolationPlan: plan
         )
         let worker = self.worker
@@ -398,7 +446,8 @@ final class VideoFramePostProcessor {
                 interpolationPlan(previous: previous, current: frame)
             },
             deadlines: deadlines,
-            upscalingBypassReason: VideoEnhancementGuardrails.superResolutionBypassReason(frame.pixelBuffer)
+            upscalingBypassReason: superResolutionBypassReason(frame),
+            superResolutionCap: superResolutionCap(for: frame) ?? effectiveConfiguration.superResolutionScale.factor
         )
         pendingExpectation = (EnhancementFrameIdentity(frame), job.interpolationPlan != nil, job.isUpscaling)
         let worker = self.worker
@@ -516,28 +565,29 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
         let untilCancelled: @Sendable () -> Bool = { !Task.isCancelled }
 
         if job.upscale {
-            let scale = job.configuration.superResolutionScale
+            let cap = job.superResolutionCap
+            let capKey = Int((cap * 100).rounded())
             switch job.configuration.superResolutionMode {
             case .off:
                 break
             case .videoToolboxML:
                 let clock = superResolutionClock
                 if clock == nil || clock?.width != width || clock?.height != height
-                    || clock?.detail != scale.rawValue || frame.pts < (clock?.pts ?? 0) {
+                    || clock?.detail != capKey || frame.pts < (clock?.pts ?? 0) {
                     let warmPTS = max(0, frame.pts - 1)
                     _ = await vtSuperRes.upscale(
                         pixelBuffer: frame.pixelBuffer, pts: CMTime(seconds: warmPTS, preferredTimescale: 600),
-                        maxScale: scale.factor, hasTimeRemaining: untilCancelled
+                        maxScale: cap, hasTimeRemaining: untilCancelled
                     )
                     vtSuperRes.flush()
-                    superResolutionClock = SessionClock(width: width, height: height, detail: scale.rawValue, pts: warmPTS)
+                    superResolutionClock = SessionClock(width: width, height: height, detail: capKey, pts: warmPTS)
                     report.superResolution = true
                 }
             case .metalFXSpatial:
                 if metalFXWarmRaster?.width != width || metalFXWarmRaster?.height != height
-                    || metalFXWarmRaster?.detail != scale.rawValue {
-                    _ = await metalFXSuperRes.upscale(pixelBuffer: frame.pixelBuffer, maxScale: scale.factor)
-                    metalFXWarmRaster = SessionClock(width: width, height: height, detail: scale.rawValue, pts: 0)
+                    || metalFXWarmRaster?.detail != capKey {
+                    _ = await metalFXSuperRes.upscale(pixelBuffer: frame.pixelBuffer, maxScale: cap)
+                    metalFXWarmRaster = SessionClock(width: width, height: height, detail: capKey, pts: 0)
                     report.superResolution = true
                 }
             }
@@ -666,7 +716,10 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
             stage.inputFPS = plan.sourceFPS
             interpolationReference = EnhancementFrameIdentity(frame)
             stage.midpoints = job.isUpscaling
-                ? await upscaleMidpoints(frames, configuration: job.configuration, hasTimeRemaining: hasTimeRemaining)
+                ? await upscaleMidpoints(
+                    frames, configuration: job.configuration, maxScale: job.superResolutionCap,
+                    hasTimeRemaining: hasTimeRemaining
+                )
                 : frames
         case .passthrough:
             interpolationReference = EnhancementFrameIdentity(frame)
@@ -688,7 +741,8 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
             return .bypassed(reason: "Super resolution deadline")
         }
         let result = await upscale(
-            job.current.frame, configuration: job.configuration, hasTimeRemaining: hasTimeRemaining
+            job.current.frame, configuration: job.configuration, maxScale: job.superResolutionCap,
+            hasTimeRemaining: hasTimeRemaining
         )
         if mode == .videoToolboxML, case .bypassed = result { vtSuperRes.flush() }
         return result
@@ -755,12 +809,15 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
     private func upscaleMidpoints(
         _ frames: [MediaVideoFrame],
         configuration: VideoEnhancementConfiguration,
+        maxScale: Float,
         hasTimeRemaining: @Sendable () -> Bool
     ) async -> [MediaVideoFrame] {
         var enhanced = frames
         for index in frames.indices {
             guard hasTimeRemaining() else { break }
-            let outcome = await upscale(frames[index], configuration: configuration, hasTimeRemaining: hasTimeRemaining)
+            let outcome = await upscale(
+                frames[index], configuration: configuration, maxScale: maxScale, hasTimeRemaining: hasTimeRemaining
+            )
             if case let .processed(buffer) = outcome {
                 enhanced[index].pixelBuffer = buffer
             } else if configuration.superResolutionMode == .videoToolboxML {
@@ -773,9 +830,9 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
     private func upscale(
         _ frame: MediaVideoFrame,
         configuration: VideoEnhancementConfiguration,
+        maxScale: Float,
         hasTimeRemaining: @Sendable () -> Bool
     ) async -> VideoEnhancementBackendOutcome {
-        let maxScale = configuration.superResolutionScale.factor
         switch configuration.superResolutionMode {
         case .off:
             return .bypassed(reason: "Off")
@@ -783,7 +840,7 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
             let pts = CMTime(seconds: max(0, frame.pts), preferredTimescale: 600)
             superResolutionClock = SessionClock(
                 width: CVPixelBufferGetWidth(frame.pixelBuffer), height: CVPixelBufferGetHeight(frame.pixelBuffer),
-                detail: configuration.superResolutionScale.rawValue, pts: max(0, frame.pts)
+                detail: Int((maxScale * 100).rounded()), pts: max(0, frame.pts)
             )
             return await vtSuperRes.upscale(
                 pixelBuffer: frame.pixelBuffer, pts: pts, maxScale: maxScale, hasTimeRemaining: hasTimeRemaining

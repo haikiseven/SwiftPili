@@ -1310,6 +1310,7 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
     }
 
     private func presentationSurfaceGeometryDidChange() {
+        updateEnhancementDisplaySurface()
         let currentWindow = displayView.window
         let currentBounds = displayView.bounds.size
         let windowChanged = lastPresentationWindow !== currentWindow
@@ -1344,6 +1345,18 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         }
         displayView.sampleBufferLayer.videoGravity = gravity
         presentationHoldView.sampleBufferLayer.videoGravity = gravity
+        updateEnhancementDisplaySurface()
+    }
+
+    /// Lets super resolution cap its output to what the layer can actually show.
+    private func updateEnhancementDisplaySurface() {
+        let bounds = displayView.bounds
+        let scale = displayView.window?.screen.scale ?? displayView.traitCollection.displayScale
+        guard bounds.width > 0, bounds.height > 0, scale > 0 else { return }
+        postProcessor.displaySurface = VideoEnhancementDisplaySurface(
+            pixelWidth: Int((bounds.width * scale).rounded()), pixelHeight: Int((bounds.height * scale).rounded()),
+            fills: scaleMode != .fit
+        )
     }
 
     private func frontmostNonWarmPresentationPixelBuffer() -> CVPixelBuffer? {

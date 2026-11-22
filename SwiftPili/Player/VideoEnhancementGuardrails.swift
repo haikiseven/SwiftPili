@@ -137,3 +137,40 @@ enum VideoFramePairFormat {
          kCVImageBufferAlphaChannelIsOpaque]
     }
 }
+
+/// Pixel size of the layer showing the video. Super resolution beyond the on-screen magnification
+/// is wasted: the display layer just scales it back down (e.g. 1080p → 4K on a 2868×1320 phone).
+struct VideoEnhancementDisplaySurface: Equatable, Sendable {
+    /// Below this on-screen magnification SR has no visible benefit and is skipped.
+    static let minimumUsefulMagnification: Float = 1.15
+
+    let pixelWidth: Int
+    let pixelHeight: Int
+    /// Aspect-fill / stretch crops or distorts, so magnification follows the larger ratio.
+    let fills: Bool
+
+    /// How much the source is magnified on screen.
+    func magnification(inputWidth: Int, inputHeight: Int) -> Float? {
+        guard pixelWidth > 0, pixelHeight > 0, inputWidth > 0, inputHeight > 0 else { return nil }
+        let horizontal = Float(pixelWidth) / Float(inputWidth)
+        let vertical = Float(pixelHeight) / Float(inputHeight)
+        return fills ? max(horizontal, vertical) : min(horizontal, vertical)
+    }
+
+    /// Scale cap for a backend, or nil when SR would not be visible.
+    func superResolutionCap(
+        inputWidth: Int, inputHeight: Int, requested: Float, mode: VideoSuperResolutionMode
+    ) -> Float? {
+        guard let magnification = magnification(inputWidth: inputWidth, inputHeight: inputHeight) else {
+            return requested
+        }
+        guard magnification >= Self.minimumUsefulMagnification else { return nil }
+        switch mode {
+        case .off: return nil
+        // MetalFX supports arbitrary output sizes; match the screen.
+        case .metalFXSpatial: return min(requested, magnification)
+        // VT only offers native factors (≥ 2×); allow the smallest one when the screen is between.
+        case .videoToolboxML: return min(requested, max(2, magnification))
+        }
+    }
+}

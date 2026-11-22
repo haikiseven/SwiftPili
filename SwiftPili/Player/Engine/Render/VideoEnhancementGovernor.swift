@@ -116,6 +116,10 @@ struct VideoEnhancementGovernor: Sendable {
     private let metalFXAvailable: Bool
     private(set) var adaptiveLevel = VideoEnhancementDegradationLevel.none
     private(set) var systemFloor = VideoEnhancementDegradationLevel.none
+    /// Minimum level imposed because the configured output rate cannot fit the buffer memory budget
+    /// (e.g. 4 output frames per source frame at screen resolution). Deterministic, so it is not
+    /// probed away; cleared when the input raster / display surface / configuration changes.
+    private(set) var structuralFloor = VideoEnhancementDegradationLevel.none
     private var window: Window
     private var consecutiveBadWindows = 0
     private var lastChange: ContinuousClock.Instant
@@ -136,11 +140,14 @@ struct VideoEnhancementGovernor: Sendable {
         lastChange = now
     }
 
-    var level: VideoEnhancementDegradationLevel { max(adaptiveLevel, systemFloor) }
+    var level: VideoEnhancementDegradationLevel { max(adaptiveLevel, systemFloor, structuralFloor) }
 
     /// Short reason for the current degradation, used in telemetry / UI.
     var reason: String? {
         guard level > .none, effectiveConfiguration != requested else { return nil }
+        if structuralFloor > .none, structuralFloor >= max(adaptiveLevel, systemFloor) {
+            return "Memory limited"
+        }
         if systemFloor >= adaptiveLevel {
             return systemFloor == .suspended ? "Thermal throttling"
                 : (systemFloor >= .interpolationSuspended ? "Low Power Mode" : "Thermal fair")
@@ -157,6 +164,26 @@ struct VideoEnhancementGovernor: Sendable {
     /// Full reset: the user changed the configuration explicitly, so give it a fresh chance.
     mutating func reset(requested: VideoEnhancementConfiguration, now: ContinuousClock.Instant = .now) {
         self = Self(requested: requested, tuning: tuning, metalFXAvailable: metalFXAvailable, now: now)
+    }
+
+    /// Steps the structural floor one effective rung below the current level. Never suspends
+    /// super resolution entirely: SR alone degrades gracefully with a shallower lookahead.
+    @discardableResult
+    mutating func raiseStructuralFloor(now: ContinuousClock.Instant = .now) -> Bool {
+        guard requested.adaptiveQualityEnabled else { return false }
+        let current = configuration(at: level)
+        var candidate = level.next
+        while let rung = candidate, rung < .suspended, configuration(at: rung) == current {
+            candidate = rung.next
+        }
+        guard let next = candidate, next <= .interpolationSuspended else { return false }
+        structuralFloor = next
+        lastChange = now
+        return true
+    }
+
+    mutating func resetStructuralFloor() {
+        structuralFloor = .none
     }
 
     /// Seek, stream switch, etc. Keep the learned level but ignore the transient late frames.

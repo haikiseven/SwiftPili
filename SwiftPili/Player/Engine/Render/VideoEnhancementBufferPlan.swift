@@ -13,7 +13,11 @@ struct VideoEnhancementBufferPlan: Equatable, Sendable {
     static let defaultLead: TimeInterval = 0.3
     static let minimumLead: TimeInterval = 0.2
     static let maximumLead: TimeInterval = 1.0
-    static let memoryBudgetBytes = 192 << 20
+    /// ~1/32 of device RAM, 128–512 MB (6 GB → 192 MB, 12 GB → 384 MB).
+    static let memoryBudgetBytes: Int = {
+        let fraction = Int(clamping: ProcessInfo.processInfo.physicalMemory / 32)
+        return min(512 << 20, max(128 << 20, fraction))
+    }()
     static let defaultSuperResolutionFrames = 8
     static let defaultInterpolationFramesPerPhase = 4
     /// Buffers in flight inside the worker / not yet handed to the display layer.
@@ -23,6 +27,9 @@ struct VideoEnhancementBufferPlan: Equatable, Sendable {
     var lead: TimeInterval = defaultLead
     var superResolutionFrames = defaultSuperResolutionFrames
     var interpolationFramesPerPhase = defaultInterpolationFramesPerPhase
+    /// The output rate needs more buffers than the budget allows even at the minimum lookahead,
+    /// so enhancement will keep hitting "pool busy" until the configuration is reduced.
+    var isMemoryBound = false
 
     static let `default` = Self()
 
@@ -47,11 +54,13 @@ struct VideoEnhancementBufferPlan: Equatable, Sendable {
             let affordable = memoryBudgetBytes / upscaledBytes
             plan.superResolutionFrames = max(defaultSuperResolutionFrames, affordable)
             plan.lead = leadFitting(frames: plan.superResolutionFrames, fps: outputFPS)
+            plan.isMemoryBound = framesNeeded(fps: outputFPS) > plan.superResolutionFrames
         } else if midpoints > 0, interpolatedBytes > 0 {
             // FI only: midpoints sit in the display queue straight from the FI pool.
             let affordable = memoryBudgetBytes / interpolatedBytes
             let midpointFPS = sourceFPS * Double(midpoints)
             plan.lead = leadFitting(frames: affordable, fps: midpointFPS)
+            plan.isMemoryBound = framesNeeded(fps: midpointFPS) > affordable
         } else {
             return .default
         }
@@ -61,6 +70,11 @@ struct VideoEnhancementBufferPlan: Equatable, Sendable {
             plan.interpolationFramesPerPhase = max(defaultInterpolationFramesPerPhase, pairsAlive)
         }
         return plan
+    }
+
+    /// Buffers alive at the minimum lookahead.
+    private static func framesNeeded(fps: Double) -> Int {
+        Int(((minimumLead + displaySlack) * fps).rounded(.up)) + workerHeadroom
     }
 
     private static func leadFitting(frames: Int, fps: Double) -> TimeInterval {

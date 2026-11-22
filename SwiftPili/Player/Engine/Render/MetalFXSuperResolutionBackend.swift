@@ -47,7 +47,7 @@ final class MetalFXSuperResolutionBackend {
     private var inputRGBATexture: MTLTexture?
     private var privateOutputTexture: MTLTexture?
     private var outputPool: VideoSuperResolutionPool?
-    private var configuredMaxScale = 0
+    private var configuredOutput: (width: Int, height: Int)?
 
     #if canImport(MetalFX)
     private var scaler: MTLFXSpatialScaler?
@@ -75,35 +75,44 @@ final class MetalFXSuperResolutionBackend {
         convertPipeline = nil
         commandQueue = nil
         device = nil
-        configuredMaxScale = 0
+        configuredOutput = nil
     }
 
+    /// - Parameter maxScale: may be fractional; the caller caps it to the on-screen magnification so
+    ///   output never exceeds the display's pixel size (upscaling past it is wasted GPU and memory).
     func upscale(pixelBuffer: CVPixelBuffer, maxScale: Float = 2) async -> VideoEnhancementBackendOutcome {
         #if !canImport(MetalFX)
         return .bypassed(reason: "MetalFX unavailable")
         #else
-        guard maxScale.isFinite, maxScale >= 2 else {
-            return .bypassed(reason: "MetalFX requires at least a 2x scale cap")
+        guard maxScale.isFinite, maxScale >= VideoEnhancementDisplaySurface.minimumUsefulMagnification else {
+            return .bypassed(reason: "Display resolution reached")
         }
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
+        let scale = min(maxScale, 4)
+        let candidates = [Self.evenSize(width, height, scale)]
+            + [4, 3, 2].filter { Float($0) < scale }.map { (width * $0, height * $0) }
         guard VideoSuperResolutionRasterBudget.contains(width: width, height: height),
-              let allowedScale = [4, 3, 2].first(where: { scale in
-                  Float(scale) <= maxScale && VideoSuperResolutionRasterBudget.contains(
-                      width: width * scale, height: height * scale
-                  )
+              let output = candidates.first(where: {
+                  VideoSuperResolutionRasterBudget.contains(width: $0.0, height: $0.1)
               }) else {
             return .bypassed(reason: "MetalFX output exceeds raster budget")
         }
         if let setupReason = ensureMetalInfrastructure() {
             return .bypassed(reason: setupReason)
         }
-        if scaler?.inputWidth != width || scaler?.inputHeight != height || configuredMaxScale != allowedScale,
-           let configReason = configureScaler(width: width, height: height, maxScale: allowedScale) {
+        if scaler?.inputWidth != width || scaler?.inputHeight != height
+            || configuredOutput?.width != output.0 || configuredOutput?.height != output.1,
+           let configReason = configureScaler(width: width, height: height, output: output) {
             return .bypassed(reason: configReason)
         }
         return await runUpscalePass(pixelBuffer: pixelBuffer, width: width, height: height)
         #endif
+    }
+
+    private static func evenSize(_ width: Int, _ height: Int, _ scale: Float) -> (Int, Int) {
+        func even(_ value: Float) -> Int { max(2, Int((value / 2).rounded()) * 2) }
+        return (even(Float(width) * scale), even(Float(height) * scale))
     }
 
     #if canImport(MetalFX)
@@ -137,10 +146,10 @@ final class MetalFXSuperResolutionBackend {
         return nil
     }
 
-    private func configureScaler(width: Int, height: Int, maxScale: Int) -> String? {
+    private func configureScaler(width: Int, height: Int, output: (Int, Int)) -> String? {
         guard let device else { return "Metal device unavailable" }
         guard let createdScaler = Self.makeScaler(
-            device: device, width: width, height: height, maxScale: maxScale
+            device: device, width: width, height: height, output: output
         ) else {
             return "MetalFX scaler init failed"
         }
@@ -169,18 +178,25 @@ final class MetalFXSuperResolutionBackend {
         inputRGBATexture = inTex
         privateOutputTexture = outTex
         outputPool = pool
-        configuredMaxScale = maxScale
+        configuredOutput = output
         return nil
     }
 
-    private static func makeScaler(device: MTLDevice, width: Int, height: Int, maxScale: Int) -> MTLFXSpatialScaler? {
+    private static func makeScaler(
+        device: MTLDevice, width: Int, height: Int, output: (Int, Int)
+    ) -> MTLFXSpatialScaler? {
         let descriptor = MTLFXSpatialScalerDescriptor()
         descriptor.colorTextureFormat = .bgra8Unorm
         descriptor.outputTextureFormat = .bgra8Unorm
         descriptor.inputWidth = width
         descriptor.inputHeight = height
         descriptor.colorProcessingMode = .perceptual
-        for scale in stride(from: maxScale, through: 2, by: -1) {
+        descriptor.outputWidth = output.0
+        descriptor.outputHeight = output.1
+        if let scaler = descriptor.makeSpatialScaler(device: device) { return scaler }
+        // Fallback if a fractional ratio is rejected: largest integer scale that fits.
+        let ratio = Float(output.0) / Float(max(1, width))
+        for scale in [4, 3, 2] where Float(scale) <= max(2, ratio.rounded(.down)) {
             descriptor.outputWidth = width * scale
             descriptor.outputHeight = height * scale
             if let scaler = descriptor.makeSpatialScaler(device: device) { return scaler }

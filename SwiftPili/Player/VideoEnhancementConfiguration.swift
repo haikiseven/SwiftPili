@@ -228,6 +228,8 @@ enum VideoEnhancementBypassDisplay {
         (["thermal"], { String(localized: "Thermal") }),
         (["low power"], { String(localized: "Low Power Mode") }),
         (["warming"], { String(localized: "Warming up") }),
+        (["memory"], { String(localized: "Memory limited") }),
+        (["display resolution"], { String(localized: "Screen resolution reached") }),
         (["performance", "worker busy"], { String(localized: "Performance limited") }),
         (["interlaced"], { String(localized: "Interlaced") }),
         (["vod only", "live unsupported"], { String(localized: "VOD only") }),

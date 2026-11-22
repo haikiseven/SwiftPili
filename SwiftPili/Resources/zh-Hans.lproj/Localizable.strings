@@ -1266,6 +1266,8 @@
 "Paused (%@)" = "已暂停 (%@)";
 "Low Power Mode" = "低电量模式";
 "Warming up" = "预热中";
+"Memory limited" = "内存限制";
+"Screen resolution reached" = "已达屏幕分辨率";
 "Performance limited" = "性能不足";
 "(Reduced · %@)" = "(已降级 · %@)";
 "Adaptive Quality" = "自适应画质";
