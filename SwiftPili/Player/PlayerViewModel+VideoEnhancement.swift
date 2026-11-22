@@ -38,7 +38,8 @@ extension PlayerViewModel {
             frameInterpolationEnabled: videoFrameInterpolationEnabled,
             interpolationRate: videoInterpolationRate,
             superResolutionScale: videoSuperResolutionScale,
-            isLiveStream: mode == .live
+            isLiveStream: mode == .live,
+            adaptiveQualityEnabled: ExperimentalSettingsStore.shared.videoEnhancementAdaptiveQuality
         )
     }
 

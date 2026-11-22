@@ -1808,14 +1808,17 @@ extension SampleBufferVideoRenderer {
         }
         guard let originalDelay = request.originalDelay else {
             if request.canUpscale { enhancementDiagnostics.superResolution.late += 1 }
+            if request.canUpscale || request.hasInterpolationPlan { postProcessor.notePerformanceMiss() }
             return nil
         }
         guard request.midpointDelay != nil || request.canUpscale else {
             let reason = request.hasInterpolationPlan ? generationDeadlineReason : "No eligible interpolation plan"
+            if request.hasInterpolationPlan { postProcessor.notePerformanceMiss() }
             postProcessor.noteBypass(reason)
             return nil
         }
         guard !postProcessor.isBusy else {
+            postProcessor.notePerformanceMiss()
             enhancementDiagnostics.workerBusy += 1
             if request.midpointDelay != nil {
                 enhancementDiagnostics.lastInterpolationBypass = "Interpolation worker busy"
@@ -1922,6 +1925,7 @@ extension SampleBufferVideoRenderer {
     }
 
     private func expireEnhancement(_ attempt: EnhancementAttempt) {
+        postProcessor.notePerformanceMiss()
         var expired = attempt
         if case .pending = expired.midpoint {
             enhancementDiagnostics.noteInterpolationDeadline("Interpolation generation deadline")
@@ -1964,6 +1968,7 @@ extension SampleBufferVideoRenderer {
             if case .processing = attempt.state { return attempt }
             return nil
         }
+        if enhancementAttempt != nil || enhancementReference != nil { postProcessor.noteDiscontinuity() }
         enhancementBoundary &+= 1
         enhancementDiagnostics = EnhancementDiagnostics(lastReport: enhancementDiagnostics.lastReport)
         clearEnhancementAttempt()
@@ -2120,7 +2125,10 @@ extension SampleBufferVideoRenderer {
             }
         }
         if enhancementBoundary == boundary {
-            if case .late = enhancedOriginal { enhancementDiagnostics.superResolution.late += 1 }
+            if case .late = enhancedOriginal {
+                enhancementDiagnostics.superResolution.late += 1
+                postProcessor.notePerformanceMiss()
+            }
             recordOriginalAdmission(
                 original, result: result, midpointCount: midpointCount, upscaled: admittedEnhancedOriginal
             )
@@ -2181,6 +2189,7 @@ extension SampleBufferVideoRenderer {
                 "deadline=\(value.deadlinesMissed) workerBusy=\(value.workerBusy) nativeWait=\(value.nativeWaits) " +
                 "original=\(value.originalsEnqueued) midpoint=\(value.midpointsEnqueued) " +
                 "fiBypass=\(value.lastInterpolationBypass ?? "none") " +
+                "degrade=\(postProcessor.degradationLevel) " +
                 value.superResolution.summary(configuredMode: config.superResolutionMode)
         )
     }

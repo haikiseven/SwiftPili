@@ -20,15 +20,32 @@ final class VideoFramePostProcessor {
     private var activeTask: Task<Void, Never>?
     private var needsFlush = false
     private var needsTearDown = false
+    private var governor = VideoEnhancementGovernor()
+    /// Outcome of the in-flight / most recent submission: `nil` = none, `true` = missed its deadline.
+    private var pendingOutcomeMissed: Bool?
+    private var systemState = VideoEnhancementSystemState.current
+    private var systemStateSampledAt = ContinuousClock.now
 
+    /// User-requested configuration. The governor may degrade it at runtime; see `effectiveConfiguration`.
     var configuration = VideoEnhancementConfiguration.disabled {
         didSet {
             guard configuration != oldValue else { return }
+            pendingOutcomeMissed = nil
+            governor.reset(requested: configuration)
             telemetry = configuration.isRequested && configuration.isLiveStream
                 ? .bypassed(reason: "VOD only") : VideoEnhancementTelemetry()
         }
     }
-    private(set) var telemetry = VideoEnhancementTelemetry()
+    private(set) var telemetry = VideoEnhancementTelemetry() {
+        didSet {
+            let note = governor.level > .none ? governor.reason : nil
+            if telemetry.degradationNote != note { telemetry.degradationNote = note }
+        }
+    }
+
+    /// Configuration actually executed, after performance / thermal / Low Power degradation.
+    var effectiveConfiguration: VideoEnhancementConfiguration { governor.effectiveConfiguration }
+    var degradationLevel: VideoEnhancementDegradationLevel { governor.level }
 
     var isBusy: Bool { activeTask != nil }
 
@@ -48,8 +65,19 @@ final class VideoFramePostProcessor {
             noteBypass(reason)
             return false
         }
+        let now = ContinuousClock.now
+        if systemStateSampledAt.duration(to: now) >= .seconds(1) {
+            systemState = .current
+            systemStateSampledAt = now
+        }
+        governor.evaluate(system: systemState, now: now)
+        let effective = effectiveConfiguration
+        guard effective.isRequested else {
+            noteBypass(governor.reason ?? "Performance limited")
+            return false
+        }
         if canUpscale(frame) { return true }
-        if configuration.frameInterpolationEnabled {
+        if effective.frameInterpolationEnabled {
             guard let reason = interpolationInputBypassReason(frame) else { return true }
             noteBypass(reason)
         } else if let reason = VideoEnhancementGuardrails.superResolutionBypassReason(frame.pixelBuffer) {
@@ -59,12 +87,13 @@ final class VideoFramePostProcessor {
     }
 
     func canUpscale(_ frame: MediaVideoFrame) -> Bool {
-        configuration.superResolutionMode != .off
+        effectiveConfiguration.superResolutionMode != .off
             && VideoEnhancementGuardrails.superResolutionBypassReason(frame.pixelBuffer) == nil
     }
 
     func interpolationPlan(previous: MediaVideoFrame, current: MediaVideoFrame) -> VideoFrameInterpolationPlan? {
-        guard configuration.frameInterpolationEnabled,
+        let effective = effectiveConfiguration
+        guard effective.frameInterpolationEnabled,
               VideoEnhancementGuardrails.commonBypassReason(
                   configuration: configuration, pixelBuffer: previous.pixelBuffer
               ) == nil,
@@ -78,7 +107,7 @@ final class VideoFramePostProcessor {
         }
         return VideoFrameInterpolationPlan(
             previousPTS: previous.pts, currentPTS: current.pts, interval: timing.delta,
-            rate: configuration.interpolationRate
+            rate: effective.interpolationRate
         )
     }
 
@@ -90,6 +119,28 @@ final class VideoFramePostProcessor {
 
     func noteBypass(_ reason: String) {
         telemetry = .bypassed(reason: reason)
+    }
+
+    /// An enhancement-eligible frame could not be enhanced in time (late arrival, worker busy,
+    /// deadline expiry, late SR output). Feeds the adaptive governor; does not touch telemetry.
+    func notePerformanceMiss() {
+        if pendingOutcomeMissed != nil {
+            pendingOutcomeMissed = true
+        } else {
+            governor.record(missed: true)
+        }
+    }
+
+    /// Seek / stream switch / renderer reset: keep the learned level but ignore transient lateness.
+    func noteDiscontinuity() {
+        pendingOutcomeMissed = nil
+        governor.noteDiscontinuity()
+    }
+
+    private func finalizePendingOutcome() {
+        guard let missed = pendingOutcomeMissed else { return }
+        pendingOutcomeMissed = nil
+        governor.record(missed: missed)
     }
 
     func noteMidpointAccepted(
@@ -112,7 +163,7 @@ final class VideoFramePostProcessor {
         if midpointCount == 0 {
             if !result.midpoints.isEmpty {
                 displayed.activeModeLabel = enhancedOriginal
-                    ? configuration.superResolutionMode.telemetryLabel : "Bypass"
+                    ? effectiveConfiguration.superResolutionMode.telemetryLabel : "Bypass"
             }
         }
         if !enhancedOriginal {
@@ -138,9 +189,11 @@ final class VideoFramePostProcessor {
         onUpdate: @escaping @MainActor (VideoFrameEnhancementUpdate) -> Void
     ) {
         precondition(activeTask == nil)
+        finalizePendingOutcome()
+        pendingOutcomeMissed = false
         let job = VideoFrameEnhancementJob(
             current: PostProcessFrameBox(frame: frame), previous: PostProcessFrameBox(frame: previous),
-            configuration: configuration, interpolationLabel: interpolationLabel,
+            configuration: effectiveConfiguration, interpolationLabel: interpolationLabel,
             interpolationPlan: deadlines.midpoint.flatMap { _ in
                 interpolationPlan(previous: previous, current: frame)
             },
@@ -157,6 +210,7 @@ final class VideoFramePostProcessor {
     }
 
     func flush() {
+        finalizePendingOutcome()
         if activeTask != nil {
             needsFlush = true
             activeTask?.cancel()
@@ -166,6 +220,8 @@ final class VideoFramePostProcessor {
     }
 
     func tearDown() {
+        pendingOutcomeMissed = nil
+        governor.reset(requested: configuration)
         telemetry = VideoEnhancementTelemetry()
         if let activeTask {
             needsTearDown = true
@@ -180,6 +236,7 @@ final class VideoFramePostProcessor {
         onUpdate: @MainActor (VideoFrameEnhancementUpdate) -> Void
     ) {
         activeTask = nil
+        recordWorkerOutcome(result)
         if needsTearDown {
             needsTearDown = false
             needsFlush = false
@@ -189,6 +246,16 @@ final class VideoFramePostProcessor {
             worker.flush()
         }
         onUpdate(.finished(result))
+    }
+
+    private func recordWorkerOutcome(_ result: VideoFrameEnhancementResult) {
+        let workerMissed = [result.interpolationBypassReason, result.originalSuperResolutionBypassReason]
+            .contains { $0?.localizedCaseInsensitiveContains("deadline") == true }
+        if workerMissed, pendingOutcomeMissed != nil { pendingOutcomeMissed = true }
+        let fps = result.telemetry.inputFPS
+        if fps.isFinite, fps > 0 {
+            governor.recordLoad(processingMs: result.telemetry.smoothedProcessingMs, frameInterval: 1 / fps)
+        }
     }
 
     private func startTearDown() {
@@ -214,6 +281,25 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
     private var previousInput: EnhancementFrameIdentity?
     private var interpolationReference: EnhancementFrameIdentity?
     private var smoothedMs: Double = 0
+    private var lastSuperResolutionMode = VideoSuperResolutionMode.off
+    private var lastInterpolationEnabled = false
+
+    /// The governor can switch backends at runtime; release sessions that are no longer used so a
+    /// device already short on resources does not keep idle VT / Metal state resident.
+    private func releaseIdleBackends(for configuration: VideoEnhancementConfiguration) {
+        let mode = configuration.superResolutionMode
+        if mode != lastSuperResolutionMode {
+            if lastSuperResolutionMode == .videoToolboxML { vtSuperRes.tearDown() }
+            if lastSuperResolutionMode == .metalFXSpatial { metalFXSuperRes.tearDown() }
+            lastSuperResolutionMode = mode
+        }
+        if lastInterpolationEnabled, !configuration.frameInterpolationEnabled {
+            vtFrameInterp.tearDown()
+            visionFrameInterp.tearDown()
+            interpolationReference = nil
+        }
+        lastInterpolationEnabled = configuration.frameInterpolationEnabled
+    }
 
     func flush() {
         vtSuperRes.flush()
@@ -231,6 +317,8 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
         previousInput = nil
         interpolationReference = nil
         smoothedMs = 0
+        lastSuperResolutionMode = .off
+        lastInterpolationEnabled = false
     }
 
     private struct InterpolationStage {
@@ -244,6 +332,7 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
         publishMidpoints: @Sendable ([PostProcessFrameBox]) async -> Void
     ) async -> VideoFrameEnhancementResult {
         let start = ContinuousClock.now
+        releaseIdleBackends(for: job.configuration)
         let frame = job.current.frame
         let previous = job.previous.frame
         let previousIdentity = EnhancementFrameIdentity(previous)

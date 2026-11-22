@@ -1264,6 +1264,11 @@
 "Skipped" = "Skipped";
 "Paused · %@" = "Paused · %@";
 "Paused (%@)" = "Paused (%@)";
+"Low Power Mode" = "Low Power Mode";
+"Performance limited" = "Performance limited";
+"(Reduced · %@)" = "(Reduced · %@)";
+"Adaptive Quality" = "Adaptive Quality";
+"When the device can't keep up, runs warm, or is in Low Power Mode, enhancement steps down gradually (lower interpolation rate, smaller scale, lighter upscaler, no interpolation) and recovers automatically. Turning this off keeps your settings; frames that miss their deadline are shown unenhanced and the device may heat up faster." = "When the device can't keep up, runs warm, or is in Low Power Mode, enhancement steps down gradually (lower interpolation rate, smaller scale, lighter upscaler, no interpolation) and recovers automatically. Turning this off keeps your settings; frames that miss their deadline are shown unenhanced and the device may heat up faster.";
 "Applies to SDR Demand VOD streams up to 1080p. High temperatures pause enhancement." = "Applies to SDR Demand VOD streams up to 1080p. High temperatures pause enhancement.";
 "Default Frame Interpolation" = "Default Frame Interpolation";
 "Applies to supported progressive SDR Demand VOD streams. High temperatures pause enhancement." = "Applies to supported progressive SDR Demand VOD streams. High temperatures pause enhancement.";

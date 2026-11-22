@@ -14,6 +14,7 @@ struct VideoEnhancementSettingsView: View {
         List {
             superResolutionDefaults
             interpolationDefaults
+            adaptiveQualitySection
 
             Section {
                 capabilityRow("VideoToolbox ML", status: capabilities.videoToolboxML)
@@ -114,6 +115,29 @@ struct VideoEnhancementSettingsView: View {
             Text("Frame Interpolation")
         } footer: {
             Text("Applies to supported progressive SDR Demand VOD streams. High temperatures pause enhancement.")
+        }
+        .disabled(!canMutate)
+    }
+
+    private var adaptiveQualitySection: some View {
+        Section {
+            Toggle(isOn: Binding(
+                get: { experiments.videoEnhancementAdaptiveQuality },
+                set: { enabled in
+                    guard canMutate else { return }
+                    experiments.setVideoEnhancementAdaptiveQuality(enabled)
+                }
+            )) {
+                Label {
+                    Text("Adaptive Quality")
+                } icon: {
+                    SettingsIcon(symbol: "gauge.with.dots.needle.33percent")
+                }
+            }
+        } header: {
+            Text("Performance")
+        } footer: {
+            Text("When the device can't keep up, runs warm, or is in Low Power Mode, enhancement steps down gradually (lower interpolation rate, smaller scale, lighter upscaler, no interpolation) and recovers automatically. Turning this off keeps your settings; frames that miss their deadline are shown unenhanced and the device may heat up faster.")
         }
         .disabled(!canMutate)
     }

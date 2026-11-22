@@ -1264,6 +1264,11 @@
 "Skipped" = "已跳过";
 "Paused · %@" = "已暂停 · %@";
 "Paused (%@)" = "已暂停 (%@)";
+"Low Power Mode" = "低电量模式";
+"Performance limited" = "性能不足";
+"(Reduced · %@)" = "(已降级 · %@)";
+"Adaptive Quality" = "自适应画质";
+"When the device can't keep up, runs warm, or is in Low Power Mode, enhancement steps down gradually (lower interpolation rate, smaller scale, lighter upscaler, no interpolation) and recovers automatically. Turning this off keeps your settings; frames that miss their deadline are shown unenhanced and the device may heat up faster." = "设备性能不足、温度偏高或开启低电量模式时，逐级降低增强强度（降低补帧帧率、缩小超分倍率、换用轻量超分、关闭补帧），恢复后自动回升。关闭后始终按你的设置运行，来不及处理的帧会以原画显示，设备也可能更快发热。";
 "Applies to SDR Demand VOD streams up to 1080p. High temperatures pause enhancement." = "适用于 1080p 及以下的 SDR Demand 点播，设备温度过高时会暂停增强。";
 "Default Frame Interpolation" = "默认开启运动补帧";
 "Applies to supported progressive SDR Demand VOD streams. High temperatures pause enhancement." = "适用于受支持的逐行 SDR Demand 点播，设备温度过高时会暂停增强。";

@@ -30,6 +30,7 @@ final class ExperimentalSettingsStore {
         videoEnhancementDefaultFrameInterpolation = VideoEnhancementPreferences.defaultFrameInterpolationEnabled
         videoEnhancementDefaultRate = VideoEnhancementPreferences.interpolationRate
         videoEnhancementDefaultScale = VideoEnhancementPreferences.superResolutionScale
+        videoEnhancementAdaptiveQuality = VideoEnhancementPreferences.adaptiveQualityEnabled
         storageError = record.storageError
         publish(record.snapshot)
     }
@@ -86,6 +87,17 @@ final class ExperimentalSettingsStore {
 
     private(set) var videoEnhancementDefaultRate = VideoEnhancementPreferences.interpolationRate
     private(set) var videoEnhancementDefaultScale = VideoEnhancementPreferences.superResolutionScale
+    private(set) var videoEnhancementAdaptiveQuality = VideoEnhancementPreferences.adaptiveQualityEnabled
+
+    @discardableResult
+    func setVideoEnhancementAdaptiveQuality(_ enabled: Bool) -> Bool {
+        guard isAllowed(.videoEnhancement), storageError == nil else { return false }
+        guard videoEnhancementAdaptiveQuality != enabled else { return true }
+        VideoEnhancementPreferences.adaptiveQualityEnabled = enabled
+        videoEnhancementAdaptiveQuality = enabled
+        notifyObservers([.videoEnhancement])
+        return true
+    }
 
     @discardableResult
     func setVideoEnhancementDefaultSRMode(_ mode: VideoSuperResolutionMode) -> Bool {

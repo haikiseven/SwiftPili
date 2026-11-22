@@ -128,6 +128,9 @@ struct VideoEnhancementConfiguration: Equatable, Sendable {
     var interpolationRate: VideoInterpolationRate = .doubleRate
     var superResolutionScale: VideoSuperResolutionScale = .two
     var isLiveStream: Bool = false
+    /// When enabled, the runtime governor may reduce quality if the device cannot keep up,
+    /// runs warm, or is in Low Power Mode. Serious thermal state always pauses enhancement.
+    var adaptiveQualityEnabled: Bool = true
 
     static let disabled = Self()
 
@@ -223,6 +226,8 @@ enum VideoEnhancementBypassDisplay {
         (["> 1080p", ">1080p"], { String(localized: ">1080p") }),
         (["hdr", "10-bit", "log transfer"], { String(localized: "HDR") }),
         (["thermal"], { String(localized: "Thermal") }),
+        (["low power"], { String(localized: "Low Power Mode") }),
+        (["performance", "worker busy"], { String(localized: "Performance limited") }),
         (["interlaced"], { String(localized: "Interlaced") }),
         (["vod only", "live unsupported"], { String(localized: "VOD only") }),
         (["libvlc", "demand only"], { String(localized: "Demand only") }),
@@ -266,6 +271,8 @@ struct VideoEnhancementTelemetry: Equatable, Sendable {
     var smoothedProcessingMs: Double = 0
     var bypassReason: String?
     var isActive: Bool = false
+    /// Set when the adaptive governor is running a reduced configuration (raw reason string).
+    var degradationNote: String?
 
     static func bypassed(reason: String) -> Self {
         Self(
@@ -290,6 +297,10 @@ struct VideoEnhancementTelemetry: Equatable, Sendable {
         if smoothedProcessingMs > 0.01 {
             parts.append(String(format: "%.1fms", smoothedProcessingMs))
         }
+        if let degradationNote {
+            parts.append(String(format: String(localized: "(Reduced · %@)"),
+                                VideoEnhancementBypassDisplay.shortLabel(for: degradationNote)))
+        }
         return parts.joined(separator: " ")
     }
 
@@ -307,6 +318,10 @@ struct VideoEnhancementTelemetry: Equatable, Sendable {
         }
         if smoothedProcessingMs > 0.01 {
             parts.append(String(format: "%.1fms", smoothedProcessingMs))
+        }
+        if let degradationNote {
+            parts.append(String(format: String(localized: "(Reduced · %@)"),
+                                VideoEnhancementBypassDisplay.shortLabel(for: degradationNote)))
         }
         return parts.joined(separator: " ")
     }
@@ -358,6 +373,13 @@ enum VideoEnhancementPreferences {
             return VideoSuperResolutionScale(rawValue: raw) ?? .two
         }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: superResolutionScaleKey) }
+    }
+
+    private static let adaptiveQualityKey = "experimental_video_enhancement_adaptive_quality"
+
+    static var adaptiveQualityEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: adaptiveQualityKey) as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: adaptiveQualityKey) }
     }
 
     static var defaultFrameInterpolationEnabled: Bool {
