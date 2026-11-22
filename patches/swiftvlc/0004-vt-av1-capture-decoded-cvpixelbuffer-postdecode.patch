@@ -1,0 +1,56 @@
+From: SwiftPili <359733720+haikiseven@users.noreply.github.com>
+Subject: [PATCH] build-libvlc: VT-AV1 capture the decoded CVPixelBuffer post-decode (F17)
+
+va_videotoolbox.c Get() read frame->data[3] at get_buffer2 time — BEFORE decode —
+so it captured the empty pool buffer and rendered black while HW decode ran fine.
+FFmpeg's VT hwaccel only writes the decoded CVPixelBuffer into the VTHWFrame behind
+buf[0]->data (ref->pixbuf) during decode. VLC clones the output picture AFTER decode
+(FrameGetPicture -> picture_Clone -> the context copy op), so re-read the decoded
+buffer there. NULL-safe (unexpected layout -> keep old buffer -> black, not a crash).
+Plus a get-time [AV1-VT] diagnostic (all %p) to confirm the buffer flow on device.
+
+diff --git a/scripts/build-libvlc.sh b/scripts/build-libvlc.sh
+index 9e0fe74..4e70861 100755
+--- a/scripts/build-libvlc.sh
++++ b/scripts/build-libvlc.sh
+@@ -1276,6 +1276,24 @@ static picture_context_t *vt_dec_pic_context_copy(picture_context_t *src)
+         return NULL;
+ 
+     *pic_ctx = *src_ctx;
++
++    /* F17 fix — capture the DECODED buffer, not the pre-decode one. Get() runs
++     * at get_buffer2 time, BEFORE decode, so the CVPixelBuffer it read from
++     * frame->data[3] is the empty pool buffer and renders black. VLC clones the
++     * output picture only AFTER avcodec_receive_frame (FrameGetPicture ->
++     * picture_Clone -> this copy op), and by then FFmpeg's VT hwaccel has
++     * written the decoded buffer into the VTHWFrame backing buf[0]->data
++     * (videotoolbox_buffer_create sets ref->pixbuf, the struct's first field —
++     * the same (VTHWFrame*)buf[0]->data cast FFmpeg itself uses). Re-read it
++     * here. NULL-safe: an unexpected layout yields NULL and we keep the original
++     * buffer (black, never a crash). */
++    CVPixelBufferRef decoded = NULL;
++    if (src_ctx->avframe != NULL && src_ctx->avframe->buf[0] != NULL &&
++        src_ctx->avframe->buf[0]->data != NULL)
++        decoded = *(CVPixelBufferRef *)src_ctx->avframe->buf[0]->data;
++    if (decoded != NULL)
++        pic_ctx->cvpx = decoded;
++
+     CVPixelBufferRetain(pic_ctx->cvpx);
+     pic_ctx->avframe = av_frame_clone(src_ctx->avframe);
+     if (!pic_ctx->avframe)
+@@ -1307,6 +1325,15 @@ static int Get(vlc_va_t *va, picture_t *pic, AVCodecContext *ctx, AVFrame *frame
+         return VLC_EGENERIC;
+     }
+ 
++    /* Diagnostic (F17): the get-time picture; pixbuf-in-buf0 is expected NULL
++     * here (pre-decode) and populated by the time vt_dec_pic_context_copy runs.
++     * All %p — safe pointer logging, no deref of unknown CF objects. */
++    msg_Dbg(va, "[AV1-VT] Get: data[3]=%p buf[0]=%p buf0->data=%p pixbuf@buf0=%p",
++            (void *)frame->data[3], (void *)frame->buf[0],
++            frame->buf[0] ? (void *)frame->buf[0]->data : NULL,
++            (frame->buf[0] && frame->buf[0]->data)
++                ? *(void **)frame->buf[0]->data : NULL);
++
+     vt_dec_pic_context *pctx = malloc(sizeof(*pctx));
+     if (unlikely(pctx == NULL))
+     {

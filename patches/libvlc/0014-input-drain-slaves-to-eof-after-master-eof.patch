@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SwiftPili <359733720+haikiseven@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 19:20:00 +0900
+Subject: [PATCH] input: drain DASH audio slaves to EOF after master EOF (F20)
+
+When the master (video) demux hits EOF, MainLoop stops calling
+MainLoopDemux, so SlaveDemux never runs again. A longer audio slave
+then leaves its last seconds undemuxed — silent tail while the clock
+freezes short of duration (device: t=95.1/99, stream_diff ~3.98s).
+Drain every remaining slave to EOF before es_out_Eos.
+Depends on 0003 only for context adjacency; independent logically.
+---
+--- a/src/input/input.c	2026-07-17 19:17:11
++++ b/src/input/input.c	2026-07-17 19:13:48
+@@ -93,6 +93,7 @@
+ /* TODO */
+ //static void InputGetAttachments( input_thread_t *, input_source_t * );
+ static void SlaveDemux( input_thread_t *p_input );
++static void SlaveDemuxToEnd( input_thread_t *p_input );
+ static void SlaveSeek( input_thread_t *p_input, const vlc_tick_t * );
+ 
+ static void InputMetaUser( input_thread_t *p_input, vlc_meta_t *p_meta );
+@@ -544,6 +545,18 @@
+     {
+         msg_Dbg( p_input, "EOF reached" );
+         p_priv->master->b_eof = true;
++        /* F20 (DASH split A/V): the master is usually the video demux. Once
++         * master->b_eof is set, MainLoop stops calling MainLoopDemux, so the
++         * normal SlaveDemux path (which only runs on SUCCESS) never runs
++         * again. The audio slave is typically a few seconds longer than the
++         * video (AAC-frame alignment / different fragment grid). Without an
++         * explicit drain here those last seconds are never demuxed, the aout
++         * plays out only what it already has, and the tail is silent while
++         * the clock freezes short of duration (device: t=95.1/99, gap
++         * stream_diff ~3.98s). Drain every remaining slave to EOF BEFORE
++         * es_out_Eos so the audio decoder fifo still accepts blocks. */
++        if( p_priv->i_slave > 0 )
++            SlaveDemuxToEnd( p_input );
+         es_out_Eos(p_priv->p_es_out);
+     }
+     else if( i_ret == VLC_DEMUXER_EGENERIC )
+@@ -3125,6 +3138,49 @@
+         if( i_ret <= 0 )
+         {
+             msg_Dbg(p_input, "slave %zu EOF", i);
++            in->b_eof = true;
++        }
++    }
++}
++
++/* Demux every non-EOF slave until each reports EOF (or the input is stopped).
++ * Used when the master hits EOF so trailing audio on a longer DASH slave is
++ * still fed into es_out before EsOutDrain freezes the pipeline. Bound the
++ * per-slave loop so a stuck demux cannot hang teardown.
++ *
++ * F20 device (2026-07): DASH split A/V, master=video. After master EOF the
++ * main loop never called SlaveDemux again; audio stopped ~4s early
++ * (t=95.1/99, clock gap stream_diff ~3.98s). Drain complete only played what
++ * was already queued. */
++static void SlaveDemuxToEnd( input_thread_t *p_input )
++{
++    /* ~60s of ~50ms steps if a slave never ends — far above the few seconds
++     * of tail we care about, cheap insurance against a wedged demux. */
++    enum { SLAVE_DRAIN_MAX_ITER = 1200 };
++
++    for( size_t i = 0; i < input_priv(p_input)->i_slave; i++ )
++    {
++        input_source_t *in = input_priv(p_input)->slave[i];
++        int iter = 0;
++
++        if( in->b_eof )
++            continue;
++
++        while( !input_Stopped( p_input ) && iter++ < SLAVE_DRAIN_MAX_ITER )
++        {
++            int i_ret = demux_Demux( in->p_demux );
++            if( i_ret <= 0 )
++            {
++                msg_Dbg( p_input, "slave %zu drained to EOF (iter=%d)", i, iter );
++                in->b_eof = true;
++                break;
++            }
++        }
++
++        if( !in->b_eof )
++        {
++            msg_Warn( p_input, "slave %zu drain aborted after %d iters "
++                      "(stopped=%d)", i, iter, (int)input_Stopped( p_input ) );
+             in->b_eof = true;
+         }
+     }

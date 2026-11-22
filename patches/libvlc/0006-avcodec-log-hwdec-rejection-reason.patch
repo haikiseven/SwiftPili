@@ -1,0 +1,74 @@
+From: SwiftPili <359733720+haikiseven@users.noreply.github.com>
+Subject: [PATCH] avcodec: log why a hardware pixel format is rejected
+
+On an A19 Pro, AV1 decoding falls through to dav1d even though VideoToolbox has
+hardware AV1. The log shows `trying format videotoolbox_vld` and then, with no
+further message, `trying format vaapi` → dav1d. The rejection is invisible: every
+failure point on the hardware path returns VLC_EGENERIC silently.
+
+There are three, and they are indistinguishable from the log:
+
+  - lavc_UpdateVideoFormat() fails (output chroma unsupported),
+  - decoder_GetDecoderDevice() returns NULL (no VideoToolbox decoder-device
+    module, or the display is not up when get_format runs — note the
+    `vout: none found` that accompanies the failure),
+  - vlc_va_New() returns NULL (the VA module is not built, not in the static
+    plugin list, or its Open() rejected the device/profile).
+
+Log each. This is diagnostic only — no control flow changes, the same
+VLC_EGENERIC is returned in every case. It just makes the hwdec negotiation say
+why it gave up, so the actual cause can be read from one device run instead of
+guessed at.
+
+diff --git a/modules/codec/avcodec/video.c b/modules/codec/avcodec/video.c
+index 04d2c2b..8d6c667 100644
+--- a/modules/codec/avcodec/video.c
++++ b/modules/codec/avcodec/video.c
+@@ -719,17 +719,26 @@ static int lavc_UpdateHWVideoFormat(decoder_t *p_dec, AVCodecContext *p_context,
+         msg_Err(p_dec, "unspecified video dimensions");
+         return VLC_EGENERIC;
+     }
+     const AVPixFmtDescriptor *dsc = av_pix_fmt_desc_get(hwfmt);
+     msg_Dbg(p_dec, "trying format %s", dsc ? dsc->name : "unknown");
+     if (lavc_UpdateVideoFormat(p_dec, p_context, hwfmt, swfmt))
++    {
++        msg_Warn(p_dec, "hwdec: %s rejected — lavc_UpdateVideoFormat failed "
++                 "(output chroma unsupported)", dsc ? dsc->name : "?");
+         return VLC_EGENERIC; /* Unsupported brand of hardware acceleration */
++    }
+ 
+     *pp_dec_device = decoder_GetDecoderDevice(p_dec);
+     if (*pp_dec_device == NULL)
++    {
++        msg_Warn(p_dec, "hwdec: %s rejected — no decoder device available "
++                 "(is a VideoToolbox decoder-device module loaded, and is the "
++                 "display up yet?)", dsc ? dsc->name : "?");
+         return VLC_EGENERIC;
++    }
+ 
+     return VLC_SUCCESS;
+ }
+ 
+ static void ffmpeg_CloseVa(decoder_t *p_dec, AVCodecContext *context)
+ {
+@@ -768,13 +777,20 @@ static int ffmpeg_OpenVa(decoder_t *p_dec, AVCodecContext *p_context,
+         .use_hwframes = false,
+         .extra_pictures = 0,
+     };
+     vlc_va_t *va = vlc_va_New(VLC_OBJECT(p_dec), &cfg);
+ 
+     if (va == NULL)
++    {
++        const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(hwfmt);
++        msg_Warn(p_dec, "hwdec: no 'hw decoder' module accepted %s — the VA "
++                 "module is either not built into this libVLC, not in the static "
++                 "plugin list, or its Open() rejected the device/profile",
++                 d ? d->name : "?");
+         return VLC_EGENERIC; /* Unsupported codec profile or such */
++    }
+     assert(p_dec->fmt_out.video.i_chroma != 0);
+     assert(cfg.vctx_out != NULL);
+     p_dec->fmt_out.i_codec = p_dec->fmt_out.video.i_chroma;
+     p_dec->i_extra_picture_buffers += cfg.extra_pictures;
+ 
+     if (decoder_UpdateVideoOutput(p_dec, cfg.vctx_out))

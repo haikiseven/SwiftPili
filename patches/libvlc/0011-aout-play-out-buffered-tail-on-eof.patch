@@ -1,0 +1,157 @@
+From 0ff7bb5d3840fc58e323deb5d3960d6ee768f0b7 Mon Sep 17 00:00:00 2001
+From: SwiftPili <359733720+haikiseven@users.noreply.github.com>
+Date: Thu, 16 Jul 2026 18:05:00 +0900
+Subject: [PATCH] aout: play out the buffered tail on EOF instead of dropping
+ it
+
+When a block carries BLOCK_FLAG_DISCONTINUITY (the demuxer's marker for a
+PTS jump), the audio core drains the current output, sets
+discontinuity.draining, and buffers every subsequent block to replay AFTER
+the drain finishes (stream_StartDiscontinuity / stream_HandleDiscontinuity).
+The replay only fires when a LATER block arrives to re-check stream_IsDrained.
+
+At end-of-stream no later block ever arrives, so the replay never runs. The
+input's end-of-media path then calls vlc_aout_stream_Drain(), which found
+discontinuity.draining still set and simply DROPPED the buffered blocks:
+
+    msg_Err(aout, "draining while handling a discontinuity not handled"
+            ", losing %"PRId64 " us of audio", length); /* FIXME */
+    stream_ResetDiscontinuity(stream);
+
+That FIXME is two SwiftPili bugs at once, both near EOF:
+
+  * F20 (silent tail): BiliBili DASH videos whose demuxer emits a benign
+    forward timeline gap a few seconds before the end mark the tail block
+    DISCONTINUITY; the tail audio is buffered and then dropped here, so the
+    last seconds play silent while the video finishes. The official player
+    plays them, so the data is present -- libVLC was discarding it.
+
+  * F21 (freeze on 2x-at-EOF): while discontinuity.draining is set,
+    vlc_aout_stream_IsDrained() returns false, so es_out_IsEmpty() never
+    becomes true and the input loop spins on "waiting decoder fifos to empty"
+    forever -- the EOF event never fires. A 2x rate change landing right on
+    EOF keeps the master clock unstable (repeated "coefficient too unstable"
+    resets), which re-arms the discontinuity and makes the state stick, so
+    the player hangs at ~95s of a 99s video and the app diagnoses a dead
+    decoder.
+
+Fix: factor the existing flush + replay (from stream_HandleDiscontinuity)
+into stream_ReplayDiscontinuity(), and call it from vlc_aout_stream_Drain()
+when EOF is reached with a discontinuity still pending. The buffered tail is
+played out instead of dropped, and discontinuity.draining is cleared so
+IsDrained() can return true and the stream ends cleanly. The helper nulls the
+fifo before replaying, so the re-Play cannot recurse into the same branch.
+Muxed single-file A+V never hits this (no separate-timeline gap to mark the
+tail DISCONTINUITY).
+
+Verified: applies with git apply --check and syntax/type-checks clean
+(cc -fsyntax-only) against the pinned c833c4be0 tree, stock and patched. The
+aout stream machinery needs the full audio pipeline to exercise at runtime,
+so unlike the clock patches this one has no offline behavioural harness --
+the tail-audio and clean-EOF behaviour must be confirmed on device.
+---
+ src/audio_output/dec.c | 56 ++++++++++++++++++++++++++++--------------
+ 1 file changed, 38 insertions(+), 18 deletions(-)
+
+diff --git a/src/audio_output/dec.c b/src/audio_output/dec.c
+index 6243296..e1bb3a5 100644
+--- a/src/audio_output/dec.c
++++ b/src/audio_output/dec.c
+@@ -222,23 +222,23 @@ static void stream_ResetDiscontinuity(vlc_aout_stream *stream)
+     stream->discontinuity.draining = false;
+ }
+ 
+-static int stream_HandleDiscontinuity(vlc_aout_stream *stream, block_t *block)
++/* Flush the drained output and play back every block buffered since the
++ * discontinuity started. Shared by the normal path (stream_HandleDiscontinuity,
++ * once the output has drained) and the end-of-stream path
++ * (vlc_aout_stream_Drain), so the buffered tail is never dropped. The caller
++ * must hold at least one buffered block. Clears the discontinuity state before
++ * replaying so the re-Play cannot recurse into this same branch. */
++static void stream_ReplayDiscontinuity(vlc_aout_stream *stream)
+ {
+     audio_output_t *aout = aout_stream_aout(stream);
+     struct vlc_tracer *tracer = aout_stream_tracer(stream);
+ 
+-    block_ChainLastAppend(&stream->discontinuity.fifo_last, block);
+-
+-    /* Will play back all blocks once the draining is finished */
+-    if (!stream_IsDrained(stream))
+-        return AOUT_DEC_SUCCESS;
+-
+     /* Keep block list and stats before flushing */
+     int count;
+     vlc_tick_t length;
+     block_ChainProperties(stream->discontinuity.fifo_first, &count, NULL,
+                           &length);
+-    block = stream->discontinuity.fifo_first;
++    block_t *block = stream->discontinuity.fifo_first;
+ 
+     if (tracer != NULL)
+         vlc_tracer_TraceEvent(tracer, "RENDER", stream->str_id,
+@@ -248,6 +248,8 @@ static int stream_HandleDiscontinuity(vlc_aout_stream *stream, block_t *block)
+ 
+     /* Reset the discontinuity state, and flush */
+     stream->discontinuity.draining = false;
++    stream->discontinuity.fifo_first = NULL;
++    stream->discontinuity.fifo_last = &stream->discontinuity.fifo_first;
+     vlc_aout_stream_Flush(stream);
+ 
+     msg_Dbg(aout, "discontinuity: playing back %d blocks for a total length of "
+@@ -269,7 +271,17 @@ static int stream_HandleDiscontinuity(vlc_aout_stream *stream, block_t *block)
+     if (tracer != NULL)
+         vlc_tracer_TraceEvent(tracer, "RENDER", stream->str_id,
+                               "discontinuity_end");
++}
+ 
++static int stream_HandleDiscontinuity(vlc_aout_stream *stream, block_t *block)
++{
++    block_ChainLastAppend(&stream->discontinuity.fifo_last, block);
++
++    /* Will play back all blocks once the draining is finished */
++    if (!stream_IsDrained(stream))
++        return AOUT_DEC_SUCCESS;
++
++    stream_ReplayDiscontinuity(stream);
+     return AOUT_DEC_SUCCESS;
+ }
+ 
+@@ -1075,17 +1087,25 @@ void vlc_aout_stream_Drain(vlc_aout_stream *stream)
+ 
+     if (unlikely(stream->discontinuity.draining))
+     {
++        /* F21: end-of-stream reached while a PTS discontinuity is still
++         * draining. The blocks buffered since the discontinuity started (the
++         * audio TAIL -- e.g. the last seconds of a BiliBili DASH video whose
++         * demuxer emits a benign forward timeline gap near EOF) used to be
++         * DROPPED here: the original code logged "losing N us of audio" (a
++         * standing FIXME) and reset. That is the silent-tail bug (docs F20).
++         *
++         * Play the tail out instead: stream_ReplayDiscontinuity() flushes the
++         * drained output and re-Plays every held block, then we fall through to
++         * drain that freshly-queued audio. It also clears
++         * discontinuity.draining, so vlc_aout_stream_IsDrained() can finally
++         * return true -- otherwise the input's end-of-media loop spins on
++         * "waiting decoder fifos to empty" forever and the stream never ends
++         * (the freeze seen when a 2x rate change lands right on EOF). */
+         if (stream->discontinuity.fifo_first != NULL)
+-        {
+-            vlc_tick_t length;
+-            block_ChainProperties(stream->discontinuity.fifo_first, NULL, NULL,
+-                                  &length);
+-
+-            msg_Err(aout, "draining while handling a discontinuity not handled"
+-                    ", losing %"PRId64 " us of audio", length); /* FIXME */
+-        }
+-        stream_ResetDiscontinuity(stream);
+-        return;
++            stream_ReplayDiscontinuity(stream);
++        else
++            stream_ResetDiscontinuity(stream);
++        /* fall through to drain the replayed tail (draining is now cleared) */
+     }
+ 
+     struct vlc_tracer *tracer = aout_stream_tracer(stream);
+-- 
+2.39.5
+

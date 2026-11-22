@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SwiftPili <359733720+haikiseven@users.noreply.github.com>
+Date: Mon, 20 Jul 2026 02:30:00 +0900
+Subject: [PATCH] input: audio-slave demux lead for hold-2x feed reservoir
+
+SlaveDemux stock-caps non-sub slaves at the master's demux time, so the
+aout bank sawtooths 0→~one audio fragment (~4.3s on Bili DASH) regardless
+of MaxRaw. A 2× hold drains that reserve before master demux accelerates.
+
+Add integer var slave-audio-lead-ms (default 0 = stock). On pace-controlled
+masters, non-subtitle slaves catch up to master_time + lead. Cache the var
+once per input (SlaveDemux is hot — no var_Inherit each pass). Startup /
+pts_delay / network-caching are untouched (lead fills after play starts).
+0008 (master owns program PCR) and 0014 (slave EOF drain) already make a
+leading slave safe. App soak: --slave-audio-lead-ms=6000 (8s + fragment
+overshoot parked on MaxRaw/RAW_HIGH; 6s + fragment ≈ 10.3s under MaxRaw=12).
+
+Rebase (2026-07-26, AC1): the previous blob's hunk geometry was generated
+from a working tree that carried a stray extra blank line in
+src/input/input.c and src/libvlc-module.c, so `git apply --check` FAILED on
+the pinned base c833c4be0 + 0002..0014. build-libvlc.sh applies with
+`git apply --check` and logs a non-fatal "Skipped (already applied or
+conflicts)" -- a fresh clone therefore built a green xcframework with NONE
+of 0015 (and check-apply-matrix.sh could not see it, because its scratch was
+normalised from the already-drifted tree instead of the pinned commit).
+Regenerated mechanically, not by hand-editing offsets: diff -u
+(stock c833c4be0 + 0002..0014) against the built tree, so the added lines
+are byte-identical to the old blob and only the anchoring changed.
+No semantic change; default is still 0 = stock SlaveDemux.
+---
+--- a/src/input/input_internal.h
++++ b/src/input/input_internal.h
+@@ -544,6 +544,10 @@
+     size_t         i_slave;
+     input_source_t **slave;
+     float          slave_subs_rate;
++    /* 0015: cached --slave-audio-lead-ms (default 0). Read once at input
++     * create — SlaveDemux is on the hot path and must not var_Inherit every
++     * pass (locked object-tree walk). */
++    int            slave_audio_lead_ms;
+ 
+     /* Resources */
+     input_resource_t *p_resource;
+--- a/src/input/input.c
++++ b/src/input/input.c
+@@ -341,6 +341,14 @@
+ 
+     priv->b_low_delay = var_InheritBool( p_input, "low-delay" );
+     priv->i_jitter_max = VLC_TICK_FROM_MS(var_InheritInteger( p_input, "clock-jitter" ));
++
++    /* 0015: cache slave-audio-lead-ms once per input (SlaveDemux hot path). */
++    {
++        int lead_ms = var_InheritInteger( p_input, "slave-audio-lead-ms" );
++        if( lead_ms < 0 )
++            lead_ms = 0;
++        priv->slave_audio_lead_ms = lead_ms;
++    }
+ 
+     /* Remove 'Now playing' info as it is probably outdated */
+     input_item_SetNowPlaying( p_item, NULL );
+@@ -3084,6 +3092,19 @@
+         msg_Err( p_input, "demux doesn't like DEMUX_GET_TIME" );
+         return;
+     }
++
++    /* 0015: optional content-time lead for non-subtitle slaves.
++     * Stock SlaveDemux caps every slave at the master's demux time, so the
++     * aout bank can never stand deeper than ~one audio fragment (~4.3 s on
++     * Bili DASH) and a 2× hold drains it before master demux accelerates.
++     * slave-audio-lead-ms (default 0 = stock) lets non-sub slaves demux up
++     * to master_time + lead on a pace-controlled master, building a standing
++     * reservoir without raising pts_delay (which would stall open/seek).
++     * Subtitles stay on master time; live/non-pace masters stay stock.
++     * lead_ms is cached on priv at input create (hot path — no var_Inherit). */
++    const int lead_ms = priv->slave_audio_lead_ms;
++    const bool allow_audio_lead = lead_ms > 0
++                               && priv->master->b_can_pace_control;
+ 
+     for (size_t i = 0; i < input_priv(p_input)->i_slave; i++)
+     {
+@@ -3105,9 +3126,14 @@
+             in->sub_rate = priv->slave_subs_rate;
+         }
+ 
++        /* Per-slave demux target: non-sub + lead on pace-controlled master
++         * → master_time + lead; otherwise stock master_time. */
++        vlc_tick_t i_target = i_time;
++        if( allow_audio_lead && !in->b_slave_sub )
++            i_target = i_time + VLC_TICK_FROM_MS( lead_ms );
+ 
+         /* Call demux_Demux until we have read enough data */
+-        if( demux_Control( in->p_demux, DEMUX_SET_NEXT_DEMUX_TIME, i_time ) )
++        if( demux_Control( in->p_demux, DEMUX_SET_NEXT_DEMUX_TIME, i_target ) )
+         {
+             for( ;; )
+             {
+@@ -3120,7 +3146,7 @@
+                     break;
+                 }
+ 
+-                if( i_stime >= i_time )
++                if( i_stime >= i_target )
+                 {
+                     i_ret = 1;
+                     break;
+--- a/src/libvlc-module.c
++++ b/src/libvlc-module.c
+@@ -742,6 +742,17 @@
+     "This allows you to play from several inputs at " \
+     "the same time. This feature is experimental, not all formats " \
+     "are supported. Use a '#' separated list of inputs.")
++
++/* 0015: standing audio-slave demux reservoir for rate changes (hold-2×).
++ * Default 0 = stock SlaveDemux (slave capped at master demux time). */
++#define SLAVE_AUDIO_LEAD_MS_TEXT N_("Audio slave demux lead (ms)")
++#define SLAVE_AUDIO_LEAD_MS_LONGTEXT N_( \
++    "How far ahead of the master demux time non-subtitle input slaves may " \
++    "demux, in milliseconds. Default 0 preserves stock behaviour (slave " \
++    "capped at master time). A positive value builds a standing audio " \
++    "reservoir for playback-rate changes without raising network-caching " \
++    "or pts_delay (which would stall open/seek). Only applies on " \
++    "pace-controlled masters; subtitle slaves are unaffected.")
+ 
+ #define BOOKMARKS_TEXT N_("Bookmarks list for a stream")
+ #define BOOKMARKS_LONGTEXT N_( \
+@@ -1905,6 +1916,11 @@
+     add_string( "input-slave", NULL,
+                  INPUT_SLAVE_TEXT, INPUT_SLAVE_LONGTEXT )
+ 
++    add_integer( "slave-audio-lead-ms", 0,
++                 SLAVE_AUDIO_LEAD_MS_TEXT, SLAVE_AUDIO_LEAD_MS_LONGTEXT )
++        change_integer_range( 0, 60000 )
++        change_safe ()
++
+     add_string( "bookmarks", NULL,
+                  BOOKMARKS_TEXT, BOOKMARKS_LONGTEXT )
+         change_safe ()

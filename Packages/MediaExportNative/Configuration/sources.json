@@ -1,0 +1,15 @@
+{
+  "ffmpeg": "3b3dc211fed40e7e4f627dffd6a4e221eb481880",
+  "dav1d": "a4958c1e37400eb4bc8a129fa88ab92d89746577",
+  "libplacebo": "285d1cc8af2ab79b72ac662eb09736de8c12392b",
+  "moltenvk": "5189f8de86ec365860f63bf1da736815cfaea5cd",
+  "glslang": "5a0d62504b8126220a924613a902e620351d5ebf",
+  "spirv-cross": "aa217aeb6c9f0ace7a0ab233b28807edf45eb165",
+  "spirv-headers": "29981f65241605e08b0ede4cfeb999fe3b723c6a",
+  "spirv-tools": "0d6fd73ca73830ccab5fa1f00ed5ed40124e2c55",
+  "volk": "776893306c5d3b22b6185b5d4a258b81d94572bf",
+  "vulkan-headers": "e3b1eec08173d6b825cd3ac88c885a63b621504a",
+  "vulkan-tools": "8c66b352925cb771f793a4d3220b1321ae0febf1",
+  "cereal": "a56bad8bbb770ee266e930c95d37fff2a5be7fea",
+  "fast-float": "97b54ca9e75f5303507699d27c6b4f4efe4641a1"
+}

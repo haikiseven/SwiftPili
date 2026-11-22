@@ -1,0 +1,54 @@
+From: SwiftPili <359733720+haikiseven@users.noreply.github.com>
+Subject: [PATCH] build-libvlc: don't skip AV1 patch on a half-patched tree
+
+patch_vlc_avcodec_vt() skipped everything when va_videotoolbox.c existed:
+
+    if [ -f "$VA_VT_C" ]; then
+        info "VLC avcodec VideoToolbox VA module already patched"
+        return 0
+    fi
+
+But the file existing does not mean the module is in the build. The VLC checkout
+is reused across runs (reset only when HEAD != VLC_HASH), so if an earlier run
+wrote the .c but did not complete the Makefile.am edit + configure regeneration,
+every later run saw the file, skipped, and never compiled the module. Result: no
+vlc_entry__vt_avcodec_va symbol, no object file, and AV1 silently decoding on
+dav1d on hardware (A19 Pro) that has VideoToolbox AV1 — for the whole project
+history, undetected.
+
+Key the skip on the Makefile registration actually being present. If the .c
+exists but the registration does not, the tree is half-patched; the video.c/va.c
+sub-patches are not idempotent (they raise on an already-changed marker), so we
+cannot re-run in place — bail with the re-clone command instead of silently
+shipping a broken binary.
+
+diff --git a/scripts/build-libvlc.sh b/scripts/build-libvlc.sh
+index 9e0fe74..4f06aa4 100755
+--- a/scripts/build-libvlc.sh
++++ b/scripts/build-libvlc.sh
+@@ -1101,8 +1101,23 @@ patch_vlc_avcodec_vt() {
+     local MAKEFILE_AM="${VLC_SRC}/modules/codec/Makefile.am"
+ 
+     if [ -f "$VA_VT_C" ]; then
+-        info "VLC avcodec VideoToolbox VA module already patched"
+-        return 0
++        # The .c existing does NOT prove the module is in the build. If an earlier
++        # run wrote it but did not finish the Makefile.am edit + configure regen
++        # (interrupted, or a marker mismatch), the REUSED checkout keeps that
++        # half-patched state — and this guard used to skip forever, so the module
++        # was never compiled (no vlc_entry__vt_avcodec_va symbol, dav1d every
++        # time). Verify the registration actually landed. The video.c/va.c
++        # sub-patches below are not idempotent (they raise on an already-patched
++        # marker), so we cannot re-run in place: a half-patched tree must be
++        # re-cloned.
++        if grep -q "libvt_avcodec_va_plugin" "$MAKEFILE_AM"; then
++            info "VLC avcodec VideoToolbox VA module already patched"
++            return 0
++        fi
++        echo "ERROR: ${VA_VT_C} exists but libvt_avcodec_va_plugin is absent from" >&2
++        echo "       ${MAKEFILE_AM} — half-patched VLC checkout. Re-clone and rebuild:" >&2
++        echo "       rm -rf ${BUILD_DIR}/vlc && $0 $*" >&2
++        exit 1
+     fi
+ 
+     info "Patching VLC avcodec module for VideoToolbox hwaccel (AV1)..."

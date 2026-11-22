@@ -1,0 +1,10 @@
+--- a/project.yml
++++ b/project.yml
+@@ -27,0 +28,2 @@
++  MediaExportNative:
++    path: Packages/MediaExportNative
+@@ -49,0 +52,4 @@
++      - package: MediaExportNative
++        product: MediaExportNative
++      - package: MediaExportNative
++        product: LiveMediaDemux

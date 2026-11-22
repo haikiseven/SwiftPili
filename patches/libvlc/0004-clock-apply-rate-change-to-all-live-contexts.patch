@@ -1,0 +1,105 @@
+From: SwiftPili <359733720+haikiseven@users.noreply.github.com>
+Subject: [PATCH] clock: apply a rate change to every live context
+
+context_stream_to_system() scales a stream timestamp by ctx->rate:
+
+    return ((vlc_tick_t) ((ts - ctx->start_time.stream) * ctx->coeff / ctx->rate))
+            + ctx->offset + ctx->start_time.system;
+
+but ctx->rate is written in exactly one place, at the end of
+vlc_clock_master_update_coeff(), and its only caller vlc_clock_master_update()
+begins with
+
+    if (ctx != main_clock->context)
+        return VLC_TICK_INVALID; /* Don't update previous contexts */
+
+So a clock parked on a previous context keeps converting at the rate that was in
+force when that context was current. Output clocks migrate only when they update,
+and a video output converts (vlc_clock_ConvertToSystem passes update=false so
+that outputs holding frames do not switch under themselves) -- it can stay parked
+for seconds.
+
+Change the playback rate in that window and video and audio run at different
+speeds. Measured on iOS, a 60fps stream with an audio master:
+
+  hold 2x:     rate=2.00, video displays  60 pictures/s  (video at 1x)
+  release:     rate=1.00, video displays 120 pictures/s  (video at 2x)
+  ~10s later:  rate=1.00, video displays  60 pictures/s  (clock migrated)
+
+Video is one rate change behind, in both directions, until it migrates.
+
+Apply the new rate to the contexts in prev_contexts too. Each is re-anchored on
+its own reference point so its mapping stays continuous across the change: the
+current context is re-anchored by ComputeOffset() against the master's fresh
+point, but a previous context has no such point, so pivot on ctx->last.
+
+Behaviour is unchanged when only one context is alive, and when the rate has not
+changed (context_change_rate() returns immediately), so the blast radius is
+exactly the broken case.
+
+Sits on top of 0002, which fixes the same class of bug for pause.
+
+diff --git a/src/clock/clock.c b/src/clock/clock.c
+index 104c43f..b84af25 100644
+--- a/src/clock/clock.c
++++ b/src/clock/clock.c
+@@ -412,16 +412,32 @@ static inline void vlc_clock_on_update(vlc_clock_t *clock,
+                               clock->cbs_data);
+ 
+     if (main_clock->tracer != NULL && clock->track_str_id != NULL &&
+         system_now != VLC_TICK_INVALID && system_now != VLC_TICK_MAX)
+         TraceRender(main_clock->tracer, "RENDER", clock->track_str_id,
+                     system_now, ts, drift, clock->context ? clock->context->clock_id : 0);
+ }
+ 
++static void context_change_rate(struct vlc_clock_context *ctx, double rate)
++{
++    if (ctx->rate == rate || ctx->last.system == VLC_TICK_INVALID)
++        return;
++
++    /* Re-anchor so this context's mapping stays continuous across the rate
++     * change: converting its own reference point must not jump. The current
++     * context is re-anchored by ComputeOffset() against the master's fresh
++     * point; a previous context has no such point, so pivot on its last one. */
++    const vlc_tick_t before = context_stream_to_system(ctx, ctx->last.stream);
++    ctx->rate = rate;
++    const vlc_tick_t after = context_stream_to_system(ctx, ctx->last.stream);
++    if (before != VLC_TICK_INVALID && after != VLC_TICK_INVALID)
++        ctx->offset += before - after;
++}
++
+ static void vlc_clock_master_update_coeff(
+     vlc_clock_t *clock, struct vlc_clock_context *ctx,
+     vlc_tick_t system_now, vlc_tick_t ts, double rate)
+ {
+     vlc_clock_main_t *main_clock = clock->owner;
+     vlc_mutex_assert(&main_clock->lock);
+ 
+     if (ctx->last.system != VLC_TICK_INVALID
+@@ -488,16 +504,26 @@ static void vlc_clock_master_update_coeff(
+     if (main_clock->tracer != NULL && clock->track_str_id != NULL)
+         vlc_tracer_Trace(main_clock->tracer,
+                          VLC_TRACE("type", "RENDER"),
+                          VLC_TRACE("id", clock->track_str_id),
+                          VLC_TRACE_TICK_NS("offset", ctx->offset),
+                          VLC_TRACE("coeff", ctx->coeff),
+                          VLC_TRACE_END);
+ 
++    /* A rate change applies to every context that is still alive, not just the
++     * current one. context_stream_to_system() scales by ctx->rate, and only the
++     * current context is ever updated here (vlc_clock_master_update() returns
++     * early for the others), so an output clock parked on a previous context
++     * keeps converting at the OLD rate until it migrates -- for seconds. Video
++     * then runs at 1x while audio runs at 2x, and vice versa on the way back. */
++    struct vlc_clock_context *prev_ctx;
++    vlc_list_foreach(prev_ctx, &main_clock->prev_contexts, node)
++        context_change_rate(prev_ctx, rate);
++
+     ctx->rate = rate;
+     vlc_cond_broadcast(&main_clock->cond);
+ }
+ 
+ static vlc_tick_t vlc_clock_master_update(vlc_clock_t *clock,
+                                           struct vlc_clock_context *ctx,
+                                           vlc_tick_t system_now,
+                                           vlc_tick_t ts, double rate,

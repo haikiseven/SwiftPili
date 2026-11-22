@@ -1,0 +1,69 @@
+From: SwiftPili <359733720+haikiseven@users.noreply.github.com>
+Subject: [PATCH] videotoolbox: native AV1 hardware decode (fixes F17 black)
+
+AV1 was decoded through a custom FFmpeg-VA module (va_videotoolbox.c) whose
+`get` op captured frame->data[3] at get_buffer2 time -- BEFORE decode.
+VideoToolbox's AV1 decoder allocates its OWN output CVPixelBuffer and FFmpeg
+swaps it into data[3] AFTER decode, so the captured pool buffer stayed empty and
+the picture rendered black (design doc F17). The module clones the frame at
+get-time, freezing the pre-decode pointers, and there is no post-decode VA hook
+-- so it cannot be fixed in that module.
+
+The native VideoToolbox decoder owns its VTDecompressionSession and receives the
+decoded CVPixelBuffer directly, exactly as it does for H.264/HEVC (which render
+fine). Teach it AV1. Like MP4V it is a "non-parsed" codec: the container supplies
+the PTS (output ordering), the picture size, and the av1C config, so no per-codec
+parsing/reorder callbacks are needed -- only pf_copy_extradata, wrapping the av1C
+record as the format-description atom. At capability 800 this module is tried
+before avcodec, so AV1 now takes the native path. A device without AV1 hardware
+decode is rejected up front (VTIsHardwareDecodeSupported), and VLC falls back to
+avcodec/dav1d exactly as before.
+
+Targets VLC c833c4be0 (modules/codec/videotoolbox/decoder.c).
+
+diff --git a/modules/codec/videotoolbox/decoder.c b/modules/codec/videotoolbox/decoder.c
+--- a/modules/codec/videotoolbox/decoder.c
++++ b/modules/codec/videotoolbox/decoder.c
+@@ -796,5 +796,17 @@
+     else
+         return NULL; /* MPEG4 without esds ? */
+ }
++
++static CFDictionaryRef CopyDecoderExtradataAV1(decoder_t *p_dec)
++{
++    /* The av1C record (AV1CodecConfigurationRecord) is the whole config; the
++     * mp4 demuxer hands it over as p_extra. VideoToolbox reads it from the
++     * "av1C" atom under SampleDescriptionExtensionAtoms, like h264's avcC. */
++    if (p_dec->fmt_in->i_extra)
++        return ExtradataInfoCreate(CFSTR("av1C"), p_dec->fmt_in->p_extra,
++                                                  p_dec->fmt_in->i_extra);
++    else
++        return NULL;
++}
+ 
+ /* !Codec Specific */
+@@ -930,3 +930,14 @@
+             return kCMVideoCodecType_HEVC;
++
++        case VLC_CODEC_AV1:
++            /* Native VideoToolbox AV1 -- bypasses the FFmpeg-VA path whose
++             * pre-decode buffer capture rendered AV1 black (design doc F17). */
++            if (!VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1))
++            {
++                msg_Warn(p_dec, "device doesn't support AV1");
++                return 0;
++            }
++            msg_Dbg(p_dec, "using native VideoToolbox AV1 decode");
++            return kCMVideoCodecType_AV1;
+ 
+         case VLC_CODEC_MP4V:
+@@ -1420,5 +1420,9 @@
+         case kCMVideoCodecType_MPEG4Video:
+             p_sys->pf_copy_extradata = CopyDecoderExtradataMPEG4;
+             break;
++
++        case kCMVideoCodecType_AV1:
++            p_sys->pf_copy_extradata = CopyDecoderExtradataAV1;
++            break;
+ 
+         default:

@@ -1,0 +1,137 @@
+From: SwiftPili <359733720+haikiseven@users.noreply.github.com>
+Subject: [PATCH] access/http: retry without the precondition on 412
+
+Every seek re-opens the resource with a conditional range request carrying the
+entity tag from the resource's own first response (vlc_http_file_req). Some CDNs
+hand out an ETag that their sibling edges do not honour: the initial request is
+answered by one node, the conditional seek is routed to another, and that node
+answers 412 Precondition Failed.
+
+vlc_http_file_seek() accepts only 206 and 416, so the seek fails outright:
+
+  [http] outgoing: Range: bytes=252722270-  If-Match: "-2590158fdc4dae27fd25fd6f05b30d58"
+  [http] incoming: HTTP/1.1 412 Precondition Failed
+  error: cannot seek (to offset 252722270)
+  warning: INPUT_CONTROL_SET_TIME @0 failed or not possible
+
+The two responses came from different edges of the same CDN:
+
+  open  via …CUCC2-CACHE7[6],  …CACHE20[0,TCP_HIT,0]    x-hcs-proxy-type: 1  206
+  seek  via …CUCC2-CACHE11[175], …CACHE20[172,TCP_MISS]  x-hcs-proxy-type: 0  412
+
+A caller opening a fragmented stream at a position then silently gets the start
+of the file, because the demuxer's seek failed but the media opened.
+
+The precondition exists to notice the entity changing under us mid-transfer.
+That is worth having, but not at the price of never seeking at all. Give it up
+once the origin has proven it will not honour its own validator, for that
+resource only, and retry the same range unconditionally. A resource that never
+412s is unaffected, and the flag is only ever set by an actual 412.
+
+This also repairs the truncated-transfer resume in vlc_http_file_read(), which
+recovers by calling vlc_http_file_seek() and today gives up on the same hosts.
+
+diff --git a/modules/access/http/file.c b/modules/access/http/file.c
+index 17ff23f..45ffa2d 100644
+--- a/modules/access/http/file.c
++++ b/modules/access/http/file.c
+@@ -38,25 +38,30 @@
+ #include "file.h"
+ 
+ #pragma GCC visibility push(default)
+ 
+ struct vlc_http_file
+ {
+     struct vlc_http_resource resource;
+     uintmax_t offset;
++    /* Set once the origin has rejected the validator it gave us (412). Some
++     * CDNs hand out an entity tag that their sibling edges do not honour, so
++     * the conditional request that every seek carries fails against whichever
++     * node answers it. Stop sending the precondition to this resource. */
++    bool no_precondition;
+ };
+ 
+ static int vlc_http_file_req(const struct vlc_http_resource *res,
+                              struct vlc_http_msg *req, void *opaque)
+ {
+     struct vlc_http_file *file = (struct vlc_http_file *)res;
+     const uintmax_t *offset = opaque;
+ 
+-    if (file->resource.response != NULL)
++    if (file->resource.response != NULL && !file->no_precondition)
+     {
+         const char *str = vlc_http_msg_get_header(file->resource.response,
+                                                   "ETag");
+         if (str != NULL)
+         {
+             if (!memcmp(str, "W/", 2))
+                 str += 2; /* skip weak mark */
+             vlc_http_msg_add_header(req, "If-Match", "%s", str);
+@@ -121,16 +126,17 @@ struct vlc_http_resource *vlc_http_file_create(struct vlc_http_mgr *mgr,
+     if (vlc_http_res_init(&file->resource, &vlc_http_file_callbacks, mgr,
+                           uri, ua, ref))
+     {
+         free(file);
+         return NULL;
+     }
+ 
+     file->offset = 0;
++    file->no_precondition = false;
+     return &file->resource;
+ }
+ 
+ static uintmax_t vlc_http_msg_get_file_size(const struct vlc_http_msg *resp)
+ {
+     int status = vlc_http_msg_get_status(resp);
+     const char *range = vlc_http_msg_get_header(resp, "Content-Range");
+ 
+@@ -198,23 +204,47 @@ bool vlc_http_file_can_seek(struct vlc_http_resource *res)
+     int status = vlc_http_res_get_status(res);
+     if (status < 0)
+         return false;
+     return vlc_http_msg_can_seek(res->response);
+ }
+ 
+ int vlc_http_file_seek(struct vlc_http_resource *res, uintmax_t offset)
+ {
++    struct vlc_http_file *file = (struct vlc_http_file *)res;
++
+     struct vlc_http_msg *resp = vlc_http_res_open(res, &offset);
+     if (resp == NULL)
+         return -1;
+ 
+-    struct vlc_http_file *file = (struct vlc_http_file *)res;
+-
+     int status = vlc_http_msg_get_status(resp);
++
++    /* 412 Precondition Failed: the origin rejected the entity tag that it
++     * handed us in its own first response. That happens on CDNs whose edges do
++     * not agree on the validator -- the initial request is answered by one node
++     * and the conditional seek by another, which computes a different ETag.
++     *
++     * There is otherwise no recovery: the seek fails, and a caller opening a
++     * fragmented stream at a position simply gets the start of the file. The
++     * precondition guards against the entity changing under us, so give it up
++     * only once it has proven unusable, and only for this resource. Then retry
++     * the same range unconditionally.
++     */
++    if (status == 412 && !file->no_precondition
++     && file->resource.response != NULL)
++    {
++        vlc_http_msg_destroy(resp);
++        file->no_precondition = true;
++
++        resp = vlc_http_res_open(res, &offset);
++        if (resp == NULL)
++            return -1;
++        status = vlc_http_msg_get_status(resp);
++    }
++
+     if (res->response != NULL)
+     {   /* Accept the new and ditch the old one if:
+          * - requested succeeded and range was accepted (206),
+          * - requested failed due to out-of-range (416),
+          * - request succeeded and seek offset is zero (2xx).
+          */
+         if (status != 206 && status != 416 && (offset != 0 || status >= 300))
+         {

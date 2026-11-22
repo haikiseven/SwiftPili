@@ -1,0 +1,221 @@
+From: SwiftPili libVLC patch stack
+Subject: [PATCH] aout: optional change_rate hook so a module can own the
+ playback rate (audio-rate rework core half)
+
+Adds optional change_rate aout hook + aout-handles-rate ownership of
+rate so a module can apply pitch-corrected rate without core scaletempo:
+  * change_rate on audio_output_t
+  * skip scaletempo when aout-handles-rate is true
+  * FiltersPlay raw when rate_filter NULL (aout-handles-rate)
+  * on ChangeRate when change_rate != NULL: immediately sync timing.rate
+    and re-anchor rate_system_ts / rate_audio_ts from the last TimingReport
+  * K2.5 (2026-07-19): NotifyTiming does NOT rewrite module content PTS as
+    wall*rate when change_rate != NULL (post-hold desync class)
+
+filters.c reads aout-handles-rate safely via var_Type parent walk so
+Open() can set it on the aout object.
+
+P0.1 rebase (2026-07-26): this patch is generated against
+c833c4be0 + 0002..0011 and no longer carries the dec.c
+stream_ReplayDiscontinuity extraction / EOF Drain replay body. That fix is
+owned SOLELY by 0011-aout-play-out-buffered-tail-on-eof.patch. The earlier
+blob duplicated 0011 verbatim in dec.c, so a clean ordered apply
+(0011 then 0012) conflicted and build-libvlc.sh logged a non-fatal
+"Skipped" -- silently shipping a green xcframework with NONE of 0012.
+0011 stays independently applyable (option B); 0012 must be applied AFTER
+it. Verified with patches/libvlc/verify/check-apply-matrix.sh (ordered
+apply on a scratch tree) + check-filters-rate-ownership.sh.
+---
+--- a/include/vlc_aout.h
++++ b/include/vlc_aout.h
+@@ -289,6 +289,26 @@
+       * \return 0 on success, non-zero on failure.
+       *
+       * \warning The same constraints apply as with volume_set().
++      */
++
++    void (*change_rate)(audio_output_t *, float rate);
++    /**< Changes the playback rate, pitch-corrected (optional, may be NULL).
++      *
++      * If set, the core does NOT insert a playback-rate filter (scaletempo)
++      * and does NOT use the sample-rate resampler as rate_filter: the module
++      * receives raw, un-stretched PCM and applies the playback rate itself
++      * (e.g. via an AVAudioUnitTimePitch node), so a rate change engages
++      * immediately instead of after the module's output buffer drains at the
++      * old rate. FindResampler still matches decoder vs device sample rates.
++      *
++      * A module that implements this MUST also create the boolean variable
++      * "aout-handles-rate" (set to true) on the audio_output_t in its open, so
++      * that aout_FiltersNew() skips core rate stretching.
++      *
++      * \param rate playback rate (1.0 = normal speed). Always positive.
++      *
++      * \note Called with the same concurrency constraints as pause(): protected
++      * against start(), stop(), volume_set(), mute_set(), device_select().
+       */
+ 
+     struct {
+--- a/src/audio_output/dec.c
++++ b/src/audio_output/dec.c
+@@ -832,6 +832,7 @@
+ 
+     vlc_tick_t rate_audio_ts = stream->timing.rate_audio_ts;
+     vlc_tick_t rate_system_ts = stream->timing.rate_system_ts;
++    audio_output_t *aout = aout_stream_aout(stream);
+ 
+     if (rate_audio_ts != VLC_TICK_INVALID)
+     {
+@@ -842,9 +843,26 @@
+             return;
+         }
+ 
+-        /* Fix the audio timestamp with the rate */
+-        audio_ts = rate_audio_ts + (system_ts - rate_system_ts)
+-                   * stream->timing.rate;
++        /* K2.5 / aout-handles-rate (device 2026-07-19 post-hold desync):
++         * When the module owns rate (change_rate != NULL), TimingReport carries
++         * true CONTENT PTS (pitch engine: firstPts + consumed content frames).
++         * Rewriting as
++         *   rate_audio_ts + (system_ts - rate_system_ts) * timing.rate
++         * invents progress across underrun/silence gaps (wall keeps advancing
++         * while content is frozen) and throws away the module's honest PTS →
++         * vlc_clock_Update poisons A/V after 2× hold empties the bank.
++         *
++         * Keep the drop-before-rate-change filter and pass timing.rate into
++         * vlc_clock_Update, but use the module audio_ts as-is.
++         *
++         * Stock modules without change_rate still get the historical rewrite
++         * (wall-domain / rate-filter path). */
++        if (aout->change_rate == NULL)
++        {
++            /* Fix the audio timestamp with the rate */
++            audio_ts = rate_audio_ts + (system_ts - rate_system_ts)
++                       * stream->timing.rate;
++        }
+     }
+ 
+     stream->timing.system_ts = system_ts;
+@@ -1038,6 +1056,47 @@
+ void vlc_aout_stream_ChangeRate(vlc_aout_stream *stream, float rate)
+ {
+     stream->sync.rate = rate;
++
++    /* A rate-aware module (one that set the "aout-handles-rate" variable so the
++     * core rate filter was skipped in aout_FiltersNew) applies the rate itself,
++     * immediately, instead of relying on the module's buffered output draining
++     * at the old rate first. */
++    audio_output_t *aout = aout_stream_aout(stream);
++    if (aout->change_rate != NULL)
++    {
++        /* P4.3 / pitch-engine (device 2026-07-18, K2.5 2026-07-19):
++         * TimingReports from a module that owns rate carry CONTENT PTS
++         * advancing at the true output rate (2× consumes content 2× per
++         * wall second). NotifyTiming feeds
++         * vlc_clock_Update(..., audio_ts, timing.rate).
++         *
++         * timing.rate used to update only on the next Play() when
++         * sync.rate != timing.rate. Between ChangeRate and that Play,
++         * reports still used timing.rate=1 while content advanced 2× →
++         * instant_coeff ≈ 0.5 → "coefficient too unstable" master-clock
++         * resets and broken hold-2×. Sync timing.rate immediately here.
++         *
++         * rate_audio_ts / rate_system_ts re-anchor the drop-before-rate
++         * filter in NotifyTiming. For change_rate modules, NotifyTiming
++         * does NOT rewrite audio_ts as wall*rate (K2.5) — module content
++         * PTS is authoritative; inventing progress across underrun silence
++         * caused post-hold A/V desync. Stock (change_rate NULL) still
++         * rewrites. */
++        vlc_mutex_lock(&stream->timing.lock);
++        if (stream->timing.rate != rate)
++        {
++            if (stream->timing.system_ts != VLC_TICK_INVALID
++             && stream->timing.audio_ts != VLC_TICK_INVALID)
++            {
++                stream->timing.rate_system_ts = stream->timing.system_ts;
++                stream->timing.rate_audio_ts = stream->timing.audio_ts;
++            }
++            stream->timing.rate = rate;
++        }
++        vlc_mutex_unlock(&stream->timing.lock);
++
++        aout->change_rate(aout, rate);
++    }
+ }
+ 
+ void vlc_aout_stream_ChangeDelay(vlc_aout_stream *stream, vlc_tick_t delay)
+--- a/src/audio_output/filters.c
++++ b/src/audio_output/filters.c
+@@ -631,7 +631,28 @@
+     assert(input_format.channel_type == AUDIO_CHANNEL_TYPE_BITMAP);
+ 
+     /* parse user filter lists */
+-    if (var_InheritBool (obj, "audio-time-stretch"))
++    /* "aout-handles-rate" is set by a rate-aware output module (see
++     * vlc_aout.h change_rate): it applies the playback rate itself, so the
++     * core must NOT insert its own rate filter here and must NOT promote
++     * FindResampler to rate_filter (L1). The sample-rate matching resampler
++     * still runs as resampler only.
++     *
++     * CRITICAL: do NOT var_InheritBool an unregistered name. Inherit falls
++     * through to config_GetInt(), which NULL-derefs under NDEBUG when the
++     * name is not a config option (device: EXC_BAD_ACCESS in config_GetInt
++     * at stream start with stock avsamplebuffer). Walk parents with var_Type
++     * and only Get when present; absent => false (core scaletempo as before). */
++    bool aout_handles_rate = false;
++    for (vlc_object_t *o = obj; o != NULL; o = vlc_object_parent(o))
++    {
++        if (var_Type(o, "aout-handles-rate") != 0)
++        {
++            aout_handles_rate = var_GetBool(o, "aout-handles-rate");
++            break;
++        }
++    }
++    if (!aout_handles_rate
++     && var_InheritBool (obj, "audio-time-stretch"))
+     {
+         if (AppendFilter(obj, "audio filter", "scaletempo",
+                          filters, &input_format, &output_format, NULL) == 0)
+@@ -681,7 +702,10 @@
+         msg_Err (obj, "cannot setup a resampler");
+         goto error;
+     }
+-    if (filters->rate_filter == NULL)
++    /* L1: module-owned rate keeps rate_filter NULL so aout_FiltersPlay does
++     * not time-stretch via the resampler input-rate hack. Sample-rate
++     * matching still uses filters->resampler only. */
++    if (filters->rate_filter == NULL && !aout_handles_rate)
+         filters->rate_filter = filters->resampler.f;
+ 
+     return filters;
+@@ -792,12 +816,14 @@
+     {
+         filter_t *rate_filter = filters->rate_filter;
+ 
+-        if (rate_filter == NULL)
+-            goto drop; /* Without linear, non-nominal rate is impossible. */
+-
+-        /* Override input rate */
+-        nominal_rate = rate_filter->fmt_in.audio.i_rate;
+-        rate_filter->fmt_in.audio.i_rate = lroundf(nominal_rate * rate);
++        if (rate_filter != NULL)
++        {
++            /* Override input rate (scaletempo or resampler-as-rate_filter). */
++            nominal_rate = rate_filter->fmt_in.audio.i_rate;
++            rate_filter->fmt_in.audio.i_rate = lroundf(nominal_rate * rate);
++        }
++        /* else: module owns rate (aout-handles-rate) — pass raw PCM; do not
++         * drop the block (stock used to goto drop when rate_filter was NULL). */
+     }
+ 
+     block = aout_FiltersPipelinePlay (filters->tab, filters->count, block);
+@@ -815,10 +841,6 @@
+         filters->rate_filter->fmt_in.audio.i_rate = nominal_rate;
+     }
+     return block;
+-
+-drop:
+-    block_Release (block);
+-    return NULL;
+ }
+ 
+ block_t *aout_FiltersDrain (aout_filters_t *filters)
