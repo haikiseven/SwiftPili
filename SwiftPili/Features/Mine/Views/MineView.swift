@@ -49,7 +49,8 @@ struct MineView: View {
     @State private var showEditProfile = false
     private let loggedInOverride: Bool?
     private var isLoggedIn: Bool { loggedInOverride ?? authManager.isLoggedIn }
-    private var authManager: AuthManager { AuthManager.shared }
+    @Environment(\.authManager) private var authManager
+    @Environment(\.accountManager) private var accountManager
     @Environment(AppCoordinator.self) private var coordinator
     @Environment(\.horizontalSizeClass) private var sizeClass
 
@@ -78,6 +79,7 @@ struct MineView: View {
             .listRowBackground(AppFill.card)
         }
         .refreshable {
+            viewModel.bind(authManager: authManager, accountManager: accountManager)
             await viewModel.load()
             await viewModel.loadHistory()
         }
@@ -93,6 +95,7 @@ struct MineView: View {
             }
         }
         .task {
+            viewModel.bind(authManager: authManager, accountManager: accountManager)
             await viewModel.load()
             await viewModel.loadHistory()
         }
@@ -102,15 +105,15 @@ struct MineView: View {
         .alert(
             "Session expired",
             isPresented: Binding(
-                get: { AccountManager.shared.expiredSessionAlert != nil },
-                set: { if !$0 { AccountManager.shared.expiredSessionAlert = nil } }
+                get: { accountManager.expiredSessionAlert != nil },
+                set: { if !$0 { accountManager.expiredSessionAlert = nil } }
             )
         ) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(String(
                 format: String(localized: "%@'s login is no longer valid. Log in again via Add Account."),
-                AccountManager.shared.expiredSessionAlert ?? ""
+                accountManager.expiredSessionAlert ?? ""
             ))
         }
     }
@@ -119,7 +122,7 @@ struct MineView: View {
 
     private var settingsSection: some View {
         Section {
-            if isLoggedIn || !AccountManager.shared.accounts.isEmpty {
+            if isLoggedIn || !accountManager.accounts.isEmpty {
                 NavigationLink {
                     AccountSwitcherView()
                 } label: {
@@ -170,9 +173,7 @@ struct MineEditProfileContent: View {
 
     var body: some View {
         if let user = viewModel.userInfo {
-            EditProfileSheet(user: user) {
-                await viewModel.load()
-            }
+            EditProfileSheet(user: user, viewModel: viewModel)
         }
     }
 }
@@ -181,7 +182,7 @@ struct MineEditProfileContent: View {
 
 private struct EditProfileSheet: View {
     let user: UserInfo
-    var onUpdated: () async -> Void
+    let viewModel: MineViewModel
 
     @State private var name: String
     @State private var sign: String
@@ -194,10 +195,11 @@ private struct EditProfileSheet: View {
     @State private var notice: String?
     @State private var errorText: String?
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accentStore) private var accentStore
 
-    init(user: UserInfo, onUpdated: @escaping () async -> Void) {
+    init(user: UserInfo, viewModel: MineViewModel) {
         self.user = user
-        self.onUpdated = onUpdated
+        self.viewModel = viewModel
         _name = State(initialValue: user.name)
         _sign = State(initialValue: user.sign ?? "")
     }
@@ -207,7 +209,7 @@ private struct EditProfileSheet: View {
     }
 
     var body: some View {
-        accentedBody.accentContentBoundary()
+        accentedBody.tint(accentStore.contentTint)
     }
 
     @ViewBuilder private var accentedBody: some View {
@@ -230,7 +232,7 @@ private struct EditProfileSheet: View {
                         if isUploadingAvatar {
                             ProgressView()
                         } else {
-                            let accent = Color.biliAccent
+                            let accent = accentStore.semanticAccent
                             PhotosPicker(selection: $photoSelection, matching: .images) {
                                 Text("Change Avatar")
                                     .font(.subheadline)
@@ -252,7 +254,7 @@ private struct EditProfileSheet: View {
                             ProgressView()
                         } else {
                             Text("Save")
-                                .foregroundStyle(Color.biliAccent)
+                                .foregroundStyle(accentStore.semanticAccent)
                         }
                     }
                     .disabled(isSavingName || trimmedName.isEmpty || trimmedName == user.name)
@@ -270,7 +272,7 @@ private struct EditProfileSheet: View {
                             ProgressView()
                         } else {
                             Text("Save")
-                                .foregroundStyle(Color.biliAccent)
+                                .foregroundStyle(accentStore.semanticAccent)
                         }
                     }
                     .disabled(isSavingSign || sign == (user.sign ?? ""))
@@ -329,13 +331,10 @@ private struct EditProfileSheet: View {
         notice = nil
         defer { isSavingName = false }
         do {
-            _ = try await UserAPI.updateUsername(trimmedName)
-            PlayerLog.log("[Profile] username updated → \(trimmedName) (6 coins deducted)")
+            try await viewModel.updateUsername(trimmedName)
             notice = String(localized: "Username updated — 6 coins deducted")
-            await onUpdated()
         } catch {
             errorText = error.localizedDescription
-            PlayerLog.log("[Profile] rename failed: \(error)")
         }
     }
 
@@ -345,13 +344,10 @@ private struct EditProfileSheet: View {
         notice = nil
         defer { isSavingSign = false }
         do {
-            _ = try await UserAPI.updateSignature(sign.trimmingCharacters(in: .whitespacesAndNewlines))
-            PlayerLog.log("[Profile] signature updated (\(sign.count) chars)")
+            try await viewModel.updateSignature(sign.trimmingCharacters(in: .whitespacesAndNewlines))
             notice = String(localized: "Bio updated")
-            await onUpdated()
         } catch {
             errorText = error.localizedDescription
-            PlayerLog.log("[Profile] signature update failed: \(error)")
         }
     }
 
@@ -369,13 +365,11 @@ private struct EditProfileSheet: View {
         let capped = image.preparingThumbnail(of: CGSize(width: 1024, height: 1024)) ?? image
         let jpeg = capped.jpegData(compressionQuality: 0.9) ?? data
         do {
-            try await UploadAPI.updateAvatar(jpeg)
+            try await viewModel.updateAvatar(jpegData: jpeg)
             localAvatar = image
             notice = String(localized: "Avatar submitted — it may take a while to pass review")
-            await onUpdated()
         } catch {
             errorText = error.localizedDescription
-            PlayerLog.log("[Profile] avatar update failed: \(error)")
         }
     }
 }

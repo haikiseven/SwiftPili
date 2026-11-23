@@ -15,41 +15,14 @@ func favoriteRouteTarget(
 }
 
 struct FavoritesView: View {
-    @State private var folders: [FavoriteFolderResult.FavoriteFolder] = []
-    @State private var previewsByFolderID: [Int: [FavoriteContentResult.FavoriteMedia]] = [:]
-    @State private var loadedFolderIDs: Set<Int> = []
-    @State private var failedPreviewIDs: Set<Int> = []
-    @State private var loadingPreviewIDs: Set<Int> = []
-    @State private var previewGeneration: UInt64 = 0
-    @State private var previewTasks: [Int: Task<Void, Never>] = [:]
-    @State private var isLoading = true
+    @State private var viewModel = FavoritesViewModel()
     @State private var showManage = false
     @State private var showCreate = false
     @State private var newFolderName = ""
     @State private var pendingDelete: FavoriteFolderResult.FavoriteFolder?
-    @State private var errorText: String?
-    @State private var isMutating = false
-    @State private var accountRevision = AccountManager.shared.identityRevision
     @Environment(AppCoordinator.self) private var coordinator
-
-    private var showsInitialPlaceholder: Bool {
-        folders.isEmpty && isLoading
-    }
-
-    private var folderRows: [FavoriteFolderRowData] {
-        folders.map { folder in
-            let cached = previewsByFolderID[folder.id]
-            let isFresh = loadedFolderIDs.contains(folder.id)
-            let hasFailed = failedPreviewIDs.contains(folder.id)
-            let displayLoaded = isFresh || cached != nil || hasFailed
-            return FavoriteFolderRowData(
-                folder: folder,
-                previews: cached ?? [],
-                isPreviewLoaded: displayLoaded,
-                needsPreview: !isFresh && !hasFailed
-            )
-        }
-    }
+    @Environment(\.authManager) private var authManager
+    @Environment(\.accountManager) private var accountManager
 
     var body: some View {
         let placeholderLabel = String(
@@ -57,17 +30,19 @@ struct FavoritesView: View {
             String(localized: "Favorites")
         )
         FavoritesCollectionView(
-            rows: folderRows,
-            placeholderCount: showsInitialPlaceholder ? 6 : 0,
+            rows: viewModel.folderRows,
+            placeholderCount: viewModel.showsInitialPlaceholder ? 6 : 0,
             placeholderLabel: placeholderLabel,
-            isMutating: isMutating,
-            previewGeneration: previewGeneration,
+            isMutating: viewModel.isMutating,
+            previewGeneration: viewModel.previewGeneration,
             onRefresh: {
-                await refreshAll()
+                viewModel.bind(authManager: authManager, accountManager: accountManager)
+                await viewModel.refreshAll()
                 return false
             },
             onNeedPreview: { folderID in
-                loadPreviewIfNeeded(for: folderID)
+                viewModel.bind(authManager: authManager, accountManager: accountManager)
+                viewModel.loadPreviewIfNeeded(for: folderID)
             },
             onOpenFolder: { folderID, title in
                 coordinator.navigate(to: .favoriteDetail(folderID, title))
@@ -90,24 +65,35 @@ struct FavoritesView: View {
                 } label: {
                     Image(systemName: "plus")
                 }
-                .disabled(isMutating)
+                .disabled(viewModel.isMutating)
                 Button {
                     showManage = true
                 } label: {
                     Image(systemName: "folder.badge.gearshape")
                 }
-                .disabled(isMutating)
+                .disabled(viewModel.isMutating)
             }
         }
         .sheet(
             isPresented: $showManage,
-            onDismiss: { Task { await reload() } },
-            content: { ManageFavoriteFoldersView(folders: folders) }
+            onDismiss: {
+                Task {
+                    viewModel.bind(authManager: authManager, accountManager: accountManager)
+                    await viewModel.reload()
+                }
+            },
+            content: { ManageFavoriteFoldersView(folders: viewModel.folders) }
         )
         .alert("New Folder", isPresented: $showCreate) {
             TextField("Folder name", text: $newFolderName)
-            Button("Create") { createFolder(isPrivate: false) }
-            Button("Create Private") { createFolder(isPrivate: true) }
+            Button("Create") {
+                viewModel.bind(authManager: authManager, accountManager: accountManager)
+                viewModel.createFolder(name: newFolderName, isPrivate: false)
+            }
+            Button("Create Private") {
+                viewModel.bind(authManager: authManager, accountManager: accountManager)
+                viewModel.createFolder(name: newFolderName, isPrivate: true)
+            }
             Button("Cancel", role: .cancel) {}
         }
         .confirmationDialog(
@@ -119,7 +105,10 @@ struct FavoritesView: View {
             titleVisibility: .visible
         ) {
             Button("Delete Folder", role: .destructive) {
-                if let folder = pendingDelete { deleteFolder(folder) }
+                if let folder = pendingDelete {
+                    viewModel.bind(authManager: authManager, accountManager: accountManager)
+                    viewModel.deleteFolder(folder)
+                }
             }
         } message: {
             Text("The folder and its saved list are removed from your account.")
@@ -127,133 +116,25 @@ struct FavoritesView: View {
         .alert(
             "Operation Failed",
             isPresented: Binding(
-                get: { errorText != nil },
-                set: { if !$0 { errorText = nil } }
+                get: { viewModel.errorText != nil },
+                set: { if !$0 { viewModel.errorText = nil } }
             )
         ) {
             Button("OK", role: .cancel) {}
         } message: {
-            Text(errorText ?? "")
+            Text(viewModel.errorText ?? "")
         }
         .overlay {
-            if !showsInitialPlaceholder, folders.isEmpty {
+            if !viewModel.showsInitialPlaceholder, viewModel.folders.isEmpty {
                 ContentUnavailableView("No Favorites", systemImage: "star.slash")
             }
         }
-        .task(id: AccountManager.shared.identityRevision) {
-            if accountRevision != AccountManager.shared.identityRevision {
-                accountRevision = AccountManager.shared.identityRevision
-                folders = []
-                resetPreviewState(clearCache: true)
+        .task(id: accountManager.identityRevision) {
+            viewModel.bind(authManager: authManager, accountManager: accountManager)
+            if viewModel.resetForAccountRevisionIfNeeded(accountManager.identityRevision) {
                 pendingDelete = nil
-                errorText = nil
-                isLoading = true
             }
-            await reload()
-            isLoading = false
-        }
-    }
-
-    private func refreshAll() async {
-        let revision = AccountManager.shared.identityRevision
-        await reload()
-        guard !Task.isCancelled, AccountManager.shared.identityRevision == revision else { return }
-        resetPreviewState(clearCache: false)
-    }
-
-    private func resetPreviewState(clearCache: Bool) {
-        previewGeneration &+= 1
-        previewTasks.values.forEach { $0.cancel() }
-        previewTasks = [:]
-        loadedFolderIDs = []
-        failedPreviewIDs = []
-        loadingPreviewIDs = []
-        if clearCache {
-            previewsByFolderID = [:]
-        }
-    }
-
-    private func reload() async {
-        let revision = AccountManager.shared.identityRevision
-        let mid = Int(AuthManager.shared.dedeUserID ?? "0") ?? 0
-        do {
-            let result = try await UserAPI.getFavorites(mid: mid)
-            guard AccountManager.shared.identityRevision == revision else { return }
-            folders = result.list ?? []
-            let validIDs = Set(folders.map(\.id))
-            previewsByFolderID = previewsByFolderID.filter { validIDs.contains($0.key) }
-            loadedFolderIDs = loadedFolderIDs.intersection(validIDs)
-            failedPreviewIDs = failedPreviewIDs.intersection(validIDs)
-        } catch {
-            PlayerLog.log("[FavoritesView] failed: \(error)")
-        }
-    }
-
-    private func loadPreviewIfNeeded(for folderID: Int) {
-        guard !loadedFolderIDs.contains(folderID),
-              !failedPreviewIDs.contains(folderID),
-              !loadingPreviewIDs.contains(folderID) else { return }
-        let revision = AccountManager.shared.identityRevision
-        let generation = previewGeneration
-        loadingPreviewIDs.insert(folderID)
-        previewTasks[folderID] = Task {
-            defer {
-                if previewGeneration == generation, AccountManager.shared.identityRevision == revision {
-                    loadingPreviewIDs.remove(folderID)
-                    previewTasks.removeValue(forKey: folderID)
-                }
-            }
-            do {
-                let result = try await UserAPI.getFavoriteContent(mediaId: folderID, ps: 10)
-                guard !Task.isCancelled,
-                      AccountManager.shared.identityRevision == revision,
-                      previewGeneration == generation else { return }
-                previewsByFolderID[folderID] = result.medias ?? []
-                failedPreviewIDs.remove(folderID)
-                loadedFolderIDs.insert(folderID)
-            } catch {
-                guard !Task.isCancelled,
-                      AccountManager.shared.identityRevision == revision,
-                      previewGeneration == generation,
-                      !(error is CancellationError),
-                      (error as? BiliError)?.isCancellation != true else { return }
-                failedPreviewIDs.insert(folderID)
-                PlayerLog.log("[FavPreview] folder \(folderID) preview failed: \(error)")
-            }
-        }
-    }
-
-    private func createFolder(isPrivate: Bool) {
-        let name = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, !isMutating else { return }
-        isMutating = true
-        Task {
-            defer { isMutating = false }
-            do {
-                try await UserAPI.createFavoriteFolder(title: name, isPrivate: isPrivate)
-            } catch {
-                errorText = "\(error)"
-            }
-            await reload()
-        }
-    }
-
-    private func deleteFolder(_ folder: FavoriteFolderResult.FavoriteFolder) {
-        guard !isMutating else { return }
-        isMutating = true
-        Task {
-            defer { isMutating = false }
-            do {
-                try await UserAPI.deleteFavoriteFolder(mediaId: folder.id)
-                previewTasks.removeValue(forKey: folder.id)?.cancel()
-                previewsByFolderID.removeValue(forKey: folder.id)
-                loadedFolderIDs.remove(folder.id)
-                failedPreviewIDs.remove(folder.id)
-                loadingPreviewIDs.remove(folder.id)
-            } catch {
-                errorText = "\(error)"
-            }
-            await reload()
+            await viewModel.loadInitial()
         }
     }
 }
@@ -264,8 +145,7 @@ struct FavoriteFolderPreviewRow: View {
 
     private static let horizontalInset: CGFloat = 16
     private let onPreviewsLoaded: (([FavoriteContentResult.FavoriteMedia]) -> Void)?
-    @State private var previews: [FavoriteContentResult.FavoriteMedia]
-    @State private var loaded: Bool
+    @State private var viewModel: FavoriteFolderPreviewViewModel
     @Environment(AppCoordinator.self) private var coordinator
 
     @State private var shelfWidth: CGFloat
@@ -290,8 +170,7 @@ struct FavoriteFolderPreviewRow: View {
         self.folder = folder
         self.seedWidth = seedWidth
         self.onPreviewsLoaded = onPreviewsLoaded
-        _previews = State(initialValue: cachedPreviews ?? [])
-        _loaded = State(initialValue: cachedPreviews != nil)
+        _viewModel = State(initialValue: FavoriteFolderPreviewViewModel(cachedPreviews: cachedPreviews))
         _shelfWidth = State(initialValue: max(0, seedWidth - Self.horizontalInset * 2))
     }
 
@@ -328,7 +207,7 @@ struct FavoriteFolderPreviewRow: View {
             }
             .buttonStyle(.plain)
 
-            if previews.isEmpty, !loaded {
+            if viewModel.previews.isEmpty, !viewModel.loaded {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(alignment: .top, spacing: 10) {
                         ForEach(0 ..< 3, id: \.self) { _ in
@@ -352,7 +231,7 @@ struct FavoriteFolderPreviewRow: View {
                 .disabled(true)
                 .allowsHitTesting(false)
                 .accessibilityHidden(true)
-            } else if previews.isEmpty {
+            } else if viewModel.previews.isEmpty {
                 Text("Empty Folder")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
@@ -360,14 +239,14 @@ struct FavoriteFolderPreviewRow: View {
             } else {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(alignment: .top, spacing: 10) {
-                        ForEach(previews, id: \.resourceKey) { item in
+                        ForEach(viewModel.previews, id: \.resourceKey) { item in
                             VideoNavigationButton(target: favoriteRouteTarget(item)) {
                                 previewCard(item)
                                     .contentShape(Rectangle())
                             }
                             .disabled(!item.isPlayableVideo)
                         }
-                        if let count = folder.mediaCount, count > previews.count {
+                        if let count = folder.mediaCount, count > viewModel.previews.count {
                             Button {
                                 coordinator.navigate(to: .favoriteDetail(folder.id, folder.title))
                             } label: {
@@ -395,16 +274,7 @@ struct FavoriteFolderPreviewRow: View {
         .padding(.horizontal, Self.horizontalInset)
         .padding(.vertical, 12)
         .task {
-            guard !loaded else { return }
-            do {
-                let result = try await UserAPI.getFavoriteContent(mediaId: folder.id, ps: 10)
-                let fetched = result.medias ?? []
-                previews = fetched
-                onPreviewsLoaded?(fetched)
-            } catch {
-                PlayerLog.log("[FavPreview] folder \(folder.id) preview failed: \(error)")
-            }
-            loaded = true
+            await viewModel.loadIfNeeded(folderID: folder.id, onPreviewsLoaded: onPreviewsLoaded)
         }
     }
 

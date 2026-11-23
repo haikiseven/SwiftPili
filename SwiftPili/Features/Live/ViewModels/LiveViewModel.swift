@@ -357,12 +357,17 @@ final class LiveRoomViewModel {
     var chatMessages: [ChatMessage] = []
     var availableQualities: [LiveQuality] = []
     var popularity: Int = 0
+    private(set) var broadcaster: UserInfo?
+    private(set) var anchor: LiveAnchorInfo?
+    private(set) var isFollowingBroadcaster: Bool?
+    private(set) var followRequestInFlight = false
 
     private var danmakuClient: LiveDanmakuClient?
     private var danmakuConnectionGeneration: UInt64 = 0
     private(set) var playerOwnerLease: PlayerOwnerLease?
     private var committedRoomID: Int?
     @ObservationIgnored private var loadRequestSerial: UInt64 = 0
+    @ObservationIgnored private var broadcasterLoadGeneration: UInt64 = 0
 
     private static let fallbackQualities: [LiveQuality] = [
         LiveQuality(qn: 10000, label: String(localized: "Original")),
@@ -693,6 +698,70 @@ private extension LiveQuality {
 }
 
 extension LiveRoomViewModel {
+    var broadcasterName: String {
+        if let name = broadcaster?.name, !name.isEmpty {
+            return name
+        }
+        if let name = anchor?.uname, !name.isEmpty {
+            return name
+        }
+        return String(localized: "Streamer")
+    }
+
+    var broadcasterFace: String? {
+        if let face = broadcaster?.face, !face.isEmpty { return face }
+        if let face = anchor?.face, !face.isEmpty { return face }
+        return nil
+    }
+
+    func loadBroadcaster(uid: Int?, authManager: AuthManager = .shared) async {
+        broadcasterLoadGeneration &+= 1
+        let generation = broadcasterLoadGeneration
+        broadcaster = nil
+        anchor = nil
+        isFollowingBroadcaster = nil
+        followRequestInFlight = false
+        guard let uid, uid > 0 else { return }
+        let canQueryRelation = authManager.isLoggedIn && String(uid) != authManager.dedeUserID
+        async let userInfo = try? UserAPI.getUserInfo(mid: uid)
+        async let anchorInfo = try? LiveAPI.getAnchorInfo(uid: uid)
+        async let relation: RelationResult? = canQueryRelation
+            ? (try? await UserAPI.getRelation(mid: uid))
+            : nil
+        let resolvedUser = await userInfo
+        let resolvedAnchor = await anchorInfo
+        let resolvedRelation = await relation
+        guard !Task.isCancelled, broadcasterLoadGeneration == generation else { return }
+        broadcaster = resolvedUser
+        anchor = resolvedAnchor
+        isFollowingBroadcaster = resolvedRelation?.isFollowing
+    }
+
+    func toggleFollowBroadcaster(mid: Int) async {
+        guard mid > 0, !followRequestInFlight, let following = isFollowingBroadcaster else { return }
+        let generation = broadcasterLoadGeneration
+        followRequestInFlight = true
+        defer {
+            if broadcasterLoadGeneration == generation {
+                followRequestInFlight = false
+            }
+        }
+        do {
+            if following {
+                try await UserAPI.unfollow(mid: mid)
+            } else {
+                try await UserAPI.follow(mid: mid)
+            }
+            guard !Task.isCancelled, broadcasterLoadGeneration == generation else { return }
+            isFollowingBroadcaster = !following
+        } catch {
+            PlayerLog.log("[LiveRoom] follow toggle failed: \(error)")
+            guard !Task.isCancelled, broadcasterLoadGeneration == generation,
+                  !BiliAPIRetryPolicy.isCancellation(error), !error.isCancellation else { return }
+            AppNoticeCenter.shared.showError(String(localized: "Follow failed"))
+        }
+    }
+
     func prefetchMetadata(roomID: Int, requestAdmission: (@MainActor () -> Bool)? = nil) async {
         guard !Task.isCancelled, requestAdmission?() ?? true else { return }
         if roomInfo?.roomId == roomID { return }

@@ -440,14 +440,12 @@ struct LiveRoomView: View {
     @FocusState private var isDanmakuFocused: Bool
     @Environment(AppCoordinator.self) private var coordinator
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.authManager) private var authManager
+    @Environment(\.accentStore) private var accentStore
     @State private var scaleModeBeforeImmersivePortrait: VideoScaleMode?
     @State private var inlineContainerSize: CGSize = .zero
     @State private var standardChatAutoScroll = LiveChatAutoScrollPolicy<UUID>()
     @State private var immersiveChatAutoScroll = LiveChatAutoScrollPolicy<UUID>()
-    @State private var broadcaster: UserInfo?
-    @State private var anchor: LiveAnchorInfo?
-    @State private var isFollowingBroadcaster: Bool?
-    @State private var followRequestInFlight = false
     @State private var portraitKeyboardFrame: CGRect?
     @State private var portraitInputBarHeight = LivePortraitOverlayMetrics.minimumInputHeight
     @State private var immersiveTransportHeight = LivePortraitOverlayMetrics.minimumInputHeight
@@ -660,19 +658,7 @@ struct LiveRoomView: View {
         }
         .freezeWatchdogScreen("LiveRoom")
         .task(id: viewModel.roomInfo?.uid) {
-            broadcaster = nil
-            anchor = nil
-            isFollowingBroadcaster = nil
-            guard let uid = viewModel.roomInfo?.uid, uid > 0 else { return }
-            let canQueryRelation = AuthManager.shared.isLoggedIn && String(uid) != AuthManager.shared.dedeUserID
-            async let userInfo = try? UserAPI.getUserInfo(mid: uid)
-            async let anchorInfo = try? LiveAPI.getAnchorInfo(uid: uid)
-            async let relation: RelationResult? = canQueryRelation
-                ? (try? await UserAPI.getRelation(mid: uid))
-                : nil
-            broadcaster = await userInfo
-            anchor = await anchorInfo
-            isFollowingBroadcaster = await relation?.isFollowing
+            await viewModel.loadBroadcaster(uid: viewModel.roomInfo?.uid, authManager: authManager)
         }
         .onDisappear {
             portraitKeyboardFrame = nil
@@ -1517,7 +1503,7 @@ struct LiveRoomView: View {
         let currentQualityLabel = viewModel.availableQualities.first {
             $0.qn == viewModel.currentQuality
         }?.label ?? String(localized: "Auto")
-        let followWidth: CGFloat = isFollowingBroadcaster.map { following in
+        let followWidth: CGFloat = viewModel.isFollowingBroadcaster.map { following in
             let text = following ? String(localized: "Following") : String(localized: "+ Follow")
             return LiveChromeLabelWidth.estimate(text, textScale: headerTextScaleProbe / 100) + 20
         } ?? 0
@@ -1595,7 +1581,7 @@ struct LiveRoomView: View {
     ) -> some View {
         HStack(spacing: 0) {
             immersiveHostIdentityBlock(info, hostLayout: hostLayout, budget: budget)
-            if let following = isFollowingBroadcaster {
+            if let following = viewModel.isFollowingBroadcaster {
                 immersiveFollowButton(mid: info.uid, following: following)
                     .padding(.leading, LivePortraitHeaderBudget.pillFollowSpacing)
             }
@@ -1603,7 +1589,7 @@ struct LiveRoomView: View {
         .padding(.leading, LivePortraitHeaderBudget.pillLeadingPadding)
         .padding(
             .trailing,
-            isFollowingBroadcaster == nil
+            viewModel.isFollowingBroadcaster == nil
                 ? LivePortraitHeaderBudget.pillTrailingPaddingWithoutFollow
                 : LivePortraitHeaderBudget.pillTrailingPaddingWithFollow
         )
@@ -1617,7 +1603,7 @@ struct LiveRoomView: View {
         hostLayout: LivePortraitHostLayout,
         budget: LivePortraitHeaderBudget
     ) -> some View {
-        let name = broadcasterName(for: info)
+        let name = viewModel.broadcasterName
         let opensHostProfile = info.uid > 0
         let hostAccessibilityLabel = [
             name,
@@ -1632,7 +1618,7 @@ struct LiveRoomView: View {
         .joined(separator: ", ")
 
         return HStack(spacing: LivePortraitHeaderBudget.interitemSpacing) {
-            AvatarImage(urlString: broadcasterFace, size: LivePortraitHeaderBudget.avatarSide)
+            AvatarImage(urlString: viewModel.broadcasterFace, size: LivePortraitHeaderBudget.avatarSide)
                 .frame(width: LivePortraitHeaderBudget.avatarSide, height: LivePortraitHeaderBudget.avatarSide)
                 .accessibilityHidden(true)
 
@@ -1674,7 +1660,7 @@ struct LiveRoomView: View {
     private func immersiveFollowButton(mid: Int, following: Bool) -> some View {
         Button {
             Task {
-                await toggleFollowBroadcaster(mid: mid)
+                await viewModel.toggleFollowBroadcaster(mid: mid)
             }
         } label: {
             (following ? Text("Following") : Text("+ Follow"))
@@ -1686,14 +1672,14 @@ struct LiveRoomView: View {
                 .background(
                     following
                         ? AnyShapeStyle(Color.white.opacity(0.16))
-                        : AnyShapeStyle(Color.biliAccent),
+                        : AnyShapeStyle(accentStore.semanticAccent),
                     in: Capsule()
                 )
                 .contentShape(Capsule())
-                .appStateLabelFeedback(isOn: following, userActionInFlight: followRequestInFlight)
+                .appStateLabelFeedback(isOn: following, userActionInFlight: viewModel.followRequestInFlight)
         }
         .buttonStyle(.appControl)
-        .disabled(followRequestInFlight)
+        .disabled(viewModel.followRequestInFlight)
     }
 
     private var immersiveChatScrollView: some View {
@@ -1878,7 +1864,7 @@ struct LiveRoomView: View {
         showsDivider: Bool = true,
         isWideStage: Bool = false
     ) -> some View {
-        let name = broadcasterName(for: info)
+        let name = viewModel.broadcasterName
         let opensHostProfile = info.uid > 0
 
         return VStack(alignment: .leading, spacing: 0) {
@@ -1902,7 +1888,7 @@ struct LiveRoomView: View {
                             .font(.caption.weight(.medium))
                             .foregroundStyle(.secondary)
                     }
-                    if let following = isFollowingBroadcaster {
+                    if let following = viewModel.isFollowingBroadcaster {
                         standardFollowButton(mid: info.uid, following: following)
                     }
                 }
@@ -1925,7 +1911,7 @@ struct LiveRoomView: View {
     ) -> some View {
         let hasArea = !info.parentAreaName.isEmpty || !info.areaName.isEmpty
         return HStack(spacing: isWideStage ? AppSpacing.m : 10) {
-            AvatarImage(urlString: broadcasterFace, size: isWideStage ? 40 : 36)
+            AvatarImage(urlString: viewModel.broadcasterFace, size: isWideStage ? 40 : 36)
             VStack(alignment: .leading, spacing: isWideStage ? 4 : 2) {
                 HStack(spacing: AppSpacing.s) {
                     Text(name)
@@ -1986,7 +1972,7 @@ struct LiveRoomView: View {
     private func standardFollowButton(mid: Int, following: Bool) -> some View {
         Button {
             Task {
-                await toggleFollowBroadcaster(mid: mid)
+                await viewModel.toggleFollowBroadcaster(mid: mid)
             }
         } label: {
             Group {
@@ -2008,49 +1994,15 @@ struct LiveRoomView: View {
             .background(
                 following
                     ? AnyShapeStyle(AppFill.inset)
-                    : AnyShapeStyle(Color.biliAccent),
+                    : AnyShapeStyle(accentStore.semanticAccent),
                 in: Capsule()
             )
             .frame(minHeight: LivePortraitOverlayMetrics.minimumInputHeight)
             .contentShape(Rectangle())
-            .appStateLabelFeedback(isOn: following, userActionInFlight: followRequestInFlight)
+            .appStateLabelFeedback(isOn: following, userActionInFlight: viewModel.followRequestInFlight)
         }
         .buttonStyle(.appControl)
-        .disabled(followRequestInFlight)
-    }
-
-    private func toggleFollowBroadcaster(mid: Int) async {
-        guard mid > 0, let following = isFollowingBroadcaster else { return }
-        followRequestInFlight = true
-        defer { followRequestInFlight = false }
-        do {
-            if following {
-                try await UserAPI.unfollow(mid: mid)
-            } else {
-                try await UserAPI.follow(mid: mid)
-            }
-            isFollowingBroadcaster = !following
-        } catch {
-            PlayerLog.log("[LiveRoom] follow toggle failed: \(error)")
-            guard !Task.isCancelled, !BiliAPIRetryPolicy.isCancellation(error) else { return }
-            AppNoticeCenter.shared.showError(String(localized: "Follow failed"))
-        }
-    }
-
-    private func broadcasterName(for info: LiveRoomInfo) -> String {
-        if let name = broadcaster?.name, !name.isEmpty {
-            return name
-        }
-        if let name = anchor?.uname, !name.isEmpty {
-            return name
-        }
-        return String(localized: "Streamer")
-    }
-
-    private var broadcasterFace: String? {
-        if let face = broadcaster?.face, !face.isEmpty { return face }
-        if let face = anchor?.face, !face.isEmpty { return face }
-        return nil
+        .disabled(viewModel.followRequestInFlight)
     }
 
     // MARK: - Chat

@@ -10,18 +10,34 @@ final class MineViewModel {
     var favorites: [FavoriteFolderResult.FavoriteFolder] = []
     var isLoading = false
 
+    @ObservationIgnored private var authManager: AuthManager
+    @ObservationIgnored private var accountManager: AccountManager
+
+    init(
+        authManager: AuthManager = .shared,
+        accountManager: AccountManager = .shared
+    ) {
+        self.authManager = authManager
+        self.accountManager = accountManager
+    }
+
+    func bind(authManager: AuthManager, accountManager: AccountManager) {
+        self.authManager = authManager
+        self.accountManager = accountManager
+    }
+
     func load() async {
         isLoading = true
         defer { isLoading = false }
 
-        guard AuthManager.shared.isLoggedIn else { return }
+        guard authManager.isLoggedIn else { return }
 
-        let mid = Int(AuthManager.shared.dedeUserID ?? "0") ?? 0
+        let mid = Int(authManager.dedeUserID ?? "0") ?? 0
 
         do {
             userInfo = try await UserAPI.getMyInfo()
             if let userInfo {
-                AccountManager.shared.noteUserInfo(userInfo)
+                accountManager.noteUserInfo(userInfo)
             }
         } catch {
             if Task.isCancelled { return }
@@ -47,13 +63,45 @@ final class MineViewModel {
     }
 
     func loadHistory() async {
-        guard AuthManager.shared.isLoggedIn else { return }
+        guard authManager.isLoggedIn else { return }
         do {
             let result = try await UserAPI.getHistory()
             history = result.list ?? []
         } catch {
             guard !Task.isCancelled, !BiliAPIRetryPolicy.isCancellation(error), !error.isCancellation else { return }
             PlayerLog.log("[MineVM] load history failed: \(error)")
+        }
+    }
+
+    func updateUsername(_ name: String) async throws {
+        do {
+            _ = try await UserAPI.updateUsername(name)
+            PlayerLog.log("[Profile] username updated → \(name) (6 coins deducted)")
+            await load()
+        } catch {
+            PlayerLog.log("[Profile] rename failed: \(error)")
+            throw error
+        }
+    }
+
+    func updateSignature(_ signature: String) async throws {
+        do {
+            _ = try await UserAPI.updateSignature(signature)
+            PlayerLog.log("[Profile] signature updated (\(signature.count) chars)")
+            await load()
+        } catch {
+            PlayerLog.log("[Profile] signature update failed: \(error)")
+            throw error
+        }
+    }
+
+    func updateAvatar(jpegData: Data) async throws {
+        do {
+            try await UploadAPI.updateAvatar(jpegData)
+            await load()
+        } catch {
+            PlayerLog.log("[Profile] avatar update failed: \(error)")
+            throw error
         }
     }
 }
