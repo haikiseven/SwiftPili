@@ -4,9 +4,16 @@ import SwiftData
 @main
 struct SwiftPiliApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    private let modelContainer: ModelContainer
+    private let modelContainer: ModelContainer?
+    private let isRunningUnitTests: Bool
 
     init() {
+        let runningTests = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+        self.isRunningUnitTests = runningTests
+        guard !runningTests else {
+            self.modelContainer = nil
+            return
+        }
         ExperimentalSettingsStore.shared.bootstrap()
         ExperimentalDiagnosticsRuntime.applyPolicy()
         BuvidManager.ensureBuvid()
@@ -22,7 +29,11 @@ struct SwiftPiliApp: App {
 
     var body: some Scene {
         WindowGroup {
-            AppSceneRootView(modelContainer: modelContainer)
+            if isRunningUnitTests {
+                Color.clear
+            } else if let modelContainer {
+                AppSceneRootView(modelContainer: modelContainer)
+            }
         }
     }
 }
@@ -64,6 +75,11 @@ private struct AppSceneRootView: View {
             .environment(coordinator)
             .environment(noticeCenter)
             .environment(\.appNoticeCenter, noticeCenter)
+            .environment(\.authManager, AuthManager.shared)
+            .environment(\.accountManager, AccountManager.shared)
+            .environment(\.accentStore, AccentStore.shared)
+            .environment(\.blocklistManager, BlocklistManager.shared)
+            .environment(\.downloadManager, DownloadManager.shared)
             .modelContainer(modelContainer)
             .onChange(of: AccountManager.shared.identityRevision) { _, _ in
                 coordinator.resetForAccountChange()

@@ -4,7 +4,7 @@ import UIKit
 extension RootView {
     var showsSidebar: Bool {
         ShellNavigationPolicy.showsSidebar(
-            isPad: UIDevice.current.userInterfaceIdiom == .pad,
+            isPad: DeviceCapability.supportsPadDetailSplit,
             isRegularWidth: horizontalSizeClass == .regular
         )
     }

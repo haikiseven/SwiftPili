@@ -210,7 +210,7 @@ struct RootView: View {
                 coordinator.noteContentLinkNavigationChange()
             }
             if ShellNavigationPolicy.showsSidebar(
-                isPad: UIDevice.current.userInterfaceIdiom == .pad,
+                isPad: DeviceCapability.supportsPadDetailSplit,
                 isRegularWidth: new == .regular
             ) {
                 coordinator.unfoldSidebarSelection()
@@ -302,7 +302,7 @@ struct RootView: View {
 private extension View {
     @ViewBuilder
     func glassTabBarBehaviour() -> some View {
-        if #available(iOS 26.0, *), UIDevice.current.userInterfaceIdiom == .phone {
+        if #available(iOS 26.0, *), DeviceCapability.usesPhoneTabBarMinimization {
             tabBarMinimizeBehavior(.onScrollDown)
         } else {
             self

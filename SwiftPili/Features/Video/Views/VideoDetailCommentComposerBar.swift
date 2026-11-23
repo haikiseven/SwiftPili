@@ -49,7 +49,7 @@ struct VideoDetailCommentComposerOverlay: View {
                 || (showsWideChrome && stagePresentation == .stage && !hasActiveThread)
             let showsInput = (isCompactOverlay || showsWideChrome)
                 && showsCommentInput(for: commentsPresented)
-            let usesFeedWidth = !showsWideChrome && UIDevice.current.userInterfaceIdiom == .pad
+            let usesFeedWidth = !showsWideChrome && DeviceCapability.supportsPadDetailSplit
             VStack(spacing: 10) {
                 Group {
                     if showsToast, let toast = model.toast {

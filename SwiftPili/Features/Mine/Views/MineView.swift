@@ -377,7 +377,7 @@ private struct EditProfileSheet: View {
 private extension MineView {
     var sidebarCarriesTheseRows: Bool {
         ShellNavigationPolicy.showsSidebar(
-            isPad: UIDevice.current.userInterfaceIdiom == .pad,
+            isPad: DeviceCapability.supportsPadDetailSplit,
             isRegularWidth: sizeClass == .regular
         )
     }

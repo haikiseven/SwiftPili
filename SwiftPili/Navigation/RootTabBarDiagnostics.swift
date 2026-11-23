@@ -8,7 +8,7 @@ struct RootTabBarDiagnostics: View {
     @AppStorage(PlaybackDebugRecorder.defaultsKey) private var reportRequested = false
 
     var body: some View {
-        if UIDevice.current.userInterfaceIdiom == .phone,
+        if DeviceCapability.usesPhoneTabBarMinimization,
            ExperimentalSettingsStore.shared.isAllowed(.diagnostics),
            consoleRequested || reportRequested || PlayerLog.debugRequestedAtLaunch {
             RootTabBarProbe(

@@ -152,7 +152,7 @@ struct VideoDetailView: View {
         return DetailPlayerGeometry.videoHeight(
             containerWidth: base,
             primaryColumnWidth: nil,
-            isPortraitContent: UIDevice.current.userInterfaceIdiom != .pad
+            isPortraitContent: DeviceCapability.usesCompactPortraitVideoFraming
                 && (shapeIsCurrent ? player.isPortraitContent : metadataPortraitHint),
             isCondensed: shapeIsCurrent && player.inlineCondensed
         )
@@ -164,7 +164,7 @@ struct VideoDetailView: View {
     }
 
     private var metadataPortraitHint: Bool {
-        guard UIDevice.current.userInterfaceIdiom != .pad, let info = viewModel.videoInfo else { return false }
+        guard DeviceCapability.usesCompactPortraitVideoFraming, let info = viewModel.videoInfo else { return false }
         guard let cid = viewModel.currentCid, cid != info.cid,
               let page = info.pages?.first(where: { $0.cid == cid }) else {
             return info.dimension?.isPortrait ?? false
@@ -203,10 +203,10 @@ struct VideoDetailView: View {
         _screenOwner = State(initialValue: "vod-detail-\(UUID().uuidString)")
         _containerWidth = State(initialValue: initialBounds.width)
         _isWideLayout = State(initialValue: DetailSplitPolicy.usesSplit(
-            isPad: UIDevice.current.userInterfaceIdiom == .pad,
+            isPad: DeviceCapability.supportsPadDetailSplit,
             containerSize: initialBounds.size
         ))
-        _usesCompactPhoneActions = State(initialValue: UIDevice.current.userInterfaceIdiom == .phone
+        _usesCompactPhoneActions = State(initialValue: DeviceCapability.usesCompactPortraitVideoFraming
             && initialBounds.height >= initialBounds.width)
         _wideContainerHeight = State(initialValue: initialBounds.height)
         _restingContainerHeight = State(initialValue: initialBounds.height)
@@ -537,7 +537,7 @@ struct VideoDetailView: View {
             containerWidth = size.width
         }
         let wide = DetailSplitPolicy.usesSplit(
-            isPad: UIDevice.current.userInterfaceIdiom == .pad,
+            isPad: DeviceCapability.supportsPadDetailSplit,
             containerSize: size
         )
         if isWideLayout != wide { isWideLayout = wide }
@@ -547,7 +547,7 @@ struct VideoDetailView: View {
         }
         if wide, wideContainerHeight != size.height { wideContainerHeight = size.height }
         if size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 {
-            let compactPhone = UIDevice.current.userInterfaceIdiom == .phone && size.height >= size.width
+            let compactPhone = DeviceCapability.usesCompactPortraitVideoFraming && size.height >= size.width
             if usesCompactPhoneActions != compactPhone { usesCompactPhoneActions = compactPhone }
         }
     }

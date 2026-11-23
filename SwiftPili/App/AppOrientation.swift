@@ -24,6 +24,6 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         supportedInterfaceOrientationsFor window: UIWindow?
     ) -> UIInterfaceOrientationMask {
-        UIDevice.current.userInterfaceIdiom == .pad ? .all : AppOrientation.shared.mask
+        DeviceCapability.supportsOrientationLock ? AppOrientation.shared.mask : .all
     }
 }

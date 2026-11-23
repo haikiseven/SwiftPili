@@ -129,7 +129,8 @@ final class FavoritesViewModel {
                 guard !Task.isCancelled,
                       accountManager.identityRevision == revision,
                       previewGeneration == generation,
-                      !error.isCancellation else { return }
+                      !BiliAPIRetryPolicy.isCancellation(error),
+                      (error as? BiliError)?.isCancellation != true else { return }
                 failedPreviewIDs.insert(folderID)
                 PlayerLog.log("[FavPreview] folder \(folderID) preview failed: \(error)")
             }

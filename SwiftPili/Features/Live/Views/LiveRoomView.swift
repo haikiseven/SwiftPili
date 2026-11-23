@@ -498,7 +498,7 @@ struct LiveRoomView: View {
 
     private var usesWideCompanionLayout: Bool {
         DetailSplitPolicy.usesSplit(
-            isPad: UIDevice.current.userInterfaceIdiom == .pad,
+            isPad: DeviceCapability.supportsPadDetailSplit,
             containerSize: inlineContainerSize
         )
     }
@@ -508,7 +508,7 @@ struct LiveRoomView: View {
     }
 
     private var pageIsPortraitContent: Bool {
-        if UIDevice.current.userInterfaceIdiom == .pad { return false }
+        guard DeviceCapability.usesCompactPortraitVideoFraming else { return false }
         return streamIsPortraitContent
     }
 
