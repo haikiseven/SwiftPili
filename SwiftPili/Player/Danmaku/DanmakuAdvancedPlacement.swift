@@ -72,9 +72,11 @@ struct DanmakuAdvancedPlacement: Equatable, Sendable {
         )
     }
 
+    static let maximumLifetimeSeconds: Double = 10
+
     private static func carriedLifetime(_ seconds: Double) -> Double {
         guard seconds.isFinite else { return 0 }
-        return max(0, seconds)
+        return min(maximumLifetimeSeconds, max(0, seconds))
     }
 
     private static func clampedMove(_ milliseconds: Double, lifetime: Double) -> Double {

@@ -251,7 +251,12 @@ struct VideoToolboxTimingPolicy: Sendable {
         var firstFailureStatus: Int32?
         var resolutions: [VideoToolboxTimingOutputResolution] = []
         resolutions.reserveCapacity(outputEvents.count)
-        let allowsOneToOneFallback = outputEvents.count == 1
+        let imageOutputCount = outputEvents.reduce(into: 0) { count, event in
+            if event.status == Self.callbackSuccessStatus && event.imagePresent {
+                count += 1
+            }
+        }
+        let allowsOneToOneFallback = imageOutputCount == 1
         let expectedCallbackIndices = Set(outputEvents.indices)
         let observedCallbackIndices = Set(outputEvents.map(\.callbackIndex))
         let callbackIndicesAreValid = observedCallbackIndices == expectedCallbackIndices
@@ -300,6 +305,20 @@ struct VideoToolboxTimingPolicy: Sendable {
                     resolution: .callback(
                         pts: callbackPTS,
                         duration: callbackDuration
+                    )
+                ))
+                continue
+            }
+
+            if let callbackPTS,
+               !allowsOneToOneFallback,
+               let inputDuration = Self.validDuration(submission.inputDuration) {
+                resolutions.append(VideoToolboxTimingOutputResolution(
+                    event: event,
+                    resolution: .oneToOneInputFallback(
+                        pts: callbackPTS,
+                        duration: inputDuration / Double(max(1, imageOutputCount)),
+                        missing: .callbackDuration
                     )
                 ))
                 continue

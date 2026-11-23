@@ -20,6 +20,13 @@ protocol PresentationFailureProjection: AnyObject {
 final class PlaybackTerminalSettlement {
     private(set) var suppressesPauseProjection = false
 
+    func suppressingPauseProjection(_ body: () -> Void) {
+        let previous = suppressesPauseProjection
+        suppressesPauseProjection = true
+        defer { suppressesPauseProjection = previous }
+        body()
+    }
+
     func settle(
         fence: DemandPresentationFence,
         failure: DemandPresentationFailure,
@@ -28,9 +35,9 @@ final class PlaybackTerminalSettlement {
         projection: any PresentationFailureProjection
     ) {
         userInterface.beginPresentationFailure(fence: fence)
-        suppressesPauseProjection = true
-        transport.pauseForPresentationFailure()
-        suppressesPauseProjection = false
+        suppressingPauseProjection {
+            transport.pauseForPresentationFailure()
+        }
         userInterface.finishPresentationFailure(
             message: "Video presentation recovery failed (\(failure.rawValue)). Tap Retry."
         )

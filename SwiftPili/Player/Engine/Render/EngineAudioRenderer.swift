@@ -188,23 +188,35 @@ struct AudioRingPublication: Equatable, Sendable {
     static let initial = AudioRingPublication(slot: 0, epoch: 0)
 
     init(slot: Int, epoch: UInt64) {
-        self.slot = slot
-        self.epoch = epoch
+        self.slot = slot & 0x3
+        self.epoch = epoch & 0x3FFF_FFFF_FFFF_FFFF
     }
 
     fileprivate var packed: UInt64 {
-        (epoch &<< 1) | UInt64(slot & 1)
+        (epoch &<< 2) | UInt64(slot & 0x3)
     }
 
     fileprivate init(packed: UInt64) {
-        slot = Int(packed & 1)
-        epoch = packed &>> 1
+        slot = Int(packed & 0x3)
+        epoch = packed &>> 2
     }
 }
 
 final class PCMFloatRingRouter: @unchecked Sendable {
-    let slot0: PCMFloatRing
-    let slot1: PCMFloatRing
+    static let slotCount = 4
+
+    private final class AtomicPointerSlot: @unchecked Sendable {
+        let address: Atomic<UInt>
+        init(_ ring: PCMFloatRing) {
+            address = Atomic<UInt>(UInt(bitPattern: Unmanaged.passUnretained(ring).toOpaque()))
+        }
+    }
+
+    private let capacity: Int
+    private let fixedSlots: [PCMFloatRing]
+    private let slotPointers: [AtomicPointerSlot]
+    private var overflowRetainedRings: [PCMFloatRing] = []
+
     let publishedPair = Atomic<UInt64>(AudioRingPublication.initial.packed)
     let acknowledgedPair = Atomic<UInt64>(AudioRingPublication.initial.packed)
     let outputGate = Atomic<UInt32>(0)
@@ -213,12 +225,17 @@ final class PCMFloatRingRouter: @unchecked Sendable {
     let acknowledgedOutputGatePair = Atomic<UInt64>(AudioRingPublication.initial.packed)
 
     init(capacity: Int = PCMFloatRing.defaultCapacitySamples) {
-        slot0 = PCMFloatRing(capacity: capacity)
-        slot1 = PCMFloatRing(capacity: capacity)
+        self.capacity = capacity
+        let allocated = (0..<Self.slotCount).map { _ in PCMFloatRing(capacity: capacity) }
+        self.fixedSlots = allocated
+        self.slotPointers = allocated.map { AtomicPointerSlot($0) }
     }
 
     func ring(at slot: Int) -> PCMFloatRing {
-        slot == 0 ? slot0 : slot1
+        let bits = slotPointers[slot & 0x3].address.load(ordering: .acquiring)
+        return Unmanaged<PCMFloatRing>.fromOpaque(
+            UnsafeMutableRawPointer(bitPattern: bits)!
+        ).takeUnretainedValue()
     }
 
     func publish(_ publication: AudioRingPublication) {
@@ -272,15 +289,40 @@ final class PCMFloatRingRouter: @unchecked Sendable {
         outputGate.load(ordering: .acquiring) != 0
     }
 
-    func resetForLifecycle() {
-        slot0.reset()
-        slot1.reset()
-        publishedPair.store(AudioRingPublication.initial.packed, ordering: .releasing)
-        acknowledgedPair.store(AudioRingPublication.initial.packed, ordering: .releasing)
-        outputGate.store(0, ordering: .releasing)
-        outputGateGeneration.store(0, ordering: .releasing)
-        acknowledgedOutputGateGeneration.store(0, ordering: .releasing)
-        acknowledgedOutputGatePair.store(AudioRingPublication.initial.packed, ordering: .releasing)
+    func retireAllDisplayContent() {
+        for slot in 0..<Self.slotCount {
+            ring(at: slot).retireDisplayContent()
+        }
+        for overflow in overflowRetainedRings {
+            overflow.retireDisplayContent()
+        }
+    }
+
+    func replaceRingInSlot(_ slot: Int) {
+        let index = slot & 0x3
+        let fresh = PCMFloatRing(capacity: capacity)
+        overflowRetainedRings.append(fresh)
+        slotPointers[index].address.store(
+            UInt(bitPattern: Unmanaged.passUnretained(fresh).toOpaque()),
+            ordering: .releasing
+        )
+    }
+
+    func reclaimOverflowRingsIfSafe(preservingSlot: Int, pendingFeederCounts: [Int]) {
+        let preserved = preservingSlot & 0x3
+        for index in 0..<Self.slotCount where index != preserved && pendingFeederCounts[index] == 0 {
+            let fixed = fixedSlots[index]
+            if ring(at: index) !== fixed {
+                fixed.reset()
+                slotPointers[index].address.store(
+                    UInt(bitPattern: Unmanaged.passUnretained(fixed).toOpaque()),
+                    ordering: .releasing
+                )
+            }
+        }
+        guard !overflowRetainedRings.isEmpty else { return }
+        let liveIDs = Set((0..<Self.slotCount).map { ObjectIdentifier(ring(at: $0)) })
+        overflowRetainedRings.removeAll { !liveIDs.contains(ObjectIdentifier($0)) }
     }
 }
 
@@ -319,12 +361,13 @@ final class EngineAudioRenderer: MediaAudioRendering {
     var equalizerConfiguration = PlayerEqualizerConfiguration.defaults {
         didSet {
             guard oldValue != equalizerConfiguration else { return }
+            let toggledBypass = oldValue.isBypassed != equalizerConfiguration.isBypassed
             if !oldValue.isBypassed, equalizerConfiguration.isBypassed { equalizerHistoryDirty = true }
             equalizerRevision &+= 1
-            if oldValue.isBypassed, !equalizerConfiguration.isBypassed {
-                pendingEqualizerReset = equalizerHistoryDirty || equalizerMaintenance != nil
+            if oldValue.isBypassed, !equalizerConfiguration.isBypassed, equalizerMaintenance != nil {
+                pendingEqualizerReset = true
             }
-            adoptEqualizerConfiguration()
+            adoptEqualizerConfiguration(toggledBypass: toggledBypass)
         }
     }
     var audioMaintenanceAdmission: (@MainActor () -> AudioMaintenancePermit?)? {
@@ -339,7 +382,6 @@ final class EngineAudioRenderer: MediaAudioRendering {
     }
     private var equalizerMaintenance: EqualizerMaintenance?
     private var nextEqualizerMaintenanceSerial: UInt64 = 0
-    private var continuousEqualizerTask: Task<Void, Never>?
     private var deferredAuthorizedOutputTask: Task<Void, Never>?
     private var deferredAuthorizedOutputSerial: UInt64 = 0
     private var deferredAuthorizedOutputPermit: AudioMaintenancePermit?
@@ -383,8 +425,12 @@ final class EngineAudioRenderer: MediaAudioRendering {
     private let muteBox = OSAllocatedUnfairLock(initialState: false)
     private let volumeBox = OSAllocatedUnfairLock(initialState: Float(1))
     private var mixerRampTask: Task<Void, Never>?
+    private var softTransitionSerial: UInt64 = 0
+    private var softTransitionActions: [@MainActor () -> Void] = []
     private static let mixerStartupRampSteps = 5
     private static let mixerStartupRampStep: Duration = .milliseconds(8)
+    private static let softTransitionFadeOutSteps = 3
+    private static let softTransitionFadeOutStep: Duration = .milliseconds(4)
 
     private(set) var isRunning = false
     private(set) var engineStarted = false
@@ -399,12 +445,13 @@ final class EngineAudioRenderer: MediaAudioRendering {
     private var activeSlotIndex = 0
     private var activeEpoch: UInt64 = 0
     private var nextPublicationEpoch: UInt64 = 1
-    private var slotDrainProgress = [AudioDrainProgress(), AudioDrainProgress()]
+    private var slotDrainProgress = Array(repeating: AudioDrainProgress(), count: PCMFloatRingRouter.slotCount)
+    private var slotRetiredEpoch = Array(repeating: UInt64(0), count: PCMFloatRingRouter.slotCount)
+    private var slotPendingFeederCount = Array(repeating: 0, count: PCMFloatRingRouter.slotCount)
     private var seekTokenGeneration: UInt64 = 0
     private var activeSeekToken: MediaAudioSeekToken?
     private var stagedSeekSlot: Int?
     private var stagedSeekWasPublished = false
-    private var retiredSeekPublication: AudioRingPublication?
     private var nextSeekGateGeneration: UInt64 = 0
     private var activeSeekGateGeneration: UInt64 = 0
     private var preserveCommittedSlotOnNextStart = false
@@ -572,16 +619,6 @@ final class EngineAudioRenderer: MediaAudioRendering {
         volumeBox.withLock { $0 = initialVolume }
         muteBox.withLock { $0 = initialMute }
         renderDiagnostics.reset()
-        if !preserveCommittedContent {
-            ringRouter.resetForLifecycle()
-            activeSlotIndex = 0
-            activeEpoch = 0
-            nextPublicationEpoch = 1
-            slotDrainProgress = [AudioDrainProgress(), AudioDrainProgress()]
-            lastPublishedSeekEpoch = 0
-            lastAcknowledgedSeekEpoch = 0
-            retiredSeekPublication = nil
-        }
         sourceUnderflowCount = 0
         lastUnderflowLogAt = 0
         lastDrainWall = ContinuousClock.now
@@ -671,6 +708,7 @@ final class EngineAudioRenderer: MediaAudioRendering {
         pendingHardwareStartContext = nil
         mixerRampTask?.cancel()
         mixerRampTask = nil
+        softTransitionActions.removeAll()
         refreshRenderRateBox()
     }
 
@@ -754,36 +792,73 @@ final class EngineAudioRenderer: MediaAudioRendering {
             && isSeekGateAcknowledged(for: publication)
     }
 
-    private func canReuseSeekSlot(_ slot: Int) -> Bool {
-        guard slot == 0 || slot == 1, slot != activeSlotIndex else { return false }
-        let publication = ringRouter.publishedPublication()
-        if hasRealtimeConsumer {
-            if publication.slot == slot {
-                return isSeekOutputGated && isSeekGateAcknowledged(for: publication)
-            }
-            return true
+    private func isSlotSafeToReset(_ slot: Int, excludingStaged: Bool = true) -> Bool {
+        guard (0..<PCMFloatRingRouter.slotCount).contains(slot) else { return false }
+        let published = ringRouter.publishedPublication()
+        if slot == activeSlotIndex || slot == published.slot { return false }
+        if excludingStaged, slot == stagedSeekSlot { return false }
+        if slotPendingFeederCount[slot] > 0 { return false }
+        if hasRealtimeConsumer || !hardwareStart.mayReuseEngine {
+            return slotRetiredEpoch[slot] <= ringRouter.acknowledgedPublication().epoch
         }
-        return ringRouter.acknowledgedPublication() == publication
+        return true
     }
 
-    private func reclaimRetiredSeekPublicationIfSafe() {
-        guard let retired = retiredSeekPublication else { return }
-        let acknowledged = ringRouter.acknowledgedPublication()
-        guard acknowledged == retired,
-              isSeekGateAcknowledged(for: retired)
-                || !hasRealtimeConsumer
-        else { return }
-
-        let slot = retired.slot
-        ringRouter.ring(at: slot).reset()
-        slotDrainProgress[slot].reset()
-        retiredSeekPublication = nil
-
-        if !hasRealtimeConsumer {
-            let active = AudioRingPublication(slot: activeSlotIndex, epoch: activeEpoch)
-            ringRouter.publish(active)
-            ringRouter.acknowledgePublishedPublication()
+    private func acquireSafeIdleSlot(excludingStaged: Bool = true) -> Int {
+        if let safe = (0..<PCMFloatRingRouter.slotCount)
+            .filter({ isSlotSafeToReset($0, excludingStaged: excludingStaged) })
+            .min(by: { slotRetiredEpoch[$0] < slotRetiredEpoch[$1] }) {
+            ringRouter.ring(at: safe).reset()
+            slotDrainProgress[safe].reset()
+            return safe
         }
+        let published = ringRouter.publishedPublication()
+        let fallback = (0..<PCMFloatRingRouter.slotCount)
+            .filter {
+                $0 != published.slot
+                    && (!excludingStaged || $0 != stagedSeekSlot)
+                    && slotPendingFeederCount[$0] == 0
+            }
+            .min(by: { slotRetiredEpoch[$0] < slotRetiredEpoch[$1] })
+            ?? (0..<PCMFloatRingRouter.slotCount).first {
+                $0 != published.slot && (!excludingStaged || $0 != stagedSeekSlot)
+            }
+            ?? ((published.slot + 1) & 0x3)
+        ringRouter.replaceRingInSlot(fallback)
+        slotDrainProgress[fallback].reset()
+        return fallback
+    }
+
+    private func publishSlot(_ slot: Int) -> AudioRingPublication {
+        let previousPublished = ringRouter.publishedPublication()
+        let epoch = nextPublicationEpoch
+        nextPublicationEpoch &+= 1
+        if nextPublicationEpoch == 0 || (nextPublicationEpoch >> 62) != 0 {
+            nextPublicationEpoch = 1
+        }
+        let publication = AudioRingPublication(slot: slot, epoch: epoch)
+        ringRouter.publish(publication)
+        if previousPublished.slot != slot {
+            slotRetiredEpoch[previousPublished.slot] = epoch
+        }
+        if !hasRealtimeConsumer && hardwareStart.mayReuseEngine {
+            ringRouter.acknowledgePublishedPublication()
+            reclaimSafeRetiredSlots()
+        }
+        return publication
+    }
+
+    private func reclaimSafeRetiredSlots() {
+        guard !hasRealtimeConsumer, hardwareStart.mayReuseEngine else { return }
+        let publishedSlot = ringRouter.publishedPublication().slot
+        for index in 0..<PCMFloatRingRouter.slotCount
+        where index != publishedSlot && slotPendingFeederCount[index] == 0 {
+            slotRetiredEpoch[index] = 0
+        }
+        ringRouter.reclaimOverflowRingsIfSafe(
+            preservingSlot: publishedSlot,
+            pendingFeederCounts: slotPendingFeederCount
+        )
     }
 
     func beginSeekTransition(source: AudioPullSource) -> MediaAudioSeekToken {
@@ -796,27 +871,20 @@ final class EngineAudioRenderer: MediaAudioRendering {
         standDownFeederForTransaction()
 
         assertSeekOutputGate()
-        ringRouter.ring(at: 0).retireDisplayContent()
-        ringRouter.ring(at: 1).retireDisplayContent()
-        reclaimRetiredSeekPublicationIfSafe()
+        ringRouter.retireAllDisplayContent()
 
-        if let oldSlot = stagedSeekSlot, !stagedSeekWasPublished {
-            if canReuseSeekSlot(oldSlot) {
-                ringRouter.ring(at: oldSlot).reset()
-                slotDrainProgress[oldSlot].reset()
-            }
+        if let oldSlot = stagedSeekSlot, !stagedSeekWasPublished,
+           isSlotSafeToReset(oldSlot, excludingStaged: false) {
+            ringRouter.ring(at: oldSlot).reset()
+            slotDrainProgress[oldSlot].reset()
         }
-
-        let inactiveSlot = 1 - activeSlotIndex
-        stagedSeekSlot = inactiveSlot
+        stagedSeekSlot = nil
         stagedSeekWasPublished = false
+
+        let targetSlot = acquireSafeIdleSlot()
+        stagedSeekSlot = targetSlot
         activeSeekToken = token
         lastDrainWall = ContinuousClock.now
-
-        if canReuseSeekSlot(inactiveSlot) {
-            ringRouter.ring(at: inactiveSlot).reset()
-            slotDrainProgress[inactiveSlot].reset()
-        }
         return token
     }
 
@@ -826,8 +894,7 @@ final class EngineAudioRenderer: MediaAudioRendering {
     ) -> MediaAudioSeekPreparation {
         guard activeSeekToken == token,
               let slot = stagedSeekSlot,
-              !stagedSeekWasPublished,
-              canReuseSeekSlot(slot)
+              !stagedSeekWasPublished
         else {
             return MediaAudioSeekPreparation(
                 token: token,
@@ -951,8 +1018,6 @@ final class EngineAudioRenderer: MediaAudioRendering {
 
         guard let publication = await publishAndAcknowledgeSeek(slot: slot, token: token) else { return false }
 
-        reclaimRetiredSeekPublicationIfSafe()
-
         guard isAuthorized?() ?? true else {
             abortSeekTransition(token)
             return false
@@ -1006,14 +1071,11 @@ final class EngineAudioRenderer: MediaAudioRendering {
     }
 
     private func publishAndAcknowledgeSeek(slot: Int, token: MediaAudioSeekToken) async -> AudioRingPublication? {
-        let publication = AudioRingPublication(slot: slot, epoch: nextPublicationEpoch)
-        nextPublicationEpoch &+= 1
+        let publication = publishSlot(slot)
         stagedSeekWasPublished = true
-        ringRouter.publish(publication)
         lastPublishedSeekEpoch = publication.epoch
         seekPublicationCount += 1
         if !hasRealtimeConsumer {
-            ringRouter.acknowledgePublishedPublication()
             ringRouter.acknowledgeOutputGateSynchronously()
         } else if !(await awaitSeekAcknowledgement(publication)) {
             abortSeekTransition(token)
@@ -1071,17 +1133,10 @@ final class EngineAudioRenderer: MediaAudioRendering {
         guard activeSeekToken == token else { return }
         standDownFeederForTransaction()
         seekAbortCount += 1
-        if let slot = stagedSeekSlot {
-            if stagedSeekWasPublished {
-                let publication = ringRouter.publishedPublication()
-                retiredSeekPublication = publication
-                reclaimRetiredSeekPublicationIfSafe()
-            } else {
-                if canReuseSeekSlot(slot) {
-                    ringRouter.ring(at: slot).reset()
-                    slotDrainProgress[slot].reset()
-                }
-            }
+        if let slot = stagedSeekSlot, !stagedSeekWasPublished,
+           isSlotSafeToReset(slot, excludingStaged: false) {
+            ringRouter.ring(at: slot).reset()
+            slotDrainProgress[slot].reset()
         }
         activeSeekToken = nil
         stagedSeekSlot = nil
@@ -1152,6 +1207,9 @@ final class EngineAudioRenderer: MediaAudioRendering {
         }
         hardwareStart.invalidate()
         pendingHardwareStartContext = nil
+        mixerRampTask?.cancel()
+        mixerRampTask = nil
+        softTransitionActions.removeAll()
         nativeOutput.retire()
         if let eng = engine {
             if nativeParametersExclusive {
@@ -1427,11 +1485,19 @@ final class EngineAudioRenderer: MediaAudioRendering {
         hardwareSampleRate = connectFormat.sampleRate
         isResamplingToHardware = abs(connectFormat.sampleRate - Self.engineSampleRate) >= 1.0
         if latestParametersRequirePausedReset {
-            retainedMaintenancePaused = true
-            scheduleContinuousEqualizerMaintenance()
-            refreshRenderRateBox()
-            return
+            if pendingEqualizerReset {
+                equalizerNode?.reset()
+                equalizerHistoryDirty = false
+                pendingEqualizerReset = false
+            }
+            let resetPitch = pendingPitchReset
+            pendingPitchReset = false
+            applyTimePitchRate(max(0, playbackRate), resetUnit: resetPitch)
+        } else {
+            applyTimePitchRate(max(0, playbackRate), resetUnit: false)
         }
+        applyEqualizerToCurrentGraph()
+        refreshEqualizerLatency()
         refreshRenderRateBox()
         if reusedGraph {
             timePitchInstalled = timePitchNode != nil
@@ -1439,8 +1505,6 @@ final class EngineAudioRenderer: MediaAudioRendering {
         hardwareSampleRate = connectFormat.sampleRate
         isResamplingToHardware = abs(connectFormat.sampleRate - Self.engineSampleRate) >= 1.0
         rampMixerInAfterGraphStart()
-        applyTimePitchRate(max(0, playbackRate), resetUnit: false)
-        adoptEqualizerConfiguration()
         refreshTimePitchProcessingLatency()
         restoreFeederAdmissionForCurrentOutput()
         if reusedGraph {
@@ -1578,12 +1642,16 @@ final class EngineAudioRenderer: MediaAudioRendering {
         }
     }
 
-    private func enqueueHardwareStop(_ eng: AVAudioEngine, detaching nodes: [AVAudioNode]) {
+    private func enqueueHardwareStop(_ eng: AVAudioEngine, detaching nodes: [AVAudioNode], rampDown: Bool = false) {
         hardwareStart.noteOperationSubmitted()
         refreshRenderRateBox()
         let transfer = AudioHardwareEngineTransfer(eng, nodes: nodes)
         Self.hardwareQueue.async { [weak self] in
-            Self.stopAndDetach(transfer.engine, nodes: transfer.nodes)
+            if rampDown {
+                Self.rampDownAndStop(transfer.engine)
+            } else {
+                Self.stopAndDetach(transfer.engine, nodes: transfer.nodes)
+            }
             DispatchQueue.main.async { [weak self] in
                 MainActor.assumeIsolated {
                     self?.acknowledgeHardwareOperation()
@@ -1594,8 +1662,22 @@ final class EngineAudioRenderer: MediaAudioRendering {
 
     private func acknowledgeHardwareOperation() {
         hardwareStart.acknowledgeOperation()
+        reclaimSafeRetiredSlots()
         settleHardwareQueueWaiters()
         refreshRenderRateBox()
+    }
+
+    nonisolated private static func rampDownAndStop(_ eng: AVAudioEngine) {
+        let startVolume = eng.mainMixerNode.outputVolume
+        if eng.isRunning, startVolume > 0.000_1 {
+            let steps = 4
+            for step in 1...steps {
+                Thread.sleep(forTimeInterval: 0.003)
+                eng.mainMixerNode.outputVolume = startVolume * Float(steps - step) / Float(steps)
+            }
+        }
+        eng.mainMixerNode.outputVolume = 0
+        if eng.isRunning { eng.stop() }
     }
 
     nonisolated private static func stopAndDetach(_ eng: AVAudioEngine, nodes: [AVAudioNode]) {
@@ -1945,7 +2027,7 @@ final class EngineAudioRenderer: MediaAudioRendering {
         applyEqualizerToCurrentGraph()
     }
 
-    private func adoptEqualizerConfiguration() {
+    private func adoptEqualizerConfiguration(toggledBypass: Bool = false) {
         guard equalizerNode != nil else {
             equalizerStatus = fillOnlyMode ? .unsupported("No native audio output") : .retainedNoGraph
             return
@@ -1954,9 +2036,24 @@ final class EngineAudioRenderer: MediaAudioRendering {
             equalizerStatus = .pendingNativeAccess
             return
         }
-        if pendingEqualizerReset || pendingPitchReset, let eng = engine, eng.isRunning {
-            equalizerStatus = .pendingNativeAccess
-            scheduleContinuousEqualizerMaintenance()
+        if let eng = engine, eng.isRunning, engineStarted {
+            let needsSoftReset = toggledBypass
+                || (!equalizerConfiguration.isBypassed && (equalizerHistoryDirty || pendingEqualizerReset))
+            if needsSoftReset {
+                performSoftParameterTransition { [weak self] in
+                    guard let self else { return }
+                    if self.equalizerHistoryDirty, !self.equalizerConfiguration.isBypassed {
+                        self.equalizerNode?.reset()
+                        self.equalizerHistoryDirty = false
+                    }
+                    self.pendingEqualizerReset = false
+                    self.applyEqualizerToCurrentGraph()
+                    self.refreshEqualizerLatency()
+                }
+            } else {
+                applyEqualizerToCurrentGraph()
+                refreshEqualizerLatency()
+            }
             return
         }
         if pendingEqualizerReset { resetStoppedEqualizerGraph() }
@@ -2030,10 +2127,11 @@ final class EngineAudioRenderer: MediaAudioRendering {
         pitchLatency = .unreported
         mixerRampTask?.cancel()
         mixerRampTask = nil
+        softTransitionActions.removeAll()
         if seek == nil {
             feeder?.setTargetFrames(0)
         } else {
-            feeder?.standDown()
+            standDownFeederForTransaction()
         }
         refreshRenderRateBox()
         if hardwareStart.mayReuseEngine { eng.mainMixerNode.outputVolume = 0 }
@@ -2079,9 +2177,11 @@ final class EngineAudioRenderer: MediaAudioRendering {
     private func pauseAndConfigureEqualizer(
         _ serial: UInt64, isAuthorized: (@MainActor @Sendable () -> Bool)?
     ) async -> Bool {
-        if equalizerMaintenance?.seek == nil, let feeder {
-            await feeder.joinAfterStandDown()
-            feeder.standDown()
+        if let feeder {
+            let receipt = feeder.standDown()
+            trackFeederStandDown(receipt, slot: feeder.admission.admittedSlot)
+            feeder.invalidateContent()
+            await receipt.join()
         }
         await awaitHardwareQueueAccess()
         guard maintenanceIsCurrent(serial, isAuthorized: isAuthorized) else { return false }
@@ -2188,7 +2288,7 @@ final class EngineAudioRenderer: MediaAudioRendering {
             applyEqualizerToCurrentGraph()
             refreshTimePitchProcessingLatency()
             refreshEqualizerLatency()
-            applyMixerGain()
+            rampMixerInAfterGraphStart()
         }
         refreshRenderRateBox()
         let waiters = maintenanceWaiters
@@ -2202,24 +2302,57 @@ final class EngineAudioRenderer: MediaAudioRendering {
         }
     }
 
-    private func scheduleContinuousEqualizerMaintenance() {
-        guard continuousEqualizerTask == nil, activeSeekToken == nil else { return }
-        continuousEqualizerTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.continuousEqualizerTask = nil }
-            await self.awaitAudioMaintenanceSettlement()
-            guard self.pendingEqualizerReset || self.pendingPitchReset,
-                  self.isRunning, self.activeSeekToken == nil,
-                  let serial = self.reserveEqualizerMaintenance(seek: nil) else { return }
-            guard await self.pauseAndConfigureEqualizer(serial, isAuthorized: nil),
-                  await self.resumeEqualizerMaintenance(
-                    serial, resumesPlayback: true, isAuthorized: nil,
-                    resumeAdmission: { [weak self] in self?.audioMaintenanceAdmission?() }
-                  ) else {
-                await self.finishRejectedMaintenance(serial)
-                return
+    private func performSoftParameterTransition(_ action: @escaping @MainActor () -> Void) {
+        guard nativeParametersExclusive, let eng = engine, eng.isRunning, engineStarted else {
+            action()
+            return
+        }
+        mixerRampTask?.cancel()
+        mixerRampTask = nil
+        softTransitionActions.append(action)
+        softTransitionSerial &+= 1
+        let serial = softTransitionSerial
+        let startVolume = eng.mainMixerNode.outputVolume
+        if startVolume <= 0.000_1 {
+            eng.mainMixerNode.outputVolume = 0
+            let pending = softTransitionActions
+            softTransitionActions.removeAll()
+            for pendingAction in pending { pendingAction() }
+            rampMixerInAfterGraphStart()
+            return
+        }
+        mixerRampTask = Task { @MainActor [weak self, weak eng] in
+            for step in 1...Self.softTransitionFadeOutSteps {
+                do {
+                    try await Task.sleep(for: Self.softTransitionFadeOutStep)
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled,
+                      let self,
+                      let eng,
+                      self.softTransitionSerial == serial,
+                      self.engine === eng,
+                      eng.isRunning,
+                      self.nativeParametersExclusive
+                else { return }
+                eng.mainMixerNode.outputVolume = startVolume
+                    * Float(Self.softTransitionFadeOutSteps - step)
+                    / Float(Self.softTransitionFadeOutSteps)
             }
-            self.releaseEqualizerMaintenance(serial, accepted: true)
+            guard !Task.isCancelled,
+                  let self,
+                  let eng,
+                  self.softTransitionSerial == serial,
+                  self.engine === eng,
+                  eng.isRunning,
+                  self.nativeParametersExclusive
+            else { return }
+            eng.mainMixerNode.outputVolume = 0
+            let pending = self.softTransitionActions
+            self.softTransitionActions.removeAll()
+            for pendingAction in pending { pendingAction() }
+            self.rampMixerInAfterGraphStart()
         }
     }
 
@@ -2247,13 +2380,18 @@ final class EngineAudioRenderer: MediaAudioRendering {
         UIHitchMonitor.measureCounted("audio.stop.feeder") { retireFeeder() }
         mixerRampTask?.cancel()
         mixerRampTask = nil
+        softTransitionActions.removeAll()
         hardwareStart.invalidate()
         pendingHardwareStartContext = nil
         if let eng = engine {
             if nativeParametersExclusive {
-                UIHitchMonitor.measureCounted("audio.stop.native") {
-                    eng.mainMixerNode.outputVolume = 0
-                    if eng.isRunning { eng.stop() }
+                if preserveCommittedContent, eng.isRunning, eng.mainMixerNode.outputVolume > 0.000_1 {
+                    enqueueHardwareStop(eng, detaching: [], rampDown: true)
+                } else {
+                    UIHitchMonitor.measureCounted("audio.stop.native") {
+                        eng.mainMixerNode.outputVolume = 0
+                        if eng.isRunning { eng.stop() }
+                    }
                 }
             } else {
                 enqueueHardwareStop(eng, detaching: [])
@@ -2277,15 +2415,14 @@ final class EngineAudioRenderer: MediaAudioRendering {
         activeSeekToken = nil
         stagedSeekSlot = nil
         stagedSeekWasPublished = false
-        retiredSeekPublication = nil
         if preserveCommittedContent {
             preserveCommittedSlotOnNextStart = false
         } else {
-            ringRouter.resetForLifecycle()
-            activeSlotIndex = 0
-            activeEpoch = 0
-            nextPublicationEpoch = 1
-            slotDrainProgress = [AudioDrainProgress(), AudioDrainProgress()]
+            ringRouter.retireAllDisplayContent()
+            let nextSlot = acquireSafeIdleSlot()
+            let publication = publishSlot(nextSlot)
+            activeSlotIndex = nextSlot
+            activeEpoch = publication.epoch
             lastPublishedSeekEpoch = 0
             lastAcknowledgedSeekEpoch = 0
             preserveCommittedSlotOnNextStart = false
@@ -2303,16 +2440,16 @@ final class EngineAudioRenderer: MediaAudioRendering {
         revokeAudioMaintenancePermission()
         equalizerHistoryDirty = true
         standDownFeederForTransaction()
-        ringRouter.resetForLifecycle()
-        activeSlotIndex = 0
-        activeEpoch = 0
-        nextPublicationEpoch = 1
-        slotDrainProgress = [AudioDrainProgress(), AudioDrainProgress()]
+        ringRouter.retireAllDisplayContent()
         activeSeekToken = nil
         stagedSeekSlot = nil
         stagedSeekWasPublished = false
-        retiredSeekPublication = nil
         isSeekOutputGated = false
+        ringRouter.setOutputGated(false)
+        let nextSlot = acquireSafeIdleSlot()
+        let publication = publishSlot(nextSlot)
+        activeSlotIndex = nextSlot
+        activeEpoch = publication.epoch
         preserveCommittedSlotOnNextStart = false
         lastDrainWall = ContinuousClock.now
         if pitchCorrectionActive {
@@ -2333,9 +2470,12 @@ final class EngineAudioRenderer: MediaAudioRendering {
             setRenderRate(rate <= 0.000_1 ? 0 : 1)
             let wasUnity = previous <= 0.000_1 || abs(previous - 1) < 0.001
             let isUnity = rate <= 0.000_1 || abs(rate - 1) < 0.001
-            if wasUnity != isUnity, !configuredEqualizerBypassed, engineStarted {
-                pendingPitchReset = true
-                scheduleContinuousEqualizerMaintenance()
+            if wasUnity != isUnity, engineStarted, let eng = engine, eng.isRunning, nativeParametersExclusive {
+                performSoftParameterTransition { [weak self] in
+                    guard let self else { return }
+                    self.pendingPitchReset = false
+                    self.applyTimePitchRate(max(0, self.playbackRate), resetUnit: true)
+                }
             } else {
                 applyTimePitchRate(rate, resetUnit: wasUnity != isUnity)
             }
@@ -2456,7 +2596,9 @@ final class EngineAudioRenderer: MediaAudioRendering {
 
     private func retireFeeder() {
         guard let feeder else { return }
-        feeder.retire()
+        let slot = feeder.admission.admittedSlot
+        let receipt = feeder.retire()
+        trackFeederStandDown(receipt, slot: slot)
         retiredFeederPullCallCount += feeder.pullCallCount
         _ = feeder.drainReport()
         self.feeder = nil
@@ -2464,8 +2606,21 @@ final class EngineAudioRenderer: MediaAudioRendering {
 
     private func standDownFeederForTransaction() {
         guard let feeder else { return }
-        feeder.standDown()
+        let slot = feeder.admission.admittedSlot
+        let receipt = feeder.standDown()
+        trackFeederStandDown(receipt, slot: slot)
         feeder.invalidateContent()
+    }
+
+    private func trackFeederStandDown(_ receipt: FeederStandDownReceipt, slot: Int) {
+        guard receipt.requiresJoin else { return }
+        let index = slot & 0x3
+        slotPendingFeederCount[index] += 1
+        receipt.onQuiesce { [weak self] in
+            guard let self else { return }
+            self.slotPendingFeederCount[index] = max(0, self.slotPendingFeederCount[index] - 1)
+            self.reclaimSafeRetiredSlots()
+        }
     }
 
     private func restoreFeederAdmissionForCurrentOutput() {
@@ -2705,6 +2860,7 @@ final class EngineAudioRenderer: MediaAudioRendering {
     private func prepareMixerForGraphStart() {
         mixerRampTask?.cancel()
         mixerRampTask = nil
+        softTransitionActions.removeAll()
         if hardwareStart.mayReuseEngine { engine?.mainMixerNode.outputVolume = 0 }
     }
 

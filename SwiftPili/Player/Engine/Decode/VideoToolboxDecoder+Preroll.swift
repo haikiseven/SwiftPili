@@ -3,116 +3,74 @@ import CoreVideo
 import Foundation
 import VideoToolbox
 
-struct VideoToolboxPrerollCallback {
-    let identity: VideoToolboxTimingIdentity
-    let status: OSStatus
-    let infoFlags: VTDecodeInfoFlags
-    let imagePresent: Bool
-    let keptImage: CVPixelBuffer?
-    let pts: TimeInterval?
-    let duration: TimeInterval?
-    let nativePTS: CMTime
-    let nativeDuration: CMTime
-}
-
-final class VideoToolboxPrerollBatchSink: @unchecked Sendable {
-    struct Record {
-        let event: VideoToolboxTimingOutputEvent
-        let keptImage: CVPixelBuffer?
-        let nativePTS: CMTime
-        let nativeDuration: CMTime
-    }
-
-    private let lock = NSLock()
-    private var collectors: [VideoToolboxTimingIdentity: VideoToolboxTimingOutputCollector] = [:]
-    private var records: [Record] = []
-
-    func append(_ callback: VideoToolboxPrerollCallback) {
-        lock.withLock {
-            var collector = collectors[callback.identity] ?? VideoToolboxTimingOutputCollector()
-            let event = collector.append(
-                identity: callback.identity,
-                status: Int32(callback.status),
-                imagePresent: callback.imagePresent,
-                callbackPTS: callback.pts,
-                callbackDuration: callback.duration,
-                infoFlags: callback.infoFlags.rawValue
-            )
-            collectors[callback.identity] = collector
-            records.append(Record(event: event, keptImage: callback.keptImage,
-                                  nativePTS: callback.nativePTS, nativeDuration: callback.nativeDuration))
-        }
-    }
-
-    func snapshot() -> [Record] {
-        lock.withLock { records }
-    }
-}
-
 extension VideoToolboxDecoder {
     private struct PrerollSubmitted {
         let timing: VideoToolboxTimingSubmission
         let packet: MediaPacket
         let truncated: Bool
-        let nativeTiming: CMSampleTimingInfo
-    }
-
-    private struct PrerollBatchContext {
-        let session: VTDecompressionSession
-        let formatDescription: CMFormatDescription
-        let sink: VideoToolboxPrerollBatchSink
-        let keepOutput: @Sendable (TimeInterval, TimeInterval) -> Bool
     }
 
     func decodePrerollBatch(
         _ batch: [VideoPrerollSubmission],
         keepOutput: @escaping @Sendable (TimeInterval, TimeInterval) -> Bool
     ) async throws -> VideoPrerollBatchResult {
-        try stateLock.withLock {
-            guard opened, let session, let formatDescription else {
-                throw MediaEngineError.stopped
-            }
-            let started = ContinuousClock.now
-            let context = PrerollBatchContext(
-                session: session,
-                formatDescription: formatDescription,
-                sink: VideoToolboxPrerollBatchSink(),
-                keepOutput: keepOutput
+        try await onDecodeQueue {
+            UncheckedQueueResult(
+                value: try self.decodePrerollBatchOnQueue(batch, keepOutput: keepOutput)
             )
-            var result = VideoPrerollBatchResult()
-            let (submitted, failure) = submitPrerollBatch(batch, context: context, result: &result)
-            let waitStarted = ContinuousClock.now
-            VTDecompressionSessionWaitForAsynchronousFrames(session)
-            let waitMs = Int(waitStarted.duration(to: .now) / .milliseconds(1))
+        }.value
+    }
 
-            let records = context.sink.snapshot()
-            let truncated = Set(submitted.filter(\.truncated).map(\.timing.identity))
-            for record in records {
-                noteDecodeAnomalies(
-                    submissionStatus: noErr,
-                    events: [record.event],
-                    truncated: truncated.contains(record.event.identity)
-                )
-            }
-            if let failure {
-                let earlier = Set(submitted.map(\.timing.identity))
-                try throwFirstPrerollCallbackFault(records.filter { earlier.contains($0.event.identity) })
-                throw failure
-            }
-            try throwFirstPrerollCallbackFault(records)
-            resolvePrerollOutputs(records, submitted: submitted, into: &result)
-            if !didLogFirstPrerollBatch {
-                didLogFirstPrerollBatch = true
-                PlayerLog.log(
-                    "[PathADecoder] event=prerollBatch sessionID=\(debugSessionID) " +
-                    "flags=async items=\(batch.count) submitted=\(result.submitted) " +
-                    "skipped=\(result.skipped) truncated=\(result.truncated) " +
-                    "outputs=\(result.outputPTS.count) " +
-                    "batchMs=\(Int(started.duration(to: .now) / .milliseconds(1))) waitMs=\(waitMs)"
-                )
-            }
-            return result
+    private func decodePrerollBatchOnQueue(
+        _ batch: [VideoPrerollSubmission],
+        keepOutput: @escaping @Sendable (TimeInterval, TimeInterval) -> Bool
+    ) throws -> VideoPrerollBatchResult {
+        guard opened else {
+            throw MediaEngineError.stopped
         }
+        let started = ContinuousClock.now
+        var result = VideoPrerollBatchResult()
+        var preSwitchEntries: [VideoToolboxOutputRouter.Entry] = []
+        let (submitted, failure) = submitPrerollBatchOnQueue(
+            batch, keepOutput: keepOutput, result: &result, preSwitchEntries: &preSwitchEntries
+        )
+        let waitStarted = ContinuousClock.now
+        if let session {
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
+        }
+        let waitMs = Int(waitStarted.duration(to: .now) / .milliseconds(1))
+
+        let entries = preSwitchEntries + outputRouter.drain(
+            identities: submitted.map(\.timing.identity),
+            forGeneration: queueSessionID
+        )
+        let entriesByIdentity = Dictionary(uniqueKeysWithValues: entries.map { ($0.submission.identity, $0) })
+        let truncated = Set(submitted.filter(\.truncated).map(\.timing.identity))
+
+        for entry in entries {
+            noteDecodeAnomalies(
+                submissionStatus: noErr,
+                events: entry.records.map(\.event),
+                truncated: truncated.contains(entry.submission.identity)
+            )
+        }
+        if let failure {
+            try throwFirstPrerollCallbackFault(entries)
+            throw failure
+        }
+        try throwFirstPrerollCallbackFault(entries)
+        resolvePrerollOutputs(entriesByIdentity, submitted: submitted, preSwitchEntries: preSwitchEntries, into: &result)
+        if !didLogFirstPrerollBatch {
+            didLogFirstPrerollBatch = true
+            PlayerLog.log(
+                "[PathADecoder] event=prerollBatch sessionID=\(queueSessionID) " +
+                "flags=async items=\(batch.count) submitted=\(result.submitted) " +
+                "skipped=\(result.skipped) truncated=\(result.truncated) " +
+                "outputs=\(result.outputPTS.count) " +
+                "batchMs=\(Int(started.duration(to: .now) / .milliseconds(1))) waitMs=\(waitMs)"
+            )
+        }
+        return result
     }
 
     func noteDecodeAnomalies(
@@ -136,10 +94,11 @@ extension VideoToolboxDecoder {
         }
     }
 
-    private func submitPrerollBatch(
+    private func submitPrerollBatchOnQueue(
         _ batch: [VideoPrerollSubmission],
-        context: PrerollBatchContext,
-        result: inout VideoPrerollBatchResult
+        keepOutput: @escaping @Sendable (TimeInterval, TimeInterval) -> Bool,
+        result: inout VideoPrerollBatchResult,
+        preSwitchEntries: inout [VideoToolboxOutputRouter.Entry]
     ) -> (submitted: [PrerollSubmitted], failure: Error?) {
         var submitted: [PrerollSubmitted] = []
         for item in batch where item.packet.track == .video {
@@ -164,7 +123,15 @@ extension VideoToolboxDecoder {
             decodeCallCount += 1
             guard !data.isEmpty else { continue }
             do {
-                submitted.append(try submitPrerollItem(item.packet, data: data, truncated: truncated, context: context))
+                if let entry = try submitPrerollItemOnQueue(
+                    item.packet,
+                    data: data,
+                    truncated: truncated,
+                    keepOutput: keepOutput,
+                    preSwitchEntries: &preSwitchEntries
+                ) {
+                    submitted.append(entry)
+                }
             } catch {
                 return (submitted, error)
             }
@@ -172,16 +139,21 @@ extension VideoToolboxDecoder {
         return (submitted, nil)
     }
 
-    private func submitPrerollItem(
+    private func submitPrerollItemOnQueue(
         _ packet: MediaPacket,
         data: Data,
         truncated: Bool,
-        context: PrerollBatchContext
-    ) throws -> PrerollSubmitted {
+        keepOutput: @escaping @Sendable (TimeInterval, TimeInterval) -> Bool,
+        preSwitchEntries: inout [VideoToolboxOutputRouter.Entry]
+    ) throws -> PrerollSubmitted? {
         noteSubmittedTiling(data, packet: packet)
+        guard let prepared = try prepareSessionForPacketOnQueue(data) else {
+            return nil
+        }
+        preSwitchEntries.append(contentsOf: prepared.drainedEntries)
         let timing = VideoToolboxTimingSubmission(
             submissionID: UInt64(decodeCallCount),
-            decoderGeneration: debugSessionID,
+            decoderGeneration: queueSessionID,
             inputPTS: packet.pts,
             inputDTS: packet.dts,
             inputDuration: packet.duration,
@@ -190,91 +162,100 @@ extension VideoToolboxDecoder {
         let (sample, sampleTiming) = try makeSampleBuffer(
             data: data,
             packet: packet,
-            formatDescription: context.formatDescription,
+            formatDescription: prepared.formatDescription,
             timingSubmission: timing
         )
         let identity = timing.identity
-        let inputPTS = packet.pts
-        let inputDuration = packet.duration
-        let keepOutput = context.keepOutput
-        let sink = context.sink
+        let router = outputRouter
+        router.register(
+            submission: timing,
+            packet: packet,
+            nativeTiming: sampleTiming,
+            truncated: truncated,
+            keepOutput: keepOutput
+        )
         var infoFlags = VTDecodeInfoFlags()
         let status = VTDecompressionSessionDecodeFrame(
-            context.session,
+            prepared.session,
             sampleBuffer: sample,
             flags: [._EnableAsynchronousDecompression],
             infoFlagsOut: &infoFlags
         ) { status, callbackInfoFlags, imageBuffer, callbackPTS, callbackDuration in
-            let pts = VideoToolboxDecoder.scalarTime(callbackPTS)
-            let duration = VideoToolboxDecoder.scalarTime(callbackDuration)
-            let keep = imageBuffer != nil
-                && keepOutput(pts ?? inputPTS, duration ?? inputDuration)
-            sink.append(VideoToolboxPrerollCallback(
+            router.receive(
                 identity: identity,
                 status: status,
                 infoFlags: callbackInfoFlags,
-                imagePresent: imageBuffer != nil,
-                keptImage: keep ? imageBuffer : nil,
-                pts: pts,
-                duration: duration, nativePTS: callbackPTS, nativeDuration: callbackDuration
-            ))
+                imageBuffer: imageBuffer,
+                callbackPTS: callbackPTS,
+                callbackDuration: callbackDuration
+            )
         }
         if let fault = Self.runtimeFault(for: status, stage: .decodeSubmission) {
             noteDecodeAnomalies(submissionStatus: status, events: [], truncated: truncated)
             logFaultIfNeeded(fault, status: status)
             throw fault
         }
-        return PrerollSubmitted(timing: timing, packet: packet, truncated: truncated, nativeTiming: sampleTiming)
+        return PrerollSubmitted(timing: timing, packet: packet, truncated: truncated)
     }
 
     private func throwFirstPrerollCallbackFault(
-        _ records: [VideoToolboxPrerollBatchSink.Record]
+        _ entries: [VideoToolboxOutputRouter.Entry]
     ) throws {
-        guard let failing = records.first(where: {
-            Self.classification(for: OSStatus($0.event.status)) != nil
-        }) else {
-            return
-        }
-        let status = OSStatus(failing.event.status)
-        if let fault = Self.runtimeFault(for: status, stage: .decodeCallback) {
-            logFaultIfNeeded(fault, status: status)
-            throw fault
+        for entry in entries {
+            guard let failing = entry.records.first(where: {
+                Self.classification(for: OSStatus($0.event.status)) != nil
+            }) else {
+                continue
+            }
+            let status = OSStatus(failing.event.status)
+            if let fault = Self.runtimeFault(for: status, stage: .decodeCallback) {
+                logFaultIfNeeded(fault, status: status)
+                throw fault
+            }
         }
     }
 
     private func resolvePrerollOutputs(
-        _ records: [VideoToolboxPrerollBatchSink.Record],
+        _ entriesByIdentity: [VideoToolboxTimingIdentity: VideoToolboxOutputRouter.Entry],
         submitted: [PrerollSubmitted],
+        preSwitchEntries: [VideoToolboxOutputRouter.Entry],
         into result: inout VideoPrerollBatchResult
     ) {
         let policy = VideoToolboxTimingPolicy()
-        for item in submitted {
-            let events = records.filter { $0.event.identity == item.timing.identity }
-            if events.first?.event.status == kVTVideoDecoderReferenceMissingErr,
+        let preSwitchIdentities = Set(preSwitchEntries.map(\.submission.identity))
+        let orderedEntries: [VideoToolboxOutputRouter.Entry] = preSwitchEntries + submitted.compactMap {
+            guard !preSwitchIdentities.contains($0.timing.identity) else { return nil }
+            return entriesByIdentity[$0.timing.identity]
+        }
+        for entry in orderedEntries {
+            let events = entry.records.map(\.event)
+            if events.first?.status == kVTVideoDecoderReferenceMissingErr,
                loggedReferenceMissingBatches < 4 {
                 loggedReferenceMissingBatches += 1
                 PlayerLog.log(
-                    "[PathADecoder] event=referenceMissing sessionID=\(debugSessionID) " +
-                    "pts=\(Self.mediaTimeDescription(item.packet.pts)) " +
-                    "keyframe=\(item.packet.isKeyframe ? 1 : 0) — frame dropped, decoding continues"
+                    "[PathADecoder] event=referenceMissing sessionID=\(queueSessionID) " +
+                    "pts=\(Self.mediaTimeDescription(entry.packet.pts)) " +
+                    "keyframe=\(entry.packet.isKeyframe ? 1 : 0) — frame dropped, decoding continues"
                 )
             }
-            let resolution = policy.resolve(submission: item.timing, outputEvents: events.map(\.event))
-            for record in events where record.event.imagePresent {
+            let resolution = policy.resolve(submission: entry.submission, outputEvents: events)
+            for record in entry.records where record.event.imagePresent {
                 guard let resolved = resolution.resolution(for: record.event) else { continue }
                 switch resolved {
                 case .callback(let pts, let duration), .oneToOneInputFallback(let pts, let duration, _):
                     framesProduced += 1
-                    if let image = record.keptImage {
+                    if let image = record.imageBuffer {
                         result.noteOutput(
                             MediaVideoFrame(
                                 pts: pts, duration: duration, pixelBuffer: image,
                                 displayCoverage: VideoToolboxOutputRecord(
                                     event: record.event, imageBuffer: image,
-                                    callbackPTS: record.nativePTS, callbackDuration: record.nativeDuration
-                                ).displayCoverage(packet: item.packet,
-                                                  resolution: resolved,
-                                                  submitted: item.nativeTiming)
+                                    callbackPTS: record.callbackPTS, callbackDuration: record.callbackDuration
+                                ).displayCoverage(
+                                    packet: entry.packet,
+                                    resolution: resolved,
+                                    submitted: entry.nativeTiming
+                                )
                             ),
                             keep: true
                         )

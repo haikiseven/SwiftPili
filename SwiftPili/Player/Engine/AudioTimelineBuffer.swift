@@ -48,8 +48,12 @@ struct AudioTimelineBuffer: Sendable {
     private let timelineContinuity: AudioTimelineContinuity
     private let maxGapSeconds: TimeInterval
 
+    private static let replayHistorySeconds: TimeInterval = 1.0
+
     private var samples: [Float] = []
     private var readIndex = 0
+    private var highWaterConsumedFrame = 0
+    private var consumedHistorySpans: [AudioDisplayLeaseSpan] = []
     private(set) var sampleRate: Double
     private(set) var channels: Int
     private(set) var endPTS: TimeInterval?
@@ -81,6 +85,8 @@ struct AudioTimelineBuffer: Sendable {
     mutating func reset() {
         samples.removeAll(keepingCapacity: true)
         readIndex = 0
+        highWaterConsumedFrame = 0
+        consumedHistorySpans.removeAll(keepingCapacity: true)
         sampleRate = defaultSampleRate
         channels = defaultChannels
         endPTS = nil
@@ -88,6 +94,19 @@ struct AudioTimelineBuffer: Sendable {
         insertedGapFrameCount = 0
         droppedOverlapFrameCount = 0
         displaySpans.removeAll()
+    }
+
+    /// Rewinds `readIndex` back into the retained consumed history window by up to `seconds`.
+    /// Returns the actual media seconds rolled back.
+    mutating func rollback(seconds: TimeInterval) -> TimeInterval {
+        guard seconds.isFinite, seconds > 0, channels > 0, sampleRate > 0 else { return 0 }
+        let currentReadFrame = readIndex / channels
+        guard currentReadFrame > 0 else { return 0 }
+        let requestedFrames = Int((seconds * sampleRate).rounded())
+        let rollbackFrames = min(currentReadFrame, max(0, requestedFrames))
+        guard rollbackFrames > 0 else { return 0 }
+        readIndex = (currentReadFrame - rollbackFrames) * channels
+        return TimeInterval(rollbackFrames) / sampleRate
     }
 
     mutating func append(
@@ -147,10 +166,34 @@ struct AudioTimelineBuffer: Sendable {
             readIndex += channels
             framesWritten += 1
         }
-        let spans = displaySpans.take(
-            in: startFrame..<(startFrame + framesWritten),
-            sampleRate: sampleRate
-        )
+        let endFrame = startFrame + framesWritten
+        var spans: [AudioDisplayLeaseSpan] = []
+        if startFrame < highWaterConsumedFrame {
+            spans.append(contentsOf: historySpans(
+                in: startFrame..<min(endFrame, highWaterConsumedFrame),
+                relativeTo: startFrame,
+                sampleRate: sampleRate
+            ))
+        }
+        let freshStart = max(startFrame, highWaterConsumedFrame)
+        if freshStart < endFrame {
+            let freshSpans = displaySpans.take(
+                in: freshStart..<endFrame,
+                sampleRate: sampleRate
+            )
+            let offset = freshStart - startFrame
+            for span in freshSpans {
+                consumedHistorySpans.append(AudioDisplayLeaseSpan(
+                    frames: (span.frames.lowerBound + freshStart)..<(span.frames.upperBound + freshStart),
+                    lease: span.lease
+                ))
+                spans.append(AudioDisplayLeaseSpan(
+                    frames: (span.frames.lowerBound + offset)..<(span.frames.upperBound + offset),
+                    lease: span.lease
+                ))
+            }
+            highWaterConsumedFrame = endFrame
+        }
         compactIfNeeded()
         return AudioSupplyPull(frames: framesWritten, displaySpans: spans)
     }
@@ -241,19 +284,91 @@ struct AudioTimelineBuffer: Sendable {
     }
 
     private mutating func compactIfNeeded() {
-        let waste = readIndex
-        guard waste >= 16_384, waste * 2 >= samples.count else { return }
-        samples.removeFirst(waste)
-        readIndex = 0
-        displaySpans.shiftConsumed(frames: waste / max(1, channels))
+        let ch = max(1, channels)
+        let historyFrames = sampleRate.isFinite && sampleRate > 0
+            ? Int((Self.replayHistorySeconds * sampleRate).rounded(.up))
+            : 0
+        let historySamples = historyFrames * ch
+        let discardCandidates = readIndex - historySamples
+        guard discardCandidates >= 16_384, discardCandidates * 2 >= samples.count else { return }
+        let discardFrames = discardCandidates / ch
+        let discardSamples = discardFrames * ch
+        guard discardSamples > 0 else { return }
+        samples.removeFirst(discardSamples)
+        readIndex -= discardSamples
+        highWaterConsumedFrame = max(readIndex / ch, highWaterConsumedFrame - discardFrames)
+        displaySpans.shiftConsumed(frames: discardFrames)
+        trimConsumedHistorySpans(discardFrames: discardFrames)
+    }
+
+    private func historySpans(
+        in range: Range<Int>,
+        relativeTo originFrame: Int,
+        sampleRate: Double
+    ) -> [AudioDisplayLeaseSpan] {
+        guard !range.isEmpty, !consumedHistorySpans.isEmpty else { return [] }
+        var result: [AudioDisplayLeaseSpan] = []
+        for span in consumedHistorySpans {
+            let lower = max(span.frames.lowerBound, range.lowerBound)
+            let upper = min(span.frames.upperBound, range.upperBound)
+            guard lower < upper,
+                  let interval = span.lease.interval,
+                  let start = interval.lower.adding(
+                      frames: lower - span.frames.lowerBound,
+                      sampleRate: sampleRate
+                  ),
+                  let narrowed = span.lease.producing(.pcm(
+                      start: start,
+                      frames: upper - lower,
+                      rate: sampleRate
+                  )) else { continue }
+            result.append(AudioDisplayLeaseSpan(
+                frames: (lower - originFrame)..<(upper - originFrame),
+                lease: narrowed
+            ))
+        }
+        return result
+    }
+
+    private mutating func trimConsumedHistorySpans(discardFrames: Int) {
+        guard discardFrames > 0, !consumedHistorySpans.isEmpty else { return }
+        var kept: [AudioDisplayLeaseSpan] = []
+        kept.reserveCapacity(consumedHistorySpans.count)
+        for span in consumedHistorySpans {
+            guard span.frames.upperBound > discardFrames else { continue }
+            if span.frames.lowerBound >= discardFrames {
+                kept.append(AudioDisplayLeaseSpan(
+                    frames: (span.frames.lowerBound - discardFrames)..<(span.frames.upperBound - discardFrames),
+                    lease: span.lease
+                ))
+            } else if let interval = span.lease.interval,
+                      let start = interval.lower.adding(
+                          frames: discardFrames - span.frames.lowerBound,
+                          sampleRate: sampleRate
+                      ),
+                      let trimmedLease = span.lease.producing(.pcm(
+                          start: start,
+                          frames: span.frames.upperBound - discardFrames,
+                          rate: sampleRate
+                      )) {
+                kept.append(AudioDisplayLeaseSpan(
+                    frames: 0..<(span.frames.upperBound - discardFrames),
+                    lease: trimmedLease
+                ))
+            }
+        }
+        consumedHistorySpans = kept
     }
 }
 
 private extension AudioTimelineBuffer {
     mutating func prepareFormat(_ context: AudioPCMAppend) -> Rejection? {
-        if samples.isEmpty || readIndex >= samples.count {
+        let formatMismatch = abs(context.sampleRate - sampleRate) > 0.5 || context.channels != channels
+        if samples.isEmpty || (readIndex >= samples.count && formatMismatch) {
             samples.removeAll(keepingCapacity: true)
             readIndex = 0
+            highWaterConsumedFrame = 0
+            consumedHistorySpans.removeAll(keepingCapacity: true)
             sampleRate = defaultSampleRate
             channels = defaultChannels
         }

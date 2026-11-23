@@ -76,7 +76,7 @@ bad()  { printf '  FAIL %s\n' "$1"; fail=1; }
 warn() { printf '  WARN %s\n' "$1"; warn=1; }
 
 # Expected ordered set (SwiftVLC's own 0001-chromecast lives in the fork; we
-# start at 0002). Two files share the 0008- prefix — both are required.
+# start at 0002).
 # shellcheck disable=SC2034
 EXPECTED=(
   0002-clock-apply-pause-delay-to-all-live-contexts.patch
@@ -84,8 +84,8 @@ EXPECTED=(
   0004-clock-apply-rate-change-to-all-live-contexts.patch
   0005-access-http-retry-without-precondition-on-412.patch
   0006-avcodec-log-hwdec-rejection-reason.patch
+  0007-videotoolbox-native-av1.patch
   0008-es_out-master-source-owns-program-pcr.patch
-  0008-videotoolbox-native-av1.patch
   0009-clock-hold-mapping-across-rate-change-transient.patch
   0010-input_clock-re-anchor-forward-gaps-without-discontinuity.patch
   0011-aout-play-out-buffered-tail-on-eof.patch

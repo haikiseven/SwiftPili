@@ -100,15 +100,31 @@ struct RecoveryBudget: Equatable {
     static let streamStableDuration: TimeInterval = 15
     private(set) var streamRetries = 0
     private(set) var streamStartedAt: TimeInterval?
+    private var streamSuspendedAt: TimeInterval?
     private var streamStableSince: TimeInterval?
     private var streamLastProgressAt: TimeInterval?
     mutating func beginStreamRecovery(at now: TimeInterval) {
-        if streamStartedAt == nil { streamStartedAt = now }
+        if streamStartedAt == nil {
+            streamStartedAt = now
+            streamSuspendedAt = nil
+        } else {
+            resumeStreamRecovery(at: now)
+        }
         interruptStreamStability()
+    }
+    mutating func suspendStreamRecovery(at now: TimeInterval) {
+        guard streamStartedAt != nil, streamSuspendedAt == nil else { return }
+        streamSuspendedAt = now
+    }
+    mutating func resumeStreamRecovery(at now: TimeInterval) {
+        guard let suspendedAt = streamSuspendedAt, let start = streamStartedAt else { return }
+        streamStartedAt = start + max(0, now - suspendedAt)
+        streamSuspendedAt = nil
     }
     func streamRemaining(at now: TimeInterval) -> TimeInterval {
         guard let start = streamStartedAt else { return Self.streamRecoveryDuration }
-        return max(0, Self.streamRecoveryDuration - (now - start))
+        let effectiveNow = streamSuspendedAt ?? now
+        return max(0, Self.streamRecoveryDuration - (effectiveNow - start))
     }
     mutating func spendStreamRetry(at now: TimeInterval) -> Bool {
         guard streamStartedAt != nil, streamRemaining(at: now) > 0,
@@ -137,6 +153,7 @@ struct RecoveryBudget: Equatable {
     mutating func clearStreamRecovery() {
         streamRetries = 0
         streamStartedAt = nil
+        streamSuspendedAt = nil
         interruptStreamStability()
     }
 

@@ -75,7 +75,7 @@ index b84af25..eeff817 100644
  }
  
  static void context_init(struct vlc_clock_context *ctx)
-@@ -440,6 +455,11 @@ static void vlc_clock_master_update_coeff(
+@@ -440,6 +455,18 @@ static void vlc_clock_master_update_coeff(
      vlc_clock_main_t *main_clock = clock->owner;
      vlc_mutex_assert(&main_clock->lock);
  
@@ -84,10 +84,17 @@ index b84af25..eeff817 100644
 +     * mapping stays put. */
 +    bool hold = false;
 +
++    /* F19: open the settle window before evaluating `settling` so the very
++     * first sample carrying a new rate is already covered. Save `rate_changed`
++     * so a `decreasing_ts` context_reset() does not wipe this stamp. */
++    bool rate_changed = (rate != ctx->rate);
++    if (rate_changed)
++        ctx->rate_change_system = system_now;
++
      if (ctx->last.system != VLC_TICK_INVALID
       && ts != ctx->last.stream)
      {
-@@ -457,7 +477,21 @@ static void vlc_clock_master_update_coeff(
+@@ -457,7 +484,21 @@ static void vlc_clock_master_update_coeff(
              bool coefficient_unstable = instant_coeff > 1.0 + COEFF_THRESHOLD
                  || instant_coeff < 1.0 - COEFF_THRESHOLD;
  
@@ -110,7 +117,7 @@ index b84af25..eeff817 100644
              {
                  if (main_clock->logger != NULL)
                  {
-@@ -499,7 +533,9 @@ static void vlc_clock_master_update_coeff(
+@@ -499,7 +540,12 @@ static void vlc_clock_master_update_coeff(
          vlc_clock_SendEvent(main_clock, discontinuity);
      }
  
@@ -118,16 +125,9 @@ index b84af25..eeff817 100644
 +    /* F19: keep the mapping across a graced post-rate-change transient sample. */
 +    if (!hold)
 +        ctx->offset = ComputeOffset(main_clock, ctx, system_now, ts, rate);
++    /* Preserve the new rate-change timestamp if context_reset() ran above. */
++    if (rate_changed)
++        ctx->rate_change_system = system_now;
  
      if (main_clock->tracer != NULL && clock->track_str_id != NULL)
          vlc_tracer_Trace(main_clock->tracer,
-@@ -519,6 +555,9 @@ static void vlc_clock_master_update_coeff(
-     vlc_list_foreach(prev_ctx, &main_clock->prev_contexts, node)
-         context_change_rate(prev_ctx, rate);
- 
-+    /* F19: open the settle window on the sample that carries the new rate. */
-+    if (rate != ctx->rate)
-+        ctx->rate_change_system = system_now;
-     ctx->rate = rate;
-     vlc_cond_broadcast(&main_clock->cond);
- }

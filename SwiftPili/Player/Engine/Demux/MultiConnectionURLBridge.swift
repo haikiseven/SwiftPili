@@ -40,13 +40,25 @@ final class MultiConnectionURLBridge: NSObject, URLSessionDataDelegate, @uncheck
         let drain: Task<Void, Never>?
         let waiter: CheckedContinuation<Void, Never>?
     }
+    typealias URLRefreshHandler = @Sendable (URL) async -> URL?
+
     private let lock = NSLock()
     private var transfers: [Int: Transfer] = [:]
     private let networkBytes: MediaNetworkByteCounter?
+    private let urlRefreshHandler: URLRefreshHandler?
 
-    init(networkBytes: MediaNetworkByteCounter? = nil) {
+    init(
+        networkBytes: MediaNetworkByteCounter? = nil,
+        urlRefreshHandler: URLRefreshHandler? = nil
+    ) {
         self.networkBytes = networkBytes
+        self.urlRefreshHandler = urlRefreshHandler
         super.init()
+    }
+
+    func refreshURL(for url: URL) async -> URL? {
+        guard let urlRefreshHandler else { return nil }
+        return await urlRefreshHandler(url)
     }
 
     func register(
@@ -84,8 +96,36 @@ final class MultiConnectionURLBridge: NSObject, URLSessionDataDelegate, @uncheck
         _ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
         newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void
     ) {
-        retire(task, error: PathAHTTPMediaSource.SourceError.invalidRange)
-        completionHandler(nil)
+        let decision: (allowed: URLRequest?, invalid: Bool) = lock.withLock {
+            guard let transfer = transfers[task.taskIdentifier], transfer.task === task,
+                  transfer.failure == nil, transfer.response == nil else {
+                return (nil, false)
+            }
+            guard let targetURL = request.url,
+                  Self.isAllowedRedirect(from: task.originalRequest?.url ?? response.url, to: targetURL) else {
+                return (nil, true)
+            }
+            return (request, false)
+        }
+        if decision.invalid {
+            retire(task, error: PathAHTTPMediaSource.SourceError.invalidRange)
+            completionHandler(nil)
+            return
+        }
+        completionHandler(decision.allowed)
+    }
+
+    private static func isAllowedRedirect(from sourceURL: URL?, to targetURL: URL) -> Bool {
+        guard let targetScheme = targetURL.scheme?.lowercased(),
+              targetScheme == "http" || targetScheme == "https",
+              let host = targetURL.host, !host.isEmpty,
+              targetURL.user == nil, targetURL.password == nil else {
+            return false
+        }
+        if sourceURL?.scheme?.lowercased() == "https", targetScheme == "http" {
+            return false
+        }
+        return true
     }
 
     func urlSession(

@@ -22,8 +22,14 @@ private struct InteractivePopGestureEnabler: UIViewControllerRepresentable {
         controller.adoptIfPossible()
     }
 
+    static func dismantleUIViewController(_ controller: ProbeController, coordinator _: Void) {
+        controller.relinquishIfNeeded()
+    }
+
     @MainActor
     final class ProbeController: UIViewController {
+        private weak var adoptedNavigation: UINavigationController?
+
         override func loadView() {
             let view = UIView(frame: .zero)
             view.backgroundColor = .clear
@@ -42,12 +48,28 @@ private struct InteractivePopGestureEnabler: UIViewControllerRepresentable {
             adoptIfPossible()
         }
 
+        override func viewDidDisappear(_ animated: Bool) {
+            super.viewDidDisappear(animated)
+            relinquishIfNeeded()
+        }
+
         func adoptIfPossible() {
             guard let navigation = nearestNavigationController else {
                 PlayerLog.log("[PopGesture] probe: no UINavigationController in the parent chain")
                 return
             }
-            NavigationPopGestureOwner.owner(for: navigation).adopt()
+            if let previous = adoptedNavigation, previous !== navigation {
+                NavigationPopGestureOwner.owner(for: previous).relinquish(probe: ObjectIdentifier(self))
+            }
+            adoptedNavigation = navigation
+            NavigationPopGestureOwner.owner(for: navigation).adopt(probe: ObjectIdentifier(self))
+        }
+
+        func relinquishIfNeeded() {
+            let navigation = adoptedNavigation ?? nearestNavigationController
+            adoptedNavigation = nil
+            guard let navigation else { return }
+            NavigationPopGestureOwner.owner(for: navigation).relinquish(probe: ObjectIdentifier(self))
         }
 
         private var nearestNavigationController: UINavigationController? {
@@ -70,6 +92,7 @@ private final class NavigationPopGestureOwner: NSObject, UIGestureRecognizerDele
     private weak var navigation: UINavigationController?
     private weak var systemDelegate: (any UIGestureRecognizerDelegate)?
     private var hasAddedTarget = false
+    private var activeProbes: Set<ObjectIdentifier> = []
     private var loggedCompetitors: Set<String> = []
 
     init(navigation: UINavigationController) {
@@ -85,7 +108,8 @@ private final class NavigationPopGestureOwner: NSObject, UIGestureRecognizerDele
         return owner
     }
 
-    func adopt() {
+    func adopt(probe: ObjectIdentifier) {
+        activeProbes.insert(probe)
         guard let navigation, let pop = navigation.interactivePopGestureRecognizer else {
             PlayerLog.log("[PopGesture] adopt: navigation has NO interactivePopGestureRecognizer")
             return
@@ -116,6 +140,21 @@ private final class NavigationPopGestureOwner: NSObject, UIGestureRecognizerDele
                 "[PopGesture] re-asserted — delegate drifted: \(delegateDrifted), " +
                     "was disabled: \(wasDisabled)"
             )
+        }
+    }
+
+    func relinquish(probe: ObjectIdentifier) {
+        activeProbes.remove(probe)
+        guard activeProbes.isEmpty,
+              let navigation,
+              let pop = navigation.interactivePopGestureRecognizer else { return }
+        if hasAddedTarget {
+            pop.removeTarget(self, action: #selector(popStateChanged(_:)))
+            hasAddedTarget = false
+        }
+        if pop.delegate === self {
+            pop.delegate = systemDelegate
+            PlayerLog.log("[PopGesture] relinquished — restored system delegate")
         }
     }
 

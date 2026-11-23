@@ -11,7 +11,7 @@ public final class PlaybackSession {
         case open(PlaybackSource)
         case play
         case pause
-        case seek(TimeInterval)
+        case seek(TimeInterval, mode: PlaybackSeekMode)
         case setRate(Float)
         case stop(PlaybackStopReason)
         case requestPictureInPicture(PlaybackPictureInPictureRequest)
@@ -47,6 +47,7 @@ public final class PlaybackSession {
     private var pendingSeek: PendingSeek?
     private var openTask: Task<Void, Never>?
     private var seekTask: Task<Void, Never>?
+    private var runtimeEventTask: Task<Void, Never>?
     private var isClosed = false
     private var isClosing = false
 
@@ -61,10 +62,22 @@ public final class PlaybackSession {
     private var latestEnvironmentSerials: [PlaybackEnvironmentEventKind: UInt64] = [:]
     private var highestApplicationEpochSeen: UInt64?
 
-    public init(configuration: PlaybackConfiguration = .init()) {
+    public convenience init(configuration: PlaybackConfiguration = .init()) {
+        self.init(
+            configuration: configuration,
+            runtime: UnavailablePlaybackRuntime(),
+            clock: SystemPlaybackMonotonicClock()
+        )
+    }
+
+    public init(
+        configuration: PlaybackConfiguration = .init(),
+        runtime: any PlaybackRuntime,
+        clock: any PlaybackMonotonicClock = SystemPlaybackMonotonicClock()
+    ) {
         self.configuration = configuration
-        self.runtime = UnavailablePlaybackRuntime()
-        self.clock = SystemPlaybackMonotonicClock()
+        self.runtime = runtime
+        self.clock = clock
         self.sessionID = PlaybackSessionID(rawValue: "session-\(UUID().uuidString)")
         self.defaultSurface = PlaybackSurface(
             id: PlaybackSurfaceID(rawValue: "surface-\(UUID().uuidString)"),
@@ -79,6 +92,13 @@ public final class PlaybackSession {
             session: self.sessionID,
             rate: Self.validatedRate(configuration.preferredRate)
         )
+        let runtimeEvents = runtime.runtimeEvents
+        self.runtimeEventTask = Task { @MainActor [weak self] in
+            for await event in runtimeEvents {
+                guard !Task.isCancelled else { break }
+                await self?.handleRuntimeEvent(event)
+            }
+        }
     }
 
     private static func validatedRate(_ rate: Float) -> Float {
@@ -86,6 +106,7 @@ public final class PlaybackSession {
     }
 
     deinit {
+        runtimeEventTask?.cancel()
         openTask?.cancel()
         if let pendingOpen {
             pendingOpen.continuation.resume(returning: .unavailable)
@@ -135,8 +156,11 @@ public final class PlaybackSession {
         await dispatch(.pause)
     }
 
-    public func seek(to time: TimeInterval) async -> PlaybackCommandResult {
-        await dispatch(.seek(time))
+    public func seek(
+        to time: TimeInterval,
+        mode: PlaybackSeekMode = .accurate
+    ) async -> PlaybackCommandResult {
+        await dispatch(.seek(time, mode: mode))
     }
 
     public func setRate(_ rate: Float) async -> PlaybackCommandResult {
@@ -172,8 +196,8 @@ public final class PlaybackSession {
             return await dispatchPlay()
         case .pause:
             return await dispatchPause()
-        case let .seek(time):
-            return await dispatchSeek(time)
+        case let .seek(time, mode):
+            return await dispatchSeek(time, mode: mode)
         case let .setRate(rate):
             return await dispatchSetRate(rate)
         case let .stop(reason):
@@ -470,7 +494,7 @@ public final class PlaybackSession {
         }
     }
 
-    private func dispatchSeek(_ time: TimeInterval) async -> PlaybackCommandResult {
+    private func dispatchSeek(_ time: TimeInterval, mode: PlaybackSeekMode) async -> PlaybackCommandResult {
         let operation = nextOperation()
         guard !isClosed && !isClosing else {
             return await finishImmediate(
@@ -537,7 +561,7 @@ public final class PlaybackSession {
                 continuation: continuation
             )
             seekTask = Task { @MainActor [weak self] in
-                let decision = await runtime.execute(.seek)
+                let decision = await runtime.execute(.seek(to: time, mode: mode))
                 await self?.finishSeek(
                     operation: operation,
                     target: time,
@@ -607,7 +631,7 @@ public final class PlaybackSession {
         updateSnapshot(operation: .set(operation))
         await supersedePendingOpen(by: operation)
         let identities = before.identities
-        let decision = await runtime.execute(.setRate)
+        let decision = await runtime.execute(.setRate(rate))
         guard isCurrent(operation: operation, source: source, identities: identities) else {
             return await finishStaleOrSuperseded(
                 staleOrSupersededResult(for: operation, source: source, identities: identities),
@@ -678,7 +702,7 @@ public final class PlaybackSession {
         updateSnapshot(operation: .set(operation))
         await supersedePendingOpen(by: operation)
         await supersedePendingSeek(by: operation)
-        _ = await runtime.execute(.stop)
+        _ = await runtime.execute(.stop(reason: stopReason))
         guard isCurrent(operation: operation, source: source, identities: identities) else {
             return await finishStaleOrSuperseded(
                 staleOrSupersededResult(for: operation, source: source, identities: identities),
@@ -923,6 +947,8 @@ public final class PlaybackSession {
         updateSnapshot(operation: .set(operation))
         await supersedePendingOpen(by: operation)
         await supersedePendingSeek(by: operation)
+        runtimeEventTask?.cancel()
+        runtimeEventTask = nil
         _ = await runtime.execute(.close)
         updateSnapshot(
             source: .set(nil),
@@ -1316,6 +1342,7 @@ public final class PlaybackSession {
         identities: PlaybackIdentityContext
     ) async -> PlaybackRuntimeDecision {
         let runtime = self.runtime
+        let configuration = self.configuration
         return await withCheckedContinuation { continuation in
             pendingOpen = PendingOpen(
                 operation: operation,
@@ -1324,7 +1351,7 @@ public final class PlaybackSession {
                 continuation: continuation
             )
             openTask = Task { @MainActor [weak self] in
-                let decision = await runtime.execute(.open)
+                let decision = await runtime.execute(.open(source: source, configuration: configuration))
                 self?.finishOpenRuntime(operation: operation, decision: decision)
             }
         }
@@ -1378,15 +1405,13 @@ public final class PlaybackSession {
         let before = currentSnapshot.transport
         switch decision {
         case .accepted, .acceptedWithCapabilities:
-            var capabilities = source.sourceCapabilities
-            if case let .acceptedWithCapabilities(reported) = decision {
-                var allowed = capabilities
-                if configuration.backgroundAudioEnabled { allowed.insert(.backgroundAudio) }
-                if configuration.pictureInPictureEnabled { allowed.insert(.pictureInPicture) }
-                capabilities.formUnion(reported.intersection(allowed))
+            let reported: Set<PlaybackCapability>?
+            if case let .acceptedWithCapabilities(value) = decision {
+                reported = value
+            } else {
+                reported = nil
             }
-            if configuration.backgroundAudioEnabled { capabilities.insert(.backgroundAudio) }
-            if configuration.pictureInPictureEnabled { capabilities.insert(.pictureInPicture) }
+            let capabilities = resolvedCapabilities(for: source, reported: reported)
             let intent: PlaybackIntent = configuration.autoplay ? .playing : .stopped
             updateSnapshot(
                 intent: .set(intent),
@@ -1618,6 +1643,131 @@ public final class PlaybackSession {
         }
     }
 
+    private func resolvedCapabilities(
+        for source: PlaybackSource,
+        reported: Set<PlaybackCapability>?
+    ) -> Set<PlaybackCapability> {
+        var capabilities = source.sourceCapabilities
+        if let reported {
+            var allowed = capabilities
+            if configuration.backgroundAudioEnabled { allowed.insert(.backgroundAudio) }
+            if configuration.pictureInPictureEnabled { allowed.insert(.pictureInPicture) }
+            capabilities.formUnion(reported.intersection(allowed))
+        }
+        if configuration.backgroundAudioEnabled { capabilities.insert(.backgroundAudio) }
+        if configuration.pictureInPictureEnabled { capabilities.insert(.pictureInPicture) }
+        return capabilities
+    }
+
+    private func handleRuntimeEvent(_ event: PlaybackRuntimeEvent) async {
+        guard !isClosed && !isClosing, let source = currentSource else { return }
+        let before = currentSnapshot
+        let operation = currentSnapshot.currentOperation
+
+        switch event {
+        case let .ready(duration, reportedCapabilities):
+            guard currentSnapshot.transport == .opening
+                || currentSnapshot.transport == .buffering
+                || currentSnapshot.transport == .ready else {
+                return
+            }
+            let durationChange: SnapshotChange<PlaybackDuration>
+            if let duration, valid(duration: duration) {
+                durationChange = .set(duration)
+            } else {
+                durationChange = .keep
+            }
+            let capabilitiesChange: SnapshotChange<Set<PlaybackCapability>> = reportedCapabilities.map {
+                .set(resolvedCapabilities(for: source, reported: $0))
+            } ?? .keep
+            updateSnapshot(
+                transport: .set(.ready),
+                suppression: currentSnapshot.suppression == .resourceUnavailable ? .set(nil) : .keep,
+                audio: currentSnapshot.intent == .playing ? .set(.active) : .keep,
+                video: currentSnapshot.intent == .playing ? .set(videoStateForPlaying) : .keep,
+                duration: durationChange,
+                capabilities: capabilitiesChange
+            )
+            await publishSnapshotChanges(from: before, operation: operation, sourceOverride: source)
+
+        case let .buffering(isBuffering):
+            if isBuffering {
+                guard currentSnapshot.transport == .ready || currentSnapshot.transport == .buffering else {
+                    return
+                }
+                guard currentSnapshot.transport != .buffering else { return }
+                updateSnapshot(transport: .set(.buffering))
+            } else {
+                guard currentSnapshot.transport == .buffering else { return }
+                updateSnapshot(transport: .set(.ready))
+            }
+            await publishSnapshotChanges(from: before, operation: operation, sourceOverride: source)
+
+        case let .progress(mediaTime, duration):
+            guard currentSnapshot.transport == .ready || currentSnapshot.transport == .buffering,
+                  pendingSeek == nil,
+                  mediaTime.isFinite,
+                  mediaTime >= 0 else {
+                return
+            }
+            let durationChange: SnapshotChange<PlaybackDuration>
+            if let duration, valid(duration: duration) {
+                durationChange = .set(duration)
+            } else {
+                durationChange = .keep
+            }
+            updateSnapshot(mediaTime: .set(mediaTime), duration: durationChange)
+
+        case .ended:
+            guard currentSnapshot.transport == .ready
+                || currentSnapshot.transport == .buffering
+                || currentSnapshot.transport == .opening else {
+                return
+            }
+            updateSnapshot(
+                intent: .set(.stopped),
+                transport: .set(.ended),
+                suppression: .set(nil),
+                audio: .set(.parked),
+                video: .set(.parked)
+            )
+            await publishSnapshotChanges(from: before, operation: operation, sourceOverride: source)
+            await emit(.stopped(reason: .ended), operation: operation, source: source)
+
+        case let .failed(failure):
+            guard currentSnapshot.transport != .closed else { return }
+            if let pendingOpen {
+                finishOpenRuntime(operation: pendingOpen.operation, decision: .failed(failure))
+                return
+            }
+            if let pendingSeek {
+                seekTask?.cancel()
+                seekTask = nil
+                self.pendingSeek = nil
+                let result = await finishImmediate(
+                    .failed(operation: pendingSeek.operation, failure: failure),
+                    command: .seek,
+                    source: pendingSeek.source,
+                    identities: pendingSeek.identities,
+                    effects: [.runtimeCommand(.seek), .publish(.commandFailed)],
+                    reason: reasonCode(for: failure),
+                    before: before.transport
+                )
+                pendingSeek.continuation.resume(returning: result)
+            }
+            updateSnapshot(
+                intent: .set(.stopped),
+                transport: .set(.failed(failure)),
+                suppression: failure == .runtime(.mediaServicesReset)
+                    ? .set(.mediaServicesUnavailable)
+                    : .keep,
+                audio: .set(.failed(failure)),
+                video: .set(.failed(failure))
+            )
+            await publishSnapshotChanges(from: before, operation: operation, sourceOverride: source)
+        }
+    }
+
     private func supersedePendingSeek(by operation: PlaybackOperationID) async {
         guard let pendingSeek else { return }
         seekTask?.cancel()
@@ -1701,10 +1851,11 @@ public final class PlaybackSession {
         let nextDuration: PlaybackDuration
         switch duration {
         case .keep:
-            if case .set(nil) = source {
-                nextDuration = .unknown
-            } else {
-                nextDuration = nextSource?.duration ?? currentSnapshot.duration
+            switch source {
+            case let .set(value):
+                nextDuration = value?.duration ?? .unknown
+            case .keep:
+                nextDuration = currentSnapshot.duration
             }
         case let .set(value):
             nextDuration = value ?? .unknown

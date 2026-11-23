@@ -38,6 +38,12 @@ actor PathAHTTPMediaSource {
         }
     }
 
+    enum ChunkStreamStep: Sendable, Equatable {
+        case chunk(Data)
+        case backpressureSuspended(resumeOffset: Int64)
+        case endOfStream
+    }
+
     private typealias ByteWindow = PathAHTTPRangeValidator.ByteWindow
     private enum ChunkResponseKind: Sendable {
         case pending
@@ -48,6 +54,7 @@ actor PathAHTTPMediaSource {
     private let url: URL
     private let headers: [String: String]
     private let session: URLSession
+    private let ownsSession: Bool
     private let isFile: Bool
 
     struct RetrievalEstimate: Sendable {
@@ -114,11 +121,19 @@ actor PathAHTTPMediaSource {
         self.byteStore = url.isFileURL ? nil : byteStore
         if let session {
             self.session = session
+            self.ownsSession = false
         } else {
             let cfg = URLSessionConfiguration.ephemeral
             cfg.timeoutIntervalForRequest = timeout
             cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
             self.session = URLSession(configuration: cfg)
+            self.ownsSession = true
+        }
+    }
+
+    deinit {
+        if ownsSession {
+            session.finishTasksAndInvalidate()
         }
     }
 
@@ -750,22 +765,33 @@ actor PathAHTTPMediaSource {
         }
     }
 
-    func nextChunk(
+    func nextChunkStep(
         _ id: UInt64, waitBudget: MediaSourceWaitBudget? = nil,
         displayOwner: MediaDisplayByteOwner? = nil
-    ) async throws -> Data? {
+    ) async throws -> ChunkStreamStep {
         while true {
             try checkWaitBudget(waitBudget)
             guard var slot = chunkSlot, slot.id == id else { throw CancellationError() }
             if !slot.buffered.isEmpty {
-                return try consumeBufferedChunk(&slot, waitBudget: waitBudget, displayOwner: displayOwner)
+                return .chunk(try consumeBufferedChunk(&slot, waitBudget: waitBudget, displayOwner: displayOwner))
             }
             if slot.tailEndedForBackpressure {
-                retireChunkSlot(throwing: CancellationError())
-                throw CancellationError()
+                guard let resumeOffset = MediaByteRange.checkedEndExclusive(
+                    offset: slot.baseOffset, length: slot.delivered
+                ) else {
+                    failChunkSlot(&slot, error: SourceError.invalidRange)
+                    chunkSlot = slot
+                    throw SourceError.invalidRange
+                }
+                let completed = slot.finished || slot.delivered >= slot.requestedCount
+                retireChunkSlot(
+                    throwing: CancellationError(),
+                    outcome: completed ? "finished" : "backpressure"
+                )
+                return completed ? .endOfStream : .backpressureSuspended(resumeOffset: resumeOffset)
             }
             if let failure = slot.failure { throw failure }
-            if slot.finished { return nil }
+            if slot.finished { return .endOfStream }
             if slot.network == nil, storeBinding != nil {
                 try await refillStoredStream(id, waitBudget: waitBudget)
                 continue
@@ -777,14 +803,14 @@ actor PathAHTTPMediaSource {
             let resumed = try await waitForNetworkChunk(id, waitBudget: waitBudget)
             try checkWaitBudget(waitBudget)
             guard chunkSlot?.id == id else { throw CancellationError() }
-            guard let resumed else { return nil }
+            guard let resumed else { return .endOfStream }
             if resumed.data.isEmpty { continue }
             if let slot = chunkSlot {
                 let end = slot.baseOffset + slot.delivered
                 displayOwner?.hold((end - Int64(resumed.data.count))..<end)
             }
             resumed.primaryDelivery?.consumed(by: waitBudget)
-            return resumed.data
+            return .chunk(resumed.data)
         }
     }
 
@@ -981,10 +1007,10 @@ actor PathAHTTPMediaSource {
               current.networkGeneration == original.networkGeneration else { throw CancellationError() }
     }
 
-    private func retireChunkSlot(throwing error: Error) {
+    private func retireChunkSlot(throwing error: Error, outcome: String = "retired") {
         guard var slot = chunkSlot else { return }
         chunkSlot = nil
-        logChunkStreamSummary(slot, outcome: "retired")
+        logChunkStreamSummary(slot, outcome: outcome)
         slot.network?.task.cancel()
         sourceClaims.release(slot.network?.claim)
         slot.network?.claim = nil

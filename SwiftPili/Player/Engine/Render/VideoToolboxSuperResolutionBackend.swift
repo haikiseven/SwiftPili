@@ -303,6 +303,7 @@ private final class VTSRSession {
 
     func flush() {
         history = nil
+        lastSubmittedPTS = nil
     }
 
     func canReuse(_ id: VTSRConfiguration.Identifier, at pts: CMTime) -> Bool {
@@ -327,7 +328,7 @@ private final class VTSRSession {
         }
         try VTSRFailure.checkDeadline(hasTimeRemaining)
         let output = pair.output.buffer
-        VTSROutputMetadata.copy(from: input, to: output)
+        ScaledVideoOutputMetadata.copy(from: input, to: output, colorSpace: .yuvSameAsSource)
         try VTSRFailure.checkDeadline(hasTimeRemaining)
         if case .legacyVideo = configuration.id { history = pair }
         return output
@@ -432,54 +433,6 @@ private final class VTSRSession {
                 if let error { continuation.resume(throwing: error) } else { continuation.resume() }
             }
         }
-    }
-}
-
-private enum VTSROutputMetadata {
-    private static var interpretationKeys: [CFString] {
-        [kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunctionKey, kCVImageBufferYCbCrMatrixKey,
-         kCVImageBufferGammaLevelKey, kCVImageBufferICCProfileKey, kCVImageBufferCGColorSpaceKey,
-         kCVImageBufferPixelAspectRatioKey, kCVImageBufferChromaLocationTopFieldKey,
-         kCVImageBufferChromaLocationBottomFieldKey, kCVImageBufferLogTransferFunctionKey,
-         kCVImageBufferMasteringDisplayColorVolumeKey, kCVImageBufferContentLightLevelInfoKey,
-         kCVImageBufferAmbientViewingEnvironmentKey, kCVImageBufferAlphaChannelModeKey,
-         kCVImageBufferAlphaChannelIsOpaque]
-    }
-
-    static func copy(from source: CVPixelBuffer, to output: CVPixelBuffer) {
-        CVBufferRemoveAllAttachments(output)
-        CVBufferPropagateAttachments(source, output)
-        for key in interpretationKeys {
-            var mode = CVAttachmentMode.shouldPropagate
-            if let value = CVBufferCopyAttachment(source, key, &mode) {
-                CVBufferSetAttachment(output, key, value, mode)
-            }
-        }
-        let horizontalScale = Double(CVPixelBufferGetWidth(output)) / Double(CVPixelBufferGetWidth(source))
-        let verticalScale = Double(CVPixelBufferGetHeight(output)) / Double(CVPixelBufferGetHeight(source))
-        let aperture = [kCVImageBufferCleanApertureWidthKey as String: horizontalScale,
-                        kCVImageBufferCleanApertureHeightKey as String: verticalScale,
-                        kCVImageBufferCleanApertureHorizontalOffsetKey as String: horizontalScale,
-                        kCVImageBufferCleanApertureVerticalOffsetKey as String: verticalScale]
-        for key in [kCVImageBufferCleanApertureKey, kCVImageBufferPreferredCleanApertureKey] {
-            scaleAttachment(key, factors: aperture, from: source, to: output)
-        }
-        let display = [kCVImageBufferDisplayWidthKey as String: horizontalScale,
-                       kCVImageBufferDisplayHeightKey as String: verticalScale]
-        scaleAttachment(kCVImageBufferDisplayDimensionsKey, factors: display, from: source, to: output)
-    }
-
-    private static func scaleAttachment(
-        _ key: CFString, factors: [String: Double], from source: CVPixelBuffer, to output: CVPixelBuffer
-    ) {
-        var mode = CVAttachmentMode.shouldPropagate
-        CVBufferRemoveAttachment(output, key)
-        guard var values = CVBufferCopyAttachment(source, key, &mode) as? [String: Any] else { return }
-        for (dimension, factor) in factors {
-            guard let value = values[dimension] as? NSNumber, value.doubleValue.isFinite else { return }
-            values[dimension] = value.doubleValue * factor
-        }
-        CVBufferSetAttachment(output, key, values as CFDictionary, mode)
     }
 }
 #endif

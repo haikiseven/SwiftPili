@@ -27,11 +27,13 @@ struct AudioFeederAdmission: Sendable, Equatable {
     private(set) var contentGeneration: UInt64 = 0
     private(set) var completedPassCount = 0
 
+    static let slotCount = 4
+
     // MARK: - MainActor side
 
     @discardableResult
     mutating func admit(slot: Int, targetFrames: Int) -> Bool {
-        guard !isRetired, slot == 0 || slot == 1 else { return false }
+        guard !isRetired, (0..<Self.slotCount).contains(slot) else { return false }
         isAdmitted = true
         admittedSlot = slot
         self.targetFrames = max(0, targetFrames)
@@ -51,9 +53,10 @@ struct AudioFeederAdmission: Sendable, Equatable {
         contentGeneration &+= 1
     }
 
-    mutating func retire() {
+    mutating func retire() -> StandDown {
         isAdmitted = false
         isRetired = true
+        return isPassInFlight ? .mustJoin : .quiesced
     }
 
     // MARK: - Feeder side

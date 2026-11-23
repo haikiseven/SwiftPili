@@ -268,13 +268,12 @@ extension PlayerViewModel {
             )
             lifecycleReadinessFence = nil
             pendingLifecycleAdmission = nil
-            terminalOpenFailure = true
-            isBuffering = false
-            updateIsPlaying(transportRunning: false)
-            if error == nil {
-                error = String(localized: "Playback failed. Tap Retry.")
+            if playbackTerminalState != .terminalFailure {
+                settleTerminalFailure(TerminalFailurePayload(
+                    message: error ?? String(localized: "Playback failed. Tap Retry."),
+                    retireStreamRecoveryReason: nil
+                ))
             }
-            pushNowPlayingPlayback()
             PlayerLog.log(
                 "[Lifecycle] epoch=\(fence.lifecycleEpoch) terminal failure " +
                     "token=\(fence.admissionToken)"

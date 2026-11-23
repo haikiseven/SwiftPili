@@ -28,9 +28,10 @@ struct PlayerRenderView: UIViewRepresentable {
         )
         guard generation == player.playerGeneration else { return }
         if player.registerRenderAttachment(container, surfaceLease: surfaceLease) {
+            let attachedGeneration = container.presentationSnapshot.renderGeneration ?? player.playerGeneration
             container.update(
                 hostedVC: player.backend.renderViewController,
-                generation: player.playerGeneration,
+                generation: attachedGeneration,
                 presentationCornerRadius: presentationCornerRadius
             )
         } else {
@@ -40,7 +41,6 @@ struct PlayerRenderView: UIViewRepresentable {
                 presentationCornerRadius: 0
             )
         }
-        player.renderAttachmentDidChange(container)
     }
 
     static func dismantleUIView(_ container: PlayerContainerView, coordinator _: Void) {

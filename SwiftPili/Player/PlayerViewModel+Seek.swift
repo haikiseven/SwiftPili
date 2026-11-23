@@ -2,6 +2,55 @@ import AVFoundation
 import Foundation
 import UIKit
 
+@MainActor
+final class SeekSettlementToken {
+    typealias Handler = @MainActor @Sendable (PlayerViewModel.SeekSettlement) -> Void
+
+    let serial: UInt64
+    private var handler: Handler?
+    private var restoreHandlers: [Handler] = []
+    private(set) var isSettled = false
+
+    init(serial: UInt64, isRestore: Bool, handler: Handler?) {
+        self.serial = serial
+        if isRestore, let handler {
+            self.restoreHandlers = [handler]
+        } else {
+            self.handler = handler
+        }
+    }
+
+    func inheritRestoreAndHandOff(_ previous: SeekSettlementToken) {
+        guard !previous.isSettled else { return }
+        if !previous.restoreHandlers.isEmpty {
+            restoreHandlers.append(contentsOf: previous.restoreHandlers)
+            previous.restoreHandlers.removeAll()
+        }
+        previous.settle(.handedOff)
+    }
+
+    func settle(_ outcome: PlayerViewModel.SeekSettlement) {
+        guard !isSettled else { return }
+        isSettled = true
+        let primary = handler
+        let inherited = restoreHandlers
+        handler = nil
+        restoreHandlers.removeAll()
+        primary?(outcome)
+        for restore in inherited {
+            restore(outcome)
+        }
+    }
+
+    isolated deinit {
+        guard !isSettled else { return }
+        handler?(.failed)
+        for restore in restoreHandlers {
+            restore(.failed)
+        }
+    }
+}
+
 extension PlayerViewModel {
 
     private func performNativeSeek(
@@ -84,6 +133,8 @@ extension PlayerViewModel {
         updateDemandVideoLivenessContext()
 
         if replacesStreamRecovery {
+            activeSeekToken?.settle(.handedOff)
+            activeSeekToken = nil
             armDurableResumeTarget(time, source: "seek")
             reopenForSeek(to: time, settlement: settlement)
             return
@@ -91,6 +142,8 @@ extension PlayerViewModel {
 
         guard nativeSeekIsReady else {
             PlayerLog.log("[Player] seek before readyToPlay — deferring \(String(format: "%.1f", time))s")
+            activeSeekToken?.settle(.handedOff)
+            activeSeekToken = nil
             resumeAtTime = time
             resumeIsFromHistory = false
             pendingSeekTarget = time
@@ -101,6 +154,8 @@ extension PlayerViewModel {
         if mode.isSeekable, backendKind == .vlc, (mode == .offline || !ExperimentalSettingsPolicy.diagnosticBool(
             key: "settime_seek_experiment", saved: ExperimentalSettingsPolicy.diagnosticOverrides.setTimeSeek
         )) {
+            activeSeekToken?.settle(.handedOff)
+            activeSeekToken = nil
             reopenForSeek(to: time, isRestore: isRestore, settlement: settlement)
             return
         }
@@ -119,6 +174,8 @@ extension PlayerViewModel {
             }
         }
 
+        reopenSeekTask?.cancel()
+        reopenSeekTask = nil
         pendingSeekTarget = time
         pendingSeekTask?.cancel()
         pendingSeekTask = Task { [weak self] in
@@ -126,6 +183,16 @@ extension PlayerViewModel {
             guard !Task.isCancelled, let self, let target = self.pendingSeekTarget else { return }
             PlayerLog.log("[Player] ⚠️ seek to \(String(format: "%.1f", target)) NOT settled after 10s — mediaTime=\(String(format: "%.1f", self.mediaTime)) buffering=\(self.isBuffering)")
         }
+
+        let token = SeekSettlementToken(
+            serial: danmakuRequestSerial,
+            isRestore: isRestore,
+            handler: settlement
+        )
+        if let previous = activeSeekToken {
+            token.inheritRestoreAndHandOff(previous)
+        }
+        activeSeekToken = token
 
         let danmakuBackendIdentity = ObjectIdentifier(backend)
         let danmakuBackendGeneration = backend.runtimeGeneration
@@ -135,58 +202,69 @@ extension PlayerViewModel {
         let danmakuURL = currentURL
         let seekLoadGeneration = loadGeneration
         performNativeSeek(to: time) { [weak self] finished in
-            guard let self, self.loadGeneration == seekLoadGeneration,
-                  self.danmakuSeekRequestSerial == danmakuRequestSerial,
-                  self.nativeSeekCompletedRequestSerial != danmakuRequestSerial,
+            guard let self else {
+                token.settle(.failed)
+                return
+            }
+            if self.activeSeekToken === token {
+                self.activeSeekToken = nil
+            }
+            guard self.loadGeneration == seekLoadGeneration,
                   ObjectIdentifier(self.backend) == danmakuBackendIdentity,
                   self.backend.runtimeGeneration == danmakuBackendGeneration,
                   self.ownerKey == danmakuOwner,
-                  self.currentURL == danmakuURL else { return }
-            self.nativeSeekCompletedRequestSerial = danmakuRequestSerial
-            self.invalidateBufferedDisplayForSeek()
-            if self.backendKind != .vlc {
-                if finished {
-                    SeekTrace.mark("arrived")
-                } else {
-                    SeekTrace.abort("native-seek-failed")
-                }
-            }
-            self.logDemandSeekTrace(
-                phase: "completion",
-                target: time,
-                ready: self.backend.isReadyToPlay,
-                result: finished
-            )
-            let settledPosition = finished ? self.nativeSeekSettledPosition : nil
-            self.settleNativeSeekDisplay(at: settledPosition)
-            guard finished else {
-                self.settleFailedNativeSeek(at: time, settlement: settlement)
+                  self.currentURL == danmakuURL else {
+                token.settle(.failed)
                 return
             }
-            if let settledPosition, settledPosition.isFinite, settledPosition >= 0,
-               self.danmakuSeekRequestSerial == danmakuRequestSerial,
-               self.danmakuSettledSeekRequestSerial != danmakuRequestSerial,
-               ObjectIdentifier(self.backend) == danmakuBackendIdentity,
-               self.backend.runtimeGeneration == danmakuBackendGeneration,
-               self.ownerLeaseGeneration == danmakuOwnerGeneration,
-               self.ownerKey == danmakuOwner,
-               let danmakuSession,
-               self.danmakuSessionLedger.liveSession(for: self.currentCid) == danmakuSession,
-               self.currentURL == danmakuURL {
-                self.danmakuSettledSeekRequestSerial = danmakuRequestSerial
-                self.noteDanmakuSeekSettled(at: settledPosition)
+            let isCurrentSeek = self.danmakuSeekRequestSerial == danmakuRequestSerial
+                && self.nativeSeekCompletedRequestSerial != danmakuRequestSerial
+            if isCurrentSeek {
+                self.nativeSeekCompletedRequestSerial = danmakuRequestSerial
+                self.invalidateBufferedDisplayForSeek()
+                if self.backendKind != .vlc {
+                    if finished {
+                        SeekTrace.mark("arrived")
+                    } else {
+                        SeekTrace.abort("native-seek-failed")
+                    }
+                }
+                self.logDemandSeekTrace(
+                    phase: "completion",
+                    target: time,
+                    ready: self.backend.isReadyToPlay,
+                    result: finished
+                )
+                let settledPosition = finished ? self.nativeSeekSettledPosition : nil
+                self.settleNativeSeekDisplay(at: settledPosition)
+                guard finished else {
+                    self.settleFailedNativeSeek(at: time, token: token)
+                    return
+                }
+                if let settledPosition, settledPosition.isFinite, settledPosition >= 0,
+                   self.danmakuSettledSeekRequestSerial != danmakuRequestSerial,
+                   self.ownerLeaseGeneration == danmakuOwnerGeneration,
+                   let danmakuSession,
+                   self.danmakuSessionLedger.liveSession(for: self.currentCid) == danmakuSession {
+                    self.danmakuSettledSeekRequestSerial = danmakuRequestSerial
+                    self.noteDanmakuSeekSettled(at: settledPosition)
+                }
+                self.pushNowPlayingPlayback()
+                self.isBuffering = false
+                if self.rebaseDemandVideoSuspensionAfterSeek(resumesPlayback: self.canAutoRevive) {
+                } else if self.canAutoRevive {
+                    self.backend.play()
+                }
+                self.resumeDeferredDemandVideoSuspensionIfNeeded()
+                self.handleNativeAudioOutputChange()
+                self.syncDanmakuTransport()
+                token.settle(.arrived)
+                return
             }
-            self.pushNowPlayingPlayback()
-            self.isBuffering = false
-            if self.rebaseDemandVideoSuspensionAfterSeek(resumesPlayback: self.canAutoRevive) {
-            } else if self.canAutoRevive {
-                self.backend.play()
-            }
-            self.resumeDeferredDemandVideoSuspensionIfNeeded()
-            self.handleNativeAudioOutputChange()
-            settlement?(.arrived)
+            token.settle(finished ? .arrived : .failed)
         }
         isBuffering = true
+        syncDanmakuTransport()
     }
 
     private func settleNativeSeekDisplay(at position: TimeInterval?) {
@@ -250,18 +328,29 @@ extension PlayerViewModel {
         resumeAtTime = time
         resumeIsFromHistory = false
         isBuffering = true
+        syncDanmakuTransport()
+        let token = SeekSettlementToken(
+            serial: seekRequestSerial,
+            isRestore: isRestore,
+            handler: settlement
+        )
+        activeSeekToken = token
         reopenSeekTask?.cancel()
         reopenSeekTask = Task { @MainActor [weak self] in
-            guard let self else { settlement?(.handedOff); return }
+            guard let self else { token.settle(.failed); return }
+            @MainActor func finish(_ outcome: SeekSettlement) {
+                if self.activeSeekToken === token { self.activeSeekToken = nil }
+                token.settle(outcome)
+            }
             guard requestOwnerLease.map({ self.isCurrentOwner($0) }) ?? false else {
-                settlement?(.handedOff)
+                finish(.failed)
                 return
             }
             if let snapshot = await self.backend.thumbnailAtCurrentTime() {
                 guard !Task.isCancelled,
                       requestOwnerLease.map({ self.isCurrentOwner($0) }) ?? false
                 else {
-                    settlement?(.handedOff)
+                    finish(.failed)
                     return
                 }
                 let coverIdentity = self.installFreezeFrame(
@@ -273,7 +362,7 @@ extension PlayerViewModel {
                       requestOwnerLease.map({ self.isCurrentOwner($0) }) ?? false,
                       self.isCurrentFreezeFrame(coverIdentity)
                 else {
-                    settlement?(.handedOff)
+                    finish(.failed)
                     return
                 }
                 SeekTrace.mark("snapshot-done")
@@ -285,19 +374,19 @@ extension PlayerViewModel {
                   self.loadGeneration == seekLoadGeneration,
                   requestOwnerLease.map({ self.isCurrentOwner($0) }) ?? false,
                   streamRetryID.map(self.acceptsStreamRequest) ?? true else {
-                settlement?(.handedOff)
+                finish(self.danmakuSeekRequestSerial != seekRequestSerial ? .handedOff : .failed)
                 return
             }
             SeekTrace.mark("reopen-issued")
             if let url = self.currentURL, Self.urlStillFresh(url) {
                 self.playURL(url, audioURL: self.isDASHMode ? self.currentDASHAudioURL : nil,
                     startAt: time, isSeekReopen: true, streamRetryID: streamRetryID)
-                settlement?(.handedOff)
+                finish(.handedOff)
             } else if let aid = self.currentAid, let cid = self.currentCid {
                 await self.loadVOD(aid: aid, cid: cid, quality: self.currentQuality,
                                    source: self.currentSource, preservePlayState: true,
                                    ownerLease: requestOwnerLease, streamRetryID: streamRetryID)
-                settlement?(.handedOff)
+                finish(.handedOff)
             } else {
                 PlayerLog.log(
                     "[Player] ↩︎ seek reopen abandoned — no fresh URL and no VOD identity"
@@ -305,8 +394,9 @@ extension PlayerViewModel {
                 self.resumeAtTime = nil
                 self.settleNativeSeekDisplay(at: nil)
                 self.isBuffering = false
+                self.syncDanmakuTransport()
                 SeekTrace.abort("no-reopen-source")
-                settlement?(.failed)
+                finish(.failed)
             }
         }
         bindStreamRestoreTask(requestID: streamRetryID)
@@ -331,17 +421,19 @@ extension PlayerViewModel {
     }
 
     private func settleFailedNativeSeek(
-        at time: TimeInterval, settlement: (@MainActor @Sendable (SeekSettlement) -> Void)?
+        at time: TimeInterval, token: SeekSettlementToken
     ) {
         if streamRecoveryOwnsWork {
             isBuffering = streamRecoveryMayRun
             updateIsPlaying(transportRunning: false)
-            settlement?(.handedOff)
+            syncDanmakuTransport()
+            token.settle(.handedOff)
             return
         }
         isBuffering = false
         updateIsPlaying(transportRunning: false)
+        syncDanmakuTransport()
         PlayerLog.log("[Player] ❌ native seek to \(String(format: "%.1f", time)) failed")
-        settlement?(.failed)
+        token.settle(.failed)
     }
 }

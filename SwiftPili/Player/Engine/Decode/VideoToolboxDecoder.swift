@@ -11,12 +11,164 @@ enum VideoToolboxSampleDependencyAttachmentPolicy {
     }
 }
 
+final class VideoToolboxOutputRouter: @unchecked Sendable {
+    struct Record {
+        let event: VideoToolboxTimingOutputEvent
+        let imageBuffer: CVPixelBuffer?
+        let callbackPTS: CMTime
+        let callbackDuration: CMTime
+    }
+
+    struct Entry {
+        let submission: VideoToolboxTimingSubmission
+        let packet: MediaPacket
+        let nativeTiming: CMSampleTimingInfo
+        let truncated: Bool
+        let keepOutput: (@Sendable (TimeInterval, TimeInterval) -> Bool)?
+        var measurementStarted: ContinuousClock.Instant?
+        var firstImageOffset: Duration?
+        var collector = VideoToolboxTimingOutputCollector()
+        var records: [Record] = []
+    }
+
+    private static let maxPendingEntries = 16
+
+    private let lock = NSLock()
+    private var activeGeneration: UInt64 = 0
+    private var pendingBySubmission: [UInt64: Entry] = [:]
+    private var submissionOrder: [UInt64] = []
+
+    func reset(sessionGeneration: UInt64) {
+        lock.withLock {
+            activeGeneration = sessionGeneration
+            pendingBySubmission.removeAll()
+            submissionOrder.removeAll()
+        }
+    }
+
+    func clear() {
+        lock.withLock {
+            pendingBySubmission.removeAll()
+            submissionOrder.removeAll()
+        }
+    }
+
+    func register(
+        submission: VideoToolboxTimingSubmission,
+        packet: MediaPacket,
+        nativeTiming: CMSampleTimingInfo,
+        truncated: Bool = false,
+        measurementStarted: ContinuousClock.Instant? = nil,
+        keepOutput: (@Sendable (TimeInterval, TimeInterval) -> Bool)? = nil
+    ) {
+        lock.withLock {
+            let id = submission.identity.submissionID
+            pendingBySubmission[id] = Entry(
+                submission: submission,
+                packet: packet,
+                nativeTiming: nativeTiming,
+                truncated: truncated,
+                keepOutput: keepOutput,
+                measurementStarted: measurementStarted
+            )
+            submissionOrder.append(id)
+            while submissionOrder.count > Self.maxPendingEntries {
+                let evicted = submissionOrder.removeFirst()
+                pendingBySubmission.removeValue(forKey: evicted)
+            }
+        }
+    }
+
+    func receive(
+        identity: VideoToolboxTimingIdentity,
+        status: OSStatus,
+        infoFlags: VTDecodeInfoFlags,
+        imageBuffer: CVPixelBuffer?,
+        callbackPTS: CMTime,
+        callbackDuration: CMTime
+    ) {
+        let pts = VideoToolboxDecoder.scalarTime(callbackPTS)
+        let duration = VideoToolboxDecoder.scalarTime(callbackDuration)
+        lock.withLock {
+            guard identity.decoderGeneration == activeGeneration,
+                  var entry = pendingBySubmission[identity.submissionID] else { return }
+            if imageBuffer != nil, entry.firstImageOffset == nil, let started = entry.measurementStarted {
+                entry.firstImageOffset = ContinuousClock.now - started
+            }
+            let event = entry.collector.append(
+                identity: identity,
+                status: Int32(status),
+                imagePresent: imageBuffer != nil,
+                callbackPTS: pts,
+                callbackDuration: duration,
+                infoFlags: infoFlags.rawValue
+            )
+            let keepImage: CVPixelBuffer?
+            if let imageBuffer, let keepOutput = entry.keepOutput {
+                let resolvedPTS = pts ?? entry.packet.pts
+                let resolvedDuration = duration ?? entry.packet.duration
+                keepImage = keepOutput(resolvedPTS, resolvedDuration) ? imageBuffer : nil
+            } else {
+                keepImage = imageBuffer
+            }
+            entry.records.append(Record(
+                event: event,
+                imageBuffer: keepImage,
+                callbackPTS: callbackPTS,
+                callbackDuration: callbackDuration
+            ))
+            pendingBySubmission[identity.submissionID] = entry
+        }
+    }
+
+    func drainReady(forGeneration generation: UInt64) -> [Entry] {
+        lock.withLock {
+            guard generation == activeGeneration else { return [] }
+            var ready: [Entry] = []
+            var remainingOrder: [UInt64] = []
+            remainingOrder.reserveCapacity(submissionOrder.count)
+            for id in submissionOrder {
+                guard let entry = pendingBySubmission[id] else { continue }
+                if entry.records.isEmpty {
+                    remainingOrder.append(id)
+                    continue
+                }
+                ready.append(entry)
+                pendingBySubmission.removeValue(forKey: id)
+            }
+            submissionOrder = remainingOrder
+            return ready
+        }
+    }
+
+    func drain(identities: [VideoToolboxTimingIdentity], forGeneration generation: UInt64) -> [Entry] {
+        lock.withLock {
+            guard generation == activeGeneration else { return [] }
+            let targetIDs = Set(identities.map(\.submissionID))
+            var drained: [Entry] = []
+            for id in identities.map(\.submissionID) {
+                if let entry = pendingBySubmission.removeValue(forKey: id) {
+                    drained.append(entry)
+                }
+            }
+            submissionOrder.removeAll { targetIDs.contains($0) }
+            return drained
+        }
+    }
+}
+
 final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingReporting, @unchecked Sendable {
     private static let debugSessionIDLock = NSLock()
     nonisolated(unsafe) private static var nextDebugSessionID: UInt64 = 0
 
-    let stateLock = NSLock()
+    let decodeQueue = DispatchQueue(label: "com.swiftpili.videotoolbox.decode", qos: .userInitiated)
+    private let sessionIDAccessLock = NSLock()
+    private var _debugSessionID: UInt64 = 0
     private let decodeTiming = MediaVideoDecodeTimingStore()
+
+    var debugSessionID: UInt64 {
+        sessionIDAccessLock.withLock { _debugSessionID }
+    }
 
     func setDecodeTimingEnabled(_ enabled: Bool) {
         decodeTiming.setEnabled(enabled)
@@ -29,7 +181,7 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
     var session: VTDecompressionSession?
     var formatDescription: CMFormatDescription?
     var opened = false
-    private(set) var debugSessionID: UInt64 = 0
+    var queueSessionID: UInt64 = 0
     var framesProduced = 0
     var decodeCallCount = 0
     private var didLogFirstDecode = false
@@ -39,6 +191,8 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
     private var loggedFaultStages: Set<MediaRuntimeFaultStage> = []
     private var integrity = VideoSubmissionIntegrity()
     private var nalUnitHeaderLength: Int?
+    private var pendingInBandCodec: PathACodecConfig.InBandVideoCodec?
+    private var currentParameterSets: [Data] = []
     private var loggedUnrootedSubmissions = 0
     var loggedReferenceMissingBatches = 0
     private var loggedDiscontinuities = 0
@@ -46,6 +200,7 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
     var didLogFirstPrerollBatch = false
     let anomalyLock = NSLock()
     var anomalyValue = VideoDecodeAnomalyCounters()
+    let outputRouter = VideoToolboxOutputRouter()
 
     var decodeAnomalyCounters: VideoDecodeAnomalyCounters {
         anomalyLock.withLock { anomalyValue }
@@ -55,6 +210,34 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
 
     init(inputOrder: VideoToolboxTimingInputOrder = .decodeOrder) {
         self.inputOrder = inputOrder
+    }
+
+    deinit {
+        if let session {
+            VTDecompressionSessionInvalidate(session)
+        }
+        outputRouter.clear()
+    }
+
+    func onDecodeQueue<T: Sendable>(_ work: @Sendable @escaping () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            decodeQueue.async {
+                do {
+                    continuation.resume(returning: try work())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    func onDecodeQueue(_ work: @Sendable @escaping () -> Void) async {
+        await withCheckedContinuation { continuation in
+            decodeQueue.async {
+                work()
+                continuation.resume()
+            }
+        }
     }
 
     private static func allocateDebugSessionID() -> UInt64 {
@@ -70,7 +253,7 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
     func logFaultIfNeeded(_ fault: MediaRuntimeFault, status: OSStatus) {
         guard loggedFaultStages.insert(fault.stage).inserted else { return }
         PlayerLog.log(
-            "[PathADecoder] event=fault sessionID=\(debugSessionID) " +
+            "[PathADecoder] event=fault sessionID=\(queueSessionID) " +
             "stage=\(fault.stage.rawValue) status=\(status) " +
             "class=\(fault.classification.rawValue) decodeCount=\(decodeCallCount)"
         )
@@ -99,9 +282,7 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
         for classification: MediaRuntimeFaultClassification
     ) -> MediaRuntimeFaultRecoverability {
         switch classification {
-        case .unsupportedFormat:
-            return .manualRetry
-        case .invalidSession, .malfunction, .badData, .input, .silentNoOutput, .unknown:
+        case .invalidSession, .malfunction, .badData, .unsupportedFormat, .input, .silentNoOutput, .unknown:
             return .automaticSourceAwareReopen
         }
     }
@@ -151,6 +332,19 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
         case .description(let description):
             try await open(formatDescription: description)
         case .codecConfig(let codec, let config, let codedDimensions):
+            if let bootstrap = PathACodecConfig.inBandBootstrap(codec: codec, config: config) {
+                if !config.isEmpty,
+                   let description = try? Self.makeFormatDescription(
+                       codec: codec, config: config, codedDimensions: codedDimensions
+                   ) {
+                    try await open(formatDescription: description)
+                    return
+                }
+                await onDecodeQueue {
+                    self.openDeferredInBandOnQueue(codec: bootstrap.codec, nalLengthSize: bootstrap.nalLengthSize)
+                }
+                return
+            }
             guard !config.isEmpty || codec?.lowercased() == "av01" else {
                 throw MediaEngineError.notImplemented(
                     "VideoToolbox needs CMFormatDescription or avcC/hvcC config (A2b/D3)"
@@ -182,52 +376,221 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
     }
 
     func open(formatDescription: CMFormatDescription) async throws {
-        try stateLock.withLock {
-            closeLocked()
+        try await onDecodeQueue {
+            try self.openSessionOnQueue(formatDescription: formatDescription, resetSessionStats: true)
+        }
+    }
 
-            let attrs: [CFString: Any] = [
-                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary
-            ]
+    private func openDeferredInBandOnQueue(
+        codec: PathACodecConfig.InBandVideoCodec,
+        nalLengthSize: Int
+    ) {
+        closeOnQueue()
+        let sessionID = Self.allocateDebugSessionID()
+        setSessionID(sessionID)
+        self.opened = true
+        self.pendingInBandCodec = codec
+        self.nalUnitHeaderLength = nalLengthSize
+        self.currentParameterSets = []
+        resetPerSessionCountersOnQueue()
+        outputRouter.reset(sessionGeneration: sessionID)
+        PlayerLog.log(
+            "[PathADecoder] event=create sessionID=\(sessionID) opened=1 deferredInBand=1 nalLen=\(nalLengthSize)"
+        )
+    }
 
-            var sessionOut: VTDecompressionSession?
-            let status = VTDecompressionSessionCreate(
-                allocator: kCFAllocatorDefault,
-                formatDescription: formatDescription,
-                decoderSpecification: nil,
-                imageBufferAttributes: attrs as CFDictionary,
-                outputCallback: nil,
-                decompressionSessionOut: &sessionOut
-            )
-            guard status == noErr, let created = sessionOut else {
-                throw MediaEngineError.decodeFailed(
-                    "VTDecompressionSessionCreate status=\(status)"
-                )
-            }
-            self.session = created
-            self.formatDescription = formatDescription
-            self.opened = true
-            self.debugSessionID = Self.allocateDebugSessionID()
-            self.framesProduced = 0
-            self.decodeCallCount = 0
-            self.didLogFirstDecode = false
-            self.didLogFirstPixelLayout = false
-            self.flushCount = 0
-            self.invalidateCount = 0
-            self.loggedFaultStages = []
-            self.integrity.reset()
-            self.nalUnitHeaderLength = Self.nalUnitHeaderLength(of: formatDescription)
-            self.loggedUnrootedSubmissions = 0
-            self.loggedReferenceMissingBatches = 0
-            self.loggedDiscontinuities = 0
-            self.loggedMalformedSamples = 0
-            self.didLogFirstPrerollBatch = false
-            anomalyLock.withLock { anomalyValue = VideoDecodeAnomalyCounters() }
-            PlayerLog.log(
-                "[PathADecoder] event=create sessionID=\(debugSessionID) opened=1 " +
-                "nalLen=\(self.nalUnitHeaderLength.map(String.init) ?? "unknown")"
+    private func openSessionOnQueue(
+        formatDescription: CMFormatDescription,
+        resetSessionStats: Bool
+    ) throws {
+        if resetSessionStats {
+            closeOnQueue()
+        } else if let existing = session {
+            VTDecompressionSessionInvalidate(existing)
+            session = nil
+        }
+
+        let pixelFormat = Self.preferredPixelFormatType(for: formatDescription)
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferPixelFormatTypeKey: pixelFormat,
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary
+        ]
+
+        var sessionOut: VTDecompressionSession?
+        let status = VTDecompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            formatDescription: formatDescription,
+            decoderSpecification: nil,
+            imageBufferAttributes: attrs as CFDictionary,
+            outputCallback: nil,
+            decompressionSessionOut: &sessionOut
+        )
+        guard status == noErr, let created = sessionOut else {
+            throw MediaEngineError.decodeFailed(
+                "VTDecompressionSessionCreate status=\(status)"
             )
         }
+        self.session = created
+        self.formatDescription = formatDescription
+        self.opened = true
+        self.pendingInBandCodec = Self.inBandCodec(for: formatDescription)
+        self.nalUnitHeaderLength = Self.nalUnitHeaderLength(of: formatDescription)
+        self.currentParameterSets = Self.extractParameterSets(from: formatDescription)
+
+        let sessionID = resetSessionStats ? Self.allocateDebugSessionID() : queueSessionID
+        setSessionID(sessionID)
+        outputRouter.reset(sessionGeneration: sessionID)
+        if resetSessionStats {
+            resetPerSessionCountersOnQueue()
+        }
+        PlayerLog.log(
+            "[PathADecoder] event=create sessionID=\(sessionID) opened=1 " +
+            "nalLen=\(self.nalUnitHeaderLength.map(String.init) ?? "unknown") " +
+            "pixelFmt=\(pixelFormat)"
+        )
+    }
+
+    private func setSessionID(_ id: UInt64) {
+        queueSessionID = id
+        sessionIDAccessLock.withLock { _debugSessionID = id }
+    }
+
+    private func resetPerSessionCountersOnQueue() {
+        framesProduced = 0
+        decodeCallCount = 0
+        didLogFirstDecode = false
+        didLogFirstPixelLayout = false
+        flushCount = 0
+        invalidateCount = 0
+        loggedFaultStages = []
+        integrity.reset()
+        loggedUnrootedSubmissions = 0
+        loggedReferenceMissingBatches = 0
+        loggedDiscontinuities = 0
+        loggedMalformedSamples = 0
+        didLogFirstPrerollBatch = false
+        anomalyLock.withLock { anomalyValue = VideoDecodeAnomalyCounters() }
+    }
+
+    private static func preferredPixelFormatType(for formatDescription: CMFormatDescription) -> OSType {
+        let extensions = CMFormatDescriptionGetExtensions(formatDescription) as? [CFString: Any]
+        let fullRange = (extensions?[kCMFormatDescriptionExtension_FullRangeVideo] as? NSNumber)?.boolValue == true
+        if is10BitOrHDR(extensions: extensions) {
+            return fullRange
+                ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+                : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        }
+        return fullRange
+            ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+    }
+
+    private static func is10BitOrHDR(extensions: [CFString: Any]?) -> Bool {
+        guard let extensions else { return false }
+        if let bits = (extensions[kCMFormatDescriptionExtension_BitsPerComponent] as? NSNumber)?.intValue,
+           bits >= 10 {
+            return true
+        }
+        if let transfer = extensions[kCMFormatDescriptionExtension_TransferFunction] {
+            let transferString = String(describing: transfer)
+            if transferString == (kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String)
+                || transferString == (kCVImageBufferTransferFunction_ITU_R_2100_HLG as String)
+                || transferString == (kCVImageBufferTransferFunction_Linear as String) {
+                return true
+            }
+        }
+        if let atoms = extensions[kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms] as? [String: Any] {
+            if let hvcC = atoms["hvcC"] as? Data {
+                let bytes = [UInt8](hvcC)
+                if bytes.count >= 2 && (bytes[1] & 0x1F) == 2 { return true }
+                if bytes.count >= 19 && ((bytes[17] & 0x07) >= 2 || (bytes[18] & 0x07) >= 2) { return true }
+            }
+            if let av1C = atoms["av1C"] as? Data {
+                let bytes = [UInt8](av1C)
+                if bytes.count >= 4 && (bytes[2] & 0x40) != 0 { return true }
+            }
+        }
+        return false
+    }
+
+    private static func inBandCodec(for formatDescription: CMFormatDescription) -> PathACodecConfig.InBandVideoCodec? {
+        switch CMFormatDescriptionGetMediaSubType(formatDescription) {
+        case kCMVideoCodecType_H264: .h264
+        case kCMVideoCodecType_HEVC: .hevc
+        default: nil
+        }
+    }
+
+    private static func extractParameterSets(from formatDescription: CMFormatDescription) -> [Data] {
+        var count = 0
+        switch CMFormatDescriptionGetMediaSubType(formatDescription) {
+        case kCMVideoCodecType_H264:
+            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                formatDescription, parameterSetIndex: 0,
+                parameterSetPointerOut: nil, parameterSetSizeOut: nil,
+                parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil
+            )
+            return (0..<count).compactMap { index in
+                var ptr: UnsafePointer<UInt8>?
+                var size = 0
+                let status = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                    formatDescription, parameterSetIndex: index,
+                    parameterSetPointerOut: &ptr, parameterSetSizeOut: &size,
+                    parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil
+                )
+                guard status == noErr, let ptr, size > 0 else { return nil }
+                return Data(bytes: ptr, count: size)
+            }
+        case kCMVideoCodecType_HEVC:
+            CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                formatDescription, parameterSetIndex: 0,
+                parameterSetPointerOut: nil, parameterSetSizeOut: nil,
+                parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil
+            )
+            return (0..<count).compactMap { index in
+                var ptr: UnsafePointer<UInt8>?
+                var size = 0
+                let status = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                    formatDescription, parameterSetIndex: index,
+                    parameterSetPointerOut: &ptr, parameterSetSizeOut: &size,
+                    parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil
+                )
+                guard status == noErr, let ptr, size > 0 else { return nil }
+                return Data(bytes: ptr, count: size)
+            }
+        default:
+            return []
+        }
+    }
+
+    func prepareSessionForPacketOnQueue(
+        _ data: Data
+    ) throws -> (session: VTDecompressionSession, formatDescription: CMFormatDescription, drainedEntries: [VideoToolboxOutputRouter.Entry])? {
+        var drainedEntries: [VideoToolboxOutputRouter.Entry] = []
+        if let codec = pendingInBandCodec {
+            let nalLength = nalUnitHeaderLength ?? 4
+            if let parameterSets = PathACodecConfig.extractInBandParameterSets(
+                from: data, nalLengthSize: nalLength, codec: codec
+            ), parameterSets != currentParameterSets {
+                let newDescription = try PathACodecConfig.makeInBandFormatDescription(
+                    codec: codec, parameterSets: parameterSets, nalLengthSize: nalLength
+                )
+                if let existing = session {
+                    if VTDecompressionSessionCanAcceptFormatDescription(existing, formatDescription: newDescription) {
+                        self.formatDescription = newDescription
+                        self.currentParameterSets = parameterSets
+                    } else {
+                        VTDecompressionSessionWaitForAsynchronousFrames(existing)
+                        drainedEntries = outputRouter.drainReady(forGeneration: queueSessionID)
+                        try openSessionOnQueue(formatDescription: newDescription, resetSessionStats: false)
+                    }
+                } else {
+                    try openSessionOnQueue(formatDescription: newDescription, resetSessionStats: false)
+                }
+            }
+        }
+        guard let session, let formatDescription else { return nil }
+        return (session, formatDescription, drainedEntries)
     }
 
     private static func nalUnitHeaderLength(
@@ -280,7 +643,7 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
             duration: packet.duration
         )
         PlayerLog.log(
-            "[PathADecoder] event=submission\(kind) sessionID=\(debugSessionID) " +
+            "[PathADecoder] event=submission\(kind) sessionID=\(queueSessionID) " +
             "prevEnd=\(Self.mediaTimeDescription(previousEnd)) " +
             "dts=\(Self.mediaTimeDescription(next)) " +
             "pts=\(Self.mediaTimeDescription(packet.pts)) " +
@@ -301,7 +664,7 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
         ), loggedUnrootedSubmissions < 4 {
             loggedUnrootedSubmissions += 1
             PlayerLog.log(
-                "[PathADecoder] event=unrootedSubmission sessionID=\(debugSessionID) " +
+                "[PathADecoder] event=unrootedSubmission sessionID=\(queueSessionID) " +
                 "sinceOpen=\(submissionsSinceOpen) " +
                 "pts=\(Self.mediaTimeDescription(packet.pts)) " +
                 "dts=\(Self.mediaTimeDescription(packet.dts)) " +
@@ -332,7 +695,7 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
         if tiling.isMalformed, loggedMalformedSamples < 8 {
             loggedMalformedSamples += 1
             PlayerLog.log(
-                "[PathADecoder] event=malformedSample sessionID=\(debugSessionID) " +
+                "[PathADecoder] event=malformedSample sessionID=\(queueSessionID) " +
                 "tiling=\(tiling.diagnosticName) size=\(data.count) " +
                 "nalLen=\(nalUnitHeaderLength.map(String.init) ?? "unknown") " +
                 "keyframe=\(packet.isKeyframe ? 1 : 0) " +
@@ -424,24 +787,33 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
         return sampleBlock
     }
 
+    struct UncheckedQueueResult<Value>: @unchecked Sendable {
+        let value: Value
+    }
+
     func decode(_ packet: MediaPacket) async throws -> [MediaVideoFrame] {
+        try await onDecodeQueue {
+            UncheckedQueueResult(value: try self.decodeOnQueue(packet))
+        }.value
+    }
+
+    private func decodeOnQueue(_ packet: MediaPacket) throws -> [MediaVideoFrame] {
         var trace = decodeTiming.observationID().map(VideoToolboxDecodeTimingTrace.init)
         defer {
             if let measurement = trace?.finish() {
                 decodeTiming.record(measurement)
             }
         }
-        return try stateLock.withLock {
-            trace?.advance(to: .integrity)
-            trace?.value.decoderSessionID = debugSessionID
-            guard opened, let session, let formatDescription else {
+        trace?.advance(to: .integrity)
+        trace?.value.decoderSessionID = queueSessionID
+        guard opened else {
             throw MediaEngineError.stopped
-            }
-            guard packet.track == .video else {
-                trace?.value.failures = 0
-                return []
-            }
-            decodeCallCount += 1
+        }
+        guard packet.track == .video else {
+            trace?.value.failures = 0
+            return []
+        }
+        decodeCallCount += 1
 
         guard !packet.data.isEmpty else {
             trace?.value.failures = 0
@@ -451,12 +823,16 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
         noteSubmissionOrder(packet)
         noteSubmittedTiling(packet.data, packet: packet)
 
+        guard let prepared = try prepareSessionForPacketOnQueue(packet.data) else {
+            trace?.value.failures = 0
+            return []
+        }
+
         trace?.advance(to: .sampleConstruction)
         let dataCopy = packet.data
-        let timingPolicy = VideoToolboxTimingPolicy()
         let timingSubmission = VideoToolboxTimingSubmission(
             submissionID: UInt64(decodeCallCount),
-            decoderGeneration: debugSessionID,
+            decoderGeneration: queueSessionID,
             inputPTS: packet.pts,
             inputDTS: packet.dts,
             inputDuration: packet.duration,
@@ -465,158 +841,145 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
         let (sample, timing) = try makeSampleBuffer(
             data: dataCopy,
             packet: packet,
-            formatDescription: formatDescription,
+            formatDescription: prepared.formatDescription,
             timingSubmission: timingSubmission
         )
 
-        final class PixelSink: @unchecked Sendable {
-            let measurementStarted: ContinuousClock.Instant?
-            var firstImageOffset: Duration?
-            init(measurementStarted: ContinuousClock.Instant?) {
-                self.measurementStarted = measurementStarted
-            }
-            var records: [VideoToolboxOutputRecord] = []
-            var timingCollector = VideoToolboxTimingOutputCollector()
-
-            var firstCallbackFailureStatus: OSStatus? {
-                timingCollector.firstFailureStatus
-            }
-
-            func append(
-                identity: VideoToolboxTimingIdentity,
-                status: OSStatus,
-                imageBuffer: CVPixelBuffer?,
-                callbackPTS: CMTime,
-                callbackDuration: CMTime,
-                infoFlags: VTDecodeInfoFlags
-            ) {
-                if imageBuffer != nil, firstImageOffset == nil, let measurementStarted {
-                    firstImageOffset = ContinuousClock.now - measurementStarted
-                }
-                let event = timingCollector.append(
-                    identity: identity,
-                    status: Int32(status),
-                    imagePresent: imageBuffer != nil,
-                    callbackPTS: VideoToolboxDecoder.scalarTime(callbackPTS),
-                    callbackDuration: VideoToolboxDecoder.scalarTime(callbackDuration),
-                    infoFlags: infoFlags.rawValue
-                )
-                records.append(VideoToolboxOutputRecord(
-                    event: event,
-                    imageBuffer: imageBuffer,
-                    callbackPTS: callbackPTS,
-                    callbackDuration: callbackDuration
-                ))
-            }
-        }
-        let sink = PixelSink(measurementStarted: trace?.started)
+        let router = outputRouter
+        router.register(
+            submission: timingSubmission,
+            packet: packet,
+            nativeTiming: timing,
+            measurementStarted: trace?.started
+        )
+        let identity = timingSubmission.identity
         var infoFlags = VTDecodeInfoFlags()
         trace?.advance(to: .nativeCall)
         let decodeStatus = VTDecompressionSessionDecodeFrame(
-            session,
+            prepared.session,
             sampleBuffer: sample,
             flags: [],
             infoFlagsOut: &infoFlags
         ) { status, callbackInfoFlags, imageBuffer, callbackPTS, callbackDuration in
-            sink.append(
-                identity: timingSubmission.identity,
+            router.receive(
+                identity: identity,
                 status: status,
+                infoFlags: callbackInfoFlags,
                 imageBuffer: imageBuffer,
                 callbackPTS: callbackPTS,
-                callbackDuration: callbackDuration,
-                infoFlags: callbackInfoFlags
+                callbackDuration: callbackDuration
             )
         }
 
         trace?.advance(to: .postprocess)
-        trace?.value.firstImageCallOffset = sink.firstImageOffset
+        let drainedEntries = prepared.drainedEntries + router.drainReady(forGeneration: queueSessionID)
+        let currentEntry = drainedEntries.first { $0.submission.identity == identity }
+        trace?.value.firstImageCallOffset = currentEntry?.firstImageOffset
 
-        noteDecodeAnomalies(
-            submissionStatus: decodeStatus,
-            events: sink.records.map(\.event),
-            truncated: false
-        )
-        if let fault = Self.runtimeFault(
-            for: decodeStatus,
-            stage: .decodeSubmission
-        ) {
+        if let fault = Self.runtimeFault(for: decodeStatus, stage: .decodeSubmission) {
+            noteDecodeAnomalies(
+                submissionStatus: decodeStatus,
+                events: currentEntry?.records.map(\.event) ?? [],
+                truncated: false
+            )
             logFaultIfNeeded(fault, status: decodeStatus)
             throw fault
         }
-        let callbackFaultStatus = sink.records
-            .map { OSStatus($0.event.status) }
-            .first { Self.classification(for: $0) != nil } ?? noErr
-        if sink.firstCallbackFailureStatus == kVTVideoDecoderReferenceMissingErr,
-           loggedReferenceMissingBatches < 4 {
-            loggedReferenceMissingBatches += 1
-            PlayerLog.log(
-                "[PathADecoder] event=referenceMissing sessionID=\(debugSessionID) " +
-                "pts=\(Self.mediaTimeDescription(packet.pts)) " +
-                "keyframe=\(packet.isKeyframe ? 1 : 0) — frame dropped, decoding continues"
-            )
-        }
-        if let fault = Self.runtimeFault(
-            for: callbackFaultStatus,
-            stage: .decodeCallback
-        ) {
-            logFaultIfNeeded(fault, status: callbackFaultStatus)
-            throw fault
+        if currentEntry == nil {
+            noteDecodeAnomalies(submissionStatus: decodeStatus, events: [], truncated: false)
         }
 
-        if !didLogFirstDecode {
-            didLogFirstDecode = true
-            let imageCount = sink.records.reduce(into: 0) { count, record in
-                if record.imageBuffer != nil { count += 1 }
-            }
-            PlayerLog.log(
-                "[PathADecoder] event=firstDecode sessionID=\(debugSessionID) " +
-                "decodeCount=\(decodeCallCount) frames=\(imageCount)"
-            )
-        }
+        let frames = try resolveRouterEntriesOnQueue(drainedEntries, currentSubmissionStatus: decodeStatus)
+        trace?.value.outputFrames = frames.count
+        trace?.value.failures = 0
+        return frames
+    }
 
-        if !didLogFirstPixelLayout, let firstPixelBuffer = sink.records.compactMap(\.imageBuffer).first {
-            didLogFirstPixelLayout = true
-            let layout = VideoPixelBufferDiagnostics.snapshot(firstPixelBuffer)
-            PlayerLog.log(
-                "[PathADecoder] pixelLayout sessionID=\(debugSessionID) " +
-                layout.logDescription
-            )
-        }
-
-        let timingResolution = timingPolicy.resolve(
-            submission: timingSubmission,
-            outputEvents: sink.records.map(\.event)
-        )
+    private func resolveRouterEntriesOnQueue(
+        _ entries: [VideoToolboxOutputRouter.Entry],
+        currentSubmissionStatus: OSStatus
+    ) throws -> [MediaVideoFrame] {
+        let timingPolicy = VideoToolboxTimingPolicy()
         var frames: [MediaVideoFrame] = []
-        if case .outputs = timingResolution.outcome {
-            for record in sink.records {
-                guard let pixelBuffer = record.imageBuffer else { continue }
-                guard let resolvedOutput = timingResolution.resolution(for: record.event) else {
-                    continue
+        for entry in entries {
+            let events = entry.records.map(\.event)
+            noteDecodeAnomalies(
+                submissionStatus: currentSubmissionStatus,
+                events: events,
+                truncated: entry.truncated
+            )
+            if entry.collector.firstFailureStatus == kVTVideoDecoderReferenceMissingErr,
+               loggedReferenceMissingBatches < 4 {
+                loggedReferenceMissingBatches += 1
+                PlayerLog.log(
+                    "[PathADecoder] event=referenceMissing sessionID=\(queueSessionID) " +
+                    "pts=\(Self.mediaTimeDescription(entry.packet.pts)) " +
+                    "keyframe=\(entry.packet.isKeyframe ? 1 : 0) — frame dropped, decoding continues"
+                )
+            }
+            let callbackFaultStatus = entry.records
+                .map { OSStatus($0.event.status) }
+                .first { Self.classification(for: $0) != nil } ?? noErr
+            if let fault = Self.runtimeFault(for: callbackFaultStatus, stage: .decodeCallback) {
+                logFaultIfNeeded(fault, status: callbackFaultStatus)
+                throw fault
+            }
+            if !didLogFirstDecode {
+                didLogFirstDecode = true
+                let imageCount = entry.records.reduce(into: 0) { count, record in
+                    if record.imageBuffer != nil { count += 1 }
                 }
-                switch resolvedOutput {
-                case .callback(let pts, let duration),
-                     .oneToOneInputFallback(let pts, let duration, _):
-                    frames.append(
-                        MediaVideoFrame(
-                            pts: pts,
-                            duration: duration,
-                            pixelBuffer: pixelBuffer,
-                            displayCoverage: record.displayCoverage(
-                                packet: packet, resolution: resolvedOutput, submitted: timing
+                PlayerLog.log(
+                    "[PathADecoder] event=firstDecode sessionID=\(queueSessionID) " +
+                    "decodeCount=\(decodeCallCount) frames=\(imageCount)"
+                )
+            }
+            if !didLogFirstPixelLayout, let firstPixelBuffer = entry.records.compactMap(\.imageBuffer).first {
+                didLogFirstPixelLayout = true
+                let layout = VideoPixelBufferDiagnostics.snapshot(firstPixelBuffer)
+                PlayerLog.log(
+                    "[PathADecoder] pixelLayout sessionID=\(queueSessionID) " +
+                    layout.logDescription
+                )
+            }
+            let timingResolution = timingPolicy.resolve(
+                submission: entry.submission,
+                outputEvents: events
+            )
+            if case .outputs = timingResolution.outcome {
+                for record in entry.records {
+                    guard let pixelBuffer = record.imageBuffer,
+                          let resolvedOutput = timingResolution.resolution(for: record.event) else {
+                        continue
+                    }
+                    switch resolvedOutput {
+                    case .callback(let pts, let duration),
+                         .oneToOneInputFallback(let pts, let duration, _):
+                        frames.append(
+                            MediaVideoFrame(
+                                pts: pts,
+                                duration: duration,
+                                pixelBuffer: pixelBuffer,
+                                displayCoverage: VideoToolboxOutputRecord(
+                                    event: record.event,
+                                    imageBuffer: pixelBuffer,
+                                    callbackPTS: record.callbackPTS,
+                                    callbackDuration: record.callbackDuration
+                                ).displayCoverage(
+                                    packet: entry.packet,
+                                    resolution: resolvedOutput,
+                                    submitted: entry.nativeTiming
+                                )
                             )
                         )
-                    )
-                    framesProduced += 1
-                case .unknown:
-                    continue
+                        framesProduced += 1
+                    case .unknown:
+                        continue
+                    }
                 }
             }
         }
-            trace?.value.outputFrames = frames.count
-            trace?.value.failures = 0
-            return frames
-        }
+        return frames
     }
 
     static func scalarTime(_ time: CMTime) -> TimeInterval? {
@@ -646,33 +1009,35 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
     }
 
     func flush() async {
-        stateLock.withLock {
-            integrity.noteFlush()
-            if let session {
-                flushCount &+= 1
-                if flushCount <= 4 {
+        await onDecodeQueue {
+            self.integrity.noteFlush()
+            if let session = self.session {
+                self.flushCount &+= 1
+                if self.flushCount <= 4 {
                     PlayerLog.log(
-                        "[PathADecoder] event=flush sessionID=\(debugSessionID) " +
-                        "count=\(flushCount)"
+                        "[PathADecoder] event=flush sessionID=\(self.queueSessionID) " +
+                        "count=\(self.flushCount)"
                     )
                 }
                 VTDecompressionSessionWaitForAsynchronousFrames(session)
             }
+            self.outputRouter.clear()
         }
     }
 
     func close() async {
-        stateLock.withLock {
-            closeLocked()
+        await onDecodeQueue {
+            self.closeOnQueue()
         }
     }
 
-    private func closeLocked() {
+    private func closeOnQueue() {
+        outputRouter.clear()
         if let session {
             invalidateCount &+= 1
             if invalidateCount <= 2 {
                 PlayerLog.log(
-                    "[PathADecoder] event=invalidate sessionID=\(debugSessionID) " +
+                    "[PathADecoder] event=invalidate sessionID=\(queueSessionID) " +
                     "count=\(invalidateCount)"
                 )
             }
@@ -681,6 +1046,8 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
         session = nil
         formatDescription = nil
         opened = false
-        debugSessionID = 0
+        pendingInBandCodec = nil
+        currentParameterSets = []
+        setSessionID(0)
     }
 }

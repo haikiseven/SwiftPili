@@ -152,6 +152,7 @@ extension PlayerViewModel {
                 self.budget.interruptStreamStability()
                 if !self.isBuffering { self.isBuffering = true }
                 self.updateIsPlaying(transportRunning: false)
+                self.syncDanmakuTransport()
 
             case .bufferFinished:
                 if self.streamRecoveryOwnsWork, self.streamRecovery?.requestID == nil { return }
@@ -166,6 +167,7 @@ extension PlayerViewModel {
                 self.updateIsPlaying(transportRunning: self.backend.isPlaying)
                 self.resumeDeferredDemandVideoSuspensionIfNeeded()
                 self.handleNativeAudioOutputChange()
+                self.syncDanmakuTransport()
 
             case .paused:
                 self.updateIsPlaying(transportRunning: false)
@@ -219,21 +221,16 @@ extension PlayerViewModel {
                 }
                 let hostIndependent = (error as? MediaEngineError)?.isHostIndependent ?? false
                 guard self.mode.usesOnlineVODServices, !hostIndependent else {
-                    self.terminalOpenFailure = true
-                    PlayerLog.log(
-                        (hostIndependent
-                            ? "[Player] engine error is host-independent — no CDN switch"
-                            : self.mode == .offline
-                            ? "[Player] offline input error — local retry required"
-                            : "[Player] live input error — stream retry required")
-                            + " (\(error.localizedDescription))"
-                    )
-                    self.error = PlaybackFailureMessage.text(for: error)
-                    self.isBuffering = false
-                    self.updateIsPlaying(transportRunning: false)
-                    self.pushNowPlayingPlayback()
-                    self.acknowledgeLifecycleReadiness(.terminalFailure)
-                    self.finishNonLifecycleRecoveryIfNeeded(outcome: .backendError)
+                    let prefix = hostIndependent
+                        ? "[Player] engine error is host-independent — no CDN switch"
+                        : self.mode == .offline
+                        ? "[Player] offline input error — local retry required"
+                        : "[Player] live input error — stream retry required"
+                    self.settleTerminalFailure(TerminalFailurePayload(
+                        message: PlaybackFailureMessage.text(for: error),
+                        retireStreamRecoveryReason: nil,
+                        logMessage: "\(prefix) (\(error.localizedDescription))"
+                    ))
                     return
                 }
                 PlayerLog.log("[Player] input error (\(error.localizedDescription)) — trying another host")

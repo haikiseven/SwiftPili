@@ -37,6 +37,8 @@ enum DemandFramePresentationResult {
     case enqueued
     case waitingOnEnhancement
     case blockedOnASBD
+    case recoveredNeedsRefeed
+    case terminalFault(MediaRuntimeFault)
 }
 
 @MainActor
@@ -82,7 +84,12 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
     private(set) var lastEnqueuedPTS: TimeInterval?
     private var presentationProgressSerial: UInt64 = 0
     private var lastPresentationProgressUptime: TimeInterval?
-    private let mediaTimescale: CMTimeScale = 600
+    private let mediaTimescale: CMTimeScale = 60_000
+    private var consecutiveRendererFaultCount = 0
+    private static let terminalRendererFaultThreshold = 3
+    private var hasTerminalRendererFault: Bool {
+        consecutiveRendererFaultCount >= Self.terminalRendererFaultThreshold
+    }
     private var mediaDataWhenReadyHandler: (() -> Void)?
     private var isRequestingMediaData = false
     private var didLogFirstEnqueueDisplaySnapshot = false
@@ -636,8 +643,30 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         displayNative.removeAll()
         renderer.flush()
         flushCount += 1
+        consecutiveRendererFaultCount = 0
         presentationProofState.clearCandidate()
         return true
+    }
+
+    private func recordRendererFault(
+        _ renderer: AVSampleBufferVideoRenderer,
+        reason: String
+    ) -> DemandFramePresentationResult {
+        consecutiveRendererFaultCount += 1
+        guard hasTerminalRendererFault else { return .recoveredNeedsRefeed }
+        let code = (renderer.error as NSError?)?.code ?? 0
+        let fault = MediaRuntimeFault(
+            subsystem: .videoRenderer,
+            stage: .render,
+            classification: .malfunction,
+            recoverability: .automaticSourceAwareReopen,
+            diagnostics: MediaRuntimeFaultDiagnostics(
+                status: Int32(code),
+                label: "asbd-fault",
+                details: "\(reason) count=\(consecutiveRendererFaultCount)"
+            )
+        )
+        return .terminalFault(fault)
     }
 
     private func enqueueSingleFrame(
@@ -665,6 +694,7 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
 
         UIHitchMonitor.measureCounted("render.enqueue") { renderer.enqueue(sample) }
         guard !recoverFaultedRenderer(renderer) else { return .rendererFault }
+        if !isMidpoint { consecutiveRendererFaultCount = 0 }
         latestAmbientPixelBuffer = frame.pixelBuffer
         guard !isMidpoint else {
             SurfaceMoveProbe.noteFrameEnqueued()
@@ -740,6 +770,7 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         let costSpan = UIHitchMonitor.beginSpan("render.ready")
         defer { UIHitchMonitor.endSpan(costSpan) }
         attachSynchronizerIfNeeded()
+        guard !hasTerminalRendererFault else { return false }
         let renderer = displayView.sampleBufferLayer.sampleBufferRenderer
         if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
             return true
@@ -962,6 +993,7 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
             displayNative.removeAll()
             renderer.flush()
             flushCount += 1
+            consecutiveRendererFaultCount = 0
         }
         inlineRenderGeneration = renderGeneration
         let floor = mediaFloor ?? mediaTime
@@ -997,6 +1029,7 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         displayNative.removeAll()
         renderer.flush()
         flushCount += 1
+        consecutiveRendererFaultCount = 0
         presentationProofState.clearCandidateAndFloor()
         presentationProofFloor = nil
         didLogFirstEnqueueDisplaySnapshot = false
@@ -1162,10 +1195,17 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
     ) {
         retireEnhancement()
         stopRequestingMediaData()
-        synchronizer.setRate(0, time: CMTime(
-            seconds: lastDisplayMediaTime,
-            preferredTimescale: mediaTimescale
-        ))
+        consecutiveRendererFaultCount = 0
+        let current = synchronizer.currentTime()
+        let currentSeconds = CMTimeGetSeconds(current)
+        let pinTime: CMTime
+        if current.isValid, current.isNumeric, currentSeconds.isFinite {
+            pinTime = current
+            lastDisplayMediaTime = max(0, currentSeconds)
+        } else {
+            pinTime = CMTime(seconds: lastDisplayMediaTime, preferredTimescale: mediaTimescale)
+        }
+        synchronizer.setRate(0, time: pinTime)
         displayRate = 0
         displayNative.removeAll()
         latestAmbientPixelBuffer = nil
@@ -1186,6 +1226,7 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         synchronizer.setRate(0, time: .zero)
         displayRate = 0
         lastDisplayMediaTime = 0
+        consecutiveRendererFaultCount = 0
         displayNative.removeAll()
         latestAmbientPixelBuffer = nil
         hasAmbientAccumulation = false
@@ -1769,7 +1810,12 @@ extension SampleBufferVideoRenderer {
         }
         attachSynchronizerIfNeeded()
         let renderer = displayView.sampleBufferLayer.sampleBufferRenderer
-        _ = recoverFaultedRenderer(renderer)
+        if hasTerminalRendererFault {
+            return recordRendererFault(renderer, reason: "ASBD terminal fault")
+        }
+        if recoverFaultedRenderer(renderer) {
+            return recordRendererFault(renderer, reason: "ASBD fault before enqueue")
+        }
         discardEnhancementForReplacedHead(frame)
         guard renderer.isReadyForMoreMediaData else { return noteNativeWait() }
         guard let request = enhancementPresentation(frame, mediaTime: mediaTime, rate: playbackRate) else {
@@ -2086,21 +2132,27 @@ extension SampleBufferVideoRenderer {
     ) throws -> DemandFramePresentationResult {
         var candidate = enhancedOriginal
         if case .ready = enhancedOriginal {
-            var retry = EnhancedOriginalAdmission.unavailable
             if !request.canUpscale {
                 candidate = .unavailable
             } else if request.originalDelay == nil || ContinuousClock.now >= attempt.deadlines.original {
                 candidate = .late
-                retry = .late
             }
-            var consumed = attempt
-            consumed.state = .ready(result, enhancedOriginal: retry)
-            enhancementAttempt = consumed
         }
-        return try admitOriginal(
+        let outcome = try admitOriginal(
             request.original, renderer: renderer, enhancedOriginal: candidate,
             result: result, midpointCount: attempt.admittedMidpointCount
         )
+        if case .blockedOnASBD = outcome, case .ready = enhancedOriginal {
+            switch candidate {
+            case .ready:
+                break
+            case .late, .unavailable:
+                var updated = attempt
+                updated.state = .ready(result, enhancedOriginal: candidate)
+                enhancementAttempt = updated
+            }
+        }
+        return outcome
     }
 
     private func isUsableMidpoint(
@@ -2126,6 +2178,13 @@ extension SampleBufferVideoRenderer {
         }
     }
 
+    private func invalidateEnhancedOriginalCandidate() {
+        guard var attempt = enhancementAttempt,
+              case let .ready(result, .ready) = attempt.state else { return }
+        attempt.state = .ready(result, enhancedOriginal: .unavailable)
+        enhancementAttempt = attempt
+    }
+
     private func admitOriginal(
         _ original: MediaVideoFrame,
         renderer: AVSampleBufferVideoRenderer,
@@ -2139,14 +2198,17 @@ extension SampleBufferVideoRenderer {
             switch enqueueOptionalFrame(candidate, renderer: renderer, isMidpoint: false) {
             case .enqueued: admittedEnhancedOriginal = candidate
             case .blocked: return noteNativeWait()
-            case .rendererFault, nil: enhancementDiagnostics.superResolution.rejected += 1
+            case .rendererFault: return recordRendererFault(renderer, reason: "ASBD fault on enhanced frame")
+            case nil:
+                enhancementDiagnostics.superResolution.rejected += 1
+                invalidateEnhancedOriginalCandidate()
             }
         }
         if admittedEnhancedOriginal == nil {
             switch try enqueueSingleFrame(original, renderer: renderer, isMidpoint: false) {
             case .enqueued: break
             case .blocked: return noteNativeWait()
-            case .rendererFault: throw MediaEngineError.renderFailed("ASBD fault during presentation")
+            case .rendererFault: return recordRendererFault(renderer, reason: "ASBD fault on original frame")
             }
         }
         if enhancementBoundary == boundary {

@@ -638,7 +638,6 @@ extension LifecycleRecoveryCoordinator {
             return []
 
         case .installInline(let fence):
-            installPresentationAuthority(fence)
             pipStartWasAbandoned = false
             pipPresentationReconcilePending = false
             presentationPhase = .inlineAttachedUnproven(
@@ -655,7 +654,6 @@ extension LifecycleRecoveryCoordinator {
             default:
                 nativePiPStartPending = false
             }
-            installPresentationAuthority(fence)
             presentationApplicationPhase = .background
             presentationRecoveryStage = .retainedRenderer
             pipPresentationReconcilePending = false
@@ -705,7 +703,7 @@ extension LifecycleRecoveryCoordinator {
                 if observedPiPLease {
                     presentationPhase = .pipActive(fence)
                 } else if case .pipActive(let current) = presentationPhase,
-                          current.hasSameContinuityAuthority(as: fence) {
+                          current.hasSameResourceAuthority(as: fence) {
                     presentationPhase = .pipActive(current)
                 } else if nativePiPStartPending {
                     presentationPhase = .pipStarting(fence)
@@ -1039,7 +1037,7 @@ extension LifecycleRecoveryCoordinator {
             return effects
 
         case .pipWillStart(let fence):
-            guard acceptsOrReplacesPresentationAuthority(fence) else { return [] }
+            guard acceptsPresentationEvent(fence) else { return [] }
             pipStartWasAbandoned = false
             pipPresentationReconcilePending = false
             presentationPhase = .pipStarting(fence)
@@ -1047,7 +1045,7 @@ extension LifecycleRecoveryCoordinator {
 
         case .pipDidStart(let fence):
             guard !pipStartWasAbandoned else { return [] }
-            guard acceptsOrReplacesPresentationAuthority(fence) else { return [] }
+            guard acceptsPresentationEvent(fence) else { return [] }
             pipPresentationReconcilePending = false
             presentationPhase = .pipActive(fence)
             presentationApplicationPhase = .background
@@ -1490,22 +1488,6 @@ extension LifecycleRecoveryCoordinator {
             pipPresentationReconcilePending = false
             return []
         }
-    }
-
-    private mutating func installPresentationAuthority(_ fence: DemandPresentationFence) {
-        _ = fence
-    }
-
-    private mutating func acceptsOrReplacesPresentationAuthority(
-        _ fence: DemandPresentationFence
-    ) -> Bool {
-        guard let current = presentationPhase.fence else {
-            installPresentationAuthority(fence)
-            return true
-        }
-        guard current.hasSameContinuityAuthority(as: fence) else { return false }
-        installPresentationAuthority(fence)
-        return true
     }
 
     private func acceptsPresentationEvent(_ fence: DemandPresentationFence) -> Bool {

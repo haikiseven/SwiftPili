@@ -431,7 +431,12 @@ struct DecoderRecoveryAdmission: Equatable {
         }
 
         var spendsAutomaticRuntimeBudget: Bool {
-            isRuntimeFault
+            switch self {
+            case .runtimeFault, .differentEncode:
+                true
+            case .lifecycle, .manualRetry, .streamTransport:
+                false
+            }
         }
 
         var replacementQuality: Int? {
@@ -594,7 +599,7 @@ struct DecoderRecoveryAdmission: Equatable {
             guard markLifecycleEpoch(epoch) else {
                 return .rejected(.lifecycleEpochAlreadySpent)
             }
-        case .runtimeFault:
+        case .runtimeFault, .differentEncode:
             guard now >= runtimeBackoffUntil else {
                 return .rejected(.backoff)
             }
@@ -603,8 +608,6 @@ struct DecoderRecoveryAdmission: Equatable {
                     return .rejected(.budgetExhausted)
                 }
             }
-        case .differentEncode:
-            break
         case .manualRetry, .streamTransport:
             break
         }

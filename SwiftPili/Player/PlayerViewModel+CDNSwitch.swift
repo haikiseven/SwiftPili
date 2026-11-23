@@ -145,16 +145,19 @@ extension PlayerViewModel {
             refundCDNSwitch(transaction)
             return false
         }
-        guard let snapshot else {
+        if let snapshot {
+            transaction.coverIdentity = installFreezeFrame(snapshot, awaitingFreshProof: true)
+            try? await Task.sleep(for: .milliseconds(32))
+            guard ownsCDNSwitch(transaction), !Task.isCancelled else {
+                refundCDNSwitch(transaction)
+                return false
+            }
+        } else if hasStartedPresenting {
             refundCDNSwitch(transaction)
             PlayerLog.log("[CDN-switch] switch refused — no current frame to cover pipeline replacement")
             return false
-        }
-        transaction.coverIdentity = installFreezeFrame(snapshot, awaitingFreshProof: true)
-        try? await Task.sleep(for: .milliseconds(32))
-        guard ownsCDNSwitch(transaction), !Task.isCancelled else {
-            refundCDNSwitch(transaction)
-            return false
+        } else {
+            PlayerLog.log("[CDN-switch] proceeding without freeze frame before first presentation")
         }
 
         PlayerLog.log("[Player] 🔁 CDN switch \(budget.cdnSwitches)/\(RecoveryBudget.maxCDNSwitches) boundary=2 (\(reason))")
@@ -344,12 +347,11 @@ extension PlayerViewModel {
             guard case let .refused(refusalAuthority) = outcome,
                   !Task.isCancelled, !self.cdnSwitchInFlight,
                   self.hasCDNSwitchAuthority(refusalAuthority) else { return }
-            PlayerLog.log("[Player] no host left for input error (\(error.localizedDescription))")
-            self.error = PlaybackFailureMessage.text(for: error)
-            self.isBuffering = false
-            self.pushNowPlayingPlayback()
-            self.acknowledgeLifecycleReadiness(.terminalFailure)
-            self.finishNonLifecycleRecoveryIfNeeded(outcome: .backendError)
+            self.settleTerminalFailure(TerminalFailurePayload(
+                message: PlaybackFailureMessage.text(for: error),
+                retireStreamRecoveryReason: nil,
+                logMessage: "[Player] no host left for input error (\(error.localizedDescription))"
+            ))
         }
     }
 
@@ -359,8 +361,11 @@ extension PlayerViewModel {
         guard transaction.reloadGeneration != nil, transaction.budgetCommitted,
               !transaction.submittedOpen, currentURL == nil,
               error == nil, unavailability == nil else { return }
-        StartupTrace.abort("load-cancelled", token: startupTraceToken)
-        error = String(localized: "Loading was interrupted. Tap Retry.")
-        PlayerLog.log("[Player] CDN load cancelled after teardown with no successor — surfacing Retry")
+        settleTerminalFailure(TerminalFailurePayload(
+            message: String(localized: "Loading was interrupted. Tap Retry."),
+            retireStreamRecoveryReason: nil,
+            startupTraceAbortLabel: "load-cancelled",
+            logMessage: "[Player] CDN load cancelled after teardown with no successor — surfacing Retry"
+        ))
     }
 }

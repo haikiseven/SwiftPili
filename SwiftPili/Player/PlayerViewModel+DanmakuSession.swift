@@ -23,11 +23,13 @@ extension PlayerViewModel {
         guard danmakuCanDoVisibleWork else { return }
         let mediaTime = danmakuTransportTime
         let host = CACurrentMediaTime()
+        let effectiveRate = backend.effectivePlaybackRate
+        let transportPlaying = isPlaying && !isBuffering && !isSeekInFlight && effectiveRate > 0
         let next = DanmakuClockSync.transitionTiming(
             previous: danmakuTiming,
             mediaTime: mediaTime,
-            rate: Double(playbackRate),
-            isPlaying: isPlaying,
+            rate: Double(effectiveRate),
+            isPlaying: transportPlaying,
             hostTime: host
         )
         if next == danmakuTiming { return }
@@ -39,12 +41,17 @@ extension PlayerViewModel {
     func syncDanmakuTransportIfNeeded(_ mediaTime: TimeInterval) {
         let host = CACurrentMediaTime()
         if let applied = danmakuTiming {
-            if !isPlaying, applied.speed == 0 { return }
-            guard DanmakuClockSync.needsResync(
-                under: applied,
-                mediaTime: mediaTime,
-                atHostTime: host
-            ) else { return }
+            let effectiveRate = backend.effectivePlaybackRate
+            let expectedSpeed = (isPlaying && !isBuffering && !isSeekInFlight && effectiveRate > 0)
+                ? Double(effectiveRate)
+                : 0
+            if applied.speed == expectedSpeed {
+                guard DanmakuClockSync.needsResync(
+                    under: applied,
+                    mediaTime: mediaTime,
+                    atHostTime: host
+                ) else { return }
+            }
         }
         syncDanmakuTransport()
     }

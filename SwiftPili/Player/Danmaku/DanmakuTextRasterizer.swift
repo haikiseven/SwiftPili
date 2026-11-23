@@ -51,20 +51,55 @@ final class DanmakuTextRasterizer: @unchecked Sendable {
         let contents: CGImage
     }
 
+    static let shared = DanmakuTextRasterizer()
     static let selfSentFrameWidth: CGFloat = 1
     static let selfSentFramePadding: CGFloat = 2
+    static let maxPixelWidth = 4096
+    static let maxPixelHeight = 2048
+    static let maxPixelArea = 4096 * 1024
+    private static let minimumEffectiveScale: CGFloat = 0.5
+    private static let maxCacheEntries = 256
+    private static let maxCacheByteCost = 16 * 1024 * 1024
 
     typealias Render = @Sendable (Key, @Sendable (CGFloat) -> Bool) -> Image?
     private let render: Render
 
-    init(render: Render? = nil) {
-        self.render = render ?? Self.render
+    private struct CacheEntry {
+        let image: Image
+        let byteCost: Int
+        var lastUsedStamp: UInt64
     }
 
     private let queue = DispatchQueue(label: "danmaku.raster", qos: .userInitiated)
     private let lock = NSLock()
-    private var cache: [Key: Image] = [:]
-    private static let cacheCapacity = 256
+    private var cache: [Key: CacheEntry] = [:]
+    private var totalCacheBytes = 0
+    private var nextUseStamp: UInt64 = 0
+    private nonisolated(unsafe) var memoryWarningToken: NSObjectProtocol?
+
+    init(render: Render? = nil) {
+        self.render = render ?? Self.render
+        memoryWarningToken = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.clearCache()
+        }
+    }
+
+    deinit {
+        if let memoryWarningToken {
+            NotificationCenter.default.removeObserver(memoryWarningToken)
+        }
+    }
+
+    func clearCache() {
+        lock.lock()
+        cache.removeAll()
+        totalCacheBytes = 0
+        lock.unlock()
+    }
 
     func image(
         for key: Key,
@@ -83,25 +118,48 @@ final class DanmakuTextRasterizer: @unchecked Sendable {
 
     private func cachedImage(for key: Key, canRender: @Sendable (CGFloat) -> Bool) -> Image? {
         lock.lock()
-        if let hit = cache[key] {
+        if var hit = cache[key] {
+            nextUseStamp &+= 1
+            hit.lastUsedStamp = nextUseStamp
+            cache[key] = hit
             lock.unlock()
-            return canRender(hit.width) ? hit : nil
+            return canRender(hit.image.width) ? hit.image : nil
         }
         lock.unlock()
         guard let made = render(key, canRender) else { return nil }
-        lock.lock()
-        cache[key] = made
-        while cache.count > Self.cacheCapacity {
-            guard let victim = cache.first(where: { $0.key != key })?.key else { break }
-            cache.removeValue(forKey: victim)
+        let cost = made.contents.bytesPerRow * made.contents.height
+        if cost <= Self.maxCacheByteCost / 2 {
+            lock.lock()
+            nextUseStamp &+= 1
+            if let existing = cache.removeValue(forKey: key) {
+                totalCacheBytes -= existing.byteCost
+            }
+            cache[key] = CacheEntry(image: made, byteCost: cost, lastUsedStamp: nextUseStamp)
+            totalCacheBytes += cost
+            while cache.count > Self.maxCacheEntries || totalCacheBytes > Self.maxCacheByteCost {
+                guard let victim = cache.min(by: { $0.value.lastUsedStamp < $1.value.lastUsedStamp })?.key,
+                      victim != key else { break }
+                if let removed = cache.removeValue(forKey: victim) {
+                    totalCacheBytes -= removed.byteCost
+                }
+            }
+            lock.unlock()
         }
-        lock.unlock()
         return made
+    }
+
+    private struct LineMetrics {
+        let colorLine: CTLine
+        let blackLine: CTLine?
+        let width: CGFloat
+        let ascent: CGFloat
+        let descent: CGFloat
+        var height: CGFloat { ascent + descent }
     }
 
     private static func render(_ key: Key, canRender: @Sendable (CGFloat) -> Bool) -> Image? {
         guard !key.text.isEmpty else { return nil }
-        let scale = key.scale > 0 ? key.scale : 1
+        let requestedScale = key.scale > 0 ? key.scale : 1
         let fontSize: CGFloat
         if let presentation = key.presentation {
             fontSize = CGFloat(DanmakuRenderPreferences.bulletPointSize(
@@ -124,35 +182,69 @@ final class DanmakuTextRasterizer: @unchecked Sendable {
             alpha: 1
         )
         let foreground = NSAttributedString.Key(rawValue: kCTForegroundColorAttributeName as String)
-        let colorLine = CTLineCreateWithAttributedString(
-            NSAttributedString(string: key.text, attributes: [
-                .font: font,
-                foreground: color,
-            ])
-        )
-        let edge: CGFloat = key.hasStroke ? max(0.85, 2.0 / scale) : 0
-        let shadowPad: CGFloat = key.hasStroke ? 1.5 : 0
-        let blackLine: CTLine? = key.hasStroke
-            ? CTLineCreateWithAttributedString(
-                NSAttributedString(string: key.text, attributes: [
+        let strokeColor = CGColor(gray: 0, alpha: 0.72)
+        let fontAscent = CTFontGetAscent(font)
+        let fontDescent = CTFontGetDescent(font)
+        let rawLines = key.text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        var measuredLines: [LineMetrics] = []
+        measuredLines.reserveCapacity(rawLines.count)
+        var maxLineWidth: CGFloat = 0
+        for lineText in rawLines {
+            let colorLine = CTLineCreateWithAttributedString(
+                NSAttributedString(string: lineText, attributes: [
                     .font: font,
-                    foreground: CGColor(gray: 0, alpha: 0.72),
+                    foreground: color,
                 ])
             )
-            : nil
-        var ascent: CGFloat = 0
-        var descent: CGFloat = 0
-        let typographicWidth = CGFloat(CTLineGetTypographicBounds(colorLine, &ascent, &descent, nil))
-        guard typographicWidth > 0, ascent + descent > 0 else { return nil }
-        let typographicHeight = ascent + descent
+            let blackLine: CTLine? = key.hasStroke
+                ? CTLineCreateWithAttributedString(
+                    NSAttributedString(string: lineText, attributes: [
+                        .font: font,
+                        foreground: strokeColor,
+                    ])
+                )
+                : nil
+            var ascent: CGFloat = 0
+            var descent: CGFloat = 0
+            let lineWidth = CGFloat(CTLineGetTypographicBounds(colorLine, &ascent, &descent, nil))
+            let resolvedAscent = ascent > 0 ? ascent : fontAscent
+            let resolvedDescent = descent > 0 ? descent : fontDescent
+            maxLineWidth = max(maxLineWidth, lineWidth)
+            measuredLines.append(LineMetrics(
+                colorLine: colorLine,
+                blackLine: blackLine,
+                width: lineWidth,
+                ascent: resolvedAscent,
+                descent: resolvedDescent
+            ))
+        }
+        let lineGap: CGFloat = measuredLines.count > 1 ? ceil(fontSize * 0.15) : 0
+        let totalLineHeight = measuredLines.reduce(0) { $0 + $1.height }
+            + lineGap * CGFloat(max(0, measuredLines.count - 1))
+        guard maxLineWidth > 0, totalLineHeight > 0 else { return nil }
+
+        let edge: CGFloat = key.hasStroke ? max(0.85, 2.0 / requestedScale) : 0
+        let shadowPad: CGFloat = key.hasStroke ? 1.5 : 0
         let frameInset: CGFloat = key.selfSentFrame
             ? Self.selfSentFrameWidth + Self.selfSentFramePadding
             : 0
         let pad = edge + shadowPad
-        let pointWidth = typographicWidth + pad * 2 + frameInset * 2
-        let pointHeight = typographicHeight + pad * 2 + frameInset * 2
-        let pixelWidth = max(1, Int(ceil(pointWidth * scale)))
-        let pixelHeight = max(1, Int(ceil(pointHeight * scale)))
+        let pointWidth = maxLineWidth + pad * 2 + frameInset * 2
+        let pointHeight = totalLineHeight + pad * 2 + frameInset * 2
+
+        let maxScaleByWidth = CGFloat(Self.maxPixelWidth) / pointWidth
+        let maxScaleByHeight = CGFloat(Self.maxPixelHeight) / pointHeight
+        let maxScaleByArea = sqrt(CGFloat(Self.maxPixelArea) / (pointWidth * pointHeight))
+        let scale = min(requestedScale, maxScaleByWidth, maxScaleByHeight, maxScaleByArea)
+        guard scale.isFinite, scale >= Self.minimumEffectiveScale else { return nil }
+
+        let pixelWidth = min(Self.maxPixelWidth, max(1, Int(ceil(pointWidth * scale))))
+        let pixelHeight = min(Self.maxPixelHeight, max(1, Int(ceil(pointHeight * scale))))
+        guard pixelWidth * pixelHeight <= Self.maxPixelArea else { return nil }
         guard canRender(CGFloat(pixelWidth) / scale) else { return nil }
         guard let context = CGContext(
             data: nil,
@@ -171,14 +263,23 @@ final class DanmakuTextRasterizer: @unchecked Sendable {
             context.setLineWidth(Self.selfSentFrameWidth)
             context.stroke(CGRect(x: 0, y: 0, width: pointWidth, height: pointHeight).insetBy(dx: half, dy: half))
         }
-        let baseline = CGPoint(x: pad + frameInset, y: descent + pad + frameInset)
-        drawGlyphs(
-            in: context,
-            colorLine: colorLine,
-            blackLine: blackLine,
-            baseline: baseline,
-            edge: edge
-        )
+        var topCursor = pointHeight - pad - frameInset
+        for (index, line) in measuredLines.enumerated() {
+            let baselineY = topCursor - line.ascent
+            if line.width > 0 {
+                drawGlyphs(
+                    in: context,
+                    colorLine: line.colorLine,
+                    blackLine: line.blackLine,
+                    baseline: CGPoint(x: pad + frameInset, y: baselineY),
+                    edge: edge
+                )
+            }
+            topCursor -= line.height
+            if index + 1 < measuredLines.count {
+                topCursor -= lineGap
+            }
+        }
         guard let contents = context.makeImage() else { return nil }
         return Image(
             width: CGFloat(pixelWidth) / scale,

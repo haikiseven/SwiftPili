@@ -620,22 +620,68 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
     private var isBuffering = false {
         didSet { if isBuffering { invalidateSourceWaitBudget() } }
     }
-    private var hasEmittedEnded = false
-    private var demuxReachedEOF = false
-    private var audioDrainingToEnd = false
-    private var audioDrainEmptiedAt: ContinuousClock.Instant?
-    private var audioDrainPlayoutDeadline: ContinuousClock.Instant?
-    private var isSeekInFlight = false {
-        didSet {
-            if isSeekInFlight {
-                invalidateSourceWaitBudget()
-                audioDisplayObservation.invalidate()
-            }
+    private struct SessionSeekTransaction {
+        private(set) var activeToken: MediaAudioSeekToken?
+        private(set) var prepared: MediaEngineSeekPreparation?
+        private(set) var isInFlight = false
+
+        mutating func begin(token: MediaAudioSeekToken) {
+            activeToken = token
+            prepared = nil
+            isInFlight = true
+        }
+
+        mutating func markPrepared(_ preparation: MediaEngineSeekPreparation) {
+            guard activeToken == preparation.token else { return }
+            prepared = preparation
+        }
+
+        mutating func finishCommitGate() {
+            isInFlight = false
+        }
+
+        mutating func clear() {
+            activeToken = nil
+            prepared = nil
+            isInFlight = false
         }
     }
+
+    private struct AudioEOFDrainState {
+        var isDraining = false
+        var emptiedAt: ContinuousClock.Instant?
+        var playoutDeadline: ContinuousClock.Instant?
+        var wakeTask: Task<Void, Never>?
+
+        mutating func reset() {
+            isDraining = false
+            emptiedAt = nil
+            playoutDeadline = nil
+            wakeTask?.cancel()
+            wakeTask = nil
+        }
+    }
+
+    private var hasEmittedEnded = false
+    private var demuxReachedEOF = false
+    private var audioEOFDrain = AudioEOFDrainState()
+    private var audioDrainingToEnd: Bool { audioEOFDrain.isDraining }
+    private var seekTransaction = SessionSeekTransaction()
+    private var isSeekInFlight: Bool { seekTransaction.isInFlight }
     private var pausedCaptureSeekPreparationReceipt: UUID?
-    private var activeSeekToken: MediaAudioSeekToken?
-    private var preparedSeek: MediaEngineSeekPreparation?
+    private var activeSeekToken: MediaAudioSeekToken? { seekTransaction.activeToken }
+    private var preparedSeek: MediaEngineSeekPreparation? { seekTransaction.prepared }
+    private var consecutiveVideoPresentErrorCount = 0
+
+    private func beginSeekTransaction(token: MediaAudioSeekToken) {
+        seekTransaction.begin(token: token)
+        invalidateSourceWaitBudget()
+        audioDisplayObservation.invalidate()
+    }
+
+    private func clearSeekTransaction() {
+        seekTransaction.clear()
+    }
     private var outputMediaFloor: TimeInterval = 0 {
         didSet {
             (videoRender as? SampleBufferVideoRenderer)?.updateDemandPresentationFloor(outputMediaFloor)
@@ -1412,13 +1458,10 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         isBuffering = false
         hasEmittedEnded = false
         demuxReachedEOF = false
-        audioDrainingToEnd = false
-        audioDrainPlayoutDeadline = nil
-        audioDrainEmptiedAt = nil
-        isSeekInFlight = false
+        audioEOFDrain.reset()
+        clearSeekTransaction()
+        consecutiveVideoPresentErrorCount = 0
         audioDisplayObservation.reset(to: outputMediaFloor)
-        activeSeekToken = nil
-        preparedSeek = nil
         videoDecoderOpened = false
         videoDecoderRepairAttempted = false
         audioDecoderOpened = false
@@ -1642,10 +1685,9 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
                 audioRender.abortSeekTransition(token)
             }
             discardSeekPreparedContent()
-            activeSeekToken = nil
-            preparedSeek = nil
-            isSeekInFlight = false
+            clearSeekTransaction()
         }
+        audioEOFDrain.reset()
         isPlaying = false
         isBuffering = false
         resetVideoLivenessState(resetStartup: false)
@@ -1663,8 +1705,23 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
             audioDisplayObservation.invalidate()
             audioRender.stop()
         } else {
+            let rewindSeconds = hasAudioTrack ? audioRender.presentationTiming.contentTimeOffset : 0
             audioDisplayObservation.suspendForPause(fallbackTime: clock.mediaTime)
-            audioRender.pause()
+            if rewindSeconds > 0 {
+                let pulledEndPTS = (audioTimelineBuffer.endPTS ?? clock.mediaTime)
+                    - audioTimelineBuffer.contentSeconds
+                let ringBuffered = max(0, pulledEndPTS - clock.mediaTime)
+                audioRender.pause()
+                audioRender.flush()
+                let rolledBack = audioTimelineBuffer.rollback(seconds: ringBuffered + rewindSeconds)
+                if rolledBack > 0 {
+                    clock.seek(to: max(0, pulledEndPTS - rolledBack))
+                    updatePiPPlaybackState()
+                    resetDisplayTimeline(to: clock.mediaTime)
+                }
+            } else {
+                audioRender.pause()
+            }
         }
         cancelSupplyLoop()
         cancelDecode()
@@ -1788,8 +1845,8 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         runtimeFaultedGeneration = nil
         publishedRuntimeFaultGeneration = nil
         let token = audioRender.beginSeekTransition(source: self)
-        activeSeekToken = token
-        preparedSeek = nil
+        beginSeekTransaction(token: token)
+        consecutiveVideoPresentErrorCount = 0
         seekPhaseStopwatch = SeekPhaseStopwatch(
             token: token.generation,
             isEnabled: diagnostics.isCapturing
@@ -1803,10 +1860,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         hasEmittedEnded = false
         isBuffering = false
         demuxReachedEOF = false
-        audioDrainingToEnd = false
-        audioDrainPlayoutDeadline = nil
-        audioDrainEmptiedAt = nil
-        isSeekInFlight = true
+        audioEOFDrain.reset()
         let audioGraphWasRunning = audioRender.isRunning
         diagnostics.log(
             "[PathA] seek audio graph " +
@@ -1987,7 +2041,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
                 stagedContentSeconds: audioPreparation.stagedContentSeconds,
                 isReady: true
             )
-            preparedSeek = preparation
+            seekTransaction.markPrepared(preparation)
             logSeekTrace(
                 phase: "prepare",
                 target: preparation.target,
@@ -2082,10 +2136,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
 
         guard isAuthorized?() ?? true else {
             discardSeekPreparedContent(for: preparation.token)
-            preparedSeek = nil
-            activeSeekToken = nil
-            isSeekInFlight = true
-            isBuffering = true
+            clearSeekTransaction()
             logSeekTrace(
                 phase: "abort",
                 target: preparation.target,
@@ -2095,9 +2146,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
             return false
         }
 
-        preparedSeek = nil
-        activeSeekToken = nil
-        isSeekInFlight = false
+        clearSeekTransaction()
         isBuffering = false
         audioOutputDisplayHold = nil
         onEvent?(.tick(
@@ -2139,7 +2188,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
                 return self.admitAudioMaintenanceResume()
             },
             beforeGateRelease: { [weak self] in
-                self?.isSeekInFlight = false
+                self?.seekTransaction.finishCommitGate()
             }
         )
     }
@@ -2148,7 +2197,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         guard activeSeekToken == preparation.token else { return }
         audioRender.abortSeekTransition(preparation.token)
         discardSeekPreparedContent(for: preparation.token)
-        preparedSeek = nil
+        clearSeekTransaction()
         logSeekTrace(
             phase: "abort",
             target: preparation.target,
@@ -2361,9 +2410,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         let target = clock.mediaTime
         audioRender.abortSeekTransition(token)
         discardSeekPreparedContent(for: token)
-        activeSeekToken = nil
-        preparedSeek = nil
-        isSeekInFlight = false
+        clearSeekTransaction()
         logSeekTrace(
             phase: "abort",
             target: target,
@@ -2427,9 +2474,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         let target = clock.mediaTime
         audioRender.abortSeekTransition(token)
         discardSeekPreparedContent(for: token)
-        activeSeekToken = nil
-        preparedSeek = nil
-        isSeekInFlight = false
+        clearSeekTransaction()
         logSeekTrace(
             phase: "abort",
             target: target,
@@ -2460,9 +2505,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         let target = clock.mediaTime
         audioRender.abortSeekTransition(token)
         discardSeekPreparedContent(for: token)
-        activeSeekToken = nil
-        preparedSeek = nil
-        isSeekInFlight = false
+        clearSeekTransaction()
         isPlaying = false
         isReady = false
         isBuffering = false
@@ -2493,9 +2536,8 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         activeStartupTraceToken = nil
         runtimeFaultedGeneration = nil
         publishedRuntimeFaultGeneration = nil
-        isSeekInFlight = false
-        activeSeekToken = nil
-        preparedSeek = nil
+        clearSeekTransaction()
+        consecutiveVideoPresentErrorCount = 0
         retireCurrentVideoDecoderWithoutWaiting()
         stopPipeline(emitPaused: false)
         videoDecoderOpened = false
@@ -2503,9 +2545,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         isBuffering = false
         hasEmittedEnded = false
         demuxReachedEOF = false
-        audioDrainingToEnd = false
-        audioDrainPlayoutDeadline = nil
-        audioDrainEmptiedAt = nil
+        audioEOFDrain.reset()
         holdsPassThroughVideo = false
         knownVideoFrameWidth = 0
         knownVideoFrameHeight = 0
@@ -6008,6 +6048,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
     private func audioSupplyExhausted() -> Bool {
         demuxReachedEOF
             && audioPackets.isEmpty
+            && residualAudioPackets.isEmpty
             && pendingAudioContentSeconds < 0.000_5
             && audioDecodeTask == nil
             && audioDecodeLaneOwners == 0
@@ -6015,8 +6056,8 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
     }
 
     private func beginAudioDrainToEnd() {
-        if !audioDrainingToEnd {
-            audioDrainingToEnd = true
+        if !audioEOFDrain.isDraining {
+            audioEOFDrain.isDraining = true
             diagnostics.log(
                 "[PathA] audio EOF draining ring pending=\(audioRender.hasPendingOutput)"
             )
@@ -6032,8 +6073,8 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
     }
 
     private func maybeFinishAudioDrain() {
-        guard audioDrainingToEnd else { return }
-        if let deadline = audioDrainPlayoutDeadline {
+        guard audioEOFDrain.isDraining, isPlaying, !isSeekInFlight, !hasEmittedEnded else { return }
+        if let deadline = audioEOFDrain.playoutDeadline {
             guard ContinuousClock.now >= deadline else { return }
             finishAudioDrain()
             return
@@ -6041,16 +6082,26 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         guard !audioRender.hasPendingOutput else { return }
         let now = ContinuousClock.now
         let latency = max(0, audioRender.presentationTiming.wallLatencySeconds)
-        audioDrainEmptiedAt = now
-        audioDrainPlayoutDeadline = now.advanced(by: .seconds(latency))
+        audioEOFDrain.emptiedAt = now
+        let deadline = now.advanced(by: .seconds(latency))
+        audioEOFDrain.playoutDeadline = deadline
         guard latency > 0 else {
             finishAudioDrain()
             return
         }
+        let gen = generation
+        audioEOFDrain.wakeTask?.cancel()
+        audioEOFDrain.wakeTask = Task { @MainActor [weak self] in
+            do {
+                try await ContinuousClock().sleep(until: deadline)
+            } catch { return }
+            guard let self, !Task.isCancelled, self.isCurrentGeneration(gen) else { return }
+            self.maybeFinishAudioDrain()
+        }
     }
 
     private func finishAudioDrain() {
-        if let emptiedAt = audioDrainEmptiedAt, let deadline = audioDrainPlayoutDeadline {
+        if let emptiedAt = audioEOFDrain.emptiedAt, let deadline = audioEOFDrain.playoutDeadline {
             let elapsedMs = Int(emptiedAt.duration(to: ContinuousClock.now) / .milliseconds(1))
             let latencyMs = Int(emptiedAt.duration(to: deadline) / .milliseconds(1))
             diagnostics.log(
@@ -6067,9 +6118,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         hasEmittedEnded = true
         isPlaying = false
         isBuffering = false
-        audioDrainingToEnd = false
-        audioDrainEmptiedAt = nil
-        audioDrainPlayoutDeadline = nil
+        audioEOFDrain.reset()
         audioRender.stop()
         cancelSupplyLoop()
         cancelDecode()
@@ -7011,6 +7060,14 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
                     pipeWindowNotReady += 1
                     pipeWindowRendererBlocked = true
                     return .blockedOnASBD
+                case .recoveredNeedsRefeed:
+                    pipeWindowNotReady += 1
+                    applyDisplayPlayback(rate: effectiveDisplayRate)
+                    return .blockedOnASBD
+                case .terminalFault(let fault):
+                    disarmPresentFeed()
+                    publishRuntimeFault(fault, generation: generation)
+                    return .nothingDue
                 case .enqueued:
                     break
                 }
@@ -7020,7 +7077,30 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
             } catch {
                 pipeWindowNotReady += 1
                 logPresentBackpressureIfNeeded(error)
-                return .blockedOnASBD
+                _ = pendingVideoFrames.removeFirst()
+                pendingVideoContentSeconds = pendingVideoFrames.reduce(0) {
+                    $0 + max(0, $1.duration)
+                }
+                consecutiveVideoPresentErrorCount += 1
+                if consecutiveVideoPresentErrorCount >= 3 {
+                    disarmPresentFeed()
+                    publishRuntimeFault(
+                        MediaRuntimeFault(
+                            subsystem: .videoRenderer,
+                            stage: .render,
+                            classification: .malfunction,
+                            recoverability: .automaticSourceAwareReopen,
+                            ownerLeaseGeneration: videoLivenessContext?.ownerLeaseGeneration ?? 0,
+                            diagnostics: MediaRuntimeFaultDiagnostics(
+                                label: "present-frame-error",
+                                details: error.localizedDescription
+                            )
+                        ),
+                        generation: generation
+                    )
+                    return .nothingDue
+                }
+                continue
             }
         }
         if !didEnqueue {
@@ -7030,6 +7110,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
     }
 
     private func recordAdmittedVideoHead(_ head: MediaVideoFrame) {
+        consecutiveVideoPresentErrorCount = 0
         tracing.mark(.firstVout, token: activeStartupTraceToken)
         _ = pendingVideoFrames.removeFirst()
         pendingVideoContentSeconds = max(0, pendingVideoContentSeconds - head.duration)
@@ -10094,9 +10175,8 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         multiConnectionQuietGate.setParked(true)
         isPlaying = false
         isBuffering = false
-        audioDrainingToEnd = false
-        audioDrainPlayoutDeadline = nil
-        audioDrainEmptiedAt = nil
+        audioEOFDrain.reset()
+        consecutiveVideoPresentErrorCount = 0
         disarmPresentFeed()
         resetDisplayTimeline(to: audioPresentationMediaTime)
         audioRender.stop()

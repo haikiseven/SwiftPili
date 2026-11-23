@@ -130,8 +130,7 @@ final class VLCPlayerBackend: PlayerBackend {
     private var startupTraceToken: StartupTrace.Token?
 
     private(set) var pendingSeekTarget: TimeInterval?
-    private var pendingSeekCompletion: (@MainActor @Sendable (Bool) -> Void)?
-    private var seekTimeoutTask: Task<Void, Never>?
+    private var pendingSeekGate: SeekCompletionGate?
     private var seekIssuedAt: CFTimeInterval = 0
     private var seekProgressAt: CFTimeInterval = 0
     private var startPositionChecked = false
@@ -184,15 +183,15 @@ final class VLCPlayerBackend: PlayerBackend {
             guard changes.contains(.diagnostics) else { return }
             owner.applyDiagnosticLogPolicy()
         }
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
-            try? AVAudioSession.sharedInstance().setActive(true)
-        }
     }
 
     isolated deinit {
+        vlcLogTask?.cancel()
+        eventTask?.cancel()
         pipEventTask?.cancel()
+        pendingSeekTarget = nil
+        pendingSeekGate?.settle(false)
+        pendingSeekGate = nil
         videoHosting.invalidate()
     }
 
@@ -338,6 +337,8 @@ final class VLCPlayerBackend: PlayerBackend {
         eventTask?.cancel()
 
         guard let media = try? Media(url: url) else {
+            pendingSeekTarget = nil
+            settlePendingSeek(false, reason: "mediaCreationFailed")
             onStateChanged?(.error(VLCError.mediaCreationFailed(source: url.absoluteString)))
             return
         }
@@ -408,7 +409,7 @@ final class VLCPlayerBackend: PlayerBackend {
         seekFromTime = 0
         let armSeekPhase = startPosition > 0.5 || isSeekReopen
         pendingSeekTarget = armSeekPhase ? startPosition : nil
-        settlePendingSeekCompletion(false, reason: "superseded by load()")
+        settlePendingSeek(false, reason: "superseded by load()")
         seekLanded = pendingSeekTarget != nil
         if armSeekPhase { seekIssuedAt = CACurrentMediaTime() }
         seekVisibleBaseline = (isSeekReopen && PlayerLog.isEnabled) ? 0 : nil
@@ -424,6 +425,8 @@ final class VLCPlayerBackend: PlayerBackend {
         do {
             try player.play(media)
         } catch {
+            pendingSeekTarget = nil
+            settlePendingSeek(false, reason: "playFailed")
             onStateChanged?(.error(error))
             return
         }
@@ -447,10 +450,8 @@ final class VLCPlayerBackend: PlayerBackend {
         PlayerLog.log("[VLC] stop() called, state=\(player.state)")
         eventTask?.cancel()
         eventTask = nil
-        seekTimeoutTask?.cancel()
-        seekTimeoutTask = nil
         pendingSeekTarget = nil
-        settlePendingSeekCompletion(false, reason: "stop()")
+        settlePendingSeek(false, reason: "stop()")
         seekVisibleBaseline = nil
         startupVisibleBaseline = nil
         retainedLivenessObservation.cancel(reason: .stop)
@@ -476,10 +477,9 @@ final class VLCPlayerBackend: PlayerBackend {
 
     func seek(to time: TimeInterval, completion: (@MainActor @Sendable (Bool) -> Void)?) {
         PlayerLog.log("[VLC] seek(to: \(String(format: "%.1f", time))) called, state=\(player.state)")
-        seekTimeoutTask?.cancel()
-        pendingSeekCompletion?(false)
+        settlePendingSeek(false, reason: "superseded by seek()")
 
-        pendingSeekCompletion = completion
+        pendingSeekGate = SeekCompletionGate(completion: completion)
         seekVisibleBaseline = PlayerLog.isEnabled ? player.statistics?.displayedPictures : nil
         seekIssuedAt = CACurrentMediaTime()
         seekFromTime = lastTickTime
@@ -519,29 +519,32 @@ final class VLCPlayerBackend: PlayerBackend {
 
     private func startSeekSilenceWatchdog(targetForLog target: TimeInterval, context: String) {
         seekProgressAt = CACurrentMediaTime()
-        seekTimeoutTask?.cancel()
-        seekTimeoutTask = Task { [weak self] in
+        let gate = pendingSeekGate ?? SeekCompletionGate()
+        pendingSeekGate = gate
+        gate.timeoutTask?.cancel()
+        gate.timeoutTask = Task { [weak self, weak gate] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
-                guard !Task.isCancelled, let self, self.pendingSeekTarget != nil else { return }
+                guard !Task.isCancelled, let self, let gate,
+                      self.pendingSeekGate === gate, self.pendingSeekTarget != nil else { return }
                 let silent = CACurrentMediaTime() - self.seekProgressAt
                 guard silent >= Self.seekSilenceTimeout else { continue }
                 PlayerLog.log("[VLC] ⚠️ \(context) to \(String(format: "%.1f", target)) made no progress for \(Int(silent))s — abandoning as FAILED (clock is at \(String(format: "%.1f", self.lastTickTime)))")
                 SeekTrace.abort("silence-\(context)")
-                let cb = self.pendingSeekCompletion
                 self.pendingSeekTarget = nil
-                self.pendingSeekCompletion = nil
-                cb?(false)
+                self.settlePendingSeek(false, reason: "silence-\(context)")
                 return
             }
         }
     }
 
-    private func settlePendingSeekCompletion(_ finished: Bool, reason: String) {
-        guard let completion = pendingSeekCompletion else { return }
-        pendingSeekCompletion = nil
-        PlayerLog.log("[VLC] pending seek completion settled \(finished) (\(reason))")
-        completion(finished)
+    private func settlePendingSeek(_ finished: Bool, reason: String) {
+        guard let gate = pendingSeekGate else { return }
+        pendingSeekGate = nil
+        if gate.hasPendingWork {
+            PlayerLog.log("[VLC] pending seek completion settled \(finished) (\(reason))")
+        }
+        gate.settle(finished)
     }
 
     private static let seekSilenceTimeout: CFTimeInterval = 8
@@ -658,6 +661,10 @@ final class VLCPlayerBackend: PlayerBackend {
     var playbackRate: Float {
         get { player.rate }
         set { try? player.setPlaybackRate(PlaybackRate(newValue)) }
+    }
+
+    var effectivePlaybackRate: Float {
+        isPlaying ? player.rate : 0
     }
 
     var volume: Float {
@@ -885,6 +892,8 @@ final class VLCPlayerBackend: PlayerBackend {
             case .stopped, .stopping, .idle:
                 break
             case .error:
+                pendingSeekTarget = nil
+                settlePendingSeek(false, reason: "stateChanged(.error)")
                 onStateChanged?(.error(VLCError.playbackFailed(reason: "Playback error")))
             }
 
@@ -943,6 +952,8 @@ final class VLCPlayerBackend: PlayerBackend {
 
         case .encounteredError:
             PlayerLog.log("[VLC] event: encounteredError")
+            pendingSeekTarget = nil
+            settlePendingSeek(false, reason: "encounteredError")
             onStateChanged?(.error(VLCError.playbackFailed(reason: "VLC error")))
 
         case .voutChanged(let count):
@@ -1081,12 +1092,8 @@ final class VLCPlayerBackend: PlayerBackend {
 
         PlayerLog.log("[VLC] seek settled: real clock \(String(format: "%.2f", t))s reached target \(String(format: "%.2f", target))s")
         SeekTrace.mark("arrived")
-        seekTimeoutTask?.cancel()
-        seekTimeoutTask = nil
-        let cb = pendingSeekCompletion
         pendingSeekTarget = nil
-        pendingSeekCompletion = nil
-        cb?(true)
+        settlePendingSeek(true, reason: "arrived")
     }
 
     private func updateFPS() {

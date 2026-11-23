@@ -49,9 +49,15 @@ struct PlayerTopControlBar: View {
     @Binding var showSponsorBlock: Bool
     @AppStorage(DanmakuFeatureGate.defaultsKey) private var danmakuEnabled = false
     @State private var inlineDanmakuPopoverPresented = false
+    @State private var inlineDanmakuPopoverTask: Task<Void, Never>?
+    @State private var barWidth: CGFloat = 0
+
+    private var isNarrowFullscreenBar: Bool {
+        player.isFullscreen && barWidth > 0 && barWidth < 540
+    }
 
     var body: some View {
-        HStack(spacing: player.isFullscreen ? 12 : 8) {
+        HStack(spacing: (player.isFullscreen && !isNarrowFullscreenBar) ? 12 : 8) {
             if !player.isFullscreen, let pageNavigationActions {
                 if pageNavigationActions.pageOwnsInlineNavigation {
                     Color.clear
@@ -74,10 +80,13 @@ struct PlayerTopControlBar: View {
                         .foregroundStyle(.white)
                         .frame(width: 44, height: 44)
                         .contentShape(Rectangle())
+                        .accessibilityHidden(true)
                 }
                 .accessibilityLabel(Text("Exit fullscreen"))
 
-                LandscapeStatusInfo()
+                if barWidth == 0 || barWidth >= 400 {
+                    LandscapeStatusInfo()
+                }
             }
 
             Spacer(minLength: 4)
@@ -123,6 +132,7 @@ struct PlayerTopControlBar: View {
                 } label: {
                     Image(systemName: danmakuEnabled ? "text.bubble.fill" : "text.bubble")
                         .playerChromeCapsule(horizontal: 10, minHeight: 44)
+                        .accessibilityHidden(true)
                 }
                 .danmakuToggleAccessibility(isOn: danmakuEnabled)
                 .popover(isPresented: $inlineDanmakuPopoverPresented) {
@@ -130,87 +140,71 @@ struct PlayerTopControlBar: View {
                         .presentationCompactAdaptation(.popover)
                 }
             }
-            if DetailDanmakuEntryPolicy.chromeShowsSettings(
-                usesOnlineVODServices: player.mode.usesOnlineVODServices,
-                danmakuEnabled: danmakuEnabled,
-                isFullscreen: player.isFullscreen
-            ) {
-                Button {
-                    danmakuPanelPresented.toggle()
-                    player.setDanmakuSettingsHold(danmakuPanelPresented)
-                } label: {
-                    Image(systemName: "slider.horizontal.3")
-                        .playerChromeCapsule(horizontal: 10, minHeight: 44)
-                }
-                .accessibilityLabel(Text("Danmaku Settings"))
-            }
 
-            if player.mode.usesOnlineVODServices, SponsorBlockManager.shared.isEnabled {
-                Button {
-                    showSponsorBlock = true
-                } label: {
-                    Image(systemName: "shield.lefthalf.filled")
-                        .playerChromeCapsule(horizontal: 10, minHeight: 44)
-                }
-            }
-
-            if player.isFullscreen {
-                Menu {
-                    ForEach(VideoScaleMode.allCases) { mode in
-                        Button {
-                            player.scaleMode = mode
-                        } label: {
-                            HStack {
-                                Text(mode.label)
-                                if mode == player.scaleMode {
-                                    Image(systemName: "checkmark")
-                                }
-                            }
-                        }
-                    }
-                } label: {
-                    Image(systemName: "aspectratio")
-                        .playerChromeCapsule(horizontal: 10, minHeight: 44)
-                }
-
-                if !player.availableSubtitles.isEmpty {
-                    Menu {
-                        Button {
-                            Task { await player.selectSubtitle(nil) }
-                        } label: {
-                            HStack {
-                                Text("Off")
-                                if player.activeSubtitleLan == nil {
-                                    Image(systemName: "checkmark")
-                                }
-                            }
-                        }
-                        ForEach(player.availableSubtitles, id: \.lan) { item in
-                            Button {
-                                Task { await player.selectSubtitle(item) }
-                            } label: {
-                                HStack {
-                                    Text(item.lanDoc ?? item.lan ?? "?")
-                                    if item.lan == player.activeSubtitleLan {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
-                            }
-                        }
+            if isNarrowFullscreenBar {
+                narrowFullscreenToolsMenu
+            } else {
+                if DetailDanmakuEntryPolicy.chromeShowsSettings(
+                    usesOnlineVODServices: player.mode.usesOnlineVODServices,
+                    danmakuEnabled: danmakuEnabled,
+                    isFullscreen: player.isFullscreen
+                ) {
+                    Button {
+                        toggleDanmakuSettingsPanel()
                     } label: {
-                        Image(systemName: player.activeSubtitleLan == nil ? "captions.bubble" : "captions.bubble.fill")
+                        Image(systemName: "slider.horizontal.3")
                             .playerChromeCapsule(horizontal: 10, minHeight: 44)
+                            .accessibilityHidden(true)
                     }
+                    .accessibilityLabel(Text("Danmaku Settings"))
                 }
 
-                Button { player.showStats.toggle() } label: {
-                    Image(systemName: "info.circle")
-                        .font(.title3)
-                        .foregroundStyle(.white)
-                        .frame(width: 44, height: 44)
-                        .contentShape(Rectangle())
+                if showsSponsorBlockControl {
+                    Button {
+                        showSponsorBlock = true
+                    } label: {
+                        Image(systemName: "shield.lefthalf.filled")
+                            .playerChromeCapsule(horizontal: 10, minHeight: 44)
+                            .accessibilityHidden(true)
+                    }
+                    .accessibilityIdentifier("player.sponsorBlock")
+                    .accessibilityLabel(Text("SponsorBlock"))
                 }
-                .accessibilityLabel(Text("Playback Info"))
+
+                if player.isFullscreen {
+                    Menu {
+                        scaleModeMenuItems
+                    } label: {
+                        Image(systemName: "aspectratio")
+                            .playerChromeCapsule(horizontal: 10, minHeight: 44)
+                            .accessibilityHidden(true)
+                    }
+                    .accessibilityLabel(Text("Aspect Mode"))
+                    .accessibilityValue(Text(player.scaleMode.label))
+
+                    if !player.availableSubtitles.isEmpty {
+                        Menu {
+                            subtitleMenuItems
+                        } label: {
+                            Image(systemName: player.activeSubtitleLan == nil ? "captions.bubble" : "captions.bubble.fill")
+                                .playerChromeCapsule(horizontal: 10, minHeight: 44)
+                                .accessibilityHidden(true)
+                        }
+                        .accessibilityLabel(Text("Subtitles"))
+                        .accessibilityValue(Text(activeSubtitleAccessibilityValue))
+                    }
+
+                    Button { player.showStats.toggle() } label: {
+                        Image(systemName: "info.circle")
+                            .font(.title3)
+                            .foregroundStyle(.white)
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
+                            .accessibilityHidden(true)
+                    }
+                    .accessibilityLabel(Text("Playback Info"))
+                    .accessibilityValue(player.showStats ? Text("On") : Text("Off"))
+                }
             }
 
             PlayerMoreControl(
@@ -230,6 +224,11 @@ struct PlayerTopControlBar: View {
             (player.isFullscreen ? 0 : PlayerPageNavigationButtons.inlineHorizontalPadding) + chromeInsets.horizontal
         )
         .padding(.top, PlayerPageNavigationButtons.topPadding + chromeInsets.top)
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
+            if abs(barWidth - width) > 1 {
+                barWidth = width
+            }
+        }
         .onChange(of: inlineDanmakuPopoverPresented) { _, presented in
             player.setDanmakuSettingsHold(presented || danmakuPanelPresented)
         }
@@ -248,6 +247,118 @@ struct PlayerTopControlBar: View {
                 player.setDanmakuSettingsHold(false)
             }
         }
+        .onDisappear {
+            inlineDanmakuPopoverTask?.cancel()
+            inlineDanmakuPopoverTask = nil
+            inlineDanmakuPopoverPresented = false
+            if screenLease.map(player.isCurrentOwner) ?? false {
+                danmakuPanelPresented = false
+                player.setDanmakuSettingsHold(false)
+            }
+        }
+    }
+
+    private var showsSponsorBlockControl: Bool {
+        player.mode.usesOnlineVODServices && SponsorBlockManager.shared.isEnabled
+    }
+
+    private var activeSubtitleAccessibilityValue: String {
+        guard let active = player.activeSubtitleLan else { return String(localized: "Off") }
+        let matched = player.availableSubtitles.first { $0.lan == active }
+        return matched?.lanDoc ?? matched?.lan ?? active
+    }
+
+    private func toggleDanmakuSettingsPanel() {
+        danmakuPanelPresented.toggle()
+        player.setDanmakuSettingsHold(danmakuPanelPresented)
+    }
+
+    @ViewBuilder
+    private var scaleModeMenuItems: some View {
+        ForEach(VideoScaleMode.allCases) { mode in
+            Button {
+                player.scaleMode = mode
+            } label: {
+                HStack {
+                    Text(mode.label)
+                    if mode == player.scaleMode {
+                        Image(systemName: "checkmark")
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var subtitleMenuItems: some View {
+        Button {
+            Task { await player.selectSubtitle(nil) }
+        } label: {
+            HStack {
+                Text("Off")
+                if player.activeSubtitleLan == nil {
+                    Image(systemName: "checkmark")
+                }
+            }
+        }
+        ForEach(player.availableSubtitles, id: \.lan) { item in
+            Button {
+                Task { await player.selectSubtitle(item) }
+            } label: {
+                HStack {
+                    Text(item.lanDoc ?? item.lan ?? "?")
+                    if item.lan == player.activeSubtitleLan {
+                        Image(systemName: "checkmark")
+                    }
+                }
+            }
+        }
+    }
+
+    private var narrowFullscreenToolsMenu: some View {
+        Menu {
+            if DetailDanmakuEntryPolicy.chromeShowsSettings(
+                usesOnlineVODServices: player.mode.usesOnlineVODServices,
+                danmakuEnabled: danmakuEnabled,
+                isFullscreen: player.isFullscreen
+            ) {
+                Button {
+                    toggleDanmakuSettingsPanel()
+                } label: {
+                    Label("Danmaku Settings", systemImage: "slider.horizontal.3")
+                }
+            }
+            if showsSponsorBlockControl {
+                Button {
+                    showSponsorBlock = true
+                } label: {
+                    Label("SponsorBlock", systemImage: "shield.lefthalf.filled")
+                }
+            }
+            Menu {
+                scaleModeMenuItems
+            } label: {
+                Label("Aspect Mode", systemImage: "aspectratio")
+            }
+            if !player.availableSubtitles.isEmpty {
+                Menu {
+                    subtitleMenuItems
+                } label: {
+                    Label(
+                        "Subtitles",
+                        systemImage: player.activeSubtitleLan == nil ? "captions.bubble" : "captions.bubble.fill"
+                    )
+                }
+            }
+            Toggle(isOn: Binding(get: { player.showStats }, set: { player.showStats = $0 })) {
+                Label("Playback Info", systemImage: "info.circle")
+            }
+        } label: {
+            Image(systemName: "slider.horizontal.3")
+                .playerChromeCapsule(horizontal: 10, minHeight: 44)
+                .accessibilityHidden(true)
+        }
+        .accessibilityLabel(Text("Player Tools"))
     }
 
     private var showsInlineMenuDanmakuSettings: Bool {
@@ -256,10 +367,13 @@ struct PlayerTopControlBar: View {
 
     private func presentInlineDanmakuPopoverFromMenu() {
         player.setDanmakuSettingsHold(true)
-        Task { @MainActor in
+        inlineDanmakuPopoverTask?.cancel()
+        inlineDanmakuPopoverTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(180))
-            guard showsInlineMenuDanmakuSettings else {
-                player.setDanmakuSettingsHold(danmakuPanelPresented)
+            guard !Task.isCancelled, showsInlineMenuDanmakuSettings else {
+                if !Task.isCancelled {
+                    player.setDanmakuSettingsHold(danmakuPanelPresented)
+                }
                 return
             }
             inlineDanmakuPopoverPresented = true

@@ -128,10 +128,6 @@ enum DanmakuTrackLayout {
 
         mutating func retarget(_ newMetrics: Metrics) {
             guard newMetrics != metrics else { return }
-            guard newMetrics.width == metrics.width else {
-                apply(newMetrics)
-                return
-            }
             metrics = newMetrics
             scrollLanes = refile(scrollLanes, kind: .scroll)
             topLanes = refile(topLanes, kind: .top)
@@ -173,23 +169,27 @@ enum DanmakuTrackLayout {
             }
         }
 
-        private mutating func occupant(for request: Request, lane: Int, lifetime: TimeInterval) -> Occupant {
-            nextSerial &+= 1
-            var extent = metrics.band(kind: request.kind, lane: lane)
-            if let band = extent, request.height > band.bottom - band.top {
-                let middle = (band.top + band.bottom) / 2
+        private func candidateExtent(for request: Request, lane: Int) -> VerticalExtent? {
+            guard var extent = metrics.band(kind: request.kind, lane: lane) else { return nil }
+            if request.height > extent.bottom - extent.top {
+                let middle = (extent.top + extent.bottom) / 2
                 extent = VerticalExtent(
                     top: middle - request.height / 2,
                     bottom: middle + request.height / 2
                 )
             }
+            return extent
+        }
+
+        private mutating func occupant(for request: Request, lane: Int, lifetime: TimeInterval) -> Occupant {
+            nextSerial &+= 1
             return Occupant(
                 serial: nextSerial,
                 direction: ScrollDirection(kind: request.kind),
                 entry: request.entry,
                 width: request.width,
                 lifetime: lifetime,
-                extent: extent
+                extent: candidateExtent(for: request, lane: lane)
             )
         }
 
@@ -225,12 +225,23 @@ enum DanmakuTrackLayout {
             return max(0, required - gap)
         }
 
+        private func isOverlapping(_ candidate: VerticalExtent?, lane: Int, occupant: Occupant, otherLane: Int) -> Bool {
+            if let candidate, let occExtent = occupant.extent {
+                return candidate.overlaps(occExtent)
+            }
+            return otherLane == lane
+        }
+
         private mutating func placeScroll(_ request: Request) -> Placement {
             var soonest: (lane: Int, delay: TimeInterval)?
             for lane in scrollLanes.indices {
+                let candidate = candidateExtent(for: request, lane: lane)
                 var delay: TimeInterval = 0
-                for occupant in scrollLanes[lane] {
-                    delay = max(delay, scrollDelay(request, behind: occupant))
+                for otherLane in scrollLanes.indices {
+                    for occupant in scrollLanes[otherLane]
+                        where isOverlapping(candidate, lane: lane, occupant: occupant, otherLane: otherLane) {
+                        delay = max(delay, scrollDelay(request, behind: occupant))
+                    }
                 }
                 if delay == 0 {
                     scrollLanes[lane].append(occupant(for: request, lane: lane, lifetime: metrics.scrollLifetime))
@@ -255,7 +266,14 @@ enum DanmakuTrackLayout {
             let lanes = band == .top ? topLanes : bottomLanes
             var soonest: (lane: Int, busyUntil: TimeInterval)?
             for lane in lanes.indices {
-                let busyUntil = lanes[lane].map(\.exit).max() ?? -.infinity
+                let candidate = candidateExtent(for: request, lane: lane)
+                var busyUntil = -TimeInterval.infinity
+                for otherLane in lanes.indices {
+                    for occupant in lanes[otherLane]
+                        where isOverlapping(candidate, lane: lane, occupant: occupant, otherLane: otherLane) {
+                        busyUntil = max(busyUntil, occupant.exit)
+                    }
+                }
                 if request.entry >= busyUntil {
                     let placed = occupant(for: request, lane: lane, lifetime: metrics.fixedLifetime)
                     store([placed], lane: lane, band: band)

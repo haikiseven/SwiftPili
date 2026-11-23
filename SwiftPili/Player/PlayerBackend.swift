@@ -118,6 +118,7 @@ protocol PlayerBackend: AnyObject {
     func revokeAudioMaintenancePermission()
 
     var playbackRate: Float { get set }
+    var effectivePlaybackRate: Float { get }
     var volume: Float { get set }
     var isMuted: Bool { get set }
 
@@ -215,6 +216,10 @@ protocol PlayerBackend: AnyObject {
 }
 
 extension PlayerBackend {
+    var effectivePlaybackRate: Float {
+        isPlaying ? playbackRate : 0
+    }
+
     var equalizerConfiguration: PlayerEqualizerConfiguration {
         get { .defaults }
         set { _ = newValue }

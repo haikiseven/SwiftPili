@@ -62,7 +62,7 @@ public struct PlaybackAuthority: Hashable, Sendable {
 
 // MARK: - Source and configuration
 
-public struct MediaResource: Sendable, Equatable {
+public struct MediaResource: Hashable, Sendable {
     public let url: URL
     public let headers: [String: String]
 
@@ -72,13 +72,13 @@ public struct MediaResource: Sendable, Equatable {
     }
 }
 
-public enum PlaybackInput: Sendable, Equatable {
+public enum PlaybackInput: Hashable, Sendable {
     case split(video: MediaResource, audio: MediaResource?)
     case muxed(MediaResource)
     case local(MediaResource)
 }
 
-public struct PlaybackSource: Sendable, Equatable {
+public struct PlaybackSource: Hashable, Sendable {
     public let id: PlaybackSourceID
     public let authority: PlaybackAuthority
     public let kind: PlaybackSourceKind
@@ -103,7 +103,7 @@ public struct PlaybackSource: Sendable, Equatable {
     }
 }
 
-public struct PlaybackDiagnosticsConfiguration: Sendable, Equatable {
+public struct PlaybackDiagnosticsConfiguration: Hashable, Sendable {
     public let enabled: Bool
     public let capacity: Int
 
@@ -115,7 +115,7 @@ public struct PlaybackDiagnosticsConfiguration: Sendable, Equatable {
     public static let disabled = PlaybackDiagnosticsConfiguration()
 }
 
-public struct PlaybackConfiguration: Sendable, Equatable {
+public struct PlaybackConfiguration: Hashable, Sendable {
     public var autoplay: Bool
     public var preferredRate: Float
     public var backgroundAudioEnabled: Bool

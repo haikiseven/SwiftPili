@@ -53,6 +53,23 @@ struct CompactSeekBar: View {
             )
         }
         .frame(height: 24)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text("Playback position"))
+        .accessibilityValue(Text("\(Int(((progress.isFinite ? min(max(progress, 0), 1) : 0) * 100).rounded()))%"))
+        .accessibilityAdjustableAction { direction in
+            let current = progress.isFinite ? min(max(progress, 0), 1) : 0
+            let next: Double
+            switch direction {
+            case .increment:
+                next = min(1, current + 0.05)
+            case .decrement:
+                next = max(0, current - 0.05)
+            @unknown default:
+                return
+            }
+            onScrub(next)
+            onCommit()
+        }
         .onChange(of: isTouching) { _, touching in
             if !touching { onCommit() }
         }

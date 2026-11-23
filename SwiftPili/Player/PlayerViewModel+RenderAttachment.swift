@@ -144,6 +144,34 @@ extension PlayerViewModel {
         return lease
     }
 
+    func upgradeOrInvalidateSurfaceSlot(
+        from outgoing: PlayerOwnerLease?,
+        to incoming: PlayerOwnerLease
+    ) {
+        guard let outgoing else {
+            invalidateSurfaceSlot(reason: "owner-lease-replacement")
+            return
+        }
+        let hasAttachment = renderAttachment != nil
+            && renderAttachmentSurfaceLease == activeSurfaceLease
+        if let upgraded = surfaceAuthority.rekeyOrInvalidate(
+            from: outgoing,
+            to: incoming,
+            hasAttachment: hasAttachment
+        ) {
+            activeSurfaceLease = upgraded
+            renderAttachmentSurfaceLease = upgraded
+            PlayerLog.log(
+                "[Surface] lease upgraded owner=\(incoming.owner) " +
+                "gen=\(outgoing.generation)→\(incoming.generation) " +
+                "role=\(upgraded.role.rawValue) token=\(upgraded.token)"
+            )
+        } else {
+            retireRenderAttachment(reason: "owner-lease-replacement")
+            activeSurfaceLease = nil
+        }
+    }
+
     func invalidateSurfaceSlot(reason: String) {
         let hadLease = activeSurfaceLease != nil
         if let ownerLease = activeSurfaceLease?.ownerLease {
@@ -205,38 +233,55 @@ extension PlayerViewModel {
         }
         renderAttachment = attachment
         renderAttachmentSurfaceLease = surfaceLease
+        var targetGeneration = playerGeneration
+        var generationReason: String?
         if usesDemandPresentationContinuity, !ownerKey.isEmpty {
             let decision = RenderDestinationDecision(phase: lifecycleRecovery.presentationPhase)
             switch decision.registration(currentRenderGeneration: playerGeneration) {
             case .adoptReservedFence:
-                advanceGeneration("adoptReservedFence")
+                targetGeneration &+= 1
+                generationReason = "adoptReservedFence"
             case .adoptTransactionDestination(let generation):
-                PlayerLog.log(
-                    "[Generation] \(playerGeneration)→\(generation) "
-                        + "why=adoptTransactionDestination"
-                )
-                playerGeneration = generation
+                targetGeneration = generation
+                if targetGeneration != playerGeneration {
+                    generationReason = "adoptTransactionDestination"
+                }
             case .newContainer:
-                advanceGeneration("newContainerRegistered")
+                targetGeneration &+= 1
+                generationReason = "newContainerRegistered"
             }
         }
-        attachment.attach(hostedVC: backend.renderViewController, generation: playerGeneration)
+        attachment.attach(hostedVC: backend.renderViewController, generation: targetGeneration)
         let snapshot = attachment.presentationSnapshot
         backend.noteDemandInlineAttachment(
-            renderGeneration: snapshot.renderGeneration ?? playerGeneration,
+            renderGeneration: snapshot.renderGeneration ?? targetGeneration,
             isVisible: snapshot.isVisible,
             boundsUsable: snapshot.boundsUsable
         )
-        if usesDemandPresentationContinuity {
-            let epoch = lifecycleRecovery.ensureDemandPresentationEpoch()
-            if let fence = makeDemandPresentationFence(epoch: epoch) {
-                let decision = RenderDestinationDecision(phase: lifecycleRecovery.presentationPhase)
-                if decision.shouldInstallInline(fence: fence) {
-                    beginDemandPresentationDebt(fence)
-                    dispatchDemandPresentation(.installInline(fence: fence))
+        if targetGeneration != playerGeneration || usesDemandPresentationContinuity {
+            Task { @MainActor [weak self, weak attachment] in
+                guard let self, let attachment,
+                      self.renderAttachment === attachment,
+                      self.renderAttachmentSurfaceLease == surfaceLease,
+                      self.isCurrentOwner(surfaceLease.ownerLease) else { return }
+                if targetGeneration != self.playerGeneration {
+                    if let generationReason {
+                        PlayerLog.log("[Generation] \(self.playerGeneration)→\(targetGeneration) why=\(generationReason)")
+                    }
+                    self.playerGeneration = targetGeneration
+                }
+                if self.usesDemandPresentationContinuity {
+                    let epoch = self.lifecycleRecovery.ensureDemandPresentationEpoch()
+                    if let fence = self.makeDemandPresentationFence(epoch: epoch) {
+                        let decision = RenderDestinationDecision(phase: self.lifecycleRecovery.presentationPhase)
+                        if decision.shouldInstallInline(fence: fence) {
+                            self.beginDemandPresentationDebt(fence)
+                            self.dispatchDemandPresentation(.installInline(fence: fence))
+                        }
+                    }
+                    self.renderAttachmentDidChange(attachment)
                 }
             }
-            renderAttachmentDidChange(attachment)
         }
         return true
     }

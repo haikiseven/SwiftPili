@@ -13,32 +13,32 @@ struct PlayerSeekStrip: View {
     @State private var stripWidth: CGFloat = 0
     @State private var isVisible = false
     @State private var scrubInteraction: ScrubInteraction?
+    @State private var cachedSponsorSegments: [SeekBarSegment] = []
     private var isOwner: Bool { isCurrentOwner && player.ownerKey == owner }
 
     var body: some View {
         if isOwner, player.mode.isSeekable, player.currentURL != nil,
            !player.isFullscreen || player.showControls || gestureDisplay.isSeeking {
-            let published = UIHitchMonitor.measureCounted("strip.body") {
-                projection(samplingClock: false)
-            }
-            let segments = sponsorBarSegments
             let interval = samplingInterval(
                 sceneIsActive: scenePhase == .active, isVisible: isVisible,
                 width: stripWidth, displayScale: displayScale
             )
             TimelineView(.animation(minimumInterval: interval ?? 0.25, paused: interval == nil)) { _ in
-                let shown = interval == nil ? published : UIHitchMonitor.measureCounted("strip.tl") {
-                    projection(samplingClock: true)
+                let shown = UIHitchMonitor.measureCounted(interval == nil ? "strip.body" : "strip.tl") {
+                    projection(samplingClock: interval != nil)
                 }
                 CompactSeekBar(
                     progress: shown.progress,
                     buffered: shown.buffered,
-                    segments: segments,
+                    segments: cachedSponsorSegments,
                     isScrubbing: gestureDisplay.isSeeking,
                     prominent: player.showControls,
                     onScrub: updateScrub,
                     onCommit: finishScrub
                 )
+            }
+            .onChange(of: sponsorCacheKey, initial: true) { _, _ in
+                cachedSponsorSegments = sponsorBarSegments
             }
             .background {
                 GeometryReader { geometry in
@@ -149,6 +149,35 @@ struct PlayerSeekStrip: View {
         let pixels = Double(width * displayScale)
         let interval = player.duration / pixels / Double(player.playbackRate)
         return min(max(interval, 1.0 / 60), 0.25)
+    }
+
+    private struct SponsorCacheKey: Equatable {
+        let usesOnlineVOD: Bool
+        let enabled: Bool
+        let showOnProgressBar: Bool
+        let duration: TimeInterval
+        let segmentIDs: [String]
+    }
+
+    private var sponsorCacheKey: SponsorCacheKey {
+        let manager = SponsorBlockManager.shared
+        let usesOnlineVOD = player.mode.usesOnlineVODServices
+        guard usesOnlineVOD, manager.isEnabled, manager.showOnProgressBar, player.duration > 0 else {
+            return SponsorCacheKey(
+                usesOnlineVOD: usesOnlineVOD,
+                enabled: manager.isEnabled,
+                showOnProgressBar: manager.showOnProgressBar,
+                duration: player.duration,
+                segmentIDs: []
+            )
+        }
+        return SponsorCacheKey(
+            usesOnlineVOD: true,
+            enabled: true,
+            showOnProgressBar: true,
+            duration: player.duration,
+            segmentIDs: manager.segments.map(\.uuid)
+        )
     }
 
     private var sponsorBarSegments: [SeekBarSegment] {

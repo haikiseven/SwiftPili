@@ -14,7 +14,7 @@ extension PlayerViewModel {
         ownerLease: PlayerOwnerLease? = nil,
         mediaResetID: UUID? = nil
     ) async -> Int? {
-        await Task {
+        let loadTask = Task {
             await performLoadLive(
                 roomID: roomID,
                 quality: quality,
@@ -24,7 +24,12 @@ extension PlayerViewModel {
                 ownerLease: ownerLease,
                 mediaResetID: mediaResetID
             )
-        }.value
+        }
+        return await withTaskCancellationHandler {
+            await loadTask.value
+        } onCancel: {
+            loadTask.cancel()
+        }
     }
 
     private func openResolvedLiveTuple(
@@ -130,7 +135,6 @@ extension PlayerViewModel {
         if !sameContent {
             nowPlayingMeta = nil
         }
-        terminalOpenFailure = true
         stop(reason: teardownReason, mediaResetID: mediaResetID)
         presentationResetPendingForOwnerChange = false
         resetMultiConnectionDisplay()
@@ -148,6 +152,7 @@ extension PlayerViewModel {
         if !preservePlayState {
             playbackIntent = .playing
         }
+        terminalOpenFailure = false
         error = nil
         unavailability = nil
         availableQualities = []
@@ -206,7 +211,9 @@ extension PlayerViewModel {
 
             guard let url = resolveLiveURL(playInfo) else {
                 guard settleResetPreOpenFailure(loadCompletion, retryable: true) else { return nil }
-                error = String(localized: "No live stream URL found")
+                settleTerminalFailure(TerminalFailurePayload(
+                    message: String(localized: "No live stream URL found")
+                ))
                 return nil
             }
             publishLiveQualityStats(quality, from: playInfo)
@@ -241,9 +248,10 @@ extension PlayerViewModel {
                 markUnavailable(reason, detail: "loadLive")
                 return nil
             }
-            self.error = error.localizedDescription
-            isBuffering = false
-            PlayerLog.log("[Player] loadLive failed: \(error)")
+            settleTerminalFailure(TerminalFailurePayload(
+                message: error.localizedDescription,
+                logMessage: "[Player] loadLive failed: \(error)"
+            ))
             return nil
         }
     }

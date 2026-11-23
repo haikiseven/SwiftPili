@@ -138,9 +138,10 @@ extension PlayerViewModel {
             case .coalesced(let token):
                 handleCoalescedWatchdogRecovery(token: token, fault: fault, at: recoverTo)
             case .rejected(.budgetExhausted):
-                PlayerLog.log("[Player] ❌ decoder still dead after \(budget.decoderReloads) source-aware reopens — surfacing Retry")
-                error = String(localized: "Video decoder failed. Tap Retry.")
-                isBuffering = false
+                settleTerminalFailure(TerminalFailurePayload(
+                    message: String(localized: "Video decoder failed. Tap Retry."),
+                    logMessage: "[Player] ❌ decoder still dead after \(budget.decoderReloads) source-aware reopens — surfacing Retry"
+                ))
             case .rejected:
                 break
             }
@@ -220,9 +221,10 @@ extension PlayerViewModel {
                 PlayerLog.log("[Player] \(fault.rawValue) #\(streak) — \(rejection), not terminal; re-evaluated next tick")
                 return
             }
-            PlayerLog.log("[Player] ❌ \(fault.rawValue) #\(streak) — \(rejection), surfacing Retry")
-            error = String(localized: "Playback timed out. Try again.")
-            isBuffering = false
+            settleTerminalFailure(TerminalFailurePayload(
+                message: String(localized: "Playback timed out. Try again."),
+                logMessage: "[Player] ❌ \(fault.rawValue) #\(streak) — \(rejection), surfacing Retry"
+            ))
         }
     }
 
@@ -248,6 +250,10 @@ extension PlayerViewModel {
             )
             if nonLifecycleRecoveryTicket?.token == token {
                 nonLifecycleRecoveryTicket = nil
+            }
+            if nonLifecycleRecoveryTask?.token == token {
+                nonLifecycleRecoveryTask?.task.cancel()
+                nonLifecycleRecoveryTask = nil
             }
             if pendingLifecycleAdmission?.token == token || lifecycleReadinessFence?.admissionToken == token {
                 if let epoch = pendingLifecycleAdmission?.epoch ?? lifecycleReadinessFence?.lifecycleEpoch {

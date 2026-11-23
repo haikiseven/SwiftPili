@@ -34,8 +34,8 @@ final class DemandPacedPlayerBackend: PlayerBackend {
     private struct SeekRequest {
         let serial: UInt64
         let target: TimeInterval
-        let completion: (@MainActor @Sendable (Bool) -> Void)?
-        let nativePiPRequest: EnginePiPSeekRequest?
+        let gate: SeekCompletionGate
+        let nativePiPOwnerGeneration: UInt64?
     }
 
     private struct RuntimeFaultDeliveryKey: Equatable {
@@ -138,6 +138,19 @@ final class DemandPacedPlayerBackend: PlayerBackend {
     var playbackRate: Float {
         get { session.playbackRate }
         set { session.playbackRate = newValue }
+    }
+
+    var effectivePlaybackRate: Float {
+        guard isPlaying, pendingSeekTarget == nil else { return 0 }
+        if session.queuedAudioRunway != nil {
+            switch audioOutputAvailability {
+            case .available, .fillOnly:
+                break
+            case .stopped, .pending, .unavailable:
+                return 0
+            }
+        }
+        return max(0, playbackRate)
     }
 
     var volume: Float = 1.0 {
@@ -639,14 +652,19 @@ final class DemandPacedPlayerBackend: PlayerBackend {
         seekSerial &+= 1
         let replaced = queuedSeekRequest
         let request = SeekRequest(
-            serial: seekSerial, target: time, completion: completion,
-            nativePiPRequest: nativePiPRequest
+            serial: seekSerial,
+            target: time,
+            gate: SeekCompletionGate(
+                completion: completion,
+                nativePiPRequest: nativePiPRequest
+            ),
+            nativePiPOwnerGeneration: nativePiPRequest?.ownerGeneration
         )
         queuedSeekRequest = request
         pendingSeekTarget = time
         logSeekTrace(phase: "request", serial: request.serial, target: time)
         startSeekWorkerIfNeeded()
-        replaced?.nativePiPRequest?.finish(success: false)
+        replaced?.gate.settle(false)
     }
 
     private func startSeekWorkerIfNeeded() {
@@ -673,10 +691,9 @@ final class DemandPacedPlayerBackend: PlayerBackend {
 
         while epoch == seekEpoch, !Task.isCancelled, let request = queuedSeekRequest {
             queuedSeekRequest = nil
-            var nativeSucceeded = false
-            defer { request.nativePiPRequest?.finish(success: nativeSucceeded) }
-            if let native = request.nativePiPRequest,
-               native.ownerGeneration != runtimeGeneration || !session.isReady {
+            defer { request.gate.settle(false) }
+            if let ownerGen = request.nativePiPOwnerGeneration,
+               ownerGen != runtimeGeneration || !session.isReady {
                 if request.serial == seekSerial { pendingSeekTarget = nil }
                 continue
             }
@@ -704,9 +721,7 @@ final class DemandPacedPlayerBackend: PlayerBackend {
             activePreparedSeek = prepared
 
             guard request.serial == seekSerial,
-                  request.nativePiPRequest.map({
-                      $0.ownerGeneration == runtimeGeneration
-                  }) ?? true else {
+                  request.nativePiPOwnerGeneration.map({ $0 == runtimeGeneration }) ?? true else {
                 activePreparedSeek = nil
                 session.abortPreparedSeek(prepared)
                 logSeekTrace(
@@ -746,7 +761,7 @@ final class DemandPacedPlayerBackend: PlayerBackend {
                     ready: false,
                     result: false
                 )
-                request.completion?(false)
+                request.gate.settle(false)
                 continue
             }
 
@@ -763,8 +778,8 @@ final class DemandPacedPlayerBackend: PlayerBackend {
                     guard let self else { return false }
                     return self.seekEpoch == epoch
                         && self.seekSerial == request.serial
-                        && (request.nativePiPRequest.map {
-                            $0.ownerGeneration == self.runtimeGeneration
+                        && (request.nativePiPOwnerGeneration.map {
+                            $0 == self.runtimeGeneration
                         } ?? true)
                 }
             )
@@ -793,9 +808,7 @@ final class DemandPacedPlayerBackend: PlayerBackend {
             }
 
             guard request.serial == seekSerial,
-                  request.nativePiPRequest.map({
-                      $0.ownerGeneration == runtimeGeneration
-                  }) ?? true else {
+                  request.nativePiPOwnerGeneration.map({ $0 == runtimeGeneration }) ?? true else {
                 session.abortPreparedSeek(prepared)
                 logSeekTrace(
                     phase: "abort",
@@ -829,21 +842,18 @@ final class DemandPacedPlayerBackend: PlayerBackend {
                 ready: prepared.isReady,
                 result: ok
             )
-            request.completion?(ok)
-            nativeSucceeded = ok && epoch == seekEpoch && request.serial == seekSerial
+            request.gate.settle(ok && epoch == seekEpoch && request.serial == seekSerial)
         }
     }
 
     private func invalidateSeekCoordinator() {
         revokeAudioMaintenancePermission()
         if activePreparedSeek == nil,
-           let queued = queuedSeekRequest ?? (pendingSeekTarget.map {
-               SeekRequest(serial: seekSerial, target: $0, completion: nil, nativePiPRequest: nil)
-           }) {
+           let target = queuedSeekRequest?.target ?? pendingSeekTarget {
             logSeekTrace(
                 phase: "abort",
-                serial: queued.serial,
-                target: queued.target,
+                serial: queuedSeekRequest?.serial ?? seekSerial,
+                target: target,
                 ready: false,
                 result: false
             )
@@ -855,7 +865,7 @@ final class DemandPacedPlayerBackend: PlayerBackend {
         queuedSeekRequest = nil
         seekWorkerTask?.cancel()
         pendingSeekTarget = nil
-        discarded?.nativePiPRequest?.finish(success: false)
+        discarded?.gate.settle(false)
     }
 
     private func abortActivePreparedSeek() {

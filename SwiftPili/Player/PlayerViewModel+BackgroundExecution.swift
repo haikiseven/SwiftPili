@@ -70,6 +70,7 @@ extension PlayerViewModel {
         backend.setAudioOutputStateChangeHandler { [weak self] in
             guard let self, ObjectIdentifier(self.backend) == identity else { return }
             self.handleNativeAudioOutputChange()
+            self.syncDanmakuTransport()
         }
     }
 

@@ -64,7 +64,10 @@ struct PlayerFullscreenHostContent: View {
     @State private var fullscreenDanmakuDraftReceipt: PlayerViewModel.FullscreenDanmakuDraftReceipt?
     private var keepsVODFullscreenDraft: Bool {
         if case .vod = receipt.context.source { return true }
-        return false
+        switch receipt.context.route {
+        case .video, .bangumi: return true
+        case .live, .offline: return false
+        }
     }
     private var isCurrentVODFullscreenDraft: Bool {
         fullscreenDanmakuDraftReceipt.map(player.isCurrentFullscreenDanmakuDraft) ?? false
@@ -132,6 +135,7 @@ struct PlayerFullscreenHostContent: View {
                            maxHeight: inlineTargetFrame == nil ? .infinity : nil)
                     .offset(x: inlineTargetFrame?.minX ?? 0,
                             y: inlineTargetFrame?.minY ?? inlineTopInset ?? 0)
+                    .opacity(player.isFullscreen ? 1 : 0)
             }
         }
         .ignoresSafeArea()

@@ -11,32 +11,60 @@ using namespace metal;
 
 struct NV12ConvertParams {
     uint fullRange;
+    uint colorMatrix; // 0 = BT.709, 1 = BT.601, 2 = BT.2020
 };
 
 kernel void nv12ToBGRA(
     texture2d<float, access::read> yTexture [[texture(0)]],
-    texture2d<float, access::read> cbcrTexture [[texture(1)]],
+    texture2d<float, access::sample> cbcrTexture [[texture(1)]],
     texture2d<float, access::write> outTexture [[texture(2)]],
     constant NV12ConvertParams &params [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    if (gid.x >= outTexture.get_width() || gid.y >= outTexture.get_height()) {
+    uint width = outTexture.get_width();
+    uint height = outTexture.get_height();
+    if (gid.x >= width || gid.y >= height) {
         return;
     }
+    constexpr sampler chromaSampler(coord::normalized, address::clamp_to_edge, filter::linear);
     float y = yTexture.read(gid).r;
-    float2 cbcr = cbcrTexture.read(gid / 2).rg - float2(0.5, 0.5);
-    float yAdj = params.fullRange != 0 ? y : clamp((y - 16.0 / 255.0) * (255.0 / 219.0), 0.0, 1.0);
-    float cb = params.fullRange != 0 ? cbcr.x : cbcr.x * (255.0 / 224.0);
-    float cr = params.fullRange != 0 ? cbcr.y : cbcr.y * (255.0 / 224.0);
-    float r = clamp(yAdj + 1.5748 * cr, 0.0, 1.0);
-    float g = clamp(yAdj - 0.1873 * cb - 0.4681 * cr, 0.0, 1.0);
-    float b = clamp(yAdj + 1.8556 * cb, 0.0, 1.0);
-    outTexture.write(float4(r, g, b, 1.0), gid);
+    float2 uv = (float2(gid) + 0.5f) / float2(width, height);
+    float2 cbcr = cbcrTexture.sample(chromaSampler, uv).rg - float2(0.5f, 0.5f);
+    float yAdj = params.fullRange != 0 ? y : clamp((y - 16.0f / 255.0f) * (255.0f / 219.0f), 0.0f, 1.0f);
+    float cb = params.fullRange != 0 ? cbcr.x : cbcr.x * (255.0f / 224.0f);
+    float cr = params.fullRange != 0 ? cbcr.y : cbcr.y * (255.0f / 224.0f);
+
+    float crv, cgu, cgv, cbu;
+    if (params.colorMatrix == 1) {
+        // BT.601
+        crv = 1.402f;
+        cgu = 0.344136f;
+        cgv = 0.714136f;
+        cbu = 1.772f;
+    } else if (params.colorMatrix == 2) {
+        // BT.2020
+        crv = 1.4746f;
+        cgu = 0.164553f;
+        cgv = 0.571353f;
+        cbu = 1.8814f;
+    } else {
+        // BT.709
+        crv = 1.5748f;
+        cgu = 0.187324f;
+        cgv = 0.468124f;
+        cbu = 1.8556f;
+    }
+
+    float r = clamp(yAdj + crv * cr, 0.0f, 1.0f);
+    float g = clamp(yAdj - cgu * cb - cgv * cr, 0.0f, 1.0f);
+    float b = clamp(yAdj + cbu * cb, 0.0f, 1.0f);
+    outTexture.write(float4(r, g, b, 1.0f), gid);
 }
 """
 
 private struct NV12ConvertParams {
     var fullRange: UInt32
+    var colorMatrix: UInt32
 }
 
 final class MetalFXSuperResolutionBackend {
@@ -247,7 +275,7 @@ final class MetalFXSuperResolutionBackend {
         }
         withExtendedLifetime((retainedInputs, outputCVTexture)) {}
         guard succeeded else { return .bypassed(reason: "MetalFX GPU error") }
-        CVBufferPropagateAttachments(pixelBuffer, destBuffer)
+        ScaledVideoOutputMetadata.copy(from: pixelBuffer, to: destBuffer, colorSpace: .rgbConverted)
         return .processed(destBuffer)
     }
 
@@ -284,7 +312,8 @@ final class MetalFXSuperResolutionBackend {
         let compute = commandBuffer.makeComputeCommandEncoder() else { return nil }
 
         var params = NV12ConvertParams(
-            fullRange: pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ? 1 : 0
+            fullRange: pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ? 1 : 0,
+            colorMatrix: Self.colorMatrixIndex(for: pixelBuffer, width: size.0, height: size.1)
         )
         compute.setComputePipelineState(convertPipeline)
         compute.setTexture(yTex, index: 0)
@@ -300,6 +329,22 @@ final class MetalFXSuperResolutionBackend {
         compute.dispatchThreadgroups(gridSize, threadsPerThreadgroup: tgSize)
         compute.endEncoding()
         return [yCV, cbcrCV]
+    }
+
+    private static func colorMatrixIndex(for pixelBuffer: CVPixelBuffer, width: Int, height: Int) -> UInt32 {
+        if let matrix = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, nil) {
+            if CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4)
+                || CFEqual(matrix, kCVImageBufferYCbCrMatrix_SMPTE_240M_1995) {
+                return 1
+            }
+            if CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_2020) {
+                return 2
+            }
+            if CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2) {
+                return 0
+            }
+        }
+        return (width <= 720 && height <= 576) ? 1 : 0
     }
 
     private func encodeScaleAndBlit(

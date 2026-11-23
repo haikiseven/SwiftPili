@@ -1,6 +1,74 @@
 import AVFoundation
+import CoreImage
 import Foundation
 import UIKit
+
+@MainActor
+final class AmbientLiveFrameBroadcaster {
+    static let shared = AmbientLiveFrameBroadcaster()
+
+    private struct WeakSink {
+        weak var view: AmbientLiveLayerHostView?
+    }
+
+    private nonisolated static let processingQueue = DispatchQueue(label: "ambient.live.blur", qos: .utility)
+    private nonisolated static let ciContext = CIContext(
+        options: [.useSoftwareRenderer: false, .cacheIntermediates: false]
+    )
+
+    private var generation: UInt64 = 0
+    private(set) var currentFrame: CGImage?
+    private var sinks: [ObjectIdentifier: WeakSink] = [:]
+
+    func register(_ view: AmbientLiveLayerHostView) {
+        sinks[ObjectIdentifier(view)] = WeakSink(view: view)
+        view.apply(frame: currentFrame, animated: false)
+    }
+
+    func unregister(_ view: AmbientLiveLayerHostView) {
+        sinks.removeValue(forKey: ObjectIdentifier(view))
+    }
+
+    func clear() {
+        generation &+= 1
+        currentFrame = nil
+        broadcast(nil, animated: false)
+    }
+
+    func submitSample(_ image: UIImage, blurRadius: CGFloat = 6.5) {
+        guard let cgImage = image.cgImage else { return }
+        let expectedGeneration = generation
+        Self.processingQueue.async {
+            let extent = CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height)
+            let input = CIImage(cgImage: cgImage).clampedToExtent()
+            let blurred = input.applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: blurRadius])
+            let saturated = blurred.applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: 1.18])
+            let cropped = saturated.cropped(to: extent)
+            guard let output = Self.ciContext.createCGImage(cropped, from: extent) else { return }
+            Task { @MainActor in
+                AmbientLiveFrameBroadcaster.shared.publish(output, generation: expectedGeneration)
+            }
+        }
+    }
+
+    private func publish(_ frame: CGImage, generation expected: UInt64) {
+        guard expected == generation else { return }
+        currentFrame = frame
+        broadcast(frame, animated: true)
+    }
+
+    private func broadcast(_ frame: CGImage?, animated: Bool) {
+        var dead: [ObjectIdentifier] = []
+        for (id, entry) in sinks {
+            if let view = entry.view {
+                view.apply(frame: frame, animated: animated)
+            } else {
+                dead.append(id)
+            }
+        }
+        for id in dead { sinks.removeValue(forKey: id) }
+    }
+}
 
 extension PlayerViewModel {
 
@@ -87,7 +155,8 @@ extension PlayerViewModel {
         ambientVideoLoadedOwner = nil
         ambientSelectionContent = nil
         ambientSelectionSource = nil
-        ambientLiveImage = nil
+        if ambientLiveImage != nil { ambientLiveImage = nil }
+        AmbientLiveFrameBroadcaster.shared.clear()
         lastAmbientLiveSampleWall = 0
         ambientStoryboard = []
         ambientStoryboardOwnerLease = nil
@@ -115,7 +184,7 @@ extension PlayerViewModel {
             return
         }
         lastAmbientLiveSampleWall = now
-        ambientLiveImage = image
+        AmbientLiveFrameBroadcaster.shared.submitSample(image)
     }
 
     func setAmbientCoverURL(_ url: String?, ownerLease: PlayerOwnerLease) {

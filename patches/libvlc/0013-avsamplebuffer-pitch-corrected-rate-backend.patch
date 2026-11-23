@@ -1,10 +1,11 @@
 --- a/modules/audio_output/apple/avsamplebuffer.m
 +++ b/modules/audio_output/apple/avsamplebuffer.m
-@@ -23,10 +23,13 @@
+@@ -23,10 +23,14 @@
  #import <TargetConditionals.h>
  #import <Foundation/Foundation.h>
  #import <AVFoundation/AVFoundation.h>
 +#import <mach/mach_time.h>   /* VLCAudioEngine timing (render hostTime → vlc_tick) */
++#import <os/lock.h>          /* VLCAudioEngine _stateLock */
  
  #import <vlc_common.h>
  #import <vlc_plugin.h>
@@ -14,7 +15,7 @@
  
  #if TARGET_OS_IPHONE || TARGET_OS_TV || TARGET_OS_VISION
  #define HAS_AVAUDIOSESSION
-@@ -78,6 +81,11 @@ API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS) VISIONOS_API_AVAILA
+@@ -78,6 +82,11 @@ API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS) VISIONOS_API_AVAILA
      unsigned _sampleRate;
      BOOL _stopped;
      BOOL _dateReached;
@@ -26,7 +27,7 @@
  }
  @end
  
-@@ -99,6 +107,7 @@ API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS) VISIONOS_API_AVAILA
+@@ -99,6 +108,7 @@ API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS) VISIONOS_API_AVAILA
  
      _outChain = NULL;
      _outChainLast = &_outChain;
@@ -34,7 +35,7 @@
  
      /* The first call to CMAudioFormatDescriptionCreate() might take some time
       * (between 200 and 600ms) as it is initializing some static context/libs.
-@@ -234,6 +243,10 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+@@ -234,6 +244,10 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
      _dateReached = NO;
      _firstPts = VLC_TICK_INVALID;
      _lastDate = VLC_TICK_INVALID;
@@ -45,7 +46,7 @@
  }
  
  - (void)pause:(BOOL)pause date:(vlc_tick_t)date
-@@ -254,6 +267,95 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+@@ -254,6 +268,95 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
      vlc_tick_t pos_ticks = [VLCAVSample CMTimeTotick:time] + _firstPts;
  
      aout_TimingReport(_aout, system_now, pos_ticks);
@@ -141,7 +142,7 @@
  }
  
  - (void)startNow:(vlc_tick_t)delta
-@@ -343,7 +445,12 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+@@ -343,7 +446,12 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
          CFRelease(buffer);
      }
  
@@ -154,7 +155,7 @@
  }
  
  - (void)play:(block_t *)block date:(vlc_tick_t)date
-@@ -387,6 +494,7 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+@@ -387,6 +495,7 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
          [_sync removeTimeObserver:_observer];
  
      _stopped = YES;
@@ -162,7 +163,7 @@
  
      block_ChainRelease(_outChain);
      _outChain = NULL;
-@@ -546,10 +654,1450 @@ error_avas:
+@@ -546,10 +655,1590 @@ error_avas:
  
  @end
  
@@ -288,6 +289,10 @@
 +    AVAudioPlayerNode  *_player;
 +    AVAudioFormat      *_format;
 +    dispatch_queue_t    _queue;
++    dispatch_queue_t    _callbackQueue;
++    os_unfair_lock      _stateLock;
++    BOOL                _closed;
++    uint64_t            _sessionGen;
 +    filter_t           *_tempo;
 +    audio_sample_format_t _fmtAudio;
 +    BOOL                _fmtValid;
@@ -381,6 +386,10 @@
 +    if (self != nil) {
 +        _aout = aout;
 +        _queue = dispatch_queue_create("org.videolan.avaudioengine", DISPATCH_QUEUE_SERIAL);
++        _callbackQueue = dispatch_queue_create("org.videolan.avaudioengine.callback", DISPATCH_QUEUE_SERIAL);
++        _stateLock = OS_UNFAIR_LOCK_INIT;
++        _closed = NO;
++        _sessionGen = 1;
 +        _firstPts = VLC_TICK_INVALID;
 +        _startDate = VLC_TICK_INVALID;
 +        _volume = 1.f;
@@ -411,6 +420,32 @@
 +}
 +
 +#pragma mark helpers
++
++- (BOOL)isClosedLockedOrSnapshotGen:(uint64_t *)outGen
++{
++    os_unfair_lock_lock(&_stateLock);
++    BOOL closed = _closed || _aout == NULL;
++    if (outGen != NULL)
++        *outGen = _sessionGen;
++    os_unfair_lock_unlock(&_stateLock);
++    return closed;
++}
++
++- (void)dispatchCallbackWithGen:(uint64_t)gen
++                          block:(void (^)(audio_output_t *aout))block
++{
++    __weak typeof(self) weakSelf = self;
++    dispatch_async(_callbackQueue, ^{
++        VLCAudioEngine *s = weakSelf;
++        if (s == nil) return;
++        os_unfair_lock_lock(&s->_stateLock);
++        audio_output_t *aout = (!s->_closed && s->_aout != NULL && gen == s->_sessionGen)
++            ? s->_aout : NULL;
++        os_unfair_lock_unlock(&s->_stateLock);
++        if (aout != NULL)
++            block(aout);
++    });
++}
 +
 +/* FEED-DIAG: last successful enqueue age in ms (0 if never enqueued). */
 +- (int64_t)lastEnqueueAgoMsLocked
@@ -806,6 +841,8 @@
 +            VLCAudioEngine *s = weakSelf;
 +            if (s == nil || s->_epoch != epoch)
 +                return;
++            if ([s isClosedLockedOrSnapshotGen:NULL])
++                return;
 +            [s wallPlayedOut:w content:c];
 +        });
 +    }];
@@ -822,7 +859,12 @@
 +    [self observeFeedUnderrunLocked];
 +    if (_draining && _pendingWall == 0 && _rawChain == NULL) {
 +        _draining = NO;
-+        aout_DrainedReport(_aout);
++        uint64_t gen = 0;
++        if (![self isClosedLockedOrSnapshotGen:&gen]) {
++            [self dispatchCallbackWithGen:gen block:^(audio_output_t *aout) {
++                aout_DrainedReport(aout);
++            }];
++        }
 +    }
 +}
 +
@@ -982,6 +1024,8 @@
 +        NSUInteger type = [note.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
 +        if (type == AVAudioSessionInterruptionTypeBegan) {
 +            dispatch_async(s->_queue, ^{
++                if ([s isClosedLockedOrSnapshotGen:NULL])
++                    return;
 +                s->_interrupted = YES;
 +                if (s->_player != nil)
 +                    [s->_player pause];
@@ -992,6 +1036,8 @@
 +            NSUInteger opts =
 +                [note.userInfo[AVAudioSessionInterruptionOptionKey] unsignedIntegerValue];
 +            dispatch_async(s->_queue, ^{
++                if ([s isClosedLockedOrSnapshotGen:NULL])
++                    return;
 +                s->_interrupted = NO;
 +                if ((opts & AVAudioSessionInterruptionOptionShouldResume) != 0
 +                    && !s->_paused) {
@@ -1011,12 +1057,18 @@
 +            [note.userInfo[AVAudioSessionRouteChangeReasonKey] integerValue];
 +        if (reason == AVAudioSessionRouteChangeReasonNewDeviceAvailable
 +         || reason == AVAudioSessionRouteChangeReasonOldDeviceUnavailable) {
-+            msg_Warn(s->_aout, "[avae] route change %ld → aout restart", (long)reason);
-+            aout_RestartRequest(s->_aout, false);
++            uint64_t gen = 0;
++            if ([s isClosedLockedOrSnapshotGen:&gen])
++                return;
++            [s dispatchCallbackWithGen:gen block:^(audio_output_t *aout) {
++                msg_Warn(aout, "[avae] route change %ld → aout restart", (long)reason);
++                aout_RestartRequest(aout, false);
++            }];
 +        }
 +    }];
 +#endif
 +    __weak typeof(self) weakSelf2 = self;
++    __weak AVAudioEngine *expectedEngine = _engine;
 +    _obsEngineConfig =
 +        [[NSNotificationCenter defaultCenter]
 +            addObserverForName:AVAudioEngineConfigurationChangeNotification
@@ -1024,10 +1076,16 @@
 +                    usingBlock:^(NSNotification *note) {
 +        VLCAudioEngine *s = weakSelf2;
 +        if (s == nil) return;
-+        if (note.object != nil && s->_engine != nil && note.object != s->_engine)
++        AVAudioEngine *eng = expectedEngine;
++        if (note.object != nil && eng != nil && note.object != eng)
 +            return;
-+        msg_Warn(s->_aout, "[avae] engine configuration change → aout restart");
-+        aout_RestartRequest(s->_aout, false);
++        uint64_t gen = 0;
++        if ([s isClosedLockedOrSnapshotGen:&gen])
++            return;
++        [s dispatchCallbackWithGen:gen block:^(audio_output_t *aout) {
++            msg_Warn(aout, "[avae] engine configuration change → aout restart");
++            aout_RestartRequest(aout, false);
++        }];
 +    }];
 +}
 +
@@ -1043,6 +1101,8 @@
 +
 +- (BOOL)start:(audio_sample_format_t *)fmt
 +{
++    if ([self isClosedLockedOrSnapshotGen:NULL])
++        return NO;
 +    if (aout_BitsPerSample(fmt->i_format) == 0)
 +        return NO;
 +    fmt->i_format = VLC_CODEC_FL32;
@@ -1133,7 +1193,9 @@
 +            goto error;
 +        }
 +    }
-+    [self applyMixerGain];
++    {
++        dispatch_sync(_queue, ^{ [self applyMixerGain]; });
++    }
 +    [self registerObservers];
 +
 +    {
@@ -1162,9 +1224,43 @@
 +                   AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation);
 +#endif
 +    [self unregisterObservers];
-+    [self closeTempoLocked];
-+    _engine = nil; _player = nil; _format = nil;
++    dispatch_sync(_queue, ^{
++        [self closeTempoLocked];
++        self->_engine = nil; self->_player = nil; self->_format = nil;
++    });
 +    return NO;
++}
++
++- (void)teardownOnQueueLocked
++{
++    os_unfair_lock_lock(&_stateLock);
++    _sessionGen++;
++    os_unfair_lock_unlock(&_stateLock);
++    _epoch++;
++    _started = NO;
++    _dateReached = NO;
++    _paused = NO;
++    _interrupted = NO;
++    _pendingWall = 0;
++    _draining = NO;
++    _firstPts = VLC_TICK_INVALID;
++    _startDate = VLC_TICK_INVALID;
++    _scheduledWallFrames = 0;
++    _playedWallFrames = 0;
++    _contentIn = 0;
++    _contentConsumed = 0;
++    [self resetWallTimelineLocked];
++    _playbackRate = 1.f;
++    [self dropRawLocked];
++    if (_player != nil)
++        [_player stop];
++    if (_engine != nil)
++        [_engine stop];
++    [self closeTempoLocked];
++    _player = nil;
++    _engine = nil;
++    _format = nil;
++    _fmtValid = NO;
 +}
 +
 +- (void)stop
@@ -1174,36 +1270,15 @@
 +        _timingTimer = nil;
 +    }
 +    [self unregisterObservers];
-+    dispatch_sync(_queue, ^{
-+        self->_epoch++;
-+        self->_started = NO;
-+        self->_dateReached = NO;
-+        self->_paused = NO;
-+        self->_interrupted = NO;
-+        self->_pendingWall = 0;
-+        self->_draining = NO;
-+        self->_firstPts = VLC_TICK_INVALID;
-+        self->_startDate = VLC_TICK_INVALID;
-+        self->_scheduledWallFrames = 0;
-+        self->_playedWallFrames = 0;
-+        self->_contentIn = 0;
-+        self->_contentConsumed = 0;
-+        [self resetWallTimelineLocked];
-+        self->_playbackRate = 1.f;
-+        [self dropRawLocked];
-+        if (self->_player != nil)
-+            [self->_player stop];
-+        if (self->_engine != nil)
-+            [self->_engine stop];
-+        [self closeTempoLocked];
-+        self->_player = nil;
-+        self->_engine = nil;
-+        self->_format = nil;
-+        self->_fmtValid = NO;
-+    });
++    dispatch_sync(_queue, ^{ [self teardownOnQueueLocked]; });
 +#ifdef HAS_AVAUDIOSESSION
-+    avas_SetActive(_aout, [AVAudioSession sharedInstance], false,
-+                   AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation);
++    os_unfair_lock_lock(&_stateLock);
++    audio_output_t *aout = (!_closed && _aout != NULL) ? _aout : NULL;
++    os_unfair_lock_unlock(&_stateLock);
++    if (aout != NULL) {
++        avas_SetActive(aout, [AVAudioSession sharedInstance], false,
++                       AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation);
++    }
 +#endif
 +}
 +
@@ -1216,6 +1291,10 @@
 +        return;
 +    }
 +    dispatch_async(_queue, ^{
++        if ([self isClosedLockedOrSnapshotGen:NULL]) {
++            block_Release(block);
++            return;
++        }
 +        if (self->_startDate == VLC_TICK_INVALID && date != VLC_TICK_INVALID)
 +            self->_startDate = date;
 +        if (self->_player == nil && self->_engine == nil) {
@@ -1280,6 +1359,8 @@
 +     * queue on 2→1 — reopen tempo ONLY on 1→2 (unityCross && !nextUnity).
 +     * 2→1: setTempoRate only (no reopen) to avoid dirty release recovery. */
 +    dispatch_async(_queue, ^{
++        if ([self isClosedLockedOrSnapshotGen:NULL])
++            return;
 +        float prev = self->_playbackRate;
 +        if (fabsf(prev - rate) < kAVAEUnityEpsilon)
 +            return;
@@ -1340,6 +1421,9 @@
 +
 +- (void)reportTiming
 +{
++    uint64_t gen = 0;
++    if ([self isClosedLockedOrSnapshotGen:&gen])
++        return;
 +    if (_player == nil || _firstPts == VLC_TICK_INVALID || _rate == 0)
 +        return;
 +    if (_interrupted || _paused)
@@ -1493,7 +1577,9 @@
 +        _diagPrevAudio = audio_ts;
 +    }
 +    _diagTick++;
-+    aout_TimingReport(_aout, system_ts, audio_ts);
++    [self dispatchCallbackWithGen:gen block:^(audio_output_t *aout) {
++        aout_TimingReport(aout, system_ts, audio_ts);
++    }];
 +}
 +
 +#pragma mark pause / flush / drain / volume
@@ -1502,6 +1588,8 @@
 +{
 +    (void)date;
 +    dispatch_async(_queue, ^{
++        if ([self isClosedLockedOrSnapshotGen:NULL])
++            return;
 +        self->_paused = pause;
 +        if (self->_player == nil)
 +            return;
@@ -1519,6 +1607,9 @@
 +{
 +    dispatch_sync(_queue, ^{
 +        /* Seek/discontinuity only — drop wall + raw; reopen scaletempo clean. */
++        os_unfair_lock_lock(&self->_stateLock);
++        self->_sessionGen++;
++        os_unfair_lock_unlock(&self->_stateLock);
 +        self->_epoch++;
 +        if (self->_player != nil)
 +            [self->_player stop];
@@ -1566,11 +1657,17 @@
 +- (void)drain
 +{
 +    dispatch_async(_queue, ^{
++        uint64_t gen = 0;
++        if ([self isClosedLockedOrSnapshotGen:&gen])
++            return;
 +        [self feedWallFromRawLocked];
-+        if (self->_pendingWall == 0 && self->_rawChain == NULL)
-+            aout_DrainedReport(self->_aout);
-+        else
++        if (self->_pendingWall == 0 && self->_rawChain == NULL) {
++            [self dispatchCallbackWithGen:gen block:^(audio_output_t *aout) {
++                aout_DrainedReport(aout);
++            }];
++        } else {
 +            self->_draining = YES;
++        }
 +    });
 +}
 +
@@ -1591,16 +1688,60 @@
 +
 +- (void)setVolume:(float)volume
 +{
-+    _volume = volume;
-+    dispatch_async(_queue, ^{ [self applyMixerGain]; });
-+    aout_VolumeReport(_aout, volume);
++    os_unfair_lock_lock(&_stateLock);
++    audio_output_t *aout = (!_closed && _aout != NULL) ? _aout : NULL;
++    os_unfair_lock_unlock(&_stateLock);
++    if (aout == NULL)
++        return;
++    dispatch_async(_queue, ^{
++        if ([self isClosedLockedOrSnapshotGen:NULL])
++            return;
++        self->_volume = volume;
++        [self applyMixerGain];
++    });
++    aout_VolumeReport(aout, volume);
 +}
 +
 +- (void)setMute:(BOOL)mute
 +{
-+    _muted = mute;
-+    dispatch_async(_queue, ^{ [self applyMixerGain]; });
-+    aout_MuteReport(_aout, mute);
++    os_unfair_lock_lock(&_stateLock);
++    audio_output_t *aout = (!_closed && _aout != NULL) ? _aout : NULL;
++    os_unfair_lock_unlock(&_stateLock);
++    if (aout == NULL)
++        return;
++    dispatch_async(_queue, ^{
++        if ([self isClosedLockedOrSnapshotGen:NULL])
++            return;
++        self->_muted = mute;
++        [self applyMixerGain];
++    });
++    aout_MuteReport(aout, mute);
++}
++
++- (void)invalidateForClose
++{
++    os_unfair_lock_lock(&_stateLock);
++    if (_closed) {
++        os_unfair_lock_unlock(&_stateLock);
++        return;
++    }
++    _closed = YES;
++    _sessionGen++;
++    os_unfair_lock_unlock(&_stateLock);
++
++    [self unregisterObservers];
++    if (_timingTimer != nil) {
++        dispatch_source_cancel(_timingTimer);
++        _timingTimer = nil;
++    }
++
++    dispatch_sync(_queue, ^{ [self teardownOnQueueLocked]; });
++
++    dispatch_sync(_callbackQueue, ^{
++        os_unfair_lock_lock(&self->_stateLock);
++        self->_aout = NULL;
++        os_unfair_lock_unlock(&self->_stateLock);
++    });
 +}
 +
 +@end
@@ -1614,7 +1755,7 @@
  
      [sys selectDevice:name];
  
-@@ -559,7 +2107,7 @@ DeviceSelect(audio_output_t *aout, const char *name)
+@@ -559,7 +2248,7 @@ DeviceSelect(audio_output_t *aout, const char *name)
  static int API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS), watchos(MIN_WATCHOS) VISIONOS_API_AVAILABLE)
  MuteSet(audio_output_t *aout, bool mute)
  {
@@ -1623,7 +1764,7 @@
  
      [sys setMute:mute];
  
-@@ -569,7 +2117,7 @@ MuteSet(audio_output_t *aout, bool mute)
+@@ -569,7 +2258,7 @@ MuteSet(audio_output_t *aout, bool mute)
  static int API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS), watchos(MIN_WATCHOS) VISIONOS_API_AVAILABLE)
  VolumeSet(audio_output_t *aout, float volume)
  {
@@ -1632,7 +1773,7 @@
  
      [sys setVolume:volume];
  
-@@ -579,7 +2127,7 @@ VolumeSet(audio_output_t *aout, float volume)
+@@ -579,7 +2268,7 @@ VolumeSet(audio_output_t *aout, float volume)
  static void API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS), watchos(MIN_WATCHOS) VISIONOS_API_AVAILABLE)
  Flush(audio_output_t *aout)
  {
@@ -1641,7 +1782,7 @@
  
      [sys flush];
  }
-@@ -587,7 +2135,7 @@ Flush(audio_output_t *aout)
+@@ -587,7 +2276,7 @@ Flush(audio_output_t *aout)
  static void API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS), watchos(MIN_WATCHOS) VISIONOS_API_AVAILABLE)
  Pause(audio_output_t *aout, bool pause, vlc_tick_t date)
  {
@@ -1650,7 +1791,7 @@
  
      [sys pause:pause date:date];
  }
-@@ -595,7 +2143,7 @@ Pause(audio_output_t *aout, bool pause, vlc_tick_t date)
+@@ -595,7 +2284,7 @@ Pause(audio_output_t *aout, bool pause, vlc_tick_t date)
  static void API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS), watchos(MIN_WATCHOS) VISIONOS_API_AVAILABLE)
  Play(audio_output_t *aout, block_t *block, vlc_tick_t date)
  {
@@ -1659,7 +1800,7 @@
  
      [sys play:block date:date];
  }
-@@ -603,7 +2151,7 @@ Play(audio_output_t *aout, block_t *block, vlc_tick_t date)
+@@ -603,7 +2292,7 @@ Play(audio_output_t *aout, block_t *block, vlc_tick_t date)
  static void API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS), watchos(MIN_WATCHOS) VISIONOS_API_AVAILABLE)
  Stop(audio_output_t *aout)
  {
@@ -1668,7 +1809,7 @@
  
      [sys stop];
  }
-@@ -611,19 +2159,35 @@ Stop(audio_output_t *aout)
+@@ -611,19 +2300,38 @@ Stop(audio_output_t *aout)
  static int API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS), watchos(MIN_WATCHOS) VISIONOS_API_AVAILABLE)
  Start(audio_output_t *aout, audio_sample_format_t *restrict fmt)
  {
@@ -1704,10 +1845,13 @@
 +        /* Transfer ownership back from VLC to ARC so that it can be released.
 +         * id: sys is VLCAVSample or VLCAudioEngine depending on the backend. */
 +        id sys = (__bridge_transfer id)aout->sys;
++        if ([sys respondsToSelector:@selector(invalidateForClose)])
++            [sys invalidateForClose];
++        aout->sys = NULL;
          (void) sys;
      }
  }
-@@ -635,6 +2199,40 @@ Open(vlc_object_t *obj)
+@@ -635,6 +2343,40 @@ Open(vlc_object_t *obj)
  
      if (@available(macOS MIN_MACOS, iOS MIN_IOS, tvOS MIN_TVOS, watchOS MIN_WATCHOS VISIONOS_AVAILABLE, *))
      {
@@ -1748,7 +1892,7 @@
          aout->sys = (__bridge_retained void*) [[VLCAVSample alloc] init:aout];
          if (aout->sys == nil)
              return VLC_EGENERIC;
-@@ -644,19 +2242,37 @@ Open(vlc_object_t *obj)
+@@ -644,19 +2386,37 @@ Open(vlc_object_t *obj)
          aout->play = Play;
          aout->pause = Pause;
          aout->flush = Flush;

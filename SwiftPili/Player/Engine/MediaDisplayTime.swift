@@ -11,6 +11,10 @@ struct MediaDisplayTime: Hashable, Comparable, Sendable {
         self.scale = scale / Int64(divisor)
     }
 
+    private static let maxQuantizedScale: Int64 = 1_000_000_000
+    private static let maxExactBinaryScale: Int64 = 1 << 20
+    private static let maxSafeSecondsProduct = Double(Int64.max / 100_000)
+
     init?(seconds: Double) {
         guard seconds.isFinite else { return nil }
         if seconds == 0 { self.init(0, scale: 1); return }
@@ -19,12 +23,31 @@ struct MediaDisplayTime: Hashable, Comparable, Sendable {
         var magnitude = (bits & 0x000f_ffff_ffff_ffff) | 0x0010_0000_0000_0000
         var shift = exponent
         while magnitude & 1 == 0 { magnitude >>= 1; shift += 1 }
-        guard shift > -63, shift < 63 else { return nil }
-        let result: (partialValue: UInt64, overflow: Bool) = shift > 0
-            ? magnitude.multipliedReportingOverflow(by: UInt64(1) << shift) : (magnitude, false)
-        guard !result.overflow, result.partialValue <= UInt64(Int64.max) else { return nil }
-        self.init(bits >> 63 == 0 ? Int64(result.partialValue) : -Int64(result.partialValue),
-                  scale: shift < 0 ? Int64(1) << -shift : 1)
+        if shift >= 0, shift < 63 {
+            let result = magnitude.multipliedReportingOverflow(by: UInt64(1) << shift)
+            guard !result.overflow, result.partialValue <= UInt64(Int64.max) else { return nil }
+            self.init(bits >> 63 == 0 ? Int64(result.partialValue) : -Int64(result.partialValue), scale: 1)
+            return
+        }
+        if shift < 0, -shift <= 20 {
+            let scale = Int64(1) << -shift
+            if scale <= Self.maxExactBinaryScale, magnitude <= UInt64(Int64.max) {
+                self.init(bits >> 63 == 0 ? Int64(magnitude) : -Int64(magnitude), scale: scale)
+                return
+            }
+        }
+        let absSeconds = abs(seconds)
+        for candidateScale in [Self.maxQuantizedScale, 1_000_000, 1_000, 1] {
+            let scaled = absSeconds * Double(candidateScale)
+            guard scaled.isFinite, scaled <= Self.maxSafeSecondsProduct else { continue }
+            let rounded = (seconds * Double(candidateScale)).rounded()
+            guard let quantized = Int64(exactly: rounded) else { continue }
+            self.init(quantized, scale: candidateScale)
+            return
+        }
+        guard absSeconds <= Double(Int64.max / 2),
+              let integer = Int64(exactly: seconds.rounded()) else { return nil }
+        self.init(integer, scale: 1)
     }
 
     var seconds: Double { Double(value) / Double(scale) }

@@ -76,6 +76,7 @@ extension Notification.Name {
 final class DanmakuHostView: UIView {
     let controller = DanmakuRenderController()
     private var appliedPreferences = DanmakuRenderPreferences.load()
+    private var appliedSmartMask = DanmakuRenderPreferences.smartMaskEnabled()
     var scaleMode: VideoScaleMode = .fit
     var picture: CGRect?
     nonisolated(unsafe) private var preferenceObserver: DanmakuPreferenceObserver?
@@ -129,7 +130,11 @@ final class DanmakuHostView: UIView {
     }
 
     fileprivate func applyRenderPreferenceChange() {
-        controller.mask.setEnabled(DanmakuRenderPreferences.smartMaskEnabled())
+        let smartMask = DanmakuRenderPreferences.smartMaskEnabled()
+        if smartMask != appliedSmartMask {
+            appliedSmartMask = smartMask
+            controller.mask.setEnabled(smartMask)
+        }
         let preferences = DanmakuRenderPreferences.load()
         guard preferences != appliedPreferences else { return }
         let layout = preferences.layoutChanged(from: appliedPreferences)

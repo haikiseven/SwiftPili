@@ -53,10 +53,71 @@ private struct PlayerAmbientAtlasProcessor: ImageProcessor {
     }
 }
 
+struct AmbientLiveLayerView: UIViewRepresentable {
+    func makeUIView(context _: Context) -> AmbientLiveLayerHostView {
+        AmbientLiveLayerHostView()
+    }
+
+    func updateUIView(_ uiView: AmbientLiveLayerHostView, context _: Context) {}
+
+    static func dismantleUIView(_ uiView: AmbientLiveLayerHostView, coordinator _: Void) {
+        AmbientLiveFrameBroadcaster.shared.unregister(uiView)
+    }
+}
+
+@MainActor
+final class AmbientLiveLayerHostView: UIView {
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        isAccessibilityElement = false
+        clipsToBounds = true
+        layer.contentsGravity = .resizeAspectFill
+        layer.opacity = 0
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil {
+            AmbientLiveFrameBroadcaster.shared.register(self)
+        } else {
+            AmbientLiveFrameBroadcaster.shared.unregister(self)
+        }
+    }
+
+    func apply(frame: CGImage?, animated: Bool) {
+        if let frame {
+            if animated, !UIAccessibility.isReduceMotionEnabled {
+                let transition = CATransition()
+                transition.type = .fade
+                transition.duration = 0.25
+                layer.add(transition, forKey: "ambientFade")
+            } else {
+                layer.removeAnimation(forKey: "ambientFade")
+            }
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.contents = frame
+            layer.opacity = 1
+            CATransaction.commit()
+        } else {
+            layer.removeAnimation(forKey: "ambientFade")
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            layer.contents = nil
+            layer.opacity = 0
+            CATransaction.commit()
+        }
+    }
+}
+
 struct PlayerAmbientArtworkView: View {
     let source: PlayerAmbientSource
-    var liveImage: UIImage?
-    var liveFrameSerial: UInt64 = 0
     var crossFadeDuration = PlayerAmbientPolicy.crossFadeDuration
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -69,28 +130,12 @@ struct PlayerAmbientArtworkView: View {
             preview
                 .id(source.artwork)
                 .transition(.opacity)
-            if let liveImage {
-                Image(uiImage: liveImage)
-                    .interpolation(.high)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(
-                        width: PlayerAmbientPolicy.analysisBox.width,
-                        height: PlayerAmbientPolicy.analysisBox.height
-                    )
-                    .clipped()
-                    .transition(.opacity)
-            }
         }
         .frame(width: PlayerAmbientPolicy.analysisBox.width, height: PlayerAmbientPolicy.analysisBox.height)
         .clipped()
         .animation(
             reduceMotion ? nil : .easeInOut(duration: crossFadeDuration),
             value: source.artwork
-        )
-        .animation(
-            reduceMotion ? nil : .easeInOut(duration: 0.45),
-            value: liveImage != nil
         )
     }
 

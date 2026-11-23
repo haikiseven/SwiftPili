@@ -218,12 +218,17 @@ struct VideoDetailView: View {
     @State private var presentationScreenID = UUID()
     private var player: PlayerViewModel { PlayerViewModel.shared }
     private var presentationContext: PlayerScreenPresentationContext? {
-        guard isRouteActivated, let aid = viewModel.videoInfo?.aid,
-              let cid = viewModel.currentCid else { return nil }
+        guard isRouteActivated else { return nil }
+        let source: PlayerPresentationSource? = if let aid = viewModel.videoInfo?.aid,
+            let cid = viewModel.currentCid {
+            .vod(aid: aid, cid: cid, source: .ugc)
+        } else {
+            nil
+        }
         return player.presentationContext(
             screenID: presentationScreenID, lease: viewModel.playerLease,
             route: .video(videoID), position: routePosition,
-            source: .vod(aid: aid, cid: cid, source: .ugc)
+            source: source
         )
     }
     private var videoID: VideoID { target.videoID }

@@ -24,6 +24,40 @@ struct AudioFeederPullReport: Sendable, Equatable {
     var isEmpty: Bool { self == .empty }
 }
 
+struct FeederStandDownReceipt: Sendable {
+    let requiresJoin: Bool
+    private let queue: DispatchQueue?
+
+    init(requiresJoin: Bool, queue: DispatchQueue?) {
+        self.requiresJoin = requiresJoin
+        self.queue = requiresJoin ? queue : nil
+    }
+
+    func join() async {
+        guard requiresJoin, let queue else { return }
+        await withCheckedContinuation { continuation in
+            queue.async {
+                continuation.resume()
+            }
+        }
+    }
+
+    @MainActor
+    func onQuiesce(_ action: @escaping @MainActor @Sendable () -> Void) {
+        guard requiresJoin, let queue else {
+            action()
+            return
+        }
+        queue.async {
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    action()
+                }
+            }
+        }
+    }
+}
+
 final class AudioFeederGate: @unchecked Sendable {
     private let state = OSAllocatedUnfairLock(initialState: AudioFeederAdmission())
 
@@ -46,7 +80,7 @@ final class AudioFeederGate: @unchecked Sendable {
         state.withLock { $0.invalidateContent() }
     }
 
-    func retire() {
+    func retire() -> AudioFeederAdmission.StandDown {
         state.withLock { $0.retire() }
     }
 
@@ -144,25 +178,17 @@ final class AudioRingFeeder: @unchecked Sendable {
         source.activate()
     }
 
-    @discardableResult
-    func standDown() -> AudioFeederAdmission.StandDown {
+    func standDown() -> FeederStandDownReceipt {
         let result = gate.standDown()
-        return result
+        return FeederStandDownReceipt(requiresJoin: result == .mustJoin, queue: queue)
     }
 
-    func joinAfterStandDown() async {
-        await withCheckedContinuation { continuation in
-            queue.async {
-                continuation.resume()
-            }
-        }
-    }
-
-    func retire() {
-        gate.retire()
+    func retire() -> FeederStandDownReceipt {
+        let result = gate.retire()
         timer?.cancel()
         timer = nil
         supplyBox.withLock { $0 = nil }
+        return FeederStandDownReceipt(requiresJoin: result == .mustJoin, queue: queue)
     }
 
     func invalidateContent() {

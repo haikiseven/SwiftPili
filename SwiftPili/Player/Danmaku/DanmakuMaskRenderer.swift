@@ -3,38 +3,71 @@ import UIKit
 
 @MainActor
 final class DanmakuMaskRenderer {
+    private static let disabledLayerActions: [String: CAAction] = [
+        "position": NSNull(),
+        "bounds": NSNull(),
+        "frame": NSNull(),
+        "transform": NSNull(),
+        "affineTransform": NSNull(),
+        "hidden": NSNull(),
+        "sublayers": NSNull(),
+        "path": NSNull(),
+    ]
+
     private let container: CALayer
-    private let maskLayer = CAShapeLayer()
+    private let maskLayer = CALayer()
+    private let maskContentLayer = CAShapeLayer()
+    private let letterboxLayers: [CALayer]
     private var segments: [Int: DanmakuMaskSegment] = [:]
     private var bounds: CGRect = .zero
     private var fit: VideoScaleMode = .fit
+    private var appliedCanvas: CGSize?
     private(set) var isEnabled: Bool
 
     init(container: CALayer, enabled: Bool) {
         self.container = container
         isEnabled = enabled
-        maskLayer.fillColor = UIColor.black.cgColor
-        maskLayer.fillRule = .nonZero
+        maskLayer.masksToBounds = true
+        maskLayer.actions = Self.disabledLayerActions
+        maskContentLayer.anchorPoint = .zero
+        maskContentLayer.fillColor = UIColor.black.cgColor
+        maskContentLayer.fillRule = .nonZero
+        maskContentLayer.actions = Self.disabledLayerActions
+        maskLayer.addSublayer(maskContentLayer)
+        letterboxLayers = (0..<4).map { _ in
+            let bar = CALayer()
+            bar.backgroundColor = UIColor.black.cgColor
+            bar.isHidden = true
+            bar.actions = Self.disabledLayerActions
+            return bar
+        }
+        for bar in letterboxLayers {
+            maskLayer.addSublayer(bar)
+        }
     }
 
     var segmentCount: Int { segments.count }
 
     func sync(_ next: [Int: DanmakuMaskSegment]) {
         for index in segments.keys where next[index] == nil {
-            maskLayer.removeAnimation(forKey: Self.key(index))
+            maskContentLayer.removeAnimation(forKey: Self.key(index))
         }
         let added = next.filter { segments[$0.key] == nil }
         segments = next
         withoutActions {
             for segment in added.values { install(segment) }
+            updateGeometryLayout()
             updateAttachment()
         }
     }
 
     func clear() {
         segments.removeAll()
+        appliedCanvas = nil
         withoutActions {
-            maskLayer.removeAllAnimations()
+            maskContentLayer.removeAllAnimations()
+            maskContentLayer.path = nil
+            for bar in letterboxLayers { bar.isHidden = true }
             updateAttachment()
         }
     }
@@ -50,10 +83,7 @@ final class DanmakuMaskRenderer {
         bounds = newBounds
         fit = newFit
         withoutActions {
-            maskLayer.removeAllAnimations()
-            maskLayer.frame = newBounds
-            maskLayer.path = CGPath(rect: CGRect(origin: .zero, size: newBounds.size), transform: nil)
-            for segment in segments.values { install(segment) }
+            updateGeometryLayout()
             updateAttachment()
         }
     }
@@ -61,34 +91,55 @@ final class DanmakuMaskRenderer {
     private func updateAttachment() {
         let wanted = isEnabled && !segments.isEmpty && bounds.width > 0 && bounds.height > 0
         if wanted, container.mask !== maskLayer {
-            maskLayer.frame = bounds
-            maskLayer.path = CGPath(rect: CGRect(origin: .zero, size: bounds.size), transform: nil)
+            updateGeometryLayout()
             container.mask = maskLayer
         } else if !wanted, container.mask != nil {
             container.mask = nil
         }
     }
 
-    private func install(_ segment: DanmakuMaskSegment) {
-        guard !segment.frames.isEmpty, bounds.width > 0, bounds.height > 0 else { return }
-        let transform = Self.transform(canvas: segment.canvas, bounds: bounds.size, fit: fit)
-        let bars = Self.letterbox(canvas: segment.canvas, bounds: bounds.size, fit: fit)
-        let paths: [CGPath] = segment.frames.map { frame in
-            let visible = CGMutablePath()
-            visible.addPath(frame.path, transform: transform)
-            for bar in bars { visible.addRect(bar) }
-            return visible
+    private func updateGeometryLayout() {
+        maskLayer.frame = bounds
+        guard bounds.width > 0, bounds.height > 0,
+              let canvas = segments.values.first?.canvas else {
+            for bar in letterboxLayers { bar.isHidden = true }
+            return
         }
-        guard let timing = Self.timing(for: segment) else { return }
+        let canvasWidth = max(canvas.width, 1)
+        let canvasHeight = max(canvas.height - 1, 1)
+        if appliedCanvas != canvas {
+            appliedCanvas = canvas
+            let canvasRect = CGRect(x: 0, y: 0, width: canvasWidth, height: canvasHeight)
+            maskContentLayer.bounds = canvasRect
+            maskContentLayer.path = CGPath(rect: canvasRect, transform: nil)
+        }
+        let rect = Self.picture(canvas: canvas, bounds: bounds.size, fit: fit)
+        maskContentLayer.position = rect.origin
+        maskContentLayer.setAffineTransform(
+            CGAffineTransform(scaleX: rect.width / canvasWidth, y: rect.height / canvasHeight)
+        )
+        let bars = Self.letterbox(canvas: canvas, bounds: bounds.size, fit: fit)
+        for (index, barLayer) in letterboxLayers.enumerated() {
+            if index < bars.count {
+                barLayer.frame = bars[index]
+                barLayer.isHidden = false
+            } else {
+                barLayer.isHidden = true
+            }
+        }
+    }
+
+    private func install(_ segment: DanmakuMaskSegment) {
+        guard !segment.frames.isEmpty, let timing = Self.timing(for: segment) else { return }
         let animation = CAKeyframeAnimation(keyPath: "path")
-        animation.values = paths
+        animation.values = segment.frames.map(\.path)
         animation.keyTimes = timing.keyTimes.map { NSNumber(value: $0) }
         animation.calculationMode = .discrete
         animation.beginTime = timing.beginTime
         animation.duration = timing.duration
         animation.fillMode = .removed
         animation.isRemovedOnCompletion = false
-        maskLayer.add(animation, forKey: Self.key(segment.index))
+        maskContentLayer.add(animation, forKey: Self.key(segment.index))
     }
 
     private func withoutActions(_ body: () -> Void) {

@@ -41,6 +41,10 @@ final class AudioTimelinePCMSupply: AudioSupplySource {
         state.withLock { $0.reset() }
     }
 
+    func rollback(seconds: TimeInterval) -> TimeInterval {
+        state.withLock { $0.rollback(seconds: seconds) }
+    }
+
     // MARK: - AudioSupplySource
 
     func pullContent(

@@ -16,7 +16,7 @@ static int set_config(MLDCodec *codec, const uint8_t *data, size_t size)
     if (codec->config) {
         if (size == (size_t)codec->config_size && !memcmp(codec->config, data, size))
             return MLD_OK;
-        return MLD_UNSUPPORTED;
+        return MLD_RELOAD;
     }
     codec->config = av_memdup(data, size);
     if (!codec->config)
@@ -39,7 +39,7 @@ static int register_parameter_set(MLDCodec *codec, const uint8_t *data, int size
             return MLD_OK;
     }
     if (codec->config)
-        return MLD_UNSUPPORTED;
+        return MLD_RELOAD;
     if (codec->set_count == sizeof(codec->sets) / sizeof(codec->sets[0]) ||
         size > MAX_CONFIG_BYTES - codec->set_bytes - 4)
         return MLD_INVALID;

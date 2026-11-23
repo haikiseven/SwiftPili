@@ -170,6 +170,10 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
         }
     }
 
+    func enterLeavingState() {
+        viewIfLoaded?.backgroundColor = .clear
+    }
+
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         if let presentingViewController {

@@ -3,6 +3,52 @@ import Foundation
 import SwiftUI
 import UIKit
 
+@MainActor
+final class FullscreenOrientationLatch {
+    static let shared = FullscreenOrientationLatch()
+    private static let minimumSettleWindow: TimeInterval = 0.8
+    private var latchedFullscreen: Bool?
+    private var latchedAt: TimeInterval = 0
+
+    func recordButtonTransition(targetFullscreen: Bool, now: TimeInterval = CACurrentMediaTime()) {
+        latchedFullscreen = targetFullscreen
+        latchedAt = now
+    }
+
+    func clear() {
+        latchedFullscreen = nil
+    }
+
+    func shouldIgnoreDeviceOrientation(
+        _ orientation: UIDeviceOrientation,
+        currentFullscreen: Bool,
+        now: TimeInterval = CACurrentMediaTime()
+    ) -> Bool {
+        let wantsFullscreen: Bool
+        if orientation.isLandscape {
+            wantsFullscreen = true
+        } else if orientation == .portrait {
+            wantsFullscreen = false
+        } else {
+            return true
+        }
+        if wantsFullscreen == currentFullscreen {
+            if let latched = latchedFullscreen, latched == wantsFullscreen,
+               now - latchedAt >= Self.minimumSettleWindow {
+                latchedFullscreen = nil
+            }
+            return true
+        }
+        if latchedFullscreen != nil, now - latchedAt < Self.minimumSettleWindow {
+            return true
+        }
+        if let latched = latchedFullscreen, wantsFullscreen != latched {
+            return true
+        }
+        return false
+    }
+}
+
 extension PlayerViewModel {
 
     func showNotice(_ text: String) {
@@ -50,12 +96,12 @@ extension PlayerViewModel {
         lastReportedVerticalSizeClass = verticalSizeClass
     }
 
-    func scheduleHideControls() {
+    func scheduleHideControls(isSeeking: Bool = false) {
         hideControlsTask?.cancel()
-        guard showControls, !danmakuSettingsHold else { return }
+        guard showControls, !danmakuSettingsHold, !isSeeking, !isSeekInFlight else { return }
         hideControlsTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(5))
-            guard !Task.isCancelled, let self else { return }
+            guard !Task.isCancelled, let self, !self.isSeekInFlight else { return }
             withAnimation(.easeInOut(duration: 0.2)) {
                 self.showControls = false
             }
@@ -194,6 +240,9 @@ extension PlayerViewModel {
         )
 
         guard case .start = decision else { return }
+        if source == .button {
+            FullscreenOrientationLatch.shared.recordButtonTransition(targetFullscreen: target)
+        }
         if target {
             enterFullscreen()
         } else {
@@ -230,11 +279,13 @@ extension PlayerViewModel {
         lease: PlayerOwnerLease?,
         route: PlayerScreenRoute,
         position: PlayerRoutePosition?,
-        source: PlayerPresentationSource
+        source: PlayerPresentationSource?
     ) -> PlayerScreenPresentationContext? {
         guard let lease, let position, isCurrentOwner(lease) else { return nil }
         switch (route, source) {
-        case (.video, .vod(_, _, .ugc)), (.bangumi, .vod(_, _, .pgc)), (.offline, .offline):
+        case (.video, .vod(_, _, .ugc)), (.video, nil),
+             (.bangumi, .vod(_, _, .pgc)), (.bangumi, nil),
+             (.offline, .offline):
             break
         case (.live(let routeRoomID), .live(let sourceRoomID)) where routeRoomID == sourceRoomID:
             break
@@ -248,7 +299,18 @@ extension PlayerViewModel {
     }
 
     func isCurrentPresentationContext(_ context: PlayerScreenPresentationContext) -> Bool {
-        isCurrentPresentationSource(lease: context.ownerLease, source: context.source)
+        guard isCurrentOwner(context.ownerLease) else { return false }
+        switch (context.route, context.source) {
+        case (.video, .vod(_, _, .ugc)), (.video, nil),
+             (.bangumi, .vod(_, _, .pgc)), (.bangumi, nil):
+            return true
+        case (.live(let roomID), .live(let sourceRoomID)):
+            return roomID == sourceRoomID && mode == .live && currentRoomID == roomID
+        case (.offline, .offline(let asset)):
+            return mode == .offline && offlineAsset == asset
+        default:
+            return false
+        }
     }
 
     func isCurrentPresentationSource(lease: PlayerOwnerLease?, source: PlayerPresentationSource) -> Bool {
@@ -286,8 +348,11 @@ extension PlayerViewModel {
     ) -> PlayerPresentationReceipt? {
         guard presentation.routeIsActive, isCurrentPresentationContext(context) else { return nil }
         if fullscreenPresentation === presentation,
-           let receipt = fullscreenPresentationReceipt, receipt.context == context {
-            return receipt
+           let existing = fullscreenPresentationReceipt,
+           existing.context.hostKey == context.hostKey {
+            let updated = PlayerPresentationReceipt(id: existing.id, context: context)
+            fullscreenPresentationReceipt = updated
+            return updated
         }
         retireFullscreenPresentation()
         let receipt = PlayerPresentationReceipt(id: UUID(), context: context)
@@ -342,6 +407,7 @@ extension PlayerViewModel {
         fullscreenPresentation = nil
         fullscreenPresentationReceipt = nil
         if isFullscreen { exitFullscreen() }
+        FullscreenOrientationLatch.shared.clear()
         previous?.relinquishForOwnerReplacement()
     }
 }

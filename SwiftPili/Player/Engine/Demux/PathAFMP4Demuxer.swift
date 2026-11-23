@@ -109,6 +109,45 @@ actor PathAFMP4Demuxer: MediaDemuxing {
         }
     }
 
+    private struct FragmentReopenBudget: Sendable {
+        static let maxBackpressureReopens = 256
+        static let maxZeroProgressErrorReopens = 2
+        static let maxTotalErrorReopens = 64
+
+        private(set) var lastProgressOffset: Int64
+        private(set) var zeroProgressReopens = 0
+        private(set) var backpressureReopens = 0
+        private(set) var errorReopens = 0
+
+        init(initialOffset: Int64) {
+            lastProgressOffset = initialOffset
+        }
+
+        mutating func admitBackpressure(resumeOffset: Int64) -> Bool {
+            guard backpressureReopens < Self.maxBackpressureReopens else { return false }
+            backpressureReopens += 1
+            if resumeOffset > lastProgressOffset {
+                lastProgressOffset = resumeOffset
+                zeroProgressReopens = 0
+                return true
+            }
+            zeroProgressReopens += 1
+            return zeroProgressReopens <= 1
+        }
+
+        mutating func admitError(currentOffset: Int64) -> Bool {
+            guard errorReopens < Self.maxTotalErrorReopens else { return false }
+            errorReopens += 1
+            if currentOffset > lastProgressOffset {
+                lastProgressOffset = currentOffset
+                zeroProgressReopens = 0
+                return true
+            }
+            zeroProgressReopens += 1
+            return zeroProgressReopens <= Self.maxZeroProgressErrorReopens
+        }
+    }
+
     private struct PumpPacing: Sendable {
         let start = ContinuousClock.now
         var netWaits = 0
@@ -1484,7 +1523,7 @@ actor PathAFMP4Demuxer: MediaDemuxing {
                 r.activeFragment = af
             }
         }
-        var reopenedOnce = false
+        var reopenBudget = FragmentReopenBudget(initialOffset: Int64(af.assembler.resumeOffset))
         while true {
             let displayBytes = r.displayTrack.map(MediaDisplayByteOwner.init)
             defer { displayBytes?.release() }
@@ -1570,56 +1609,54 @@ actor PathAFMP4Demuxer: MediaDemuxing {
                 r.activeFragment = af
             }
             let chunkWaitStart = pacing != nil ? ContinuousClock.now : nil
-            let chunk: Data?
+            let step: PathAHTTPMediaSource.ChunkStreamStep
             do {
-                chunk = try await r.source.nextChunk(
+                step = try await r.source.nextChunkStep(
                     af.streamID ?? 0, waitBudget: waitBudget, displayOwner: displayBytes
                 )
                 try checkWaitBudget(waitBudget)
                 if let chunkWaitStart { pacing?.recordWait(since: chunkWaitStart) }
-            } catch is CancellationError {
-                if let chunkWaitStart { pacing?.recordWait(since: chunkWaitStart) }
-                if Task.isCancelled || waitBudget?.isCancelled == true {
-                    r.activeFragment = af
-                    throw CancellationError()
-                }
-                guard !reopenedOnce else {
-                    r.activeFragment = af
-                    throw CancellationError()
-                }
-                reopenedOnce = true
-                pacing?.reopens += 1
-                PlayerLog.log(
-                    "[PathA] mdat-stream-reopen \(kind.rawValue) " +
-                    "resume@\(af.assembler.resumeOffset) reason=slot-retired"
-                )
-                af.streamID = nil
-                r.activeFragment = af
-                continue
             } catch {
                 if let chunkWaitStart { pacing?.recordWait(since: chunkWaitStart) }
-                if Task.isCancelled || waitBudget?.isCancelled == true {
-                    if let id = af.streamID { await r.source.closeChunkStream(id) }
-                    r.activeFragment = af
-                    throw CancellationError()
+                if let id = af.streamID {
+                    await r.source.closeChunkStream(id)
+                    af.streamID = nil
                 }
-                guard !reopenedOnce else {
-                    if let id = af.streamID { await r.source.closeChunkStream(id) }
+                if error is CancellationError || Self.isCancellation(error)
+                    || Task.isCancelled || waitBudget?.isCancelled == true {
                     r.activeFragment = af
                     throw error
                 }
-                reopenedOnce = true
+                guard reopenBudget.admitError(currentOffset: Int64(af.assembler.resumeOffset)) else {
+                    r.activeFragment = af
+                    throw error
+                }
                 pacing?.reopens += 1
                 PlayerLog.log(
                     "[PathA] mdat-stream-reopen \(kind.rawValue) " +
                     "resume@\(af.assembler.resumeOffset) reason=\(error.localizedDescription)"
                 )
-                if let id = af.streamID { await r.source.closeChunkStream(id) }
-                af.streamID = nil
                 r.activeFragment = af
                 continue
             }
-            guard let chunk else {
+            let chunk: Data
+            switch step {
+            case .chunk(let data):
+                chunk = data
+            case .backpressureSuspended(let resumeOffset):
+                af.streamID = nil
+                guard reopenBudget.admitBackpressure(resumeOffset: resumeOffset) else {
+                    r.activeFragment = af
+                    throw MediaEngineError.demuxFailed("fMP4 mdat backpressure reopen budget exhausted")
+                }
+                pacing?.reopens += 1
+                PlayerLog.log(
+                    "[PathA] mdat-stream-reopen \(kind.rawValue) " +
+                    "resume@\(af.assembler.resumeOffset) reason=backpressure"
+                )
+                r.activeFragment = af
+                continue
+            case .endOfStream:
                 _ = af.assembler.finishTruncated()
                 await finalizeActiveFragment(
                     &r, &af, diagnostics: &diagnostics, kind: kind, truncated: true

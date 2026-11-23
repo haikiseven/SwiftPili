@@ -74,7 +74,7 @@ final class DanmakuRenderController: DanmakuTimelineSink {
         canDisplay: @escaping @MainActor () -> Bool = { UIApplication.shared.applicationState == .active }
     ) {
         self.canDisplay = canDisplay
-        let rasterizer = DanmakuTextRasterizer()
+        let rasterizer = DanmakuTextRasterizer.shared
         self.rasterize = rasterize ?? { key, canRender, completion in
             rasterizer.image(for: key, canRender: canRender, completion: completion)
         }
@@ -99,8 +99,12 @@ final class DanmakuRenderController: DanmakuTimelineSink {
 
     private struct LiveBullet {
         let layer: CALayer
+        let kind: DanmakuRenderKind
+        let beginTime: TimeInterval
         let endsAt: TimeInterval
         let isSelfSent: Bool
+        let lane: Int?
+        let bulletWidth: CGFloat
     }
 
     private(set) var presentation: DanmakuPresentation = .inline
@@ -124,7 +128,8 @@ final class DanmakuRenderController: DanmakuTimelineSink {
         appliedPicture = Self.usablePicture(picture, in: size)
         let sameViewport = abs(appliedViewport.width - size.width) < 0.5
             && abs(appliedViewport.height - size.height) < 0.5
-        if !force, sameViewport, self.presentation == presentation {
+        let presentationChanged = self.presentation != presentation
+        if !force, !presentationChanged, sameViewport {
             if appliedViewport != size {
                 CATransaction.begin()
                 CATransaction.setDisableActions(true)
@@ -140,6 +145,11 @@ final class DanmakuRenderController: DanmakuTimelineSink {
         CATransaction.setDisableActions(true)
         container.frame = CGRect(origin: .zero, size: size)
         CATransaction.commit()
+        if !force, !presentationChanged {
+            retarget(next)
+            repositionLiveLanedBullets()
+            return false
+        }
         metrics = next
         allocator.apply(metrics)
         invalidateRasterWork()
@@ -270,53 +280,73 @@ final class DanmakuRenderController: DanmakuTimelineSink {
         fontScale: Double,
         pictureHeight: CGFloat
     ) {
-        guard let script = DanmakuAdvancedScript.parse(item.content) else { return }
-        guard !DanmakuRenderPreferences.load().blocks(script.text) else { return }
-        let placed = DanmakuAdvancedPlacement.place(
-            script,
-            viewport: DanmakuAdvancedPlacement.Viewport(
-                width: Double(appliedPicture.width), height: Double(appliedPicture.height)
-            )
-        )
-        guard Self.animationIsLive(
-            progress: item.progress, lifetime: placed.lifetimeSeconds, at: clockMediaTime
-        ) else { return }
         guard let admissionTicket = claimRaster(for: item) else { return }
-        let key = DanmakuTextRasterizer.Key(
-            text: script.text,
-            fontSize: item.fontSize,
-            colorRGB: item.color,
-            hasStroke: DanmakuAdvancedStroke.isEnabled(script.stroke),
-            scale: UIScreen.main.scale,
-            fontPostScriptName: DanmakuAdvancedFontMapping.postScriptName(for: script.fontName),
-            fontScale: CGFloat(fontScale),
-            pictureHeight: pictureHeight
-        )
         let itemID = item.id
+        let content = item.content
         let progress = item.progress
+        let fontSize = item.fontSize
+        let color = item.color
+        let scale = UIScreen.main.scale
         let ticket = generation
         let work = rasterWork
-        rasterize(key, { _ in
-            work.accepts(generation: ticket, id: itemID, ticket: admissionTicket) { timing in
-                Self.animationIsLive(
-                    progress: progress, lifetime: placed.lifetimeSeconds, at: timing.mediaTime
-                )
+        let preferences = DanmakuRenderPreferences.load()
+        let viewport = DanmakuAdvancedPlacement.Viewport(
+            width: Double(appliedPicture.width), height: Double(appliedPicture.height)
+        )
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let script = DanmakuAdvancedScript.parse(content)
+            let admittedScript: DanmakuAdvancedScript? = script.flatMap { parsed in
+                guard !preferences.blocks(parsed.text) else { return nil }
+                let placed = DanmakuAdvancedPlacement.place(parsed, viewport: viewport)
+                let live = work.accepts(generation: ticket, id: itemID, ticket: admissionTicket) { timing in
+                    Self.animationIsLive(
+                        progress: progress, lifetime: placed.lifetimeSeconds, at: timing.mediaTime
+                    )
+                }
+                return live ? parsed : nil
             }
-        }, { [weak self] image in
-            Task { @MainActor in
+            await MainActor.run {
                 guard let self, self.generation == ticket,
                       self.pending[itemID]?.ticket == admissionTicket else { return }
-                self.pending.removeValue(forKey: itemID)
-                self.rasterWork.finish(id: itemID, ticket: admissionTicket)
-                guard let image, self.canDisplay() else { return }
-                self.placeAdvanced(
-                    item: item,
-                    script: script,
-                    image: image,
-                    laneHeight: laneHeight
+                guard let script = admittedScript else {
+                    self.pending.removeValue(forKey: itemID)
+                    self.rasterWork.finish(id: itemID, ticket: admissionTicket)
+                    return
+                }
+                let placed = DanmakuAdvancedPlacement.place(script, viewport: viewport)
+                let key = DanmakuTextRasterizer.Key(
+                    text: script.text,
+                    fontSize: fontSize,
+                    colorRGB: color,
+                    hasStroke: DanmakuAdvancedStroke.isEnabled(script.stroke),
+                    scale: scale,
+                    fontPostScriptName: DanmakuAdvancedFontMapping.postScriptName(for: script.fontName),
+                    fontScale: CGFloat(fontScale),
+                    pictureHeight: pictureHeight
                 )
+                self.rasterize(key, { _ in
+                    work.accepts(generation: ticket, id: itemID, ticket: admissionTicket) { timing in
+                        Self.animationIsLive(
+                            progress: progress, lifetime: placed.lifetimeSeconds, at: timing.mediaTime
+                        )
+                    }
+                }, { [weak self] image in
+                    Task { @MainActor in
+                        guard let self, self.generation == ticket,
+                              self.pending[itemID]?.ticket == admissionTicket else { return }
+                        self.pending.removeValue(forKey: itemID)
+                        self.rasterWork.finish(id: itemID, ticket: admissionTicket)
+                        guard let image, self.canDisplay() else { return }
+                        self.placeAdvanced(
+                            item: item,
+                            script: script,
+                            image: image,
+                            laneHeight: laneHeight
+                        )
+                    }
+                })
             }
-        })
+        }
     }
 
     func applyTiming(_ timing: DanmakuClockSync.LayerTiming, mediaTime: TimeInterval) {
@@ -453,24 +483,71 @@ extension DanmakuRenderController {
             return
         }
         let centerY = CGFloat((band.top + band.bottom) / 2)
-        let x: CGFloat
-        switch kind {
-        case .top, .bottom:
-            x = container.bounds.midX
-        case .reverse:
-            x = -image.width / 2
-        case .scroll:
-            x = container.bounds.width + image.width / 2
-        case .advanced, .unsupported:
-            x = container.bounds.midX
-        }
+        let x = Self.initialX(kind: kind, width: image.width, bounds: container.bounds)
         layer.bounds = CGRect(x: 0, y: 0, width: image.width, height: image.height)
         layer.contentsScale = image.scale
         layer.contents = image.contents
         layer.position = CGPoint(x: x, y: centerY)
         container.addSublayer(layer)
-        live[id] = LiveBullet(layer: layer, endsAt: endsAt, isSelfSent: selfSent)
+        live[id] = LiveBullet(
+            layer: layer,
+            kind: kind,
+            beginTime: entry,
+            endsAt: endsAt,
+            isSelfSent: selfSent,
+            lane: lane,
+            bulletWidth: image.width
+        )
         attachMotion(layer, kind: kind, beginTime: entry, width: image.width, lifetime: lifetime)
+    }
+
+    private static func initialX(kind: DanmakuRenderKind, width: CGFloat, bounds: CGRect) -> CGFloat {
+        switch kind {
+        case .top, .bottom, .advanced, .unsupported:
+            bounds.midX
+        case .reverse:
+            -width / 2
+        case .scroll:
+            bounds.width + width / 2
+        }
+    }
+
+    private func repositionLiveLanedBullets() {
+        guard !live.isEmpty else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        var dropped: [Int64] = []
+        for (id, bullet) in live {
+            guard bullet.kind != .advanced, bullet.kind != .unsupported else { continue }
+            guard let lane = bullet.lane,
+                  lane < metrics.laneCount,
+                  let band = metrics.band(kind: bullet.kind, lane: lane) else {
+                dropped.append(id)
+                continue
+            }
+            let lifetime: TimeInterval = (bullet.kind == .scroll || bullet.kind == .reverse)
+                ? metrics.scrollLifetime
+                : metrics.fixedLifetime
+            let centerY = CGFloat((band.top + band.bottom) / 2)
+            bullet.layer.position = CGPoint(
+                x: Self.initialX(kind: bullet.kind, width: bullet.bulletWidth, bounds: container.bounds),
+                y: centerY
+            )
+            bullet.layer.removeAnimation(forKey: "danmaku")
+            attachMotion(
+                bullet.layer,
+                kind: bullet.kind,
+                beginTime: bullet.beginTime,
+                width: bullet.bulletWidth,
+                lifetime: lifetime
+            )
+        }
+        for id in dropped {
+            if let bullet = live.removeValue(forKey: id) {
+                recycle(bullet.layer)
+            }
+        }
     }
 
     nonisolated static func entryTime(
@@ -565,7 +642,15 @@ extension DanmakuRenderController {
             layer.add(animation, forKey: animation.keyPath)
         }
         container.addSublayer(layer)
-        live[id] = LiveBullet(layer: layer, endsAt: endsAt, isSelfSent: selfSent)
+        live[id] = LiveBullet(
+            layer: layer,
+            kind: .advanced,
+            beginTime: progress,
+            endsAt: endsAt,
+            isSelfSent: selfSent,
+            lane: nil,
+            bulletWidth: image.width
+        )
     }
 
     private func replaceOrdinaryLiveCopy(id: Int64, withSelfSent selfSent: Bool) -> Bool {

@@ -59,10 +59,21 @@ grep -q 'RATE_SETTLE_WINDOW' "$CLOCK" \
   && ok "RATE_SETTLE_WINDOW present" \
   || bad "RATE_SETTLE_WINDOW missing — 2× press/release still jerks the video (F19)"
 # The hold must live inside the coeff estimator, next to the reset it replaces.
-if awk '/^static void vlc_clock_master_update_coeff/,/^}/' "$CLOCK" | grep -q 'rate_change_system'; then
+UPDATE_COEFF="$(awk '/^static void vlc_clock_master_update_coeff/,/^}/' "$CLOCK")"
+if printf '%s\n' "$UPDATE_COEFF" | grep -q 'rate_change_system'; then
   ok "the settle-window hold is inside vlc_clock_master_update_coeff"
 else
   bad "rate_change_system not in vlc_clock_master_update_coeff — 0009 hunk misplaced"
+fi
+if printf '%s\n' "$UPDATE_COEFF" | awk '
+  /bool rate_changed[[:space:]]*=/ { saw_changed = 1 }
+  /rate_change_system[[:space:]]*=[[:space:]]*system_now/ && !saw_settle { saw_stamp_before = 1 }
+  /settling[[:space:]]*=/ { saw_settle = 1 }
+  END { exit !(saw_changed && saw_stamp_before && saw_settle) }
+'; then
+  ok "0009: rate_change_system = system_now (rate_changed) precedes settling calculation"
+else
+  bad "0009: rate_change_system = system_now must precede settling calculation in vlc_clock_master_update_coeff"
 fi
 
 echo "0010 — input_clock: re-anchor forward stream gaps without a discontinuity (F20)"
@@ -322,10 +333,60 @@ if awk '/changeRate:\(float\)rate/,/^}/' "$AVSB" | grep -q 'clearWallResidualLoc
 else
   bad "K2.6: changeRate missing residual wall clear — old-scale tail on rate edge"
 fi
-if awk '/^static void SlaveDemuxToEnd/,/^}/' "$INPUT" | grep -q 'SLAVE_DRAIN_MAX_ITER'; then
+if grep -q '_callbackQueue' "$AVSB" && grep -q '_stateLock' "$AVSB" \
+   && grep -q '_sessionGen' "$AVSB" && grep -q 'invalidateForClose' "$AVSB" \
+   && grep -q 'dispatchCallbackWithGen' "$AVSB"; then
+  ok "0013: callback serialization markers (_callbackQueue/_stateLock/_sessionGen/invalidateForClose/dispatchCallbackWithGen) present"
+else
+  bad "0013: missing _callbackQueue/_stateLock/_sessionGen/invalidateForClose/dispatchCallbackWithGen — stale/unsafe callback lifecycle"
+fi
+if awk '/^Close\(vlc_object_t/,/^}/' "$AVSB" | grep -q 'invalidateForClose'; then
+  ok "0013: Close() invokes invalidateForClose"
+else
+  bad "0013: Close() does not invoke invalidateForClose — async callback UAF risk"
+fi
+AVAE_IMPL="$(awk '/^@implementation VLCAudioEngine/,/^@end/' "$AVSB")"
+if [ -z "$AVAE_IMPL" ]; then
+  bad "0013: could not extract @implementation VLCAudioEngine"
+else
+  if printf '%s\n' "$AVAE_IMPL" | grep -qE 'aout_(Timing|Drained)Report\((self->|s->)?_aout'; then
+    bad "0013: VLCAudioEngine still calls aout_TimingReport/aout_DrainedReport directly on _aout (must go through dispatchCallbackWithGen)"
+  else
+    ok "0013: VLCAudioEngine never calls aout_TimingReport/aout_DrainedReport directly on _aout"
+  fi
+  if printf '%s\n' "$AVAE_IMPL" | awk '/^- \(void\)reportTiming/,/^}/' | grep -q 'dispatchCallbackWithGen' \
+     && printf '%s\n' "$AVAE_IMPL" | awk '/^- \(void\)reportTiming/,/^}/' | grep -q 'aout_TimingReport(aout'; then
+    ok "0013: reportTiming dispatches aout_TimingReport via dispatchCallbackWithGen"
+  else
+    bad "0013: reportTiming missing dispatchCallbackWithGen -> aout_TimingReport(aout)"
+  fi
+  if printf '%s\n' "$AVAE_IMPL" | awk '/^- \(void\)wallPlayedOut:/,/^}/' | grep -q 'dispatchCallbackWithGen' \
+     && printf '%s\n' "$AVAE_IMPL" | awk '/^- \(void\)drain/,/^}/' | grep -q 'dispatchCallbackWithGen'; then
+    ok "0013: wallPlayedOut and drain dispatch aout_DrainedReport via dispatchCallbackWithGen"
+  else
+    bad "0013: wallPlayedOut or drain missing dispatchCallbackWithGen"
+  fi
+  if printf '%s\n' "$AVAE_IMPL" | awk '/^- \(void\)flush/,/^}/' | grep -q '_sessionGen++' \
+     && printf '%s\n' "$AVAE_IMPL" | awk '/^- \(void\)teardownOnQueueLocked/,/^}/' | grep -q '_sessionGen++' \
+     && printf '%s\n' "$AVAE_IMPL" | awk '/^- \(void\)stop/,/^}/' | grep -q 'teardownOnQueueLocked'; then
+    ok "0013: flush and stop/teardown bump _sessionGen under _stateLock"
+  else
+    bad "0013: flush or stop/teardown missing _sessionGen++ generation fence"
+  fi
+fi
+
+echo "0014 — input: drain DASH audio slaves to EOF after master EOF (F20)"
+SLAVE_DRAIN_FN="$(awk '/^static void SlaveDemuxToEnd/,/^}/' "$INPUT")"
+if printf '%s\n' "$SLAVE_DRAIN_FN" | grep -q 'SLAVE_DRAIN_MAX_ITER'; then
   ok "SlaveDemuxToEnd is defined with a bounded drain loop"
 else
   bad "SlaveDemuxToEnd definition missing or incomplete — 0014 not applied; slave drain unbounded/missing"
+fi
+if printf '%s\n' "$SLAVE_DRAIN_FN" | grep -q 'vlc_tick_now()' \
+   && printf '%s\n' "$SLAVE_DRAIN_FN" | grep -q 'deadline'; then
+  ok "SlaveDemuxToEnd has wall-clock time budget check (vlc_tick_now() / deadline)"
+else
+  bad "SlaveDemuxToEnd missing wall-clock time budget check (vlc_tick_now() / deadline) — 0014 stale/incomplete"
 fi
 # Placement: on master EOF, drain slaves BEFORE es_out_Eos so the audio decoder
 # fifo still accepts blocks. A misplaced call after Eos (or only a dead helper)
@@ -441,23 +502,23 @@ else
   bad "the guard is not gated on i_query == ES_OUT_SET_PCR — it would wrongly drop GROUP_PCR too"
 fi
 
-# 0007 (avsamplebuffer cap) was reverted 2026-07 — its standing backpressure
+# Reverted 2026-07 avsamplebuffer cap — its standing backpressure
 # destabilised the master clock. If a stale copy lingers in the fork's
 # scripts/patches, flag it: the reverted cap must NOT be in the tree.
 AVSB="$V/modules/audio_output/apple/avsamplebuffer.m"
 if [ -f "$AVSB" ] && grep -q 'downstreamAheadLocked' "$AVSB"; then
-  bad "0007 is STILL applied — it was reverted; delete scripts/patches/0007-* and rebuild"
+  bad "reverted avsamplebuffer cap is STILL applied — delete scripts/patches/0007-avsamplebuffer-cap-* and rebuild"
 fi
 
-# 0008 lands in the native VideoToolbox decoder, not one of the files above;
+# 0007 lands in the native VideoToolbox decoder, not one of the files above;
 # build-libvlc.sh keeps building when a patch fails to apply, so verify it — a
-# dropped 0008 sends AV1 back to the black FFmpeg-VA path (F17).
-echo "0008 — videotoolbox: native AV1 hardware decode (F17)"
+# dropped 0007 sends AV1 back to the black FFmpeg-VA path (F17).
+echo "0007 — videotoolbox: native AV1 hardware decode (F17)"
 AV1DEC="$V/modules/codec/videotoolbox/decoder.c"
 if [ -f "$AV1DEC" ] && grep -q 'CopyDecoderExtradataAV1' "$AV1DEC"; then
   ok "native AV1 decode present"
 else
-  bad "0008 not applied — AV1 still routes to the black FFmpeg-VA path (F17)"
+  bad "0007 not applied — AV1 still routes to the black FFmpeg-VA path (F17)"
 fi
 
 echo

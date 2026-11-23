@@ -39,7 +39,7 @@ Depends on 0003 only for context adjacency; independent logically.
          es_out_Eos(p_priv->p_es_out);
      }
      else if( i_ret == VLC_DEMUXER_EGENERIC )
-@@ -3125,6 +3138,49 @@
+@@ -3125,6 +3138,51 @@
          if( i_ret <= 0 )
          {
              msg_Dbg(p_input, "slave %zu EOF", i);
@@ -50,8 +50,9 @@ Depends on 0003 only for context adjacency; independent logically.
 +
 +/* Demux every non-EOF slave until each reports EOF (or the input is stopped).
 + * Used when the master hits EOF so trailing audio on a longer DASH slave is
-+ * still fed into es_out before EsOutDrain freezes the pipeline. Bound the
-+ * per-slave loop so a stuck demux cannot hang teardown.
++ * still fed into es_out before EsOutDrain freezes the pipeline. Bound both the
++ * per-slave iteration count and total wall-clock time so an abnormally long or
++ * wedged external slave cannot stall the input thread.
 + *
 + * F20 device (2026-07): DASH split A/V, master=video. After master EOF the
 + * main loop never called SlaveDemux again; audio stopped ~4s early
@@ -59,9 +60,8 @@ Depends on 0003 only for context adjacency; independent logically.
 + * was already queued. */
 +static void SlaveDemuxToEnd( input_thread_t *p_input )
 +{
-+    /* ~60s of ~50ms steps if a slave never ends — far above the few seconds
-+     * of tail we care about, cheap insurance against a wedged demux. */
 +    enum { SLAVE_DRAIN_MAX_ITER = 1200 };
++    const vlc_tick_t deadline = vlc_tick_now() + VLC_TICK_FROM_SEC(2);
 +
 +    for( size_t i = 0; i < input_priv(p_input)->i_slave; i++ )
 +    {
@@ -71,7 +71,9 @@ Depends on 0003 only for context adjacency; independent logically.
 +        if( in->b_eof )
 +            continue;
 +
-+        while( !input_Stopped( p_input ) && iter++ < SLAVE_DRAIN_MAX_ITER )
++        while( !input_Stopped( p_input )
++            && iter++ < SLAVE_DRAIN_MAX_ITER
++            && vlc_tick_now() < deadline )
 +        {
 +            int i_ret = demux_Demux( in->p_demux );
 +            if( i_ret <= 0 )

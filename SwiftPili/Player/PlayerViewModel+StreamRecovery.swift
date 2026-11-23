@@ -116,7 +116,10 @@ extension PlayerViewModel {
             "[StreamRetry] cycle=\(cycle.id) next=\(budget.streamRetries + 1) " +
                 "delay=\(delay) remaining=\(remaining) target=\(cycle.target)"
         )
-        guard delay < remaining else { return }
+        guard delay < remaining else {
+            finishStreamRecovery(cycle, reason: "deadline")
+            return
+        }
         let requestID = UUID()
         cycle.operation = Task { @MainActor [weak self, weak cycle] in
             do { try await Task.sleep(for: .seconds(delay)) } catch { return }
@@ -175,14 +178,16 @@ extension PlayerViewModel {
 
     func suspendStreamRecovery() {
         guard let cycle = streamRecovery, ownsStreamRecovery(cycle) else { return }
+        let now = CACurrentMediaTime()
         budget.interruptStreamStability()
         guard cycle.recovering else { return }
+        budget.suspendStreamRecovery(at: now)
         cycle.suspended = true
         cancelStreamOperation(cycle)
         isBuffering = false
         PlayerLog.log(
             "[StreamRetry] cycle=\(cycle.id) suspended " +
-                "remaining=\(budget.streamRemaining(at: CACurrentMediaTime()))"
+                "remaining=\(budget.streamRemaining(at: now))"
         )
     }
 
@@ -192,6 +197,7 @@ extension PlayerViewModel {
             retireStreamRecovery(reason: "superseded")
             return false
         }
+        budget.resumeStreamRecovery(at: CACurrentMediaTime())
         error = nil
         terminalOpenFailure = false
         isBuffering = true
@@ -217,22 +223,22 @@ extension PlayerViewModel {
         streamRecovery = nil
         resumeAtTime = cycle.target
         armDurableResumeTarget(cycle.target, source: "stream-retry-final")
-        terminalOpenFailure = true
-        isBuffering = false
-        updateIsPlaying(transportRunning: false)
+        let retries = budget.streamRetries
+        budget.clearStreamRecovery()
+        let logMessage = "[StreamRetry] cycle=\(cycle.id) final=\(reason) attempts=\(retries) target=\(cycle.target)"
         if cycle.failure.stage == .probe {
             markTransientStreamUnreachable()
-        } else if cycle.failure.stage == .resolver {
-            error = message
+            PlayerLog.log(logMessage)
         } else {
-            error = PlaybackFailureMessage.text(for: MediaEngineError.transportFailed(cycle.failure))
+            let resolvedMessage = cycle.failure.stage == .resolver
+                ? message
+                : PlaybackFailureMessage.text(for: MediaEngineError.transportFailed(cycle.failure))
+            settleTerminalFailure(TerminalFailurePayload(
+                message: resolvedMessage,
+                retireStreamRecoveryReason: nil,
+                logMessage: logMessage
+            ))
         }
-        pushNowPlayingPlayback()
-        PlayerLog.log(
-            "[StreamRetry] cycle=\(cycle.id) final=\(reason) " +
-                "attempts=\(budget.streamRetries) target=\(cycle.target)"
-        )
-        budget.clearStreamRecovery()
     }
 
     func noteStreamReady() {
@@ -312,9 +318,17 @@ extension PlayerViewModel {
             let decision = self.admitRecovery(
                 trigger: .streamTransport(cycle: cycle.id, request: requestID), position: cycle.target
             )
-            if case .admitted = decision { return }
-            self.finishStreamRecovery(cycle, reason: "admission")
-            return
+            switch decision {
+            case .admitted:
+                return
+            case .coalesced, .rejected(.backoff):
+                cycle.requestID = nil
+                self.scheduleStreamRecovery(cycle)
+                return
+            case .rejected:
+                self.finishStreamRecovery(cycle, reason: "admission")
+                return
+            }
         }
         cycle.operation = Task { @MainActor [weak self, weak cycle] in
             guard let self, let cycle, self.acceptsStreamRequest(requestID) else { return }

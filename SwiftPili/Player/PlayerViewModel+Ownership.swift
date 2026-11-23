@@ -44,21 +44,25 @@ extension PlayerViewModel {
 
     func claimOwnerLease(owner: String) -> PlayerOwnerLease {
         retireFullscreenPresentation()
+        let outgoingOwner = currentOwnerLease
         let retainsRunningSession = !ownerKey.isEmpty
             && ownerKey == owner
-            && currentOwnerLease != nil
+            && outgoingOwner != nil
         if !retainsRunningSession {
             invalidateSurfaceSlot(reason: "owner-lease-replacement")
         }
         mediaResetRecovery.invalidate()
         let keepsRunningSession = ownerKey == owner
-        let outgoingOwner = currentOwnerLease
         playerInfoHandoffPolicy.invalidate()
         pendingPlayerInfo = nil
         claim(owner: owner)
         if let recoveryCover { clearRecoveryCover(matching: recoveryCover.identity) }
         retireCDNFrameCover()
         ownerLeaseGeneration &+= 1
+        let incomingOwner = PlayerOwnerLease(owner: owner, generation: ownerLeaseGeneration)
+        if retainsRunningSession {
+            upgradeOrInvalidateSurfaceSlot(from: outgoingOwner, to: incomingOwner)
+        }
         if keepsRunningSession, let outgoingOwner {
             _ = NowPlayingCenter.shared.deactivate(owner: outgoingOwner)
         }
@@ -72,7 +76,7 @@ extension PlayerViewModel {
         nonLifecycleRecoveryTicket = nil
         deferredPiPOwnerExit.cancel()
         installEqualizerMaintenanceAdmission()
-        return PlayerOwnerLease(owner: owner, generation: ownerLeaseGeneration)
+        return incomingOwner
     }
 
     @discardableResult
@@ -286,6 +290,25 @@ struct PlayerSurfaceAuthority: Equatable, Sendable {
         else { return false }
         self.active = nil
         return true
+    }
+
+    mutating func rekeyOrInvalidate(
+        from outgoing: PlayerOwnerLease,
+        to incoming: PlayerOwnerLease,
+        hasAttachment: Bool
+    ) -> PlayerSurfaceLease? {
+        guard let active, active.ownerLease == outgoing, hasAttachment else {
+            self.active = nil
+            return nil
+        }
+        nextToken &+= 1
+        let upgraded = PlayerSurfaceLease(
+            ownerLease: incoming,
+            token: nextToken,
+            role: active.role
+        )
+        self.active = upgraded
+        return upgraded
     }
 }
 

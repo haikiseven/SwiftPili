@@ -468,9 +468,12 @@ extension PlayerViewModel {
             retireStreamRecovery(reason: "permanent-resolver")
             if error.isCancellation {
                 if generation == loadGeneration, currentURL == nil {
-                    PlayerLog.log("[Player] loadVOD cancelled after teardown with no successor — surfacing Retry")
-                    StartupTrace.abort("load-cancelled", token: startupTraceToken ?? self.startupTraceToken)
-                    self.error = String(localized: "Loading was interrupted. Tap Retry.")
+                    settleTerminalFailure(TerminalFailurePayload(
+                        message: String(localized: "Loading was interrupted. Tap Retry."),
+                        retireStreamRecoveryReason: nil,
+                        startupTraceAbortLabel: "load-cancelled",
+                        logMessage: "[Player] loadVOD cancelled after teardown with no successor — surfacing Retry"
+                    ))
                 } else {
                     PlayerLog.log("[Player] loadVOD cancelled (benign) — no error surfaced")
                 }
@@ -480,10 +483,12 @@ extension PlayerViewModel {
                 markUnavailable(reason, detail: "loadVOD")
                 return
             }
-            StartupTrace.abort("load-failed", token: startupTraceToken ?? self.startupTraceToken)
-            self.error = error.localizedDescription
-            isBuffering = false
-            PlayerLog.log("[Player] loadVOD failed: \(error)")
+            settleTerminalFailure(TerminalFailurePayload(
+                message: error.localizedDescription,
+                retireStreamRecoveryReason: nil,
+                startupTraceAbortLabel: "load-failed",
+                logMessage: "[Player] loadVOD failed: \(error)"
+            ))
         }
     }
 }

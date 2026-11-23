@@ -1,29 +1,38 @@
 import Foundation
 
-import PiliPlayerApple
-import PiliPlayerCore
-import PiliPlayerMedia
+// MARK: - Public runtime, event channel, and clock seams
 
-// MARK: - Package-only runtime and clock seams
-
-package enum PlaybackRuntimeAvailability: Hashable, Sendable {
+public enum PlaybackRuntimeAvailability: Hashable, Sendable {
     case available
     case unavailable
 }
 
-package enum PlaybackRuntimeCommand: Hashable, Sendable {
-    case open
+public enum PlaybackSeekMode: Hashable, Sendable {
+    case accurate
+    case fast
+}
+
+public enum PlaybackRuntimeCommand: Hashable, Sendable {
+    case open(source: PlaybackSource, configuration: PlaybackConfiguration)
     case play
     case pause
-    case seek
-    case setRate
-    case stop
+    case seek(to: TimeInterval, mode: PlaybackSeekMode = .accurate)
+    case setRate(Float)
+    case stop(reason: PlaybackStopReason)
     case requestPictureInPicture(PlaybackPictureInPictureRequest)
     case environment(PlaybackEnvironmentEventKind)
     case close
 }
 
-package enum PlaybackRuntimeDecision: Hashable, Sendable {
+public enum PlaybackRuntimeEvent: Hashable, Sendable {
+    case ready(duration: PlaybackDuration? = nil, capabilities: Set<PlaybackCapability>? = nil)
+    case buffering(Bool)
+    case progress(mediaTime: TimeInterval, duration: PlaybackDuration? = nil)
+    case ended
+    case failed(PlaybackFailure)
+}
+
+public enum PlaybackRuntimeDecision: Hashable, Sendable {
     case accepted
     case acceptedWithCapabilities(Set<PlaybackCapability>)
     case rejected(PlaybackRejection)
@@ -31,36 +40,43 @@ package enum PlaybackRuntimeDecision: Hashable, Sendable {
     case unavailable
 }
 
-package protocol PlaybackRuntime: Sendable {
+public protocol PlaybackRuntime: Sendable {
     var availability: PlaybackRuntimeAvailability { get }
+    var runtimeEvents: AsyncStream<PlaybackRuntimeEvent> { get }
     func execute(_ command: PlaybackRuntimeCommand) async -> PlaybackRuntimeDecision
 }
 
-package protocol PlaybackMonotonicClock: Sendable {
+public extension PlaybackRuntime {
+    var runtimeEvents: AsyncStream<PlaybackRuntimeEvent> {
+        AsyncStream { $0.finish() }
+    }
+}
+
+public protocol PlaybackMonotonicClock: Sendable {
     @MainActor func now() -> Duration
 }
 
-package struct SystemPlaybackMonotonicClock: PlaybackMonotonicClock {
+public struct SystemPlaybackMonotonicClock: PlaybackMonotonicClock {
     private let clock: ContinuousClock
     private let origin: ContinuousClock.Instant
 
-    package init() {
+    public init() {
         let clock = ContinuousClock()
         self.clock = clock
         self.origin = clock.now
     }
 
-    @MainActor package func now() -> Duration {
+    @MainActor public func now() -> Duration {
         origin.duration(to: clock.now)
     }
 }
 
-package struct UnavailablePlaybackRuntime: PlaybackRuntime {
-    package let availability: PlaybackRuntimeAvailability = .unavailable
+public struct UnavailablePlaybackRuntime: PlaybackRuntime {
+    public let availability: PlaybackRuntimeAvailability = .unavailable
 
-    package init() {}
+    public init() {}
 
-    package func execute(_ command: PlaybackRuntimeCommand) async -> PlaybackRuntimeDecision {
+    public func execute(_ command: PlaybackRuntimeCommand) async -> PlaybackRuntimeDecision {
         .unavailable
     }
 }

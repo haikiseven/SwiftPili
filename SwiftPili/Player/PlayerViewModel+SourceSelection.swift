@@ -87,10 +87,10 @@ extension PlayerViewModel {
                 streamRetryID: streamRetryID
             )
         }
-        if cdnSwitchID != nil || streamRetryID != nil {
-            await withTaskCancellationHandler { await loadTask.value } onCancel: { loadTask.cancel() }
-        } else {
+        await withTaskCancellationHandler {
             await loadTask.value
+        } onCancel: {
+            loadTask.cancel()
         }
     }
 

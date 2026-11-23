@@ -4,7 +4,11 @@ import Foundation
 private let converterNoInputDataAvailable: OSStatus = 0x6E6F_6474
 
 actor AudioToolboxAudioDecoder: MediaAudioDecoding {
-    private var converter: AudioConverterRef?
+    private struct ConverterHandle: @unchecked Sendable {
+        let ref: AudioConverterRef
+    }
+
+    private var converter: ConverterHandle?
     private var retainedConverterInput: InputBox?
     private var opened = false
     private var inputSampleRate: Double = 44_100
@@ -26,6 +30,14 @@ actor AudioToolboxAudioDecoder: MediaAudioDecoding {
     private var nativeAccessUnitBoundaryKnown = false
     private var noPCMReturns = 0
     private var lastDiagnostics = MediaAudioDecodeDiagnostics.unavailable
+
+    deinit {
+        if let converter {
+            _ = withExtendedLifetime(retainedConverterInput) {
+                AudioConverterDispose(converter.ref)
+            }
+        }
+    }
 
     private struct PendingAccessUnit {
         let pts: TimeInterval
@@ -149,7 +161,13 @@ actor AudioToolboxAudioDecoder: MediaAudioDecoding {
                 )
             }
         }
-        self.converter = converterOut
+        self.converter = ConverterHandle(ref: converterOut)
+        var openSucceeded = false
+        defer {
+            if !openSucceeded {
+                closeNative()
+            }
+        }
         self.opened = true
         self.framesProduced = 0
         resetResampler()
@@ -199,9 +217,6 @@ actor AudioToolboxAudioDecoder: MediaAudioDecoding {
         self.nativeDecodedSampleRate = negotiatedOutputRate
         self.outChannels = negotiatedOutputChannels
         if abs(negotiatedInputRate - negotiatedOutputRate) > 0.5 {
-            AudioConverterDispose(converterOut)
-            self.converter = nil
-            self.opened = false
             throw MediaEngineError.notImplemented(
                 "\(label) converter negotiated \(Int(negotiatedInputRate))Hz in / " +
                 "\(Int(negotiatedOutputRate))Hz out; a rate conversion inside the " +
@@ -282,6 +297,7 @@ actor AudioToolboxAudioDecoder: MediaAudioDecoding {
         } else {
             aacFlags = "fpp=\(input.compressedFramesPerPacket) "
         }
+        openSucceeded = true
         PlayerLog.log(
             "[PathA] \(label) decoder open " + codecDetail +
             "decode=\(Int(negotiatedOutputRate))Hz pcm=\(Int(outSampleRate))Hz/" +
@@ -356,7 +372,7 @@ actor AudioToolboxAudioDecoder: MediaAudioDecoding {
                     )
                 )
                 return AudioConverterFillComplexBuffer(
-                    converter,
+                    converter.ref,
                     callback,
                     userData,
                     &packetSize,
@@ -531,7 +547,7 @@ actor AudioToolboxAudioDecoder: MediaAudioDecoding {
         guard !Task.isCancelled else { return }
         if let converter {
             let status = withExtendedLifetime(retainedConverterInput) {
-                AudioConverterReset(converter)
+                AudioConverterReset(converter.ref)
             }
             nativeAccessUnitBoundaryKnown = status == noErr
             if status == noErr {
@@ -560,7 +576,7 @@ actor AudioToolboxAudioDecoder: MediaAudioDecoding {
     private func closeNative() {
         if let converter {
             _ = withExtendedLifetime(retainedConverterInput) {
-                AudioConverterDispose(converter)
+                AudioConverterDispose(converter.ref)
             }
         }
         converter = nil

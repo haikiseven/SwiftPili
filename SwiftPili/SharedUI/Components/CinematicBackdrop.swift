@@ -23,27 +23,34 @@ struct CinematicBackdrop: View {
                     let envelope = ambientEnvelope(for: proxy.size, safeTop: safeTop)
                     ZStack(alignment: .top) {
                         if !reduceTransparency, let source = sourceForDisplay {
-                            PlayerAmbientArtworkView(
-                                source: source,
-                                liveImage: liveImageForDisplay,
-                                liveFrameSerial: liveFrameSerialForDisplay,
-                                crossFadeDuration: Self.crossFadeDuration
-                            )
-                                .blur(radius: Self.sourceBlur, opaque: true)
-                                .saturation(liveImageForDisplay != nil ? 1.18 : 1.14)
-                                .scaleEffect(
-                                    x: scale(
-                                        proxy.size.width * Self.horizontalOverscan,
-                                        source: PlayerAmbientPolicy.analysisBox.width
-                                    ),
-                                    y: scale(
-                                        envelope.height,
-                                        source: PlayerAmbientPolicy.analysisBox.height
-                                    )
+                            ZStack {
+                                PlayerAmbientArtworkView(
+                                    source: source,
+                                    crossFadeDuration: Self.crossFadeDuration
                                 )
-                                .frame(width: proxy.size.width, height: envelope.height)
-                                .clipped()
-                                .mask(
+                                    .blur(radius: Self.sourceBlur, opaque: true)
+                                    .saturation(1.14)
+                                    .scaleEffect(
+                                        x: scale(
+                                            proxy.size.width * Self.horizontalOverscan,
+                                            source: PlayerAmbientPolicy.analysisBox.width
+                                        ),
+                                        y: scale(
+                                            envelope.height,
+                                            source: PlayerAmbientPolicy.analysisBox.height
+                                        )
+                                    )
+                                    .frame(width: proxy.size.width, height: envelope.height)
+                                    .clipped()
+                                AmbientLiveLayerView()
+                                    .frame(
+                                        width: proxy.size.width * Self.horizontalOverscan,
+                                        height: envelope.height
+                                    )
+                                    .frame(width: proxy.size.width, height: envelope.height)
+                                    .clipped()
+                            }
+                            .mask(
                                     LinearGradient(
                                         stops: [
                                             .init(color: .white.opacity(0.76), location: 0.0),
@@ -146,28 +153,10 @@ struct CinematicBackdrop: View {
             && ExperimentalSettingsPolicy.isAllowed(.ambient)
     }
 
-    private var liveImageForDisplay: UIImage? {
-        guard isLiveAmbientEligible else { return nil }
-        return player?.ambientLiveImage
-    }
-
-    private var liveFrameSerialForDisplay: UInt64 {
-        guard isLiveAmbientEligible else { return 0 }
-        return player?.ambientLiveFrameSerial ?? 0
-    }
-
     private var sourceForDisplay: PlayerAmbientSource? {
         guard isLiveAmbientEligible, let player else { return nil }
         if let source = player.ambientSource {
             return source
-        }
-        if player.ambientLiveImage != nil {
-            let fallback = coverURL.flatMap(PlayerAmbientStoryboardFrame.normalizedURL)
-                ?? player.ambientCoverURL
-            return PlayerAmbientSource(
-                artwork: PlayerAmbientArtwork(url: fallback ?? "ambient://live-frame"),
-                fallbackCover: fallback
-            )
         }
         guard let cover = coverURL.flatMap(PlayerAmbientStoryboardFrame.normalizedURL)
             ?? player.ambientCoverURL else { return nil }

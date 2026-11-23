@@ -53,7 +53,9 @@ struct PlayerBottomControlBar: View {
                             .foregroundStyle(.white)
                             .frame(width: 44, height: 44)
                             .contentShape(Rectangle())
+                            .accessibilityHidden(true)
                     }
+                    .accessibilityLabel(Text("Rewind 10 seconds"))
 
                     Button { player.seek(to: min(player.duration, player.displayTime + 10)) } label: {
                         Image(systemName: "goforward.10")
@@ -61,7 +63,9 @@ struct PlayerBottomControlBar: View {
                             .foregroundStyle(.white)
                             .frame(width: 44, height: 44)
                             .contentShape(Rectangle())
+                            .accessibilityHidden(true)
                     }
+                    .accessibilityLabel(Text("Forward 10 seconds"))
                 }
 
                 if DetailDanmakuEntryPolicy.chromeShowsSendEntry(

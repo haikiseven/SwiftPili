@@ -86,7 +86,8 @@ enum AudioToolboxInput: Equatable, Sendable {
     var requestedOutputChannels: UInt32 {
         switch self {
         case .aac: return AudioToolboxAudioDecoder.engineChannelCount
-        case .flac(let info, _): return info.channels
+        case .flac(let info, _):
+            return info.channels == 1 ? 1 : AudioToolboxAudioDecoder.engineChannelCount
         }
     }
 

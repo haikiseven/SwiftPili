@@ -7,6 +7,7 @@ actor PathAHLSFMP4Demuxer: MediaDemuxing {
     func cancelMultiConnectionPrefetching() async {}
 
     private let session: URLSession
+    private let ownsSession: Bool
     private var generation: UInt64 = 0
     private var inFlightRequest: PathAHLSInFlightRequest?
     private var playlistURL: URL?
@@ -28,11 +29,19 @@ actor PathAHLSFMP4Demuxer: MediaDemuxing {
     init(session: URLSession? = nil) {
         if let session {
             self.session = session
+            self.ownsSession = false
         } else {
             let configuration = URLSessionConfiguration.ephemeral
             configuration.timeoutIntervalForRequest = 15
             configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
             self.session = URLSession(configuration: configuration)
+            self.ownsSession = true
+        }
+    }
+
+    deinit {
+        if ownsSession {
+            session.finishTasksAndInvalidate()
         }
     }
 

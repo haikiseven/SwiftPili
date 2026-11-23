@@ -14,7 +14,7 @@ enum {
     MAX_PROBE_BYTES = 16 * 1024 * 1024,
     MAX_READ_BYTES = 16 * 1024 * 1024,
     MAX_PROBE_PACKETS = 384,
-    MAX_SKIPPED_PACKETS = 256,
+    MAX_SKIPPED_PACKETS = 2048,
     PROBE_TIME_US = 12 * 1000 * 1000,
     READ_TIME_US = 12 * 1000 * 1000,
     FLV_HEADER_BYTES = 9,
@@ -232,7 +232,7 @@ static int update_timing(MLDContext *context, MLDStream *stream, MLDPacket *view
         if (isfinite(stream->last_dts)) {
             double delta = view->dts - stream->last_dts;
             if (delta < -2 || delta > 30)
-                return MLD_INVALID;
+                return MLD_RELOAD;
         }
         stream->last_dts = view->dts;
     }

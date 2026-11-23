@@ -33,13 +33,15 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
     }
 
     func update(context: PlayerScreenPresentationContext) {
-        if self.context != context {
+        if self.context.hostKey != context.hostKey {
             if let receipt {
                 PlayerViewModel.shared.unregisterFullscreenPresentation(self, receipt: receipt)
             }
             self.context = context
             receipt = nil
             phase = .inline
+        } else if self.context != context {
+            self.context = context
         }
         registerIfCurrent()
     }
@@ -133,7 +135,10 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
         if PlayerViewModel.shared.isFullscreen {
             presentHostIfNeeded()
         } else {
-            if host != nil { phase = .leaving }
+            if let controller = host {
+                phase = .leaving
+                controller.enterLeavingState()
+            }
             dismissHostWhenSceneSettled()
         }
     }
@@ -148,6 +153,9 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
         }
         pendingMask = mask
         pendingMaskLabel = label
+        if phase == .leaving || !PlayerViewModel.shared.isFullscreen {
+            host?.enterLeavingState()
+        }
         if phase == .fullscreen || phase == .leaving {
             commitPendingOrientation(reason: "hostPresented")
         } else if !PlayerViewModel.shared.isFullscreen {
@@ -246,8 +254,7 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
 
     func hostRotationDidBegin(_ controller: PlayerFullscreenHostController) {
         guard accepts(controller), !PlayerViewModel.shared.isFullscreen else { return }
-        rotationInFlight = false
-        dismissHostWhenSceneSettled()
+        controller.enterLeavingState()
     }
 
     func hostDidCompleteRotation(_ controller: PlayerFullscreenHostController) {

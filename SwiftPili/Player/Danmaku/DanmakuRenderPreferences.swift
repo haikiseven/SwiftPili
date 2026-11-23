@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 enum DanmakuPresentation: Sendable, Equatable {
     case inline
@@ -6,6 +7,65 @@ enum DanmakuPresentation: Sendable, Equatable {
 }
 
 struct DanmakuRenderPreferences: Equatable, Sendable {
+    private final class StandardCache: Sendable {
+        struct Snapshot: Sendable {
+            var preferences: DanmakuRenderPreferences?
+            var smartMask: Bool?
+        }
+
+        static let shared = StandardCache()
+        private let state = OSAllocatedUnfairLock(initialState: Snapshot())
+        private nonisolated(unsafe) let observers: [NSObjectProtocol]
+
+        private init() {
+            let state = self.state
+            let clear: @Sendable (Notification) -> Void = { _ in
+                state.withLock {
+                    $0.preferences = nil
+                    $0.smartMask = nil
+                }
+            }
+            let token1 = NotificationCenter.default.addObserver(
+                forName: UserDefaults.didChangeNotification,
+                object: UserDefaults.standard,
+                queue: nil,
+                using: clear
+            )
+            let token2 = NotificationCenter.default.addObserver(
+                forName: .danmakuPreferencesCommit,
+                object: nil,
+                queue: nil,
+                using: clear
+            )
+            observers = [token1, token2]
+        }
+
+        func invalidate() {
+            state.withLock {
+                $0.preferences = nil
+                $0.smartMask = nil
+            }
+        }
+
+        func preferences(loader: () -> DanmakuRenderPreferences) -> DanmakuRenderPreferences {
+            if let cached = state.withLock({ $0.preferences }) {
+                return cached
+            }
+            let loaded = loader()
+            state.withLock { $0.preferences = loaded }
+            return loaded
+        }
+
+        func smartMask(loader: () -> Bool) -> Bool {
+            if let cached = state.withLock({ $0.smartMask }) {
+                return cached
+            }
+            let loaded = loader()
+            state.withLock { $0.smartMask = loaded }
+            return loaded
+        }
+    }
+
     static let opacityKey = "danmaku_opacity"
     static let fontScaleKey = "danmaku_font_scale"
     static let fullscreenFontScaleKey = "danmaku_font_scale_fullscreen"
@@ -15,6 +75,9 @@ struct DanmakuRenderPreferences: Equatable, Sendable {
             defaults.set(load(defaults).fullscreenFontScale, forKey: fullscreenFontScaleKey)
         }
         defaults.set(value, forKey: fontScaleKey)
+        if defaults === UserDefaults.standard {
+            StandardCache.shared.invalidate()
+        }
     }
     static let scrollLifetimeKey = "danmaku_scroll_lifetime"
     static let displayAreaKey = "danmaku_display_area"
@@ -115,6 +178,13 @@ struct DanmakuRenderPreferences: Equatable, Sendable {
     )
 
     static func load(_ defaults: UserDefaults = .standard) -> DanmakuRenderPreferences {
+        if defaults === UserDefaults.standard {
+            return StandardCache.shared.preferences { loadUncached(defaults) }
+        }
+        return loadUncached(defaults)
+    }
+
+    private static func loadUncached(_ defaults: UserDefaults) -> DanmakuRenderPreferences {
         if defaults === UserDefaults.standard,
            !defaults.bool(forKey: displayTuningMigrationV2Key) {
             defaults.set(true, forKey: displayTuningMigrationV2Key)
@@ -308,7 +378,12 @@ struct DanmakuRenderPreferences: Equatable, Sendable {
     }
 
     static func smartMaskEnabled(_ defaults: UserDefaults = .standard) -> Bool {
-        bool(defaults, smartMaskKey, defaultSmartMask)
+        if defaults === UserDefaults.standard {
+            return StandardCache.shared.smartMask {
+                bool(defaults, smartMaskKey, defaultSmartMask)
+            }
+        }
+        return bool(defaults, smartMaskKey, defaultSmartMask)
     }
 
     private static func bool(_ defaults: UserDefaults, _ key: String, _ fallback: Bool) -> Bool {

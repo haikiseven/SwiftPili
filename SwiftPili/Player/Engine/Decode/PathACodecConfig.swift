@@ -23,6 +23,80 @@ enum PathACodecConfig {
         }
     }
 
+    enum InBandVideoCodec: Sendable {
+        case h264
+        case hevc
+    }
+
+    static func inBandBootstrap(codec: String?, config: Data) -> (codec: InBandVideoCodec, nalLengthSize: Int)? {
+        switch codec?.lowercased() {
+        case "avc3":
+            let nalLengthSize = config.count >= 5 ? Int(config[4] & 0x03) + 1 : 4
+            return (.h264, nalLengthSize)
+        case "hev1":
+            let nalLengthSize = config.count >= 22 ? Int(config[21] & 0x03) + 1 : 4
+            return (.hevc, nalLengthSize)
+        default:
+            return nil
+        }
+    }
+
+    static func makeInBandFormatDescription(
+        codec: InBandVideoCodec,
+        parameterSets: [Data],
+        nalLengthSize: Int
+    ) throws -> CMFormatDescription {
+        switch codec {
+        case .h264:
+            return try createH264FormatDescription(parameterSets: parameterSets, nalLengthSize: nalLengthSize)
+        case .hevc:
+            return try createHEVCFormatDescription(parameterSets: parameterSets, nalLengthSize: nalLengthSize)
+        }
+    }
+
+    static func extractInBandParameterSets(
+        from data: Data,
+        nalLengthSize: Int,
+        codec: InBandVideoCodec
+    ) -> [Data]? {
+        guard (1...4).contains(nalLengthSize), data.count > nalLengthSize else { return nil }
+        return data.withUnsafeBytes { raw -> [Data]? in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return nil }
+            var offset = 0
+            var sets: [Data] = []
+            var hasSPS = false
+            var hasPPS = false
+            while offset + nalLengthSize <= raw.count {
+                var nalLength = 0
+                for i in 0..<nalLengthSize {
+                    nalLength = (nalLength << 8) | Int(base[offset + i])
+                }
+                offset += nalLengthSize
+                guard nalLength > 0, offset + nalLength <= raw.count else { break }
+                let header = base[offset]
+                let isParameterSet: Bool
+                switch codec {
+                case .h264:
+                    let type = header & 0x1F
+                    if type == 7 { hasSPS = true; isParameterSet = true }
+                    else if type == 8 { hasPPS = true; isParameterSet = true }
+                    else { isParameterSet = false }
+                case .hevc:
+                    let type = (header >> 1) & 0x3F
+                    if type == 32 { isParameterSet = true }
+                    else if type == 33 { hasSPS = true; isParameterSet = true }
+                    else if type == 34 { hasPPS = true; isParameterSet = true }
+                    else { isParameterSet = false }
+                }
+                if isParameterSet {
+                    sets.append(Data(bytes: base + offset, count: nalLength))
+                }
+                offset += nalLength
+            }
+            return (hasSPS && hasPPS) ? sets : nil
+        }
+    }
+
     static func makeVideoFormatDescription(
         codec: String,
         config: Data,
@@ -397,9 +471,16 @@ enum PathACodecConfig {
         guard !sets.isEmpty else {
             throw MediaEngineError.decodeFailed("hvcC empty parameter sets")
         }
+        return try createHEVCFormatDescription(parameterSets: sets, nalLengthSize: nalLengthSize)
+    }
+
+    private static func createHEVCFormatDescription(
+        parameterSets: [Data],
+        nalLengthSize: Int
+    ) throws -> CMFormatDescription {
         var flat = Data()
         var ranges: [Range<Int>] = []
-        for set in sets {
+        for set in parameterSets {
             let start = flat.count
             flat.append(set)
             ranges.append(start..<(start + set.count))
@@ -413,7 +494,7 @@ enum PathACodecConfig {
             var formatOut: CMFormatDescription?
             let status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
                 allocator: kCFAllocatorDefault,
-                parameterSetCount: sets.count,
+                parameterSetCount: parameterSets.count,
                 parameterSetPointers: &pointers,
                 parameterSetSizes: &sizes,
                 nalUnitHeaderLength: Int32(nalLengthSize),

@@ -35,17 +35,46 @@ struct PlayerRouteDestination: Equatable {
     let position: PlayerRoutePosition
 }
 
-struct PlayerScreenPresentationContext: Equatable {
+struct PlayerScreenHostKey: Equatable {
     let screenID: UUID
     let ownerLease: PlayerOwnerLease
     let route: PlayerScreenRoute
     let position: PlayerRoutePosition
-    let source: PlayerPresentationSource
+}
+
+struct PlayerScreenPresentationContext: Equatable {
+    let hostKey: PlayerScreenHostKey
+    let source: PlayerPresentationSource?
+
+    var screenID: UUID { hostKey.screenID }
+    var ownerLease: PlayerOwnerLease { hostKey.ownerLease }
+    var route: PlayerScreenRoute { hostKey.route }
+    var position: PlayerRoutePosition { hostKey.position }
+
+    init(
+        screenID: UUID,
+        ownerLease: PlayerOwnerLease,
+        route: PlayerScreenRoute,
+        position: PlayerRoutePosition,
+        source: PlayerPresentationSource?
+    ) {
+        self.hostKey = PlayerScreenHostKey(
+            screenID: screenID,
+            ownerLease: ownerLease,
+            route: route,
+            position: position
+        )
+        self.source = source
+    }
 }
 
 struct PlayerPresentationReceipt: Equatable {
     let id: UUID
     let context: PlayerScreenPresentationContext
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.id == rhs.id && lhs.context.hostKey == rhs.context.hostKey
+    }
 }
 
 enum PlayerPresentationCoverage {

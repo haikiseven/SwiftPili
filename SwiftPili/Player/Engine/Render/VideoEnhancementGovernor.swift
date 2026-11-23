@@ -287,8 +287,8 @@ struct VideoEnhancementGovernor: Sendable {
 
     private mutating func stepDown(now: ContinuousClock.Instant) {
         consecutiveBadWindows = 0
-        // Degradations already imposed by the system floor are not the bottleneck; go below it.
-        let base = max(adaptiveLevel, systemFloor)
+        // Degradations already imposed by the system/structural floor are not the bottleneck; go below them.
+        let base = level
         let current = configuration(at: base)
         var candidate = base.next
         // Skip rungs that do not change anything for this configuration (e.g. SR scale when only FI is on).

@@ -116,6 +116,7 @@ struct PlayerView: View {
     @State private var verticalAdjustIsVolume = false
     @State private var verticalAdjustBase: Double = 0
     @State private var surfaceSize: CGSize = .zero
+    @GestureState private var isSurfacePressing = false
     @State private var surfaceTouchInFlight = false
     @State private var surfaceHoldEngaged = false
     private var surfaceOwnsTouch: Bool {
@@ -222,7 +223,7 @@ struct PlayerView: View {
             )
         )
         ZStack {
-            Color.black
+            (surfaceRole == .inline || vm.isFullscreen) ? Color.black : Color.clear
 
             if isOwner {
                 PlayerFullscreenAmbientBackdrop(player: vm)
@@ -284,19 +285,21 @@ struct PlayerView: View {
             }
             .zIndex(0)
 
-            PlayerControlsOverlay(
-                player: vm, owner: owner, screenLease: screenLease,
-                presentationReceipt: presentationReceipt, fullscreenHostIdentity: fullscreenHostIdentity,
-                gestureDisplay: gestureDisplay, liveQualityControl: liveQualityControl,
-                pageNavigationActions: pageNavigationActions,
-                showsAnimeOptions: showsAnimeOptions,
-                chromeInsets: chromeInsets, transportPlacement: transportPlacement,
-                suppressTransportRow: isPlaybackUnavailable,
-                danmakuPanelPresented: $danmakuPanelPresented, showSponsorBlock: $showSponsorBlock
-            )
-                .opacity(vm.showControls ? 1 : 0)
-                .allowsHitTesting(vm.showControls)
-                .zIndex(1)
+            if surfaceRole == .inline || vm.isFullscreen {
+                PlayerControlsOverlay(
+                    player: vm, owner: owner, screenLease: screenLease,
+                    presentationReceipt: presentationReceipt, fullscreenHostIdentity: fullscreenHostIdentity,
+                    gestureDisplay: gestureDisplay, liveQualityControl: liveQualityControl,
+                    pageNavigationActions: pageNavigationActions,
+                    showsAnimeOptions: showsAnimeOptions,
+                    chromeInsets: chromeInsets, transportPlacement: transportPlacement,
+                    suppressTransportRow: isPlaybackUnavailable,
+                    danmakuPanelPresented: $danmakuPanelPresented, showSponsorBlock: $showSponsorBlock
+                )
+                    .opacity(vm.showControls ? 1 : 0)
+                    .allowsHitTesting(vm.showControls)
+                    .zIndex(1)
+            }
 
             if vm.isFullscreen, danmakuPanelPresented, danmakuEnabled {
                 ZStack {
@@ -517,10 +520,28 @@ struct PlayerView: View {
             if let claimedSurfaceLease { vm.releaseSurfaceSlot(lease: claimedSurfaceLease) }
             claimedSurfaceLease = nil
             resetSurfaceTouch(reason: "view disappeared")
+            danmakuPanelPresented = false
+            if vm.ownerKey == owner {
+                vm.setDanmakuSettingsHold(false)
+            }
             surfaceHoldTask?.cancel()
             surfaceHoldTask = nil
             pendingTapTask?.cancel()
             pendingTapTask = nil
+        }
+        .onChange(of: isSurfacePressing) { _, pressing in
+            if !pressing, surfaceTouchInFlight {
+                resetSurfaceTouch(reason: "system-cancelled")
+            }
+        }
+        .onChange(of: gestureDisplay.isSeeking) { _, seeking in
+            guard isOwner else { return }
+            if seeking {
+                vm.hideControlsTask?.cancel()
+                vm.hideControlsTask = nil
+            } else {
+                vm.scheduleHideControls()
+            }
         }
         .onChange(of: vm.ownerKey) { _, _ in
             claimScreenSurfaceIfCurrent()
@@ -534,6 +555,10 @@ struct PlayerView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
             guard isOwner, UIDevice.current.userInterfaceIdiom == .phone else { return }
             let orientation = UIDevice.current.orientation
+            guard !FullscreenOrientationLatch.shared.shouldIgnoreDeviceOrientation(
+                orientation,
+                currentFullscreen: vm.isFullscreen
+            ) else { return }
             if orientation.isLandscape, vm.currentURL != nil, !vm.isFullscreen {
                 vm.requestFullscreenTransition(target: true, source: .deviceOrientation)
             } else if orientation == .portrait, vm.isFullscreen {
@@ -598,6 +623,9 @@ struct PlayerView: View {
 
     private var surfaceGesture: some Gesture {
         DragGesture(minimumDistance: 0)
+            .updating($isSurfacePressing) { _, pressing, _ in
+                pressing = true
+            }
             .onChanged { gesture in
                 guard isOwner, surfaceLease != nil else { return }
                 UIHitchMonitor.count("gesture")
@@ -814,6 +842,6 @@ struct PlayerView: View {
     }
 
     private func scheduleHideControls() {
-        if isOwner { vm.scheduleHideControls() }
+        if isOwner { vm.scheduleHideControls(isSeeking: gestureDisplay.isSeeking) }
     }
 }

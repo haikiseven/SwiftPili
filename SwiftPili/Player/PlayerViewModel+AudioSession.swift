@@ -66,7 +66,12 @@ extension PlayerViewModel {
                 play()
             } else {
                 backgroundExecution.end(reason: "interruption-not-resumed")
-                if playbackIntent == .pausedBySystem, !shouldResume { playbackIntent = .pausedByUser }
+                if playbackIntent == .pausedBySystem {
+                    playbackIntent = .pausedByUser
+                    if audioSessionPolicy.needsActivation {
+                        audioSessionPolicy.requireUserPlay()
+                    }
+                }
             }
         case .oldDeviceUnavailable:
             audioSessionPolicy.requireUserPlay()
@@ -132,6 +137,8 @@ extension PlayerViewModel {
         lifecycleRecovery.invalidate()
         decoderRecoveryAdmission.invalidate()
         nonLifecycleRecoveryTicket = nil
+        nonLifecycleRecoveryTask?.task.cancel()
+        nonLifecycleRecoveryTask = nil
         explicitPlayReloadInFlight = false
         if let owner, let source {
             mediaResetRecovery.admit(owner: owner, source: source)

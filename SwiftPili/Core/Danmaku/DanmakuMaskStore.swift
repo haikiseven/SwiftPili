@@ -152,10 +152,11 @@ final class DanmakuMaskStore {
         let declaredEnd = index.declaredEnd(of: key)
         do {
             let compressed = try await range(from: bytes.from, through: bytes.through)
+            guard !Task.isCancelled, inFlight[key]?.request == request, self.index == index else { return }
             let decoded = try await Task.detached(priority: .utility) {
                 try DanmakuMaskFormat.segment(compressed, index: key, start: start, declaredEnd: declaredEnd)
             }.value
-            guard !Task.isCancelled, self.index == index else { return }
+            guard !Task.isCancelled, inFlight[key]?.request == request, self.index == index else { return }
             failures.removeValue(forKey: key)
             segments[key] = decoded
             let width = Int(decoded.canvas.width)
@@ -166,6 +167,7 @@ final class DanmakuMaskStore {
             )
             onChange?()
         } catch {
+            guard !Task.isCancelled, inFlight[key]?.request == request, self.index == index else { return }
             fail(key, error)
         }
     }

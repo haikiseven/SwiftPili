@@ -36,13 +36,18 @@ struct BangumiDetailView: View {
     @State private var presentationScreenID = UUID()
     private var player: PlayerViewModel { PlayerViewModel.shared }
     private var presentationContext: PlayerScreenPresentationContext? {
-        guard isRouteActivated, let aid = viewModel.currentEpisodeAid,
-              let episode = viewModel.season?.episodes?.first(where: { $0.id == viewModel.selectedEpisodeId }),
-              let cid = episode.cid else { return nil }
+        guard isRouteActivated else { return nil }
+        let source: PlayerPresentationSource? = if let aid = viewModel.currentEpisodeAid,
+            let episode = viewModel.season?.episodes?.first(where: { $0.id == viewModel.selectedEpisodeId }),
+            let cid = episode.cid {
+            .vod(aid: aid, cid: cid, source: .pgc(epId: episode.id))
+        } else {
+            nil
+        }
         return player.presentationContext(
             screenID: presentationScreenID, lease: viewModel.playerLease,
             route: .bangumi(seasonId), position: routePosition,
-            source: .vod(aid: aid, cid: cid, source: .pgc(epId: episode.id))
+            source: source
         )
     }
     private var isWideLayout: Bool {

@@ -40,19 +40,13 @@ extension PlayerViewModel {
     }
 
     private func surfaceDemandRuntimeFault(_ fault: MediaRuntimeFault) {
-        retireStreamRecovery(reason: "decoder-fault")
-        terminalOpenFailure = true
-        error = MediaRuntimeFaultPresentation.message(for: fault)
-        isBuffering = false
-        updateIsPlaying(transportRunning: false)
-        pushNowPlayingPlayback()
-        acknowledgeLifecycleReadiness(.terminalFailure)
-        finishNonLifecycleRecoveryIfNeeded(outcome: .backendError)
-        PlayerLog.log(
-            "[PathA] runtime fault rejected/terminal class=\(fault.classification.rawValue) " +
-                "stage=\(fault.stage.rawValue) recovery=\(fault.recoverability.rawValue) " +
-                fault.diagnostics.summary
-        )
+        settleTerminalFailure(TerminalFailurePayload(
+            message: MediaRuntimeFaultPresentation.message(for: fault),
+            retireStreamRecoveryReason: "decoder-fault",
+            logMessage: "[PathA] runtime fault rejected/terminal class=\(fault.classification.rawValue) "
+                + "stage=\(fault.stage.rawValue) recovery=\(fault.recoverability.rawValue) "
+                + fault.diagnostics.summary
+        ))
     }
 
     @discardableResult
@@ -105,14 +99,28 @@ extension PlayerViewModel {
             return decision
         }
         clearCoalescedWatchdogTracking()
+        let isStreamTransport: Bool
+        if case .streamTransport = trigger {
+            isStreamTransport = true
+        } else {
+            isStreamTransport = false
+        }
+        if !isStreamTransport {
+            nonLifecycleRecoveryTask?.task.cancel()
+        }
         let operation = Task { @MainActor [weak self] in
             guard let self else { return }
             await self.performAdmittedRecovery(token: token, request: request)
+            if self.nonLifecycleRecoveryTask?.token == token {
+                self.nonLifecycleRecoveryTask = nil
+            }
         }
         if case .streamTransport(let cycleID, let requestID) = trigger,
            streamRecovery?.id == cycleID, streamRecovery?.requestID == requestID {
             streamRecovery?.ticket = token
             streamRecovery?.operation = operation
+        } else {
+            nonLifecycleRecoveryTask = (token, operation)
         }
         return decision
     }
@@ -164,7 +172,11 @@ extension PlayerViewModel {
                 lifecycleRecovery.invalidate()
             }
         case .coalesced:
-            surfaceDemandRuntimeFault(fault)
+            isBuffering = true
+            PlayerLog.log(
+                "[PathA] runtime fault coalesced into in-flight recovery " +
+                    "class=\(fault.classification.rawValue)"
+            )
         case .rejected(let rejection) where rejection.endsAutomaticRecovery:
             surfaceDemandRuntimeFault(fault)
         case .rejected(let rejection):
@@ -189,6 +201,7 @@ extension PlayerViewModel {
             PlayerLog.log("[Player] retry accepted — \(unavailability.rawValue) is transient")
         }
         self.unavailability = nil
+        playbackTerminalState = .active
         terminalOpenFailure = false
         error = nil
         isBuffering = true
@@ -204,8 +217,9 @@ extension PlayerViewModel {
         case .coalesced:
             break
         case .rejected:
-            error = String(localized: "Playback failed. Tap Retry.")
-            isBuffering = false
+            settleTerminalFailure(TerminalFailurePayload(
+                message: String(localized: "Playback failed. Tap Retry.")
+            ))
         }
     }
 }

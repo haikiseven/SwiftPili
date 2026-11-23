@@ -109,16 +109,20 @@ extension PlayerViewModel {
         scheduleLifecycleRecovery(action)
     }
 
-    func scheduleForegroundLivenessCheck() {
+    func synchronizeForegroundEnvironment() {
         backgroundExecution.end(reason: "foreground")
         handleNativeAudioOutputChange()
-        danmakuApplicationActive = UIApplication.shared.applicationState == .active
-        synchronizeTerminalAdmissionFromBackend()
-        guard !standDownLifecycleForTerminalPlayback() else {
-            noteDanmakuApplicationActivityChanged(isActive: danmakuApplicationActive)
-            return
+        let isActive = UIApplication.shared.applicationState == .active
+        if isActive {
+            lifecycleRecovery.presentationApplicationPhase = .active
         }
-        noteDanmakuApplicationActivityChanged(isActive: danmakuApplicationActive)
+        synchronizeTerminalAdmissionFromBackend()
+        _ = standDownLifecycleForTerminalPlayback()
+        noteDanmakuApplicationActivityChanged(isActive: isActive)
+    }
+
+    func scheduleForegroundLivenessCheck() {
+        guard !currentPlaybackTerminalState.isTerminal else { return }
         if usesDemandPresentationContinuity {
             let epoch = lifecycleRecovery.ensureDemandPresentationEpoch()
             let destination = lifecycleRecovery.foregroundPresentationDestination

@@ -72,14 +72,16 @@ extension PlayerViewModel {
         startHistoryReporting()
     }
 
-    func startHistoryReporting() {
+    func startHistoryReporting(preservingSession: Bool = false) {
         historyReportTask?.cancel()
-        historyPassIsOpen = true
-        lastReportedProgress = -1
-        completionMarkerReported = false
-        historyStartTs = Int(Date().timeIntervalSince1970)
+        if !preservingSession || historyStartTs == 0 {
+            historyPassIsOpen = true
+            lastReportedProgress = -1
+            completionMarkerReported = false
+            historyStartTs = Int(Date().timeIntervalSince1970)
+            historyReportMid = AuthManager.shared.dedeUserID
+        }
         lastReportClock = CACurrentMediaTime()
-        historyReportMid = AuthManager.shared.dedeUserID
         historyReportTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(15))

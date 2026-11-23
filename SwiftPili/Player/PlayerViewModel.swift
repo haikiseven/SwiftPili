@@ -439,6 +439,7 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     var pendingSeekTarget: TimeInterval?
     var pendingSeekTask: Task<Void, Never>?
     var reopenSeekTask: Task<Void, Never>?
+    @ObservationIgnored var activeSeekToken: SeekSettlementToken?
     var resumeAtTime: TimeInterval?
 
     var lastLoadStartPosition: TimeInterval = 0
@@ -682,6 +683,7 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
             MainActor.assumeIsolated {
                 let vm = PlayerViewModel.shared
                 vm.reconcileAmbientStoryboard()
+                vm.synchronizeForegroundEnvironment()
                 if vm.resumeStreamRecoveryIfNeeded() { return }
                 vm.scheduleForegroundLivenessCheck()
             }
@@ -786,6 +788,8 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     var lifecycleReadinessFence: LifecycleReadinessFence?
     @ObservationIgnored
     var nonLifecycleRecoveryTicket: DecoderRecoveryAdmission.Ticket?
+    @ObservationIgnored
+    var nonLifecycleRecoveryTask: (token: UInt64, task: Task<Void, Never>)?
 
     var usesDemandPresentationContinuity: Bool {
         activeBackendKind == .demandPaced
@@ -1271,7 +1275,7 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         }
         if mode.usesOnlineVODServices,
            historyReportTask == nil || historyReportTask!.isCancelled {
-            startHistoryReporting()
+            startHistoryReporting(preservingSession: true)
         }
         if mode == .offline, offlineProgressTask?.isCancelled ?? true {
             startOfflineProgressPersistence()
@@ -1291,6 +1295,8 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
            let fence = makeDemandPresentationFence(epoch: lifecycleRecovery.ensureDemandPresentationEpoch()) {
             dispatchDemandPresentation(.transportSuppressed(fence: fence))
         }
+        activeSeekToken?.settle(.failed)
+        activeSeekToken = nil
         backend.pause()
         pendingSeekTarget = nil
         pendingSeekTask?.cancel()
@@ -1384,6 +1390,8 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
             lifecycleRecovery.invalidate()
             decoderRecoveryAdmission.invalidate()
             nonLifecycleRecoveryTicket = nil
+            nonLifecycleRecoveryTask?.task.cancel()
+            nonLifecycleRecoveryTask = nil
             coalescedRecoveryWatchdog = nil
         }
         playbackWatchdogTask?.cancel()
@@ -1411,6 +1419,8 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         pendingSeekTask = nil
         pendingSeekTarget = nil
         settledSeekDisplaySample = nil
+        activeSeekToken?.settle(.failed)
+        activeSeekToken = nil
         reopenSeekTask?.cancel()
         reopenSeekTask = nil
         videoProbeTask?.cancel()

@@ -142,6 +142,13 @@ extension PlayerViewModel {
         revokeEqualizerMaintenancePermission()
         loadBackend.equalizerConfiguration = effectiveEqualizerConfiguration
         syncVideoEnhancementToBackend(loadBackend)
+        if playbackIntent == .playing, audioSessionInterrupted,
+           audioSessionPolicy.interrupted || !authorizeAudioPlayback() {
+            if playbackIntent == .playing {
+                playbackIntent = .pausedBySystem
+            }
+            PlayerLog.log("[Player] playURL opening paused — audio session interrupted")
+        }
         let configuration = PlayerBackendLoadConfiguration(
             url: loadURL,
             audioURL: loadAudioURL,
@@ -160,6 +167,9 @@ extension PlayerViewModel {
             liveSource: liveSource
         )
         configuration.load(using: loadBackend)
+        if !userWantsPlaying || audioSessionInterrupted {
+            loadBackend.pause()
+        }
         if recoveryCover != nil {
             prepareRecoveryCoverForSuccessorLoad()
         } else if freezeFrameAwaitingFreshProof, usesDemandPresentationContinuity {

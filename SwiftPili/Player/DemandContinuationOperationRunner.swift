@@ -17,28 +17,33 @@ final class DemandContinuationOperationRunner {
     }
 
     func prepareVideoLane(fence: DemandPresentationFence, token: DemandVideoSuspendToken) {
-        currentTask = Self.makePreparationTask(owner: owner, fence: fence, token: token)
+        replaceCurrentTask(with: Self.makePreparationTask(owner: owner, fence: fence, token: token))
     }
 
     func resumeVideoLane(fence: DemandPresentationFence, token: DemandVideoSuspendToken) {
-        currentTask = Self.makeResumeTask(owner: owner, fence: fence, token: token)
+        replaceCurrentTask(with: Self.makeResumeTask(owner: owner, fence: fence, token: token))
     }
 
     func restoreInline(fence: DemandPresentationFence) {
-        currentTask = Self.makeInlineRestoreTask(owner: owner, fence: fence)
+        replaceCurrentTask(with: Self.makeInlineRestoreTask(owner: owner, fence: fence))
     }
 
     func reconcilePiP(fence: DemandPresentationFence) {
-        currentTask = Self.makePiPReconcileTask(owner: owner, fence: fence)
+        replaceCurrentTask(with: Self.makePiPReconcileTask(owner: owner, fence: fence))
     }
 
     func recreateVideoDecoder(fence: DemandPresentationFence) {
-        currentTask = Self.makeDecoderRecreationTask(owner: owner, fence: fence)
+        replaceCurrentTask(with: Self.makeDecoderRecreationTask(owner: owner, fence: fence))
     }
 
     func cancelCurrent() {
         currentTask?.cancel()
         currentTask = nil
+    }
+
+    private func replaceCurrentTask(with task: Task<Void, Never>) {
+        cancelCurrent()
+        currentTask = task
     }
 
     private static func makePreparationTask(

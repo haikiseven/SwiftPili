@@ -255,19 +255,26 @@ extension PlayerViewModel {
 
     func beginPresentationFailure(fence: DemandPresentationFence) {
         retireStreamRecovery(reason: "presentation-failure")
+        retireCDNSwitch()
         markDemandForegroundStage("failed", fence: fence)
         isBuffering = false
         terminalOpenFailure = true
+        playbackTerminalState = .terminalFailure
     }
 
     func pauseForPresentationFailure() {
         revokeEqualizerMaintenancePermission()
+        activeSeekToken?.settle(.failed)
+        activeSeekToken = nil
         backend.pause()
+        updateIsPlaying(transportRunning: false)
     }
 
     func finishPresentationFailure(message: String) {
-        isPlaying = false
         error = message
+        acknowledgeLifecycleReadiness(.terminalFailure)
+        finishNonLifecycleRecoveryIfNeeded(outcome: .backendError)
+        standDownLifecycleForTerminalPlayback()
     }
 
     func publishPresentationFailure(fence: DemandPresentationFence) {

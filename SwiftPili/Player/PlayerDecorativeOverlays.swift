@@ -51,8 +51,6 @@ enum PlayerAmbientPolicy {
 
 struct PlayerAmbientBackdrop: View {
     let source: PlayerAmbientSource
-    var liveImage: UIImage?
-    var liveFrameSerial: UInt64 = 0
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -61,27 +59,28 @@ struct PlayerAmbientBackdrop: View {
     var body: some View {
         GeometryReader { proxy in
             let size = proxy.size
+            let backdropAlpha = PlayerAmbientPolicy.backdropOpacity(
+                isDarkAppearance: colorScheme == .dark
+            )
             ZStack {
                 Color.black
                 if scenePhase == .active, !reduceTransparency {
-                    PlayerAmbientArtworkView(
-                        source: source,
-                        liveImage: liveImage,
-                        liveFrameSerial: liveFrameSerial
-                    )
-                        .blur(radius: PlayerAmbientPolicy.blurRadius, opaque: true)
-                        .saturation(liveImage != nil ? 1.18 : 1.14)
-                        .scaleEffect(
-                            PlayerAmbientPolicy.scale(
-                                from: PlayerAmbientPolicy.analysisBox,
-                                toCover: size
+                    ZStack {
+                        PlayerAmbientArtworkView(source: source)
+                            .blur(radius: PlayerAmbientPolicy.blurRadius, opaque: true)
+                            .saturation(1.14)
+                            .scaleEffect(
+                                PlayerAmbientPolicy.scale(
+                                    from: PlayerAmbientPolicy.analysisBox,
+                                    toCover: size
+                                )
                             )
-                        )
-                        .frame(width: size.width, height: size.height)
-                        .opacity(PlayerAmbientPolicy.backdropOpacity(
-                            isDarkAppearance: colorScheme == .dark
-                        ))
-                        .clipped()
+                            .frame(width: size.width, height: size.height)
+                            .clipped()
+                        AmbientLiveLayerView()
+                            .frame(width: size.width, height: size.height)
+                    }
+                    .opacity(backdropAlpha)
                     Color.black.opacity(PlayerAmbientPolicy.scrimOpacity(
                         isDarkAppearance: colorScheme == .dark,
                         isIncreasedContrast: contrast == .increased
@@ -101,11 +100,7 @@ struct PlayerFullscreenAmbientBackdrop: View {
 
     var body: some View {
         if let source = sourceForDisplay {
-            PlayerAmbientBackdrop(
-                source: source,
-                liveImage: player.ambientLiveImage,
-                liveFrameSerial: player.ambientLiveFrameSerial
-            )
+            PlayerAmbientBackdrop(source: source)
         }
     }
 
@@ -123,13 +118,10 @@ struct PlayerFullscreenAmbientBackdrop: View {
            ) {
             return source
         }
-        if player.ambientLiveImage != nil {
-            return PlayerAmbientSource(
-                artwork: PlayerAmbientArtwork(url: player.ambientCoverURL ?? "ambient://live-frame"),
-                fallbackCover: player.ambientCoverURL
-            )
-        }
-        return nil
+        return PlayerAmbientSource(
+            artwork: PlayerAmbientArtwork(url: player.ambientCoverURL ?? "ambient://live-frame"),
+            fallbackCover: player.ambientCoverURL
+        )
     }
 }
 

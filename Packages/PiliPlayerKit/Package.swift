@@ -34,5 +34,10 @@ let package = Package(
             dependencies: ["PiliPlayerCore", "PiliPlayerMedia", "PiliPlayerApple"],
             path: "Sources/PiliPlayerEngine"
         ),
+        .testTarget(
+            name: "PiliPlayerEngineTests",
+            dependencies: ["PiliPlayerEngine"],
+            path: "Tests/PiliPlayerEngineTests"
+        ),
     ]
 )
