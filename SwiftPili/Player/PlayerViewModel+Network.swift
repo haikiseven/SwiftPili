@@ -2,10 +2,19 @@ import AVFoundation
 import Foundation
 import Network
 import UIKit
+import os
 
 extension PlayerViewModel {
+    private nonisolated static let networkMonitorStarted = OSAllocatedUnfairLock(initialState: false)
+    private nonisolated static let networkPathReceived = OSAllocatedUnfairLock(initialState: false)
 
     nonisolated static func startNetworkMonitor() {
+        let shouldStart = networkMonitorStarted.withLock { started -> Bool in
+            guard !started else { return false }
+            started = true
+            return true
+        }
+        guard shouldStart else { return }
         networkMonitor.pathUpdateHandler = { path in
             let classChanged = multiConnectionPath.withLock { current -> Bool in
                 let previous = current.networkClass
@@ -18,8 +27,9 @@ extension PlayerViewModel {
                 )
                 return current.networkClass != previous
             }
+            networkPathReceived.withLock { $0 = true }
             if classChanged { MultiConnectionLadderMemo.shared.reset() }
-            Task { @MainActor in PlayerViewModel.shared.refreshMultiConnectionQuiet() }
+            Task { @MainActor in PlayerViewModel.existingShared?.refreshMultiConnectionQuiet() }
             if path.usesInterfaceType(.wifi) {
                 currentNetwork = .wifi
             } else {
@@ -28,6 +38,22 @@ extension PlayerViewModel {
             noteDanmakuPathUpdate(path)
         }
         networkMonitor.start(queue: DispatchQueue.global(qos: .utility))
+    }
+
+    nonisolated static func resolvedDownloadNetworkPath() -> MultiConnectionNetworkPath? {
+        startNetworkMonitor()
+        if networkPathReceived.withLock({ $0 }) {
+            return multiConnectionNetworkPath
+        }
+        let current = networkMonitor.currentPath
+        guard current.status == .satisfied else { return nil }
+        return MultiConnectionNetworkPath(
+            satisfied: true,
+            wifi: current.usesInterfaceType(.wifi),
+            cellular: current.usesInterfaceType(.cellular),
+            expensive: current.isExpensive,
+            constrained: current.isConstrained
+        )
     }
 
     private nonisolated static func noteDanmakuPathUpdate(_ path: NWPath) {
@@ -45,7 +71,7 @@ extension PlayerViewModel {
         }
         guard let previous, previous != signature, satisfied else { return }
         Task { @MainActor in
-            PlayerViewModel.shared.noteDanmakuNetworkPathChanged(from: previous, to: signature)
+            PlayerViewModel.existingShared?.noteDanmakuNetworkPathChanged(from: previous, to: signature)
         }
     }
 }

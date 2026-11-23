@@ -9,6 +9,7 @@ func downloadPercentText(_ fraction: Double) -> String {
 
 func downloadPhaseWord(_ phase: DownloadManager.ActiveDownload.Phase) -> String {
     switch phase {
+    case .queued: String(localized: "Waiting…")
     case .preparing: String(localized: "Preparing…")
     case .downloadingVideo, .downloadingAudio: String(localized: "Downloading")
     case .retryingVideo, .retryingAudio: String(localized: "Retrying…")
@@ -37,7 +38,7 @@ extension DownloadManager.ActiveDownload {
         switch phase {
         case .downloadingVideo, .downloadingAudio:
             fraction.map(downloadPercentText) ?? downloadPhaseWord(phase)
-        case .preparing, .retryingVideo, .retryingAudio, .validating, .committing:
+        case .queued, .preparing, .retryingVideo, .retryingAudio, .validating, .committing:
             downloadPhaseWord(phase)
         case .failed, .paused: String(localized: "Downloading")
         }
@@ -47,6 +48,22 @@ extension DownloadManager.ActiveDownload {
         switch phase {
         case .downloadingVideo, .downloadingAudio: fraction
         default: nil
+        }
+    }
+
+    var capsuleTrimmedTitle: String {
+        title.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var capsuleSpeedText: String? {
+        switch phase {
+        case .downloadingVideo, .downloadingAudio:
+            guard let value = speedBytesPerSecond, value.isFinite, value > 0 else { return nil }
+            let rounded = value.rounded()
+            let readableBytes = rounded >= Double(Int64.max) ? Int64.max : Int64(rounded)
+            return "\(ByteCountFormatter.string(fromByteCount: readableBytes, countStyle: .file))/s"
+        default:
+            return nil
         }
     }
 }
@@ -60,6 +77,22 @@ private func capsuleAccessibilityDescription(
             headline, othersInFlight
         )
         : headline
+}
+
+private func capsuleAccessibilityLabel(
+    item: DownloadManager.ActiveDownload, othersInFlight: Int
+) -> String {
+    let summary = capsuleAccessibilityDescription(
+        headline: item.capsuleHeadline,
+        othersInFlight: othersInFlight
+    )
+    let title = item.capsuleTrimmedTitle
+    return title.isEmpty ? summary : "\(title), \(summary)"
+}
+
+private func clampedDownloadFraction(_ fraction: Double) -> Double {
+    guard fraction.isFinite else { return 0 }
+    return min(max(fraction, 0), 1)
 }
 
 extension View {
@@ -115,19 +148,19 @@ struct DownloadProgressCapsuleHost: View {
     }
 
     private var tracked: DownloadManager.ActiveDownload? {
-        inFlight.first
+        inFlight.first(where: { $0.phase.isActivelyRunning }) ?? inFlight.first
     }
 
     var body: some View {
         Group {
             if let tracked {
-                if collapseState.isCollapsed(tracked.id) {
+                if showsSurface, collapseState.isCollapsed(tracked.id) {
                     CollapsedDownloadRing(
-                        showsSurface: showsSurface,
+                        showsSurface: true,
                         fraction: tracked.capsuleBarFraction,
                         accent: accent,
-                        accessibilityDescription: capsuleAccessibilityDescription(
-                            headline: tracked.capsuleHeadline,
+                        accessibilityDescription: capsuleAccessibilityLabel(
+                            item: tracked,
                             othersInFlight: inFlight.count - 1
                         ),
                         expand: { collapseState.setCollapsed(false, for: tracked.id) }
@@ -141,20 +174,65 @@ struct DownloadProgressCapsuleHost: View {
                         othersInFlight: inFlight.count - 1,
                         accent: accent,
                         open: {
-                            collapseState.setCollapsed(true, for: tracked.id)
+                            if showsSurface {
+                                collapseState.setCollapsed(true, for: tracked.id)
+                            }
                             open()
                         },
-                        collapse: { collapseState.setCollapsed(true, for: tracked.id) }
+                        collapse: {
+                            guard showsSurface else { return }
+                            collapseState.setCollapsed(true, for: tracked.id)
+                        }
                     )
-                    .transition(motion.transition(normal: .move(edge: .bottom).combined(with: .opacity)))
+                    .transition(
+                        showsSurface
+                            ? motion.transition(normal: .move(edge: .bottom).combined(with: .opacity))
+                            : motion.transition(normal: .opacity)
+                    )
                 }
             }
         }
         .animation(presentationAnimation, value: tracked?.id)
-        .animation(presentationAnimation, value: collapseState)
+        .animation(showsSurface ? presentationAnimation : nil, value: collapseState)
         .onChange(of: inFlight.map(\.id)) { _, ids in
             collapseState.purge(activeIDs: ids)
         }
+    }
+}
+
+private struct DownloadProgressRing: View {
+    let fraction: Double?
+    let accent: Color
+    var size: CGFloat = 22
+    var lineWidth: CGFloat = 2.25
+    var iconSize: CGFloat = 8.5
+
+    @AppMotion private var motion
+
+    var body: some View {
+        Group {
+            if let fraction {
+                let clamped = clampedDownloadFraction(fraction)
+                ZStack {
+                    Circle()
+                        .stroke(Color.primary.opacity(0.16), lineWidth: lineWidth)
+                    Circle()
+                        .trim(from: 0, to: CGFloat(clamped))
+                        .stroke(accent, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                    Image(systemName: "arrow.down")
+                        .font(.system(size: iconSize, weight: .bold))
+                        .foregroundStyle(accent)
+                }
+                .animation(motion.animation(normal: .linear(duration: 0.18)), value: clamped)
+            } else {
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(accent)
+            }
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
     }
 }
 
@@ -169,19 +247,13 @@ private struct CollapsedDownloadRing: View {
 
     var body: some View {
         Button(action: expand) {
-            Group {
-                if let fraction {
-                    Gauge(value: fraction) {
-                        Text(verbatim: "")
-                    }
-                    .gaugeStyle(.accessoryCircularCapacity)
-                    .tint(accent)
-                } else {
-                    ProgressView()
-                        .controlSize(.small)
-                }
-            }
-            .accessibilityHidden(true)
+            DownloadProgressRing(
+                fraction: fraction,
+                accent: accent,
+                size: 24,
+                lineWidth: 2.5,
+                iconSize: 9.5
+            )
             .frame(width: Self.diameter, height: Self.diameter)
             .contentShape(Circle())
         }
@@ -192,46 +264,271 @@ private struct CollapsedDownloadRing: View {
     }
 }
 
+@available(iOS 26.0, *)
+private struct TabAccessoryDownloadBar: View {
+    let item: DownloadManager.ActiveDownload
+    let othersInFlight: Int
+    let accent: Color
+    let open: () -> Void
+
+    @Environment(\.tabViewBottomAccessoryPlacement) private var placement
+
+    var body: some View {
+        DownloadAccessoryRow(
+            item: item,
+            othersInFlight: othersInFlight,
+            accent: accent,
+            isInlinePlacement: placement == .inline,
+            open: open
+        )
+    }
+}
+
+private struct DownloadAccessoryRow: View {
+    let item: DownloadManager.ActiveDownload
+    let othersInFlight: Int
+    let accent: Color
+    let isInlinePlacement: Bool
+    let open: () -> Void
+
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    private var accessibilityLabelText: String {
+        capsuleAccessibilityLabel(item: item, othersInFlight: othersInFlight)
+    }
+
+    var body: some View {
+        let title = item.capsuleTrimmedTitle
+        Button(action: open) {
+            HStack(spacing: isInlinePlacement ? 8 : 10) {
+                DownloadProgressRing(
+                    fraction: item.capsuleBarFraction,
+                    accent: accent,
+                    size: 22,
+                    lineWidth: 2.25,
+                    iconSize: 8.5
+                )
+
+                if isInlinePlacement {
+                    Text(item.capsuleHeadline)
+                        .font(.footnote.weight(.semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    if othersInFlight > 0 {
+                        Text(verbatim: "+\(othersInFlight)")
+                            .font(.caption2.weight(.semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.tertiary)
+                        .accessibilityHidden(true)
+                } else if !title.isEmpty {
+                    Text(title)
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 6)
+                    expandedTrailingMetrics
+                } else {
+                    Text(item.capsuleHeadline)
+                        .font(.footnote.weight(.medium))
+                        .monospacedDigit()
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    if let speed = item.capsuleSpeedText, !dynamicTypeSize.isAccessibilitySize {
+                        Text(verbatim: "·")
+                            .font(.caption)
+                            .foregroundStyle(.quaternary)
+                            .accessibilityHidden(true)
+                        Text(speed)
+                            .font(.caption)
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 4)
+                    if othersInFlight > 0 {
+                        othersCountBadge
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.tertiary)
+                        .accessibilityHidden(true)
+                }
+            }
+            .padding(.horizontal, isInlinePlacement ? 10 : 14)
+            .padding(.vertical, 8)
+            .frame(
+                maxWidth: .infinity,
+                minHeight: isInlinePlacement ? 36 : 40,
+                alignment: .leading
+            )
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.appControl)
+        .foregroundStyle(.primary)
+        .accessibilityLabel(Text(accessibilityLabelText))
+        .accessibilityHint(Text("Open Downloads"))
+    }
+
+    private var expandedTrailingMetrics: some View {
+        HStack(spacing: 5) {
+            Text(item.capsuleHeadline)
+                .font(.footnote.weight(.semibold))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            if let speed = item.capsuleSpeedText, !dynamicTypeSize.isAccessibilitySize {
+                Text(verbatim: "·")
+                    .font(.caption)
+                    .foregroundStyle(.quaternary)
+                    .accessibilityHidden(true)
+                Text(speed)
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            if othersInFlight > 0 {
+                othersCountBadge
+            }
+            Image(systemName: "chevron.right")
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(.tertiary)
+                .accessibilityHidden(true)
+        }
+        .layoutPriority(1)
+    }
+
+    private var othersCountBadge: some View {
+        Text(verbatim: "+\(othersInFlight)")
+            .font(.caption2.weight(.semibold))
+            .monospacedDigit()
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 2)
+            .background(AppFill.inset, in: Capsule())
+    }
+}
+
 struct DownloadProgressCapsule: View {
     var showsSurface = true
     let item: DownloadManager.ActiveDownload
     let othersInFlight: Int
     let accent: Color
     let open: () -> Void
-    let collapse: () -> Void
+    var collapse: () -> Void = {}
 
-    private var accessibilityDescription: String {
-        capsuleAccessibilityDescription(
-            headline: item.capsuleHeadline, othersInFlight: othersInFlight
-        )
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    private var accessibilityLabelText: String {
+        capsuleAccessibilityLabel(item: item, othersInFlight: othersInFlight)
     }
 
     var body: some View {
-        HStack(spacing: 10) {
+        if showsSurface {
+            floatingCapsule
+        } else if #available(iOS 26.0, *) {
+            TabAccessoryDownloadBar(
+                item: item,
+                othersInFlight: othersInFlight,
+                accent: accent,
+                open: open
+            )
+        } else {
+            DownloadAccessoryRow(
+                item: item,
+                othersInFlight: othersInFlight,
+                accent: accent,
+                isInlinePlacement: false,
+                open: open
+            )
+        }
+    }
+
+    private var floatingCapsule: some View {
+        let title = item.capsuleTrimmedTitle
+        return HStack(spacing: 10) {
             Button(action: open) {
                 VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
+                    HStack(spacing: 6) {
                         if item.capsuleBarFraction == nil {
                             ProgressView()
                                 .controlSize(.mini)
+                                .tint(accent)
                         }
-                        Text(item.capsuleHeadline)
-                            .font(.footnote.weight(.medium))
-                            .lineLimit(1)
-                            .monospacedDigit()
-                        Spacer(minLength: 0)
-                        if othersInFlight > 0 {
-                            Text(verbatim: "+\(othersInFlight)")
-                                .font(.caption2.weight(.semibold))
+                        if !title.isEmpty {
+                            Text(title)
+                                .font(.footnote.weight(.medium))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                            Spacer(minLength: 6)
+                            HStack(spacing: 5) {
+                                Text(item.capsuleHeadline)
+                                    .font(.footnote.weight(.semibold))
+                                    .monospacedDigit()
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                if let speed = item.capsuleSpeedText, !dynamicTypeSize.isAccessibilitySize {
+                                    Text(verbatim: "·")
+                                        .font(.caption)
+                                        .foregroundStyle(.quaternary)
+                                        .accessibilityHidden(true)
+                                    Text(speed)
+                                        .font(.caption)
+                                        .monospacedDigit()
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                if othersInFlight > 0 {
+                                    Text(verbatim: "+\(othersInFlight)")
+                                        .font(.caption2.weight(.semibold))
+                                        .monospacedDigit()
+                                        .foregroundStyle(.secondary)
+                                }
+                                Image(systemName: "chevron.right")
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(.tertiary)
+                                    .accessibilityHidden(true)
+                            }
+                            .layoutPriority(1)
+                        } else {
+                            Text(item.capsuleHeadline)
+                                .font(.footnote.weight(.medium))
+                                .lineLimit(1)
                                 .monospacedDigit()
-                                .foregroundStyle(.secondary)
+                            if let speed = item.capsuleSpeedText, !dynamicTypeSize.isAccessibilitySize {
+                                Text(verbatim: "·")
+                                    .font(.caption)
+                                    .foregroundStyle(.quaternary)
+                                    .accessibilityHidden(true)
+                                Text(speed)
+                                    .font(.caption)
+                                    .monospacedDigit()
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer(minLength: 4)
+                            if othersInFlight > 0 {
+                                Text(verbatim: "+\(othersInFlight)")
+                                    .font(.caption2.weight(.semibold))
+                                    .monospacedDigit()
+                                    .foregroundStyle(.secondary)
+                            }
+                            Image(systemName: "chevron.right")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(.tertiary)
+                                .accessibilityHidden(true)
                         }
-                        Image(systemName: "chevron.right")
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(.secondary)
                     }
                     if let barFraction = item.capsuleBarFraction {
-                        ProgressView(value: barFraction)
+                        ProgressView(value: clampedDownloadFraction(barFraction))
                             .tint(accent)
                     }
                 }
@@ -239,7 +536,7 @@ struct DownloadProgressCapsule: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(.primary)
-            .accessibilityLabel(Text(accessibilityDescription))
+            .accessibilityLabel(Text(accessibilityLabelText))
             .accessibilityHint(Text("Open Downloads"))
 
             Button(action: collapse) {
@@ -255,6 +552,6 @@ struct DownloadProgressCapsule: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .floatingControlSurface(Capsule(), enabled: showsSurface)
+        .floatingControlSurface(Capsule(), enabled: true)
     }
 }

@@ -1,10 +1,109 @@
 import Foundation
 
+// MARK: - Byte ranges
+
+struct DownloadByteRange: Codable, Equatable, Hashable, Sendable {
+    let start: Int64
+    let end: Int64
+
+    var length: Int64 { max(0, end - start) }
+    var isEmpty: Bool { end <= start }
+    var range: Range<Int64> {
+        let lower = max(0, start)
+        return lower..<max(lower, end)
+    }
+
+    init(start: Int64, end: Int64) {
+        let normalizedStart = max(0, start)
+        self.start = normalizedStart
+        self.end = max(normalizedStart, end)
+    }
+
+    init(_ range: Range<Int64>) {
+        self.init(start: range.lowerBound, end: range.upperBound)
+    }
+
+    static func coalesce(_ ranges: [DownloadByteRange]) -> [DownloadByteRange] {
+        let valid = ranges
+            .filter { $0.start >= 0 && $0.end > $0.start }
+            .sorted { $0.start != $1.start ? $0.start < $1.start : $0.end < $1.end }
+        var merged: [DownloadByteRange] = []
+        merged.reserveCapacity(valid.count)
+        for range in valid {
+            if let last = merged.last, range.start <= last.end {
+                if range.end > last.end {
+                    merged[merged.count - 1] = DownloadByteRange(start: last.start, end: range.end)
+                }
+            } else {
+                merged.append(range)
+            }
+        }
+        return merged
+    }
+
+    static func clamped(_ ranges: [DownloadByteRange], totalBytes: Int64) -> [DownloadByteRange] {
+        guard totalBytes > 0 else { return [] }
+        let bounded = ranges.compactMap { range -> DownloadByteRange? in
+            let lower = max(0, range.start)
+            let upper = min(totalBytes, range.end)
+            return upper > lower ? DownloadByteRange(start: lower, end: upper) : nil
+        }
+        return coalesce(bounded)
+    }
+
+    static func missingRanges(
+        in completed: [DownloadByteRange],
+        totalBytes: Int64
+    ) -> [DownloadByteRange] {
+        guard totalBytes > 0 else { return [] }
+        let merged = clamped(completed, totalBytes: totalBytes)
+        var missing: [DownloadByteRange] = []
+        var cursor: Int64 = 0
+        for range in merged {
+            if range.start > cursor {
+                missing.append(DownloadByteRange(start: cursor, end: range.start))
+            }
+            cursor = max(cursor, range.end)
+        }
+        if cursor < totalBytes {
+            missing.append(DownloadByteRange(start: cursor, end: totalBytes))
+        }
+        return missing
+    }
+
+    static func totalBytes(in ranges: [DownloadByteRange]) -> Int64 {
+        coalesce(ranges).reduce(into: Int64(0)) { total, range in
+            let (sum, overflow) = total.addingReportingOverflow(range.length)
+            total = overflow ? Int64.max : sum
+        }
+    }
+
+    static func isComplete(_ completed: [DownloadByteRange], totalBytes: Int64) -> Bool {
+        guard totalBytes > 0 else { return false }
+        let merged = clamped(completed, totalBytes: totalBytes)
+        return merged.count == 1 && merged[0].start == 0 && merged[0].end == totalBytes
+    }
+
+    static func covers(_ completed: [DownloadByteRange], target: Range<Int64>) -> Bool {
+        guard target.lowerBound >= 0, target.upperBound > target.lowerBound else { return true }
+        return coalesce(completed).contains {
+            $0.start <= target.lowerBound && $0.end >= target.upperBound
+        }
+    }
+
+    static func contiguousPrefixLength(in ranges: [DownloadByteRange]) -> Int64 {
+        let merged = coalesce(ranges)
+        guard let first = merged.first, first.start == 0 else { return 0 }
+        return first.end
+    }
+}
+
 // MARK: - Manifest
 
 struct DownloadManifest: Codable, Equatable, Sendable {
     static let fileName = "manifest.json"
-    static let currentVersion = 1
+    static let currentVersion = 2
+    static let supportedVersions: ClosedRange<Int> = 1...currentVersion
 
     var version: Int
     let contentID: String
@@ -21,6 +120,7 @@ struct DownloadManifest: Codable, Equatable, Sendable {
     var hasSeparateAudio: Bool?
     var expectedBytes: [String: Int64]
     var userPaused: Bool?
+    var completedRanges: [String: [DownloadByteRange]]?
 
     var allowsAutomaticResume: Bool { userPaused != true }
 
@@ -38,7 +138,8 @@ struct DownloadManifest: Codable, Equatable, Sendable {
         resolvedQuality: Int? = nil,
         codecs: String? = nil,
         hasSeparateAudio: Bool? = nil,
-        expectedBytes: [String: Int64] = [:]
+        expectedBytes: [String: Int64] = [:],
+        completedRanges: [String: [DownloadByteRange]]? = nil
     ) {
         self.version = version
         self.contentID = contentID
@@ -55,6 +156,7 @@ struct DownloadManifest: Codable, Equatable, Sendable {
         self.hasSeparateAudio = hasSeparateAudio
         self.userPaused = nil
         self.expectedBytes = expectedBytes
+        self.completedRanges = completedRanges
     }
 
     func expected(_ stage: DownloadStage) -> Int64? {
@@ -65,6 +167,41 @@ struct DownloadManifest: Codable, Equatable, Sendable {
     mutating func setExpected(_ stage: DownloadStage, bytes: Int64) {
         guard bytes > 0 else { return }
         expectedBytes[stage.rawValue] = bytes
+    }
+
+    func completedRanges(for stage: DownloadStage) -> [DownloadByteRange]? {
+        completedRanges?[stage.rawValue]
+    }
+
+    mutating func setCompletedRanges(_ ranges: [DownloadByteRange], for stage: DownloadStage) {
+        var map = completedRanges ?? [:]
+        map[stage.rawValue] = DownloadByteRange.coalesce(ranges)
+        completedRanges = map
+    }
+
+    mutating func clearCompletedRanges(for stage: DownloadStage) {
+        completedRanges?[stage.rawValue] = nil
+        if completedRanges?.isEmpty == true {
+            completedRanges = nil
+        }
+    }
+
+    func effectiveCompletedRanges(
+        for stage: DownloadStage,
+        fileLength: Int64
+    ) -> [DownloadByteRange] {
+        let onDisk = max(0, fileLength)
+        guard onDisk > 0 else { return [] }
+        if let recorded = completedRanges?[stage.rawValue] {
+            return DownloadByteRange.clamped(recorded, totalBytes: onDisk)
+        }
+        return [DownloadByteRange(start: 0, end: onDisk)]
+    }
+
+    func effectiveDownloadedBytes(for stage: DownloadStage, fileLength: Int64) -> Int64 {
+        DownloadByteRange.totalBytes(
+            in: effectiveCompletedRanges(for: stage, fileLength: fileLength)
+        )
     }
 
     var expectedBytesByStage: [DownloadStage: Int64] {
@@ -93,6 +230,7 @@ struct DownloadManifest: Codable, Equatable, Sendable {
     }
 
     var isCurrentVersion: Bool { version == Self.currentVersion }
+    var isSupportedVersion: Bool { Self.supportedVersions.contains(version) }
 }
 
 struct DownloadAutomaticResumeQueue: Equatable, Sendable {

@@ -123,14 +123,18 @@ final class MultiConnectionURLTransport: MultiConnectionTransport, @unchecked Se
 
     init(
         configuration: URLSessionConfiguration = .ephemeral, policy: MultiConnectionPolicy? = nil,
-        networkBytes: MediaNetworkByteCounter? = nil
+        networkBytes: MediaNetworkByteCounter? = nil,
+        allowsCellular: Bool? = nil,
+        allowsExpensive: Bool? = nil,
+        timeoutIntervalForRequest: TimeInterval = 15
     ) {
-        let allowsExpensive = policy?.allowsExpensive ?? false
-        configuration.allowsCellularAccess = allowsExpensive
+        let resolvedExpensive = allowsExpensive ?? allowsCellular ?? (policy?.allowsExpensive ?? false)
+        let resolvedCellular = allowsCellular ?? resolvedExpensive
+        configuration.allowsCellularAccess = resolvedCellular
         configuration.allowsConstrainedNetworkAccess = false
-        configuration.allowsExpensiveNetworkAccess = allowsExpensive
+        configuration.allowsExpensiveNetworkAccess = resolvedExpensive
         configuration.httpMaximumConnectionsPerHost = max(1, policy?.edgeBound ?? 1)
-        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForRequest = timeoutIntervalForRequest
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         let count = max(
             1, min(MultiConnectionPolicy.maximumSessionsPerEdge, policy?.sessionsPerEdge ?? 1)
@@ -141,7 +145,11 @@ final class MultiConnectionURLTransport: MultiConnectionTransport, @unchecked Se
         }
     }
 
-    deinit { lanes.forEach { $0.session.invalidateAndCancel() } }
+    deinit { invalidateAndCancel() }
+
+    func invalidateAndCancel() {
+        lanes.forEach { $0.session.invalidateAndCancel() }
+    }
 
     func fetch(
         _ request: MultiConnectionFetchRequest, quietGate: MultiConnectionQuietGate,

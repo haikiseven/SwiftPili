@@ -1,5 +1,6 @@
 import SwiftData
 import SwiftUI
+import UIKit
 
 struct DownloadsView: View {
     @Query(sort: \DownloadedVideo.addedAt, order: .reverse)
@@ -9,6 +10,7 @@ struct DownloadsView: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var search = ""
     @State private var invalidDownloadID: String?
+    @State private var activeError: ActiveErrorPresentation?
     @State var brokenIDs: Set<String> = []
     let manager = DownloadManager.shared
     let exports = DownloadExportCoordinator.shared
@@ -22,6 +24,10 @@ struct DownloadsView: View {
     @State var exportPreparation: Task<Void, Never>?
     @State private var openRequestID: UUID?
     @State private var openPreparation: Task<Void, Never>?
+
+    static let gridHorizontalHalfGap: CGFloat = AppSpacing.m / 2
+    static let gridVerticalHalfGap: CGFloat = AppSpacing.xs
+    static let trailingMenuTitleInset: CGFloat = 28
 
     var exportNavigationRevision: UInt64 { coordinator.contentLinkNavigationRevision }
 
@@ -38,6 +44,10 @@ struct DownloadsView: View {
         let folderName: String
         let addedAt: Date
         let redownload: Bool
+    }
+    private struct ActiveErrorPresentation {
+        let downloadID: String
+        let message: String
     }
 
     private var query: String {
@@ -62,21 +72,51 @@ struct DownloadsView: View {
         }
     }
 
-    private func coverWidth(columnWidth: CGFloat?) -> CGFloat {
-        LibraryRowMetrics.coverWidth(
-            columnWidth: columnWidth,
+    func coverWidth(columnWidth: CGFloat?) -> CGFloat {
+        let cardWidth = columnWidth.map { max(0, $0 - Self.gridHorizontalHalfGap * 2) }
+        return LibraryRowMetrics.coverWidth(
+            columnWidth: cardWidth,
             isRegularWidth: sizeClass == .regular
         )
+    }
+
+    func coverHeight(for width: CGFloat) -> CGFloat {
+        CoverPresentationStore.shared.presentation.height(forWidth: width)
     }
 
     var body: some View {
         let completed = filtered
         let active = filteredActive
+        let runningCount = manager.active.filter { !$0.phase.isResumable }.count
+        let resumableCount = manager.active.filter { $0.phase.isResumable }.count
         return downloadsScrollContent(completed: completed, active: active)
             .appAmbientBrowseBackground()
             .navigationTitle("Downloads")
             .navigationBarTitleDisplayMode(.inline)
             .searchable(text: $search, prompt: "Search downloads")
+            .toolbar {
+                if runningCount > 0 || resumableCount > 0 {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        if runningCount > 0, resumableCount > 0 {
+                            Menu {
+                                Button(action: pauseAllActive) {
+                                    Label("Pause All", systemImage: "pause.fill")
+                                }
+                                Button(action: resumeAllActive) {
+                                    Label("Resume All", systemImage: "play.fill")
+                                }
+                            } label: {
+                                Image(systemName: "ellipsis.circle")
+                            }
+                            .accessibilityLabel(Text("Download actions"))
+                        } else if runningCount > 0 {
+                            Button("Pause All", action: pauseAllActive)
+                        } else {
+                            Button("Resume All", action: resumeAllActive)
+                        }
+                    }
+                }
+            }
             .alert(
                 "Download unavailable",
                 isPresented: Binding(
@@ -98,6 +138,30 @@ struct DownloadsView: View {
             } message: {
                 Text("Downloaded files are missing or corrupt.")
             }
+            .alert(
+                "Download Failed",
+                isPresented: Binding(
+                    get: { activeError != nil },
+                    set: { if !$0 { activeError = nil } }
+                )
+            ) {
+                if let failed = activeError {
+                    if manager.active.contains(where: { $0.id == failed.downloadID }) {
+                        Button("Retry") {
+                            activeError = nil
+                            manager.retry(id: failed.downloadID)
+                        }
+                    }
+                    Button("Copy") {
+                        UIPasteboard.general.string = failed.message
+                    }
+                }
+                Button("OK", role: .cancel) { activeError = nil }
+            } message: {
+                if let failed = activeError {
+                    Text(verbatim: failed.message)
+                }
+            }
             .sheet(item: $exportRequest) { request in
                 DownloadExportSheet(source: request.source)
                     .appAdaptiveSheet(padSizing: .form)
@@ -110,7 +174,7 @@ struct DownloadsView: View {
                     saveRequest = nil
                 }
             }
-            .alert("Export", isPresented: Binding(
+            .alert("Export Failed", isPresented: Binding(
                 get: { exportError != nil },
                 set: { if !$0 { exportError = nil } }
             )) {
@@ -143,31 +207,75 @@ struct DownloadsView: View {
             }
     }
 
-    func downloadRow(_ item: DownloadedVideo) -> some View {
-        VideoListRowView(
-            sources: VideoCoverSources(widescreen: item.coverURL),
-            title: item.title,
-            subtitle: item.ownerName,
-            durationText: FormatUtils.duration(item.durationSeconds),
-            progress: item.watchedFraction
-        ) {
-            HStack(spacing: 6) {
-                qualityBadge(item.qualityLabel)
-                Text(byteString(item.fileSizeBytes))
-                    .monospacedDigit()
-                if brokenIDs.contains(item.id) {
-                    HStack(spacing: 3) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .accessibilityHidden(true)
-                        Text("Missing files")
-                    }
-                    .foregroundStyle(.red)
-                }
+    func downloadRowCover(
+        coverURL: String,
+        width: CGFloat,
+        height: CGFloat,
+        durationSeconds: Int? = nil,
+        watchedFraction: Double? = nil
+    ) -> some View {
+        ZStack(alignment: .bottomTrailing) {
+            VideoCoverImage(
+                sources: VideoCoverSources(widescreen: coverURL),
+                width: width
+            )
+            .videoCoverFrame(cornerRadius: AppRadius.thumbnail)
+
+            if let watchedFraction {
+                CoverWatchProgressBar(
+                    progress: watchedFraction,
+                    width: width,
+                    height: height
+                )
             }
-            .appFont(.libraryRowMeta)
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
+
+            if let durationSeconds, durationSeconds > 0 {
+                Text(FormatUtils.duration(durationSeconds))
+                    .appFont(.overlayBadge, monospacedDigit: true)
+                    .fontWeight(.medium)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(
+                        .black.opacity(0.72),
+                        in: RoundedRectangle(cornerRadius: AppRadius.badge, style: .continuous)
+                    )
+                    .foregroundStyle(.white)
+                    .padding(5)
+            }
         }
+    }
+
+    func rowMenuButton<MenuContent: View>(
+        @ViewBuilder actions: () -> MenuContent
+    ) -> some View {
+        Menu {
+            actions()
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .font(.callout)
+                .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+                .foregroundStyle(.secondary)
+                .padding(.top, AppSpacing.m - 2)
+                .padding(.trailing, AppSpacing.m - 2)
+                .frame(width: 44, height: 44, alignment: .topTrailing)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text("Download actions"))
+    }
+
+    func qualityBadge(_ label: String) -> some View {
+        Text(label)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(AccentStore.shared.badgeFill, in: RoundedRectangle(cornerRadius: AppRadius.badge))
+    }
+
+    func byteString(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 
     func open(_ item: DownloadedVideo, in shown: [DownloadedVideo], zoom: RouteZoomSource = .none) {
@@ -284,58 +392,47 @@ private extension DownloadsView {
                     RowCardColumnWidthReader { column in
                         activeRow(item, columnWidth: column)
                     }
-                    .background(
-                        AppFill.card,
-                        in: RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
-                    )
-                    .contextMenu { activeActions(item) }
-                    .padding(.horizontal, AppSpacing.xs)
-                    .padding(.vertical, AppSpacing.xs)
+                    .padding(.horizontal, Self.gridHorizontalHalfGap)
+                    .padding(.vertical, Self.gridVerticalHalfGap)
                 }
             }
-            .padding(.horizontal, AppSpacing.m)
+            .padding(.horizontal, AppSpacing.l - Self.gridHorizontalHalfGap)
+            .padding(.vertical, -Self.gridVerticalHalfGap)
         }
     }
 
     func completedSection(_ completed: [DownloadedVideo]) -> some View {
         VStack(alignment: .leading, spacing: AppSpacing.s) {
-            sectionHeader { storageSummaryHeader(for: completed) }
+            sectionHeader { completedHeader(for: completed) }
             LibraryRowLayout {
                 ForEach(completed) { item in
-                    completedRow(item, in: completed)
-                        .padding(.trailing, AppSpacing.xs)
-                        .background(
-                            AppFill.card,
-                            in: RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
-                        )
-                        .contextMenu { completedActions(item, in: completed) }
-                        .padding(.horizontal, AppSpacing.xs)
-                        .padding(.vertical, AppSpacing.xs)
+                    RowCardColumnWidthReader { column in
+                        completedRow(item, in: completed, columnWidth: column)
+                    }
+                    .padding(.horizontal, Self.gridHorizontalHalfGap)
+                    .padding(.vertical, Self.gridVerticalHalfGap)
                 }
             }
-            .padding(.horizontal, AppSpacing.m)
+            .padding(.horizontal, AppSpacing.l - Self.gridHorizontalHalfGap)
+            .padding(.vertical, -Self.gridVerticalHalfGap)
         }
     }
 
     var storageSummaryCard: some View {
         let totalBytes = downloads.reduce(Int64(0)) { $0 + $1.fileSizeBytes }
-        let runningCount = manager.active.filter { !$0.phase.isResumable }.count
-        let resumableCount = manager.active.filter { $0.phase.isResumable }.count
         return DownloadsStorageSummaryCard(
             downloadedCount: downloads.count,
             totalStorageText: byteString(totalBytes),
             activeCount: manager.active.count,
-            runningCount: runningCount,
-            resumableCount: resumableCount,
-            brokenCount: brokenIDs.count,
-            onPauseAll: pauseAllActive,
-            onResumeAll: resumeAllActive
+            brokenCount: brokenIDs.count
         )
         .padding(.horizontal, AppSpacing.l)
     }
 
     func pauseAllActive() {
-        for item in manager.active where !item.phase.isResumable {
+        let queued = manager.active.filter { $0.phase == .queued }
+        let running = manager.active.filter { $0.phase.isActivelyRunning }
+        for item in queued + running {
             manager.pause(id: item.id)
         }
     }
@@ -350,42 +447,49 @@ private extension DownloadsView {
         _ item: DownloadManager.ActiveDownload,
         columnWidth: CGFloat?
     ) -> some View {
-        VStack(alignment: .leading, spacing: AppSpacing.s) {
-            HStack(alignment: .top, spacing: RowGeometry.coverToTextSpacing) {
-                VideoCoverImage(
-                    sources: VideoCoverSources(widescreen: item.coverURL),
-                    width: coverWidth(columnWidth: columnWidth)
-                )
-                .videoCoverFrame(cornerRadius: AppRadius.thumbnail)
+        let width = coverWidth(columnWidth: columnWidth)
+        let height = coverHeight(for: width)
+        return HStack(alignment: .top, spacing: RowGeometry.coverToTextSpacing) {
+            downloadRowCover(
+                coverURL: item.coverURL,
+                width: width,
+                height: height
+            )
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(item.title)
-                        .appFont(.libraryRowTitle)
-                        .fontWeight(.medium)
-                        .lineLimit(2)
-                    activeProgressContent(item)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(item.title)
+                    .appFont(.libraryRowTitle)
+                    .fontWeight(.medium)
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .padding(.trailing, Self.trailingMenuTitleInset)
 
-                Menu {
-                    activeActions(item)
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                        .font(.title3)
-                        .foregroundStyle(.secondary)
-                        .frame(width: 44, height: 44)
-                        .contentShape(Rectangle())
-                }
-                .accessibilityLabel(Text("Download actions"))
+                activeProgressContent(item)
+
+                Spacer(minLength: 0)
+
+                activeFooterRow(item)
             }
-            .padding(.leading, LibraryRowMetrics.horizontalInset)
-            .padding(.trailing, AppSpacing.xs)
-            .padding(.top, AppSpacing.m)
-
-            activeTransportBar(item)
-                .padding(.leading, LibraryRowMetrics.horizontalInset)
-                .padding(.trailing, AppSpacing.m)
-                .padding(.bottom, AppSpacing.s)
+            .frame(maxWidth: .infinity, minHeight: height, alignment: .leading)
+        }
+        .padding(AppSpacing.m)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            AppFill.card,
+            in: RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
+        )
+        .overlay(alignment: .topTrailing) {
+            rowMenuButton {
+                activeActions(item)
+            }
+        }
+        .contentShape(
+            .contextMenuPreview,
+            RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
+        )
+        .contextMenu {
+            activeActions(item)
         }
     }
 
@@ -393,96 +497,139 @@ private extension DownloadsView {
     func activeProgressContent(_ item: DownloadManager.ActiveDownload) -> some View {
         switch item.phase {
         case .failed(let message):
-            HStack(alignment: .top, spacing: AppSpacing.xs) {
-                Image(systemName: "exclamationmark.circle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .accessibilityHidden(true)
-                Text(message)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .lineLimit(2)
+            Button {
+                activeError = ActiveErrorPresentation(
+                    downloadID: item.id,
+                    message: message
+                )
+            } label: {
+                HStack(alignment: .firstTextBaseline, spacing: AppSpacing.xs) {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .accessibilityHidden(true)
+                    Text(verbatim: message)
+                        .multilineTextAlignment(.leading)
+                        .lineLimit(2)
+                }
+                .appFont(.libraryRowMeta)
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint(Text("View Details"))
+        case .queued:
+            VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                if let fraction = item.fraction {
+                    ProgressView(value: fraction)
+                        .tint(.secondary)
+                }
+                HStack(spacing: AppSpacing.xs) {
+                    Image(systemName: "clock")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                    metadataLine(item)
+                }
             }
         case .paused:
-            if let fraction = item.fraction {
-                ProgressView(value: fraction)
-                    .tint(.secondary)
+            VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                if let fraction = item.fraction {
+                    ProgressView(value: fraction)
+                        .tint(.secondary)
+                }
+                metadataLine(item)
             }
-            metadataLine(item)
         default:
             if let fraction = item.fraction {
-                ProgressView(value: fraction)
-                    .tint(.biliAccent)
+                VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                    ProgressView(value: fraction)
+                        .tint(.biliAccent)
+                    metadataLine(item)
+                }
             } else {
-                ProgressView()
-                    .controlSize(.small)
-                    .tint(.biliAccent)
+                HStack(spacing: AppSpacing.xs) {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(.biliAccent)
+                    metadataLine(item)
+                }
             }
-            metadataLine(item)
         }
     }
 
-    func activeTransportBar(_ item: DownloadManager.ActiveDownload) -> some View {
-        let stacksVertically = dynamicTypeSize >= .xxLarge
-        let layout: AnyLayout = stacksVertically
-            ? AnyLayout(VStackLayout(alignment: .leading, spacing: AppSpacing.s))
-            : AnyLayout(HStackLayout(alignment: .center, spacing: AppSpacing.s))
-        return layout {
-            qualityBadge(item.qualityLabel)
-            if !stacksVertically {
-                Spacer(minLength: 0)
+    @ViewBuilder
+    func activeFooterRow(_ item: DownloadManager.ActiveDownload) -> some View {
+        if dynamicTypeSize >= .xxLarge {
+            VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                qualityBadge(item.qualityLabel)
+                activeActionButton(item)
             }
-            activePrimaryButton(item)
+        } else {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .center, spacing: AppSpacing.s) {
+                    qualityBadge(item.qualityLabel)
+                        .fixedSize()
+                    Spacer(minLength: 0)
+                    activeActionButton(item)
+                        .fixedSize()
+                }
+                VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                    qualityBadge(item.qualityLabel)
+                    activeActionButton(item)
+                }
+            }
         }
     }
 
-    func activePrimaryButton(_ item: DownloadManager.ActiveDownload) -> some View {
+    @ViewBuilder
+    func activeActionButton(_ item: DownloadManager.ActiveDownload) -> some View {
+        let isFailed: Bool = if case .failed = item.phase { true } else { false }
         let isResumable = item.phase.isResumable
-        let icon: String = if case .failed = item.phase {
+        let title: LocalizedStringKey = if isFailed {
+            "Retry"
+        } else if isResumable {
+            "Resume"
+        } else {
+            "Pause"
+        }
+        let icon: String = if isFailed {
             "arrow.clockwise"
         } else if isResumable {
             "play.fill"
         } else {
             "pause.fill"
         }
-        return Button {
-            if isResumable {
-                manager.retry(id: item.id)
-            } else {
-                manager.pause(id: item.id)
-            }
-        } label: {
-            Label {
-                Text(isResumable ? LocalizedStringKey("Resume") : LocalizedStringKey("Pause"))
-            } icon: {
-                Image(systemName: icon)
-            }
-            .appFont(.controlLabel)
-            .fontWeight(.medium)
-            .foregroundStyle(isResumable ? Color.white : Color.biliAccent)
-            .padding(.horizontal, AppSpacing.m)
-            .frame(minWidth: 44, minHeight: 44)
-            .background(
-                isResumable
-                    ? AnyShapeStyle(AccentStore.shared.badgeFill)
-                    : AnyShapeStyle(Color.biliAccent.opacity(0.14)),
-                in: Capsule()
-            )
-            .contentShape(Capsule())
+        let accessibilityText: LocalizedStringKey = if isFailed {
+            "Retry download"
+        } else if isResumable {
+            "Resume download"
+        } else {
+            "Pause download"
         }
-        .buttonStyle(.appControl)
-        .accessibilityLabel(
-            isResumable ? Text("Resume download") : Text("Pause download")
-        )
-    }
 
-    func qualityBadge(_ label: String) -> some View {
-        Text(label)
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1)
-            .background(AccentStore.shared.badgeFill, in: RoundedRectangle(cornerRadius: AppRadius.badge))
+        if isResumable {
+            Button {
+                manager.retry(id: item.id)
+            } label: {
+                Label(title, systemImage: icon)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .buttonBorderShape(.capsule)
+            .tint(.biliAccent)
+            .accessibilityLabel(Text(accessibilityText))
+        } else {
+            Button {
+                manager.pause(id: item.id)
+            } label: {
+                Label(title, systemImage: icon)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .buttonBorderShape(.capsule)
+            .tint(.biliAccent)
+            .accessibilityLabel(Text(accessibilityText))
+        }
     }
 
     func metadataLine(_ item: DownloadManager.ActiveDownload) -> some View {
@@ -500,14 +647,31 @@ private extension DownloadsView {
 
     @ViewBuilder
     func activeActions(_ item: DownloadManager.ActiveDownload) -> some View {
-        if item.phase.isResumable {
+        switch item.phase {
+        case .failed(let message):
             Button {
                 manager.retry(id: item.id)
             } label: {
-                Label("Resume", systemImage: "arrow.clockwise")
+                Label("Retry", systemImage: "arrow.clockwise")
+            }
+            .accessibilityLabel(Text("Retry download"))
+
+            Button {
+                activeError = ActiveErrorPresentation(
+                    downloadID: item.id,
+                    message: message
+                )
+            } label: {
+                Label("View Details", systemImage: "exclamationmark.circle")
+            }
+        case .paused:
+            Button {
+                manager.retry(id: item.id)
+            } label: {
+                Label("Resume", systemImage: "play.fill")
             }
             .accessibilityLabel(Text("Resume download"))
-        } else {
+        default:
             Button {
                 manager.pause(id: item.id)
             } label: {
@@ -515,7 +679,8 @@ private extension DownloadsView {
             }
             .accessibilityLabel(Text("Pause download"))
         }
-        Button {
+
+        Button(role: .destructive) {
             manager.cancel(id: item.id)
         } label: {
             Label("Cancel", systemImage: "xmark")
@@ -528,24 +693,26 @@ private extension DownloadsView {
             .font(.footnote.weight(.medium))
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, AppSpacing.l + AppSpacing.xs)
+            .padding(.horizontal, AppSpacing.l)
     }
 
-    func storageSummaryHeader(for shown: [DownloadedVideo]) -> some View {
+    func completedHeader(for shown: [DownloadedVideo]) -> some View {
         HStack {
-            Text(String(format: String(localized: "%d videos"), shown.count))
-                .monospacedDigit()
+            Text("Downloaded")
             Spacer()
-            Text(String(
-                format: String(localized: "%@ used"),
-                byteString(shown.reduce(0) { $0 + $1.fileSizeBytes })
-            ))
-            .monospacedDigit()
+            if !query.isEmpty {
+                Text(String(format: String(localized: "%d videos"), shown.count))
+                    .monospacedDigit()
+            }
         }
     }
 
     func showsEmptyState(completed: [DownloadedVideo], active: [DownloadManager.ActiveDownload]) -> Bool {
-        completed.isEmpty && active.isEmpty
+        guard completed.isEmpty, active.isEmpty else { return false }
+        if !query.isEmpty {
+            return true
+        }
+        return exports.activeJob == nil && exports.artifacts.isEmpty
     }
 
     var emptyState: some View {
@@ -577,88 +744,81 @@ private extension DownloadsView {
         let readableBytes = rounded >= Double(Int64.max) ? Int64.max : Int64(rounded)
         return "\(byteString(readableBytes))/s"
     }
-
-    func byteString(_ bytes: Int64) -> String {
-        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
-    }
 }
 
 private struct DownloadsStorageSummaryCard: View {
     let downloadedCount: Int
     let totalStorageText: String
     let activeCount: Int
-    let runningCount: Int
-    let resumableCount: Int
     let brokenCount: Int
-    let onPauseAll: () -> Void
-    let onResumeAll: () -> Void
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         VStack(alignment: .leading, spacing: AppSpacing.m) {
-            HStack(spacing: AppSpacing.s) {
-                Image(systemName: "internaldrive.fill")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(Color.biliAccent)
-                    .accessibilityHidden(true)
-                Text("Downloads & Storage")
-                    .appFont(.sectionTitle)
-                    .foregroundStyle(.primary)
-                Spacer(minLength: 0)
-            }
-
-            metricsGrid
-
-            if activeCount > 0 {
-                bulkActions
-            }
+            metricsStrip
 
             if brokenCount > 0 {
-                missingFilesBanner
+                Divider()
+                missingFilesRow
             }
         }
-        .padding(AppSpacing.l)
+        .padding(.horizontal, AppSpacing.l)
+        .padding(.vertical, AppSpacing.m)
         .background(
             AppFill.card,
-            in: RoundedRectangle(cornerRadius: AppRadius.panel, style: .continuous)
+            in: RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
         )
     }
 
     @ViewBuilder
-    private var metricsGrid: some View {
+    private var metricsStrip: some View {
         if dynamicTypeSize >= .xxLarge {
             stackedMetrics
         } else {
             ViewThatFits(in: .horizontal) {
-                HStack(alignment: .top, spacing: AppSpacing.s) {
-                    horizontalMetricTile(title: "Downloaded", value: downloadedCount.formatted(), tint: .primary)
-                    horizontalMetricTile(title: "Storage", value: totalStorageText, tint: .primary)
-                    horizontalMetricTile(
-                        title: "Downloading",
-                        value: activeCount.formatted(),
-                        tint: activeCount > 0 ? .biliAccent : .primary
-                    )
-                }
+                horizontalMetrics
                 stackedMetrics
             }
         }
     }
 
-    private var stackedMetrics: some View {
-        VStack(alignment: .leading, spacing: AppSpacing.s) {
-            stackedMetricRow(title: "Downloaded", value: downloadedCount.formatted(), tint: .primary)
-            stackedMetricRow(title: "Storage", value: totalStorageText, tint: .primary)
-            stackedMetricRow(
-                title: "Downloading",
-                value: activeCount.formatted(),
-                tint: activeCount > 0 ? .biliAccent : .primary
+    private var horizontalMetrics: some View {
+        HStack(spacing: 0) {
+            horizontalMetricItem(
+                title: "Downloaded",
+                value: downloadedCount.formatted(),
+                tint: .primary
             )
+            metricDivider
+            horizontalMetricItem(
+                title: "Storage",
+                value: totalStorageText,
+                tint: .primary
+            )
+            if activeCount > 0 {
+                metricDivider
+                horizontalMetricItem(
+                    title: "Downloading",
+                    value: activeCount.formatted(),
+                    tint: .biliAccent
+                )
+            }
         }
     }
 
-    private func horizontalMetricTile(title: LocalizedStringKey, value: String, tint: Color) -> some View {
-        VStack(alignment: .leading, spacing: AppSpacing.xs) {
+    private var metricDivider: some View {
+        Divider()
+            .frame(height: 28)
+            .padding(.horizontal, AppSpacing.s)
+    }
+
+    private func horizontalMetricItem(
+        title: LocalizedStringKey,
+        value: String,
+        tint: Color
+    ) -> some View {
+        VStack(alignment: .center, spacing: 2) {
             Text(verbatim: value)
                 .font(.headline.weight(.semibold))
                 .monospacedDigit()
@@ -669,20 +829,34 @@ private struct DownloadsStorageSummaryCard: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: true, vertical: false)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, AppSpacing.m)
-        .padding(.vertical, AppSpacing.s)
-        .background(
-            AppFill.inset,
-            in: RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous)
-        )
+        .frame(maxWidth: .infinity)
         .accessibilityElement(children: .combine)
     }
 
-    private func stackedMetricRow(title: LocalizedStringKey, value: String, tint: Color) -> some View {
+    private var stackedMetrics: some View {
+        VStack(alignment: .leading, spacing: AppSpacing.s) {
+            stackedMetricRow(title: "Downloaded", value: downloadedCount.formatted(), tint: .primary)
+            Divider()
+            stackedMetricRow(title: "Storage", value: totalStorageText, tint: .primary)
+            if activeCount > 0 {
+                Divider()
+                stackedMetricRow(
+                    title: "Downloading",
+                    value: activeCount.formatted(),
+                    tint: .biliAccent
+                )
+            }
+        }
+    }
+
+    private func stackedMetricRow(
+        title: LocalizedStringKey,
+        value: String,
+        tint: Color
+    ) -> some View {
         let stacksVertically = dynamicTypeSize.isAccessibilitySize
         let layout: AnyLayout = stacksVertically
-            ? AnyLayout(VStackLayout(alignment: .leading, spacing: AppSpacing.xs))
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: 2))
             : AnyLayout(HStackLayout(alignment: .firstTextBaseline, spacing: AppSpacing.s))
         return layout {
             Text(title)
@@ -699,76 +873,20 @@ private struct DownloadsStorageSummaryCard: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, AppSpacing.m)
-        .padding(.vertical, AppSpacing.s)
-        .background(
-            AppFill.inset,
-            in: RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous)
-        )
         .accessibilityElement(children: .combine)
     }
 
-    private var bulkActions: some View {
-        let layout: AnyLayout = dynamicTypeSize >= .xxLarge
-            ? AnyLayout(VStackLayout(alignment: .leading, spacing: AppSpacing.s))
-            : AnyLayout(HStackLayout(spacing: AppSpacing.s))
-        return layout {
-            if runningCount > 0 {
-                Button(action: onPauseAll) {
-                    Label("Pause All", systemImage: "pause.fill")
-                        .appFont(.controlLabel)
-                        .fontWeight(.medium)
-                        .foregroundStyle(.primary)
-                        .frame(maxWidth: .infinity, minHeight: 44)
-                        .padding(.horizontal, AppSpacing.m)
-                        .background(
-                            AppFill.inset,
-                            in: RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous)
-                        )
-                        .contentShape(RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous))
-                }
-                .buttonStyle(.appControl)
-            }
-            if resumableCount > 0 {
-                Button(action: onResumeAll) {
-                    Label("Resume All", systemImage: "play.fill")
-                        .appFont(.controlLabel)
-                        .fontWeight(.semibold)
-                        .foregroundStyle(.white)
-                        .frame(maxWidth: .infinity, minHeight: 44)
-                        .padding(.horizontal, AppSpacing.m)
-                        .background(
-                            AccentStore.shared.badgeFill,
-                            in: RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous)
-                        )
-                        .contentShape(RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous))
-                }
-                .buttonStyle(.appControl)
-            }
-        }
-    }
-
-    private var missingFilesBanner: some View {
-        HStack(alignment: .top, spacing: AppSpacing.s) {
+    private var missingFilesRow: some View {
+        HStack(alignment: .firstTextBaseline, spacing: AppSpacing.s) {
             Image(systemName: "exclamationmark.triangle.fill")
-                .font(.subheadline)
+                .font(.footnote)
                 .foregroundStyle(.red)
                 .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(String(format: String(localized: "%d downloads have missing files"), brokenCount))
-                    .appFont(.libraryRowMeta)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(.primary)
-                Text("Downloaded files are missing or corrupt.")
-                    .appFont(.libraryRowFooter)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            Text(String(format: String(localized: "%d downloads have missing files"), brokenCount))
+                .appFont(.libraryRowMeta)
+                .foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
         }
-        .padding(AppSpacing.m)
-        .background(
-            Color.red.opacity(0.10),
-            in: RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous)
-        )
     }
 }

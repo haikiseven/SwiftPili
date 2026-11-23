@@ -11,6 +11,7 @@ struct SettingsView: View {
     @State private var showClearConfirm = false
     @AppStorage(CacheManager.sizeLimitKey) private var cacheLimitMB = 500
     @AppStorage(DownloadNetworkPolicy.cellularSettingsKey) private var downloadOverCellular = true
+    @AppStorage(DownloadNetworkPolicy.multiConnectionSettingsKey) private var multiConnectionDownloads = true
     @State private var backgroundAudio = PlayerPlaybackPreferences.backgroundAudioEnabled
     @State private var pictureInPicture = PlayerPlaybackPreferences.pictureInPictureEnabled
     @AppStorage(AppearanceMode.storageKey) private var appearanceRaw = AppearanceMode.system.rawValue
@@ -293,7 +294,11 @@ private extension SettingsView {
     }
 
     var storageSection: some View {
-        Section("Downloads & Storage") {
+        Section {
+            Toggle(isOn: $multiConnectionDownloads) {
+                settingsLabel("Multi-Connection Downloads", symbol: "arrow.triangle.branch")
+            }
+
             Toggle(isOn: $downloadOverCellular) {
                 settingsLabel("Download over Cellular", symbol: "arrow.down.circle")
             }
@@ -340,6 +345,10 @@ private extension SettingsView {
                     }
                 }
             }
+        } header: {
+            Text("Downloads & Storage")
+        } footer: {
+            Text("Downloads use parallel CDN connections on Wi-Fi for faster speeds and automatically limit concurrency on cellular.")
         }
     }
 

@@ -1,20 +1,98 @@
 import SwiftUI
 
 extension DownloadsView {
-    func completedRow(_ item: DownloadedVideo, in shown: [DownloadedVideo]) -> some View {
-        HStack(spacing: 0) {
-            ZoomSourceButton(
-                id: item.id,
-                open: { zoom in open(item, in: shown, zoom: zoom) },
-                label: { downloadRow(item) }
-            )
-            Menu { completedActions(item, in: shown) } label: {
-                Image(systemName: "ellipsis.circle")
-                    .font(.title3).foregroundStyle(.secondary)
-                    .frame(width: 44, height: 44).contentShape(Rectangle())
+    func completedRow(
+        _ item: DownloadedVideo,
+        in shown: [DownloadedVideo],
+        columnWidth: CGFloat?
+    ) -> some View {
+        ZoomSourceButton(
+            id: item.id,
+            cornerRadius: AppRadius.card,
+            open: { zoom in open(item, in: shown, zoom: zoom) },
+            label: {
+                completedRowCard(item, columnWidth: columnWidth)
             }
-            .accessibilityLabel("Download actions")
+        )
+        .overlay(alignment: .topTrailing) {
+            rowMenuButton {
+                completedActions(item, in: shown)
+            }
         }
+        .contentShape(
+            .contextMenuPreview,
+            RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
+        )
+        .contextMenu {
+            completedActions(item, in: shown)
+        }
+    }
+
+    private func completedRowCard(
+        _ item: DownloadedVideo,
+        columnWidth: CGFloat?
+    ) -> some View {
+        let width = coverWidth(columnWidth: columnWidth)
+        let height = coverHeight(for: width)
+        return HStack(alignment: .top, spacing: RowGeometry.coverToTextSpacing) {
+            downloadRowCover(
+                coverURL: item.coverURL,
+                width: width,
+                height: height,
+                durationSeconds: item.durationSeconds,
+                watchedFraction: item.watchedFraction
+            )
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text(item.title)
+                    .appFont(.libraryRowTitle)
+                    .fontWeight(.medium)
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .padding(.trailing, Self.trailingMenuTitleInset)
+
+                Spacer(minLength: 2)
+
+                if !item.ownerName.isEmpty {
+                    Text(item.ownerName)
+                        .appFont(.libraryRowMeta)
+                        .lineLimit(1)
+                        .foregroundStyle(.secondary)
+                }
+
+                completedMetadataFooter(item)
+            }
+            .frame(maxWidth: .infinity, minHeight: height, alignment: .leading)
+        }
+        .padding(AppSpacing.m)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            AppFill.card,
+            in: RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
+        )
+        .videoCardSurface()
+    }
+
+    private func completedMetadataFooter(_ item: DownloadedVideo) -> some View {
+        HStack(spacing: 6) {
+            qualityBadge(item.qualityLabel)
+                .fixedSize()
+            Text(byteString(item.fileSizeBytes))
+                .monospacedDigit()
+                .lineLimit(1)
+            if brokenIDs.contains(item.id) {
+                HStack(spacing: 3) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .accessibilityHidden(true)
+                    Text("Missing files")
+                }
+                .foregroundStyle(.red)
+                .lineLimit(1)
+            }
+        }
+        .appFont(.libraryRowMeta)
+        .foregroundStyle(.secondary)
     }
 
     func presentExport(_ item: DownloadedVideo) {
@@ -144,5 +222,4 @@ extension DownloadsView {
             )
         }
     }
-
 }

@@ -80,48 +80,70 @@ struct DownloadProgressEventCoalescer: Sendable {
 }
 
 struct DownloadCallbackFence: Sendable {
+    private struct StageFence: Sendable {
+        var stageGeneration: UInt64
+        var candidateGeneration: UInt64 = 0
+        var taskIdentifier: Int?
+        var lastSequence: UInt64 = 0
+        var accepting = true
+    }
+
     let operationToken: UUID
-    private(set) var stage: DownloadStage?
-    private(set) var stageGeneration: UInt64 = 0
-    private(set) var candidateGeneration: UInt64 = 0
-    private(set) var taskIdentifier: Int?
-    private(set) var lastSequence: UInt64 = 0
+    private var stageFences: [DownloadStage: StageFence] = [:]
 
     init(operationToken: UUID) {
         self.operationToken = operationToken
     }
 
     mutating func beginStage(_ stage: DownloadStage, generation: UInt64) {
-        self.stage = stage
-        stageGeneration = generation
-        candidateGeneration = 0
-        taskIdentifier = nil
+        stageFences[stage] = StageFence(stageGeneration: generation)
+    }
+
+    mutating func endStage(_ stage: DownloadStage) {
+        stageFences[stage]?.accepting = false
+    }
+
+    mutating func closeAll() {
+        for stage in stageFences.keys {
+            stageFences[stage]?.accepting = false
+        }
+    }
+
+    func candidateGeneration(for stage: DownloadStage) -> UInt64 {
+        stageFences[stage]?.candidateGeneration ?? 0
+    }
+
+    func isAccepting(_ stage: DownloadStage, generation: UInt64) -> Bool {
+        guard let fence = stageFences[stage] else { return false }
+        return fence.accepting && fence.stageGeneration == generation
     }
 
     mutating func accepts(_ event: DownloadTransferEvent) -> Bool {
         guard event.operationToken == operationToken,
-              event.stage == stage,
-              event.stageGeneration == stageGeneration,
-              event.sequence > lastSequence,
-              event.candidateGeneration >= candidateGeneration
+              var fence = stageFences[event.stage],
+              fence.accepting,
+              event.stageGeneration == fence.stageGeneration,
+              event.sequence > fence.lastSequence,
+              event.candidateGeneration >= fence.candidateGeneration
         else { return false }
 
         let nextTaskIdentifier: Int
-        if event.candidateGeneration > candidateGeneration {
+        if event.candidateGeneration > fence.candidateGeneration {
             guard event.kind == .candidateStarted else { return false }
             nextTaskIdentifier = event.taskIdentifier
         } else {
-            guard let taskIdentifier,
+            guard let taskIdentifier = fence.taskIdentifier,
                   event.taskIdentifier == taskIdentifier
             else { return false }
             nextTaskIdentifier = taskIdentifier
         }
 
-        if event.candidateGeneration > candidateGeneration {
-            candidateGeneration = event.candidateGeneration
-            taskIdentifier = nextTaskIdentifier
+        if event.candidateGeneration > fence.candidateGeneration {
+            fence.candidateGeneration = event.candidateGeneration
+            fence.taskIdentifier = nextTaskIdentifier
         }
-        lastSequence = event.sequence
+        fence.lastSequence = event.sequence
+        stageFences[event.stage] = fence
         return true
     }
 }
@@ -135,10 +157,15 @@ struct DownloadProgressSnapshot: Sendable, Equatable {
 }
 
 struct DownloadProgressAccumulator: Sendable {
+    private static let minimumSpeedSampleInterval: TimeInterval = 0.25
+    private static let maxSpeedSamples = 4
+
     private struct StageState: Sendable {
         var transferred: Int64 = 0
         var candidateTransferred: Int64 = 0
         var expected: Int64?
+        var isRetrying = false
+        var isActive = false
     }
 
     private var requiredStages: Set<DownloadStage>
@@ -146,7 +173,6 @@ struct DownloadProgressAccumulator: Sendable {
     private var knownExpected: [DownloadStage: Int64] = [:]
     private var estimatedExpected: [DownloadStage: Int64] = [:]
     private var highWaterFraction: Double?
-    private var retrying = false
     private var lastSampleBytes: Int64?
     private var lastSampleTime: TimeInterval?
     private var speedSamples: [Double] = []
@@ -188,17 +214,24 @@ struct DownloadProgressAccumulator: Sendable {
         }
         for (stage, transferred) in transferredBytes where transferred > 0 {
             var state = stages[stage] ?? StageState()
-            state.transferred = max(state.transferred, transferred)
+            let clamped = max(state.transferred, transferred)
+            state.transferred = clamped
+            state.candidateTransferred = max(state.candidateTransferred, clamped)
             stages[stage] = state
         }
+        rebaseSpeed(at: ProcessInfo.processInfo.systemUptime)
         refreshSnapshot()
     }
 
     mutating func beginStage(_ stage: DownloadStage) {
-        if stages[stage] == nil { stages[stage] = StageState() }
-        stages[stage]?.candidateTransferred = 0
-        retrying = false
-        rebaseSpeed(at: ProcessInfo.processInfo.systemUptime)
+        var state = stages[stage] ?? StageState()
+        state.candidateTransferred = state.transferred
+        state.isRetrying = false
+        state.isActive = true
+        stages[stage] = state
+        if lastSampleTime == nil {
+            rebaseSpeed(at: ProcessInfo.processInfo.systemUptime)
+        }
         refreshSnapshot()
     }
 
@@ -209,15 +242,26 @@ struct DownloadProgressAccumulator: Sendable {
     ) {
         let floor = max(0, resumedFromBytes)
         var state = stages[stage] ?? StageState()
+        let previousCandidate = state.candidateTransferred
         state.candidateTransferred = floor
         state.transferred = max(state.transferred, floor)
         if let measured = state.expected, measured > 0 {
             knownExpected[stage] = measured
         }
         state.expected = nil
+        state.isRetrying = retrying
+        state.isActive = true
         stages[stage] = state
-        self.retrying = retrying
-        rebaseSpeed(at: ProcessInfo.processInfo.systemUptime)
+
+        let hasActiveSibling = stages.contains { $0.key != stage && $0.value.isActive && !$0.value.isRetrying }
+        if hasActiveSibling {
+            if let previousSample = lastSampleBytes {
+                let delta = floor - previousCandidate
+                lastSampleBytes = max(0, previousSample + delta)
+            }
+        } else {
+            rebaseSpeed(at: ProcessInfo.processInfo.systemUptime)
+        }
         refreshSnapshot()
     }
 
@@ -226,35 +270,41 @@ struct DownloadProgressAccumulator: Sendable {
         transferredBytes: Int64,
         expectedBytes: Int64?
     ) {
+        let clamped = max(0, transferredBytes)
         var state = stages[stage] ?? StageState()
-        state.transferred = max(state.transferred, max(0, transferredBytes))
-        state.candidateTransferred = max(
-            state.candidateTransferred,
-            max(0, transferredBytes)
-        )
+        state.transferred = max(state.transferred, clamped)
+        state.candidateTransferred = max(state.candidateTransferred, clamped)
         if let expectedBytes, expectedBytes > 0 {
             state.expected = expectedBytes
         }
+        state.isRetrying = false
+        state.isActive = true
         stages[stage] = state
-        retrying = false
         sampleSpeed(at: ProcessInfo.processInfo.systemUptime)
         refreshSnapshot()
     }
 
     mutating func completeStage(_ stage: DownloadStage, actualBytes: Int64) {
+        let clamped = max(0, actualBytes)
         var state = stages[stage] ?? StageState()
-        state.transferred = max(state.transferred, max(0, actualBytes))
-        state.candidateTransferred = max(
-            state.candidateTransferred,
-            max(0, actualBytes)
-        )
+        state.transferred = max(state.transferred, clamped)
+        state.candidateTransferred = max(state.candidateTransferred, clamped)
+        if clamped > 0 {
+            state.expected = clamped
+            knownExpected[stage] = clamped
+        }
+        state.isRetrying = false
+        state.isActive = false
         stages[stage] = state
-        retrying = false
+        sampleSpeed(at: ProcessInfo.processInfo.systemUptime)
         refreshSnapshot()
     }
 
     mutating func markTerminal() {
-        retrying = false
+        for stage in stages.keys {
+            stages[stage]?.isRetrying = false
+            stages[stage]?.isActive = false
+        }
         rebaseSpeed(at: ProcessInfo.processInfo.systemUptime)
         refreshSnapshot()
     }
@@ -293,8 +343,11 @@ struct DownloadProgressAccumulator: Sendable {
 
         let elapsed = time - previousTime
         let delta = bytes - previousBytes
-        guard elapsed > 0, elapsed.isFinite, delta >= 0 else {
+        guard elapsed.isFinite, elapsed >= 0, delta >= 0 else {
             rebaseSpeed(at: time)
+            return
+        }
+        guard elapsed >= Self.minimumSpeedSampleInterval else {
             return
         }
         let rate = Double(delta) / elapsed
@@ -304,7 +357,7 @@ struct DownloadProgressAccumulator: Sendable {
         }
 
         speedSamples.append(rate)
-        if speedSamples.count > 3 { speedSamples.removeFirst() }
+        if speedSamples.count > Self.maxSpeedSamples { speedSamples.removeFirst() }
         lastSampleBytes = bytes
         lastSampleTime = time
     }
@@ -343,11 +396,17 @@ struct DownloadProgressAccumulator: Sendable {
         return (total, isEstimated)
     }
 
+    private var isAllActiveRetrying: Bool {
+        let active = stages.values.filter(\.isActive)
+        guard !active.isEmpty else { return false }
+        return active.allSatisfy(\.isRetrying)
+    }
+
     private mutating func refreshSnapshot() {
         let expected = totalExpected
         var fraction: Double?
         var fractionIsEstimated = false
-        if !retrying, let expected, expected.bytes > 0 {
+        if !isAllActiveRetrying, let expected, expected.bytes > 0 {
             let raw = min(max(Double(totalTransferred) / Double(expected.bytes), 0), 1)
             highWaterFraction = max(highWaterFraction ?? 0, raw)
             fraction = highWaterFraction

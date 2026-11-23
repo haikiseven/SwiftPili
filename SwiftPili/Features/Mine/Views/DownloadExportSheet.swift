@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct DownloadExportSheet: View {
     let source: DownloadExportSource
@@ -11,6 +12,7 @@ struct DownloadExportSheet: View {
     @State private var color: ExportColorMode = .sdr
     @State private var includeAudio = true
     @State private var error: String?
+    @State private var prepareError: String?
     @State private var loading = true
     @State private var starting = false
     private let exports = DownloadExportCoordinator.shared
@@ -30,21 +32,37 @@ struct DownloadExportSheet: View {
         NavigationStack {
             Form {
                 Group {
-                    Section("File") {
+                    Section {
                         TextField("File name", text: $filename)
                             .autocorrectionDisabled()
+                    } header: {
+                        Text("File")
+                    } footer: {
                         Text("MP4 · Choose a location in Files after export finishes.")
-                            .appFont(.libraryRowMeta)
-                            .foregroundStyle(.secondary)
                     }
+
                     if loading {
-                        ProgressView("Reading local tracks…")
+                        Section {
+                            ProgressView("Reading local tracks…")
+                                .frame(maxWidth: .infinity, alignment: .center)
+                        }
                     } else if let inventory {
                         sourceSection(inventory)
                         optionsSection(inventory)
-                    }
-                    if let error {
-                        Section { ExportErrorCopyView(message: error) }
+                    } else if let prepareError {
+                        Section {
+                            HStack(spacing: AppSpacing.s) {
+                                Label("Export failed", systemImage: "exclamationmark.circle.fill")
+                                    .foregroundStyle(.red)
+                                Spacer(minLength: 0)
+                                Button("Details") {
+                                    error = prepareError
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .buttonBorderShape(.capsule)
+                            }
+                        }
                     }
                 }
                 .listRowBackground(AppFill.card)
@@ -58,6 +76,24 @@ struct DownloadExportSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Export") { start() }.disabled(!canStart)
                 }
+            }
+            .alert(
+                "Export Failed",
+                isPresented: Binding(
+                    get: { error != nil },
+                    set: { if !$0 { error = nil } }
+                )
+            ) {
+                if let message = error {
+                    Button("Copy") {
+                        UIPasteboard.general.string = message
+                    }
+                }
+                Button("OK", role: .cancel) {
+                    error = nil
+                }
+            } message: {
+                Text(verbatim: error ?? "")
             }
         }
         .accentContentBoundary()
@@ -75,9 +111,15 @@ struct DownloadExportSheet: View {
                     resolution = first.resolution
                 }
                 if !result.canRemuxOriginal && result.recipes.isEmpty {
-                    self.error = String(localized: "No supported export recipe is available for these local tracks.")
+                    let message = String(localized: "No supported export recipe is available for these local tracks.")
+                    prepareError = message
+                    error = message
                 }
-            } catch { self.error = error.localizedDescription }
+            } catch {
+                guard !Task.isCancelled else { return }
+                prepareError = error.localizedDescription
+                self.error = error.localizedDescription
+            }
             loading = false
         }
     }
@@ -93,19 +135,15 @@ struct DownloadExportSheet: View {
                 LabeledContent("Color", value: inventory.hdr ? "HDR" : "SDR")
             }
         }
-        .appFont(.libraryRowMeta)
     }
 
     private func optionsSection(_ inventory: ExportMediaInventory) -> some View {
-        Section("Output") {
+        Section {
             Picker("Mode", selection: $mode) {
                 if inventory.canRemuxOriginal { Text("Original tracks").tag(ExportMode.original) }
                 Text("Transcode MP4").tag(ExportMode.transcode)
             }
-            if mode == .original {
-                Text("Preserves source video, audio and available HDR / Dolby information without re-encoding.")
-                    .appFont(.libraryRowMeta).foregroundStyle(.secondary)
-            } else {
+            if mode == .transcode {
                 Picker("Codec", selection: $codec) {
                     ForEach([ExportVideoCodec.h264, .hevc], id: \.self) { value in
                         if inventory.recipes.contains(where: { $0.codec == value }) {
@@ -129,16 +167,28 @@ struct DownloadExportSheet: View {
                         }
                     }
                 }
-                Text("Fits within the selected resolution without enlarging the source.")
-                    .appFont(.libraryRowMeta).foregroundStyle(.secondary)
-                Text("Transcoding removes Dolby Vision metadata.")
-                    .appFont(.libraryRowMeta).foregroundStyle(.secondary)
-                Text("Included audio becomes AAC and loses Dolby / Atmos information.")
-                    .appFont(.libraryRowMeta).foregroundStyle(.secondary)
                 if inventory.audioCodec != nil {
                     Toggle("Include local audio", isOn: $includeAudio)
+                }
+            }
+        } header: {
+            Text("Output")
+        } footer: {
+            outputFooter(for: inventory)
+        }
+    }
+
+    private func outputFooter(for inventory: ExportMediaInventory) -> some View {
+        VStack(alignment: .leading, spacing: AppSpacing.xs) {
+            if mode == .original {
+                Text("Preserves source video, audio and available HDR / Dolby information without re-encoding.")
+            } else {
+                Text("Fits within the selected resolution without enlarging the source.")
+                Text("Transcoding removes Dolby Vision metadata.")
+                if inventory.audioCodec != nil {
+                    Text("Included audio becomes AAC and loses Dolby / Atmos information.")
                 } else {
-                    Text("No local audio track — silent export.").appFont(.libraryRowMeta)
+                    Text("No local audio track — silent export.")
                 }
             }
         }

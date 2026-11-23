@@ -9,8 +9,13 @@ final class DownloadActivityState {
             if hasInFlightDownloads != hasInFlight {
                 hasInFlightDownloads = hasInFlight
             }
+            let hasRunning = active.contains { $0.phase.isActivelyRunning }
+            if hasRunningDownloads != hasRunning {
+                hasRunningDownloads = hasRunning
+            }
         }
     }
 
     private(set) var hasInFlightDownloads = false
+    private(set) var hasRunningDownloads = false
 }

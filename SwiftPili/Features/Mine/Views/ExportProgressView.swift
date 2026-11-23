@@ -1,47 +1,24 @@
 import SwiftUI
 import UIKit
 
-struct ExportErrorCopyView: View {
-    let message: String
-    @State private var copiedMessage: String?
-
-    private var isCopied: Bool { copiedMessage == message }
-
-    var body: some View {
-        Button {
-            UIPasteboard.general.string = message
-            copiedMessage = message
-        } label: {
-            VStack(alignment: .leading, spacing: 6) {
-                Text(verbatim: message)
-                    .multilineTextAlignment(.leading)
-                    .lineLimit(nil)
-                    .fixedSize(horizontal: false, vertical: true)
-                Label {
-                    isCopied ? Text("Copied") : Text("Copy")
-                } icon: {
-                    Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
-                }
-            }
-            .appFont(.libraryRowMeta)
-            .foregroundStyle(.red)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onChange(of: message) { _, _ in copiedMessage = nil }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(isCopied ? Text("Copied") : Text("Copy"))
-        .accessibilityValue(Text(verbatim: message))
-    }
-}
-
 struct ExportProgressView: View {
     let save: (ExportArtifact) -> Void
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var discardID: UUID?
-    @State private var error: String?
+    @State private var presentedError: String?
+    @State private var lastAutoPresentedJobError: JobErrorToken?
     private let exports = DownloadExportCoordinator.shared
+
+    private struct JobErrorToken: Equatable {
+        let jobID: UUID
+        let message: String
+    }
+
+    private var currentJobErrorToken: JobErrorToken? {
+        guard let job = exports.activeJob,
+              let message = surfacedJobError(for: job) else { return nil }
+        return JobErrorToken(jobID: job.id, message: message)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: AppSpacing.m) {
@@ -57,22 +34,47 @@ struct ExportProgressView: View {
                 }
                 artifactRow(artifact)
             }
-            if let error {
-                ExportErrorCopyView(message: error)
-            }
         }
-        .padding(AppSpacing.l)
+        .padding(.horizontal, AppSpacing.l)
+        .padding(.vertical, AppSpacing.m)
         .background(
             AppFill.card,
-            in: RoundedRectangle(cornerRadius: AppRadius.panel, style: .continuous)
+            in: RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
         )
+        .onChange(of: currentJobErrorToken) { _, token in
+            guard let token, token != lastAutoPresentedJobError else { return }
+            lastAutoPresentedJobError = token
+            presentedError = token.message
+        }
+        .alert(
+            "Export Failed",
+            isPresented: Binding(
+                get: { presentedError != nil },
+                set: { if !$0 { presentedError = nil } }
+            )
+        ) {
+            if let message = presentedError {
+                Button("Copy") {
+                    UIPasteboard.general.string = message
+                }
+            }
+            Button("OK", role: .cancel) {
+                presentedError = nil
+            }
+        } message: {
+            Text(verbatim: presentedError ?? "")
+        }
         .confirmationDialog("Discard exported file?", isPresented: Binding(
             get: { discardID != nil }, set: { if !$0 { discardID = nil } }
         )) {
             Button("Discard", role: .destructive) {
                 guard let id = discardID else { return }
                 Task {
-                    do { try await exports.discard(id: id) } catch { self.error = error.localizedDescription }
+                    do {
+                        try await exports.discard(id: id)
+                    } catch {
+                        presentedError = error.localizedDescription
+                    }
                 }
                 discardID = nil
             }
@@ -86,13 +88,13 @@ struct ExportProgressView: View {
             nil
         }
         return VStack(alignment: .leading, spacing: AppSpacing.s) {
-            HStack(alignment: .top, spacing: AppSpacing.m) {
-                Image(systemName: "square.and.arrow.up.circle.fill")
+            HStack(alignment: .center, spacing: AppSpacing.m) {
+                Image(systemName: stateIcon(job.state))
                     .font(.title3)
-                    .foregroundStyle(Color.biliAccent)
+                    .foregroundStyle(stateTint(job.state))
                     .accessibilityHidden(true)
 
-                VStack(alignment: .leading, spacing: AppSpacing.xs) {
+                VStack(alignment: .leading, spacing: 2) {
                     Text(job.title)
                         .appFont(.libraryRowTitle)
                         .fontWeight(.medium)
@@ -107,24 +109,17 @@ struct ExportProgressView: View {
                         }
                     }
                     .appFont(.libraryRowMeta)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(job.state == .failed ? Color.red : Color.secondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 if exports.hasActiveOperation {
-                    Button {
+                    Button("Cancel") {
                         exports.cancel()
-                    } label: {
-                        Text("Cancel")
-                            .appFont(.controlLabel)
-                            .fontWeight(.medium)
-                            .foregroundStyle(.primary)
-                            .padding(.horizontal, AppSpacing.m)
-                            .frame(minWidth: 44, minHeight: 44)
-                            .background(AppFill.inset, in: Capsule())
-                            .contentShape(Capsule())
                     }
-                    .buttonStyle(.appControl)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .buttonBorderShape(.capsule)
                     .disabled(job.state == .stopping)
                 }
             }
@@ -134,12 +129,39 @@ struct ExportProgressView: View {
                     .tint(.biliAccent)
             } else if exports.hasActiveOperation {
                 ProgressView()
+                    .controlSize(.small)
                     .tint(.biliAccent)
             }
 
-            if let jobError = job.error {
-                ExportErrorCopyView(message: jobError)
+            if let jobError = surfacedJobError(for: job) {
+                failedStatusRow(message: jobError)
             }
+        }
+    }
+
+    private func failedStatusRow(message: String) -> some View {
+        let layout: AnyLayout = dynamicTypeSize.isAccessibilitySize
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: AppSpacing.xs))
+            : AnyLayout(HStackLayout(alignment: .center, spacing: AppSpacing.s))
+        return layout {
+            HStack(alignment: .firstTextBaseline, spacing: AppSpacing.xs) {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .accessibilityHidden(true)
+                Text(verbatim: message)
+                    .appFont(.libraryRowMeta)
+                    .foregroundStyle(.red)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button("Details") {
+                presentedError = message
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .buttonBorderShape(.capsule)
         }
     }
 
@@ -174,33 +196,56 @@ struct ExportProgressView: View {
             }
 
             HStack(spacing: AppSpacing.s) {
-                Button {
+                Button("Save") {
                     save(artifact)
-                } label: {
-                    Text("Save")
-                        .appFont(.controlLabel)
-                        .fontWeight(.semibold)
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, AppSpacing.l)
-                        .frame(minWidth: 44, minHeight: 44)
-                        .background(AccentStore.shared.badgeFill, in: Capsule())
-                        .contentShape(Capsule())
                 }
-                .buttonStyle(.appControl)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .buttonBorderShape(.capsule)
+                .tint(.biliAccent)
 
                 Button(role: .destructive) {
                     discardID = artifact.id
                 } label: {
                     Image(systemName: "trash")
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.red)
-                        .frame(width: 44, height: 44)
-                        .background(AppFill.inset, in: Circle())
-                        .contentShape(Circle())
                 }
-                .buttonStyle(.appControl)
-                .accessibilityLabel("Discard exported file")
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .buttonBorderShape(.circle)
+                .accessibilityLabel(Text("Discard exported file"))
             }
+        }
+    }
+
+    private func surfacedJobError(for job: ExportJobView) -> String? {
+        guard let message = job.error, !message.isEmpty else { return nil }
+        if job.state == .cancelled, message == ExportFailure.cancelled.errorDescription {
+            return nil
+        }
+        return message
+    }
+
+    private func stateIcon(_ state: ExportJobState) -> String {
+        switch state {
+        case .failed, .interrupted:
+            "exclamationmark.circle.fill"
+        case .finalized, .readyToSave, .saved:
+            "checkmark.circle.fill"
+        default:
+            "square.and.arrow.up.circle.fill"
+        }
+    }
+
+    private func stateTint(_ state: ExportJobState) -> Color {
+        switch state {
+        case .failed, .interrupted:
+            .red
+        case .cancelled:
+            .secondary
+        case .finalized, .readyToSave, .saved:
+            .green
+        default:
+            .biliAccent
         }
     }
 
