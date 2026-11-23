@@ -117,13 +117,6 @@ actor PathAHTTPMediaSource {
     private(set) var info: ResourceInfo?
 
     private var primedHead: Data?
-    private var displayTrack: MediaDisplayTrack?
-    private var displayPrimed: MediaDisplayLease?
-
-    func setDisplayTrack(_ track: MediaDisplayTrack?) {
-        displayTrack = track
-        displayPrimed = primedHead.flatMap { track?.own(bytes: 0..<Int64($0.count)) }
-    }
 
     private let byteStore: MediaByteRangeStore?
     private var storeBinding: PathAByteStoreBinding?
@@ -281,7 +274,6 @@ actor PathAHTTPMediaSource {
 
     func read(
         offset: Int64, count: Int, waitBudget: MediaSourceWaitBudget? = nil,
-        displayOwner: MediaDisplayByteOwner? = nil,
         recordReadPosition: Bool = true
     ) async throws -> Data {
         try checkWaitBudget(waitBudget)
@@ -293,7 +285,6 @@ actor PathAHTTPMediaSource {
         }
 
         if let slice = primedHeadSlice(offset: offset, count: count) {
-            displayOwner?.hold(offset..<(offset + Int64(slice.count)))
             PlayerLog.log(
                 "[PathA] http read served from primed head " +
                 "off=\(offset) count=\(count) (no request)"
@@ -304,7 +295,7 @@ actor PathAHTTPMediaSource {
         if let binding = storeBinding {
             return try await readStoredWindow(
                 window, binding: binding, waitBudget: waitBudget,
-                displayOwner: displayOwner, recordReadPosition: recordReadPosition
+                recordReadPosition: recordReadPosition
             )
         }
         return try await readNetworkWindow(
@@ -314,7 +305,7 @@ actor PathAHTTPMediaSource {
 
     private func readStoredWindow(
         _ window: ByteWindow, binding: PathAByteStoreBinding, waitBudget: MediaSourceWaitBudget?,
-        displayOwner: MediaDisplayByteOwner?, recordReadPosition: Bool
+        recordReadPosition: Bool
     ) async throws -> Data {
         let ticket = chunkOpenTicket
         let end = min(window.endExclusive, binding.key.contentLength)
@@ -326,7 +317,7 @@ actor PathAHTTPMediaSource {
             try checkClaimFence(ticket, waitBudget: waitBudget)
             let count = Int(end - cursor)
             if let held = await binding.store.prefix(
-                binding.key, offset: cursor, count: count, displayOwner: displayOwner
+                binding.key, offset: cursor, count: count
             ) {
                 try checkClaimFence(ticket, waitBudget: waitBudget)
                 if recordReadPosition {
@@ -360,7 +351,6 @@ actor PathAHTTPMediaSource {
             )
             try checkClaimFence(ticket, waitBudget: waitBudget)
             guard let response else { continue }
-            displayOwner?.hold(cursor..<(cursor + Int64(response.data.count)))
             output.append(response.data)
             cursor += Int64(response.data.count)
             deadline = nil
@@ -592,7 +582,6 @@ actor PathAHTTPMediaSource {
     private struct StreamChunk: Sendable {
         let data: Data
         let primaryDelivery: PrimaryDelivery?
-        var displayBytes: MediaDisplayLease? = nil
     }
 
     private var chunkSlot: ChunkStreamSlot?
@@ -610,10 +599,7 @@ actor PathAHTTPMediaSource {
             throw SourceError.invalidRange
         }
 
-        let displayBytes = displayTrack.map(MediaDisplayByteOwner.init)
-        defer { displayBytes?.release() }
         let primed = primedHeadPrefix(offset: offset, count: count)
-        if let primed { displayBytes?.hold(offset..<(offset + Int64(primed.count))) }
         let primedCount = primed?.count ?? 0
         chunkOpenTicket &+= 1
         let ticket = chunkOpenTicket
@@ -621,7 +607,7 @@ actor PathAHTTPMediaSource {
         if let binding = storeBinding {
             try checkClaimFence(ticket, waitBudget: waitBudget)
             cached = await binding.streamPrefix(
-                offset: offset, count: count, after: primedCount, limit: Self.chunkBufferHighWater, displayOwner: displayBytes
+                offset: offset, count: count, after: primedCount, limit: Self.chunkBufferHighWater
             )
             try checkClaimFence(ticket, waitBudget: waitBudget)
         }
@@ -658,28 +644,18 @@ actor PathAHTTPMediaSource {
 
     private func installHeldOnlySlot(id: UInt64, window: ByteWindow, held: [Data], heldCount: Int) {
         var slot = ChunkStreamSlot(id: id, baseOffset: window.offset, requestedCount: window.count64)
-        slot.buffered = displayChunks(held, offset: window.offset)
+        slot.buffered = held.map { StreamChunk(data: $0, primaryDelivery: nil) }
         slot.bufferedBytes = heldCount
         slot.heldQueuedBytes = heldCount
         slot.finished = Int64(heldCount) == window.count64
         chunkSlot = slot
     }
 
-    private func displayChunks(_ pieces: [Data], offset: Int64) -> [StreamChunk] {
-        var cursor = offset
-        return pieces.map { data in
-            let end = cursor + Int64(data.count)
-            defer { cursor = end }
-            return StreamChunk(data: data, primaryDelivery: nil,
-                               displayBytes: displayTrack?.own(bytes: cursor..<end))
-        }
-    }
-
     private func startNetworkRemainder(
         id: UInt64, window: ByteWindow, held: [Data], heldCount: Int, waitBudget: MediaSourceWaitBudget?
     ) throws {
         var slot = ChunkStreamSlot(id: id, baseOffset: window.offset, requestedCount: window.count64)
-        slot.buffered = displayChunks(held, offset: window.offset)
+        slot.buffered = held.map { StreamChunk(data: $0, primaryDelivery: nil) }
         slot.bufferedBytes = heldCount
         chunkSlot = slot
         try beginNetworkSpan(
@@ -836,7 +812,6 @@ actor PathAHTTPMediaSource {
     private func releaseHead() {
         guard primedHead != nil else { return }
         primedHead = nil
-        displayPrimed = nil
     }
 
     func chunkStreamPosition(_ id: UInt64) -> Int64? {
@@ -932,14 +907,13 @@ actor PathAHTTPMediaSource {
     }
 
     func nextChunkStep(
-        _ id: UInt64, waitBudget: MediaSourceWaitBudget? = nil,
-        displayOwner: MediaDisplayByteOwner? = nil
+        _ id: UInt64, waitBudget: MediaSourceWaitBudget? = nil
     ) async throws -> ChunkStreamStep {
         while true {
             try checkWaitBudget(waitBudget)
             guard var slot = chunkSlot, slot.id == id else { throw CancellationError() }
             if !slot.buffered.isEmpty {
-                return .chunk(try consumeBufferedChunk(&slot, waitBudget: waitBudget, displayOwner: displayOwner))
+                return .chunk(try consumeBufferedChunk(&slot, waitBudget: waitBudget))
             }
             if slot.tailEndedForBackpressure {
                 guard let resumeOffset = MediaByteRange.checkedEndExclusive(
@@ -971,34 +945,24 @@ actor PathAHTTPMediaSource {
             guard chunkSlot?.id == id else { throw CancellationError() }
             guard let resumed else { return .endOfStream }
             if resumed.data.isEmpty { continue }
-            if let slot = chunkSlot {
-                let end = slot.baseOffset + slot.delivered
-                displayOwner?.hold((end - Int64(resumed.data.count))..<end)
-            }
             resumed.primaryDelivery?.consumed(by: waitBudget)
             return .chunk(resumed.data)
         }
     }
 
     private func consumeBufferedChunk(
-        _ slot: inout ChunkStreamSlot, waitBudget: MediaSourceWaitBudget?,
-        displayOwner: MediaDisplayByteOwner?
+        _ slot: inout ChunkStreamSlot, waitBudget: MediaSourceWaitBudget?
     ) throws -> Data {
         let delivery = slot.buffered[0]
         let chunk = delivery.data
         let deliveryResult = Int64(exactly: chunk.count).map { slot.delivered.addingReportingOverflow($0) }
         guard slot.bufferedBytes >= chunk.count,
               let deliveryResult, !deliveryResult.overflow,
-              deliveryResult.partialValue <= slot.requestedCount,
-              let deliveredStart = MediaByteRange.checkedEndExclusive(offset: slot.baseOffset, length: slot.delivered),
-              let deliveredEnd = MediaByteRange.checkedEndExclusive(
-                offset: slot.baseOffset, length: deliveryResult.partialValue
-              ) else {
+              deliveryResult.partialValue <= slot.requestedCount else {
             failChunkSlot(&slot, error: SourceError.invalidRange)
             chunkSlot = slot
             throw SourceError.invalidRange
         }
-        displayOwner?.hold(deliveredStart..<deliveredEnd)
         slot.buffered.removeFirst()
         slot.bufferedBytes -= chunk.count
         slot.heldQueuedBytes -= min(chunk.count, slot.heldQueuedBytes)
@@ -1063,15 +1027,13 @@ actor PathAHTTPMediaSource {
                 chunkSlot = current
                 return
             }
-            let displayBytes = displayTrack.map(MediaDisplayByteOwner.init)
-            defer { displayBytes?.release() }
             let pieces = await binding.heldPieces(
-                offset: position, count: min(Int(end - position), Self.chunkBufferHighWater), displayOwner: displayBytes
+                offset: position, count: min(Int(end - position), Self.chunkBufferHighWater)
             )
             try checkStoredStreamFence(id, original: original, ticket: ticket, waitBudget: waitBudget)
             if !pieces.isEmpty {
                 current = chunkSlot ?? current
-                current.buffered = displayChunks(pieces, offset: position)
+                current.buffered = pieces.map { StreamChunk(data: $0, primaryDelivery: nil) }
                 current.bufferedBytes = pieces.reduce(0) { $0 + $1.count }
                 current.heldQueuedBytes = current.bufferedBytes
                 current.finished = position + Int64(current.bufferedBytes) >= end
@@ -1324,15 +1286,13 @@ actor PathAHTTPMediaSource {
             slot.delivered = deliveredResult.partialValue
             chunkSlot = slot
             waiter.resume(returning: StreamChunk(
-                data: data, primaryDelivery: network.primaryDelivery,
-                displayBytes: displayTrack?.own(bytes: (network.offset + network.responseBytes)..<(network.offset + responseResult.partialValue))
+                data: data, primaryDelivery: network.primaryDelivery
             ))
             return admission
         }
         slot.buffered.append(StreamChunk(
-                data: data, primaryDelivery: network.primaryDelivery,
-                displayBytes: displayTrack?.own(bytes: (network.offset + network.responseBytes)..<(network.offset + responseResult.partialValue))
-            ))
+            data: data, primaryDelivery: network.primaryDelivery
+        ))
         slot.bufferedBytes = bufferedResult.partialValue
         if !slot.tailEndedForBackpressure,
            slot.bufferedBytes - slot.heldQueuedBytes > Self.chunkBufferHighWater {

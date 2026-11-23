@@ -18,6 +18,8 @@ struct OfflinePlayerView: View {
     @State private var pagingCoordinator = PlayerVerticalPagingCoordinator()
     @State private var assetValid = true
     @State private var inlineContainerSize: CGSize = .zero
+    @State private var pendingInlineContainerSize: CGSize?
+    @State private var pendingContainerSize: CGSize?
     @State private var owner: String
     @State private var containerWidth: CGFloat = WindowMetricsFallback.currentWidth
     private var player: PlayerViewModel { .shared }
@@ -155,7 +157,15 @@ struct OfflinePlayerView: View {
 
     private var pagingNeighboursReachable: Bool {
         PortraitPagingPolicy.allowsVerticalPaging(on: .offlinePlayback)
-            && isRouteActivated && pagingEnabled && !player.isFullscreen
+            && isRouteActivated && pagingEnabled && !player.isFullscreenPresentationActive
+    }
+
+    private var hostOwnsInlineSurface: Bool {
+        guard player.isFullscreenPresentationActive,
+              let ownerLease,
+              player.isCurrentOwner(ownerLease) else { return false }
+        return player.activeSurfaceLease?.ownerLease == ownerLease
+            && player.activeSurfaceLease?.role == .fullscreen
     }
 
     private func beginPagingDrag() -> Bool {
@@ -276,26 +286,32 @@ extension OfflinePlayerView {
                     let playerCornerRadius: CGFloat = layout.isSplit ? DetailStageLayout.playerCornerRadius : 0
                     OfflinePlayerPage(layout: layout, viewportHeight: max(0, geometry.size.height)) {
                         ZStack(alignment: .topLeading) {
-                            if isRouteActivated, !player.isFullscreen {
-                                PlayerView(owner: owner, verticalPagingGestureSink: pagingSink,
-                                    pageNavigationActions: playerPageNavigation,
-                                    inlineViewportSize: layout.playerSize,
-                                    inlineCornerRadius: playerCornerRadius,
-                                    screenLease: ownerLease
-                                )
-                                .frame(width: layout.playerSize.width, height: layout.playerSize.height)
-                                .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { _ in
-                                    guard !player.isFullscreen, hasInlineExitChrome else { return }
-                                    player.refreshInlineVideoRect()
+                            if isRouteActivated {
+                                if hostOwnsInlineSurface {
+                                    RoundedRectangle(cornerRadius: playerCornerRadius, style: .continuous)
+                                        .fill(Color.black)
+                                        .frame(width: layout.playerSize.width, height: layout.playerSize.height)
+                                } else {
+                                    PlayerView(owner: owner, verticalPagingGestureSink: pagingSink,
+                                        pageNavigationActions: playerPageNavigation,
+                                        inlineViewportSize: layout.playerSize,
+                                        inlineCornerRadius: playerCornerRadius,
+                                        screenLease: ownerLease
+                                    )
+                                    .frame(width: layout.playerSize.width, height: layout.playerSize.height)
+                                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { _ in
+                                        guard !player.isFullscreenPresentationActive, hasInlineExitChrome else { return }
+                                        player.refreshInlineVideoRect()
+                                    }
                                 }
-                            } else if !player.isFullscreen {
+                            } else {
                                 RouteActivationPlaceholderView(
                                     still: player.outgoingRouteStill(for: owner),
                                     coverURL: item.coverURL, height: layout.playerSize.height,
                                     cornerRadius: playerCornerRadius
                                 )
                             }
-                            if !player.isFullscreen, isActiveOfflineRoute {
+                            if !player.isFullscreenPresentationActive, isActiveOfflineRoute {
                                 let showsNavigation = !hasInlineExitChrome || player.showControls
                                 if showsNavigation && (!isRouteActivated || !player.showControls) {
                                     PlayerControlsScrim()
@@ -312,30 +328,27 @@ extension OfflinePlayerView {
                                     .accessibilityHidden(!showsNavigation)
                             }
                         }
-                    } metadata: {
-                        if !player.isFullscreen {
-                            OfflinePlayerMetadataView(title: item.title, ownerName: item.ownerName,
-                                qualityLabel: item.qualityLabel, fileSizeBytes: item.fileSizeBytes,
-                                isSplit: layout.isSplit
-                            )
-                            .animation(nil, value: player.isFullscreen)
+                        .background {
+                            PlayerInlineSlotProbe(cornerRadius: playerCornerRadius)
+                                .allowsHitTesting(false)
+                                .accessibilityHidden(true)
                         }
-                    }
-                }
-                .guardIPadTopSafeArea(when: !player.isFullscreen)
-                .background {
-                    if player.isFullscreen {
-                        Color.black.ignoresSafeArea()
-                    } else {
-                        CinematicBackdrop(
-                            coverURL: item.coverURL,
-                            player: player,
-                            ownerLease: ownerLease,
-                            isRouteActive: isRouteActivated
+                    } metadata: {
+                        OfflinePlayerMetadataView(title: item.title, ownerName: item.ownerName,
+                            qualityLabel: item.qualityLabel, fileSizeBytes: item.fileSizeBytes,
+                            isSplit: layout.isSplit
                         )
                     }
                 }
-                .animation(nil, value: player.isFullscreen)
+                .guardIPadTopSafeArea(when: true)
+                .background {
+                    CinematicBackdrop(
+                        coverURL: item.coverURL,
+                        player: player,
+                        ownerLease: ownerLease,
+                        isRouteActive: isRouteActivated
+                    )
+                }
             } else {
                 ContentUnavailableView(item == nil ? "Not Available" : "Download unavailable",
                     systemImage: "questionmark.folder",
@@ -347,7 +360,25 @@ extension OfflinePlayerView {
                         .padding(.horizontal, PlayerPageNavigationButtons.inlineHorizontalPadding)
                         .padding(.top, PlayerPageNavigationButtons.topPadding)
                 }
-                .guardIPadTopSafeArea(when: !player.isFullscreen)
+                .guardIPadTopSafeArea(when: true)
+            }
+        }
+        .allowsHitTesting(!player.isFullscreenPresentationActive)
+        .accessibilityHidden(player.isFullscreenPresentationActive)
+        .onChange(of: player.isFullscreenPresentationActive) { _, active in
+            guard !active else { return }
+            if let pendingInline = pendingInlineContainerSize {
+                pendingInlineContainerSize = nil
+                if inlineContainerSize != pendingInline { inlineContainerSize = pendingInline }
+            }
+            if let pendingSize = pendingContainerSize {
+                pendingContainerSize = nil
+                pagingReducer.updateContainerHeight(pendingSize.height)
+                if dragOffsetBox.y != pagingReducer.offset {
+                    dragOffsetBox.y = pagingReducer.offset
+                }
+                if containerWidth != pendingSize.width { containerWidth = pendingSize.width }
+                pagingReducer.noteCoverResolution(width: pendingSize.width, height: pendingSize.height)
             }
         }
         .appSurface(.cinematic)
@@ -355,12 +386,22 @@ extension OfflinePlayerView {
             GeometryReader { _ in
                 Color.clear
                     .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
+                        if DeviceCapability.supportsOrientationLock,
+                           player.isFullscreenPresentationActive {
+                            pendingInlineContainerSize = size
+                            return
+                        }
                         if inlineContainerSize != size { inlineContainerSize = size }
                     }
             }
             .ignoresSafeArea(.all, edges: .vertical)
         }
         .onGeometryChange(for: CGSize.self) { $0.size } action: {
+            if DeviceCapability.supportsOrientationLock,
+               player.isFullscreenPresentationActive {
+                pendingContainerSize = $0
+                return
+            }
             pagingReducer.updateContainerHeight($0.height)
             if dragOffsetBox.y != pagingReducer.offset {
                 dragOffsetBox.y = pagingReducer.offset

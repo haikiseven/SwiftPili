@@ -59,9 +59,7 @@ final class VisionFrameInterpolationBackend {
             return .bypassed(reason: VisionInterpolationFailure.cancelled.rawValue)
         }
         let previous = previousFrame
-        var reference = frame
-        reference.displayCoverage = nil
-        previousFrame = reference
+        previousFrame = frame
         guard let plan, let previous else { return .passthrough }
         guard let timing = VideoFrameInterpolationTiming(
             previousPTS: previous.pts, previousDuration: previous.duration, current: frame

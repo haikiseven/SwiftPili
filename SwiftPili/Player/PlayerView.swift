@@ -129,7 +129,7 @@ struct PlayerView: View {
     @State private var showSponsorBlock = false
 
     private var allocatedInlineViewport: CGSize? {
-        guard !vm.isFullscreen, let size = inlineViewportSize,
+        guard surfaceRole == .inline, !vm.isFullscreen, let size = inlineViewportSize,
               size.width.isFinite, size.height.isFinite,
               size.width >= 0, size.height >= 0 else { return nil }
         return size
@@ -140,8 +140,12 @@ struct PlayerView: View {
         return size.width == 0 || size.height == 0
     }
 
+    private var isFullscreenPresentation: Bool {
+        surfaceRole == .fullscreen || vm.isFullscreen
+    }
+
     private var containerAspect: CGFloat {
-        if vm.isFullscreen {
+        if isFullscreenPresentation {
             return fullscreenViewportAspect ?? PlayerFullscreenViewportPolicy.fallbackAspect
         }
         if let size = allocatedInlineViewport, size.width > 0, size.height > 0 {
@@ -168,7 +172,7 @@ struct PlayerView: View {
     }
 
     private var resolvedPresentation: PlayerContainerPresentation {
-        vm.isFullscreen ? .fullscreen : container
+        isFullscreenPresentation ? .fullscreen : container
     }
 
     private var transportPlacement: PlayerTransportPlacement {
@@ -216,14 +220,18 @@ struct PlayerView: View {
 
     var body: some View {
         let _ = UIHitchMonitor.countBody("player")
-        let effectiveCornerRadius = max(
-            vm.isFullscreen ? 0 : inlineCornerRadius,
-            PlayerPresentationCornerPolicy.cornerRadius(
-                isPiPRestoringInline: vm.isPiPRestoringInline
+        let isFullscreenTransitioning = surfaceRole == .fullscreen
+            && PlayerFullscreenTransitionState.shared.isGeometryTransitioning
+        let effectiveCornerRadius = isFullscreenPresentation
+            ? 0
+            : max(
+                inlineCornerRadius,
+                PlayerPresentationCornerPolicy.cornerRadius(
+                    isPiPRestoringInline: vm.isPiPRestoringInline
+                )
             )
-        )
         ZStack {
-            (surfaceRole == .inline || vm.isFullscreen) ? Color.black : Color.clear
+            (surfaceRole == .inline || isFullscreenPresentation) ? Color.black : Color.clear
 
             if isOwner {
                 PlayerFullscreenAmbientBackdrop(player: vm)
@@ -272,7 +280,7 @@ struct PlayerView: View {
             }
 
             HStack(spacing: 0) {
-                if !vm.isFullscreen {
+                if !isFullscreenPresentation {
                     Color.clear
                         .frame(width: Self.systemBackEdgeReserve)
                         .allowsHitTesting(false)
@@ -285,6 +293,9 @@ struct PlayerView: View {
             }
             .zIndex(0)
 
+            let showsControlsOverlay = vm.showControls
+                && !isFullscreenTransitioning
+                && (surfaceRole == .inline || vm.isFullscreen)
             if surfaceRole == .inline || vm.isFullscreen {
                 PlayerControlsOverlay(
                     player: vm, owner: owner, screenLease: screenLease,
@@ -296,12 +307,14 @@ struct PlayerView: View {
                     suppressTransportRow: isPlaybackUnavailable,
                     danmakuPanelPresented: $danmakuPanelPresented, showSponsorBlock: $showSponsorBlock
                 )
-                    .opacity(vm.showControls ? 1 : 0)
-                    .allowsHitTesting(vm.showControls)
+                    .opacity(showsControlsOverlay ? 1 : 0)
+                    .allowsHitTesting(showsControlsOverlay)
+                    .animation(controlAnimation, value: isFullscreenTransitioning)
+                    .animation(controlAnimation, value: vm.showControls)
                     .zIndex(1)
             }
 
-            if vm.isFullscreen, danmakuPanelPresented, danmakuEnabled {
+            if surfaceRole == .fullscreen, vm.isFullscreen, danmakuPanelPresented, danmakuEnabled {
                 ZStack {
                     Color.clear
                         .contentShape(Rectangle())
@@ -397,11 +410,12 @@ struct PlayerView: View {
                 .ignoresSafeArea(.keyboard, edges: .all)
         }
         .overlay(alignment: .bottom) {
-            if !isPlaybackUnavailable {
+            if !isPlaybackUnavailable,
+               surfaceRole == .inline || (vm.isFullscreen && !isFullscreenTransitioning) {
                 PlayerSeekStrip(
                     player: vm, owner: owner, isCurrentOwner: isOwner, gestureDisplay: gestureDisplay,
                     chromeInsets: chromeInsets,
-                    inlineCornerRadius: vm.isFullscreen ? 0 : inlineCornerRadius,
+                    inlineCornerRadius: isFullscreenPresentation ? 0 : inlineCornerRadius,
                     controlAnimation: controlAnimation
                 )
                 .ignoresSafeArea(.keyboard, edges: .all)
@@ -422,8 +436,8 @@ struct PlayerView: View {
                         }
                         .playerChromeCapsule(horizontal: 14, vertical: 9)
                     }
-                    .padding(.trailing, (vm.isFullscreen ? 4 : 12) + chromeInsets.horizontal)
-                    .padding(.bottom, (vm.isFullscreen ? 32 : 20) + chromeInsets.bottom)
+                    .padding(.trailing, (isFullscreenPresentation ? 4 : 12) + chromeInsets.horizontal)
+                    .padding(.bottom, (isFullscreenPresentation ? 32 : 20) + chromeInsets.bottom)
                     .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
@@ -437,10 +451,10 @@ struct PlayerView: View {
         .frame(maxWidth: .infinity)
         .aspectRatio(containerAspect, contentMode: .fit)
         .frame(width: allocatedInlineViewport?.width, height: allocatedInlineViewport?.height)
-        .frame(maxHeight: vm.isFullscreen ? .infinity : nil)
-        .background { if vm.isFullscreen { Color.black } }
+        .frame(maxHeight: isFullscreenPresentation ? .infinity : nil)
+        .background { if isFullscreenPresentation { Color.black } }
         .ignoresSafeArea(.keyboard, edges: .all)
-        .ignoresSafeArea(.all, edges: vm.isFullscreen ? .all : [])
+        .ignoresSafeArea(.all, edges: isFullscreenPresentation ? .all : [])
         .background(
             GeometryReader { proxy in
                 Color.clear
@@ -555,6 +569,9 @@ struct PlayerView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
             guard isOwner, UIDevice.current.userInterfaceIdiom == .phone else { return }
             let orientation = UIDevice.current.orientation
+            if vm.isPortraitContent, !AppOrientation.shared.mask.contains(.landscape) {
+                return
+            }
             guard !FullscreenOrientationLatch.shared.shouldIgnoreDeviceOrientation(
                 orientation,
                 currentFullscreen: vm.isFullscreen
@@ -568,10 +585,11 @@ struct PlayerView: View {
         .onChange(of: verticalSizeClass) { _, newValue in
             recordGeometrySettlement(size: surfaceSize)
             guard isOwner, UIDevice.current.userInterfaceIdiom == .phone else { return }
-            if newValue == .regular, vm.isFullscreen {
+            if newValue == .regular, vm.isFullscreen, AppOrientation.shared.mask.contains(.landscape) {
                 PlayerLog.log("[Player] window rotated to portrait behind isFullscreen — reconciling")
                 vm.requestFullscreenTransition(target: false, source: .verticalSizeClass)
-            } else if newValue == .compact, !vm.isFullscreen, vm.currentURL != nil {
+            } else if newValue == .compact, !vm.isFullscreen, vm.currentURL != nil,
+                      !PlayerFullscreenTransitionState.shared.isHostActive {
                 PlayerLog.log("[Player] window rotated to landscape behind inline state — reconciling")
                 vm.requestFullscreenTransition(target: true, source: .verticalSizeClass)
             }

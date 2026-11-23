@@ -620,7 +620,6 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
             if clock == nil || clock?.width != width || clock?.height != height
                 || clock?.detail != plan.phases.count || frame.pts < (clock?.pts ?? 0) {
                 var first = frame
-                first.displayCoverage = nil
                 first.pts = plan.pts.first.map { $0 - plan.sourceInterval * Double(plan.phases[0]) } ?? frame.pts
                 first.duration = plan.sourceInterval
                 var second = first

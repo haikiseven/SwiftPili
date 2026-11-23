@@ -70,18 +70,17 @@ struct PathAByteStoreBinding: Sendable {
     }
 
     func streamPrefix(
-        offset: Int64, count: Int, after primedCount: Int, limit: Int,
-        displayOwner: MediaDisplayByteOwner? = nil
+        offset: Int64, count: Int, after primedCount: Int, limit: Int
     ) async -> [Data] {
         let want = min(count, limit) - primedCount
         guard want > 0,
               let cacheOffset = MediaByteRange.checkedEndExclusive(offset: offset, length: Int64(primedCount))
         else { return [] }
-        return await heldPieces(offset: cacheOffset, count: want, displayOwner: displayOwner)
+        return await heldPieces(offset: cacheOffset, count: want)
     }
 
     func heldPieces(
-        offset: Int64, count: Int, displayOwner: MediaDisplayByteOwner? = nil
+        offset: Int64, count: Int
     ) async -> [Data] {
         await store.noteRead(key, offset: offset)
         var pieces: [Data] = []
@@ -89,7 +88,7 @@ struct PathAByteStoreBinding: Sendable {
         var remaining = count
         while remaining > 0 {
             let want = min(remaining, Self.heldPieceLimit)
-            guard let piece = await store.prefix(key, offset: cursor, count: want, displayOwner: displayOwner),
+            guard let piece = await store.prefix(key, offset: cursor, count: want),
                   !piece.isEmpty,
                   let next = MediaByteRange.checkedEndExclusive(offset: cursor, length: Int64(piece.count))
             else { break }

@@ -647,10 +647,11 @@ final class VLCPlayerBackend: PlayerBackend {
     }
 
     var playableTime: TimeInterval {
-        vlcAvailabilityHorizon(
+        let live = currentTime.isFinite ? max(0, currentTime) : 0
+        return vlcAvailabilityHorizon(
             inputIsLocalFile: inputIsLocalFile,
             mediaDuration: duration,
-            lastObservedPosition: lastTickTime
+            lastObservedPosition: max(lastTickTime, live)
         )
     }
 

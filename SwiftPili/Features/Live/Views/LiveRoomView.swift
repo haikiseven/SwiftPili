@@ -444,6 +444,7 @@ struct LiveRoomView: View {
     @Environment(\.accentStore) private var accentStore
     @State private var scaleModeBeforeImmersivePortrait: VideoScaleMode?
     @State private var inlineContainerSize: CGSize = .zero
+    @State private var pendingInlineContainerSize: CGSize?
     @State private var standardChatAutoScroll = LiveChatAutoScrollPolicy<UUID>()
     @State private var immersiveChatAutoScroll = LiveChatAutoScrollPolicy<UUID>()
     @State private var portraitKeyboardFrame: CGRect?
@@ -521,7 +522,19 @@ struct LiveRoomView: View {
     }
 
     private var usesImmersivePortraitLayout: Bool {
-        !usesWideCompanionLayout && !isRoomOffline && !player.isFullscreen && pageIsPortraitContent
+        !usesWideCompanionLayout && !isRoomOffline && pageIsPortraitContent
+    }
+
+    private var shouldUseImmersiveFillScale: Bool {
+        usesImmersivePortraitLayout && !player.isFullscreenPresentationActive
+    }
+
+    private var hostOwnsInlineSurface: Bool {
+        guard player.isFullscreenPresentationActive,
+              let lease = viewModel.playerOwnerLease,
+              player.isCurrentOwner(lease) else { return false }
+        return player.activeSurfaceLease?.ownerLease == lease
+            && player.activeSurfaceLease?.role == .fullscreen
     }
 
     private var playerPageNavigation: PlayerPageNavigationActions {
@@ -540,7 +553,7 @@ struct LiveRoomView: View {
     }
 
     private var inlineQualityControl: LiveQualityControl? {
-        guard !usesImmersivePortraitLayout, isRouteActivated, !player.isFullscreen,
+        guard !usesImmersivePortraitLayout, isRouteActivated, !player.isFullscreenPresentationActive,
               canChooseQuality, let lease = viewModel.playerOwnerLease,
               player.isCurrentOwner(lease), player.mode == .live else { return nil }
         let room = viewModel
@@ -589,12 +602,19 @@ struct LiveRoomView: View {
                     edges: usesImmersivePortraitLayout ? .all : (usesWideCompanionLayout ? .bottom : [])
                 )
 
-            if usesWideCompanionLayout, !player.isFullscreen, !isRoomOffline,
+            if usesWideCompanionLayout, !isRoomOffline,
                viewModel.roomInfo != nil, AuthManager.shared.isLoggedIn {
                 wideDanmakuInput
             }
         }
-        .guardIPadTopSafeArea(when: !player.isFullscreen && !usesImmersivePortraitLayout)
+        .allowsHitTesting(!player.isFullscreenPresentationActive)
+        .accessibilityHidden(player.isFullscreenPresentationActive)
+        .onChange(of: player.isFullscreenPresentationActive) { _, active in
+            guard !active, let pending = pendingInlineContainerSize else { return }
+            pendingInlineContainerSize = nil
+            if inlineContainerSize != pending { inlineContainerSize = pending }
+        }
+        .guardIPadTopSafeArea(when: !usesImmersivePortraitLayout)
         .onPreferenceChange(LivePortraitInputBarHeightKey.self) { measuredHeight in
             guard measuredHeight > 0,
                   abs(measuredHeight - portraitInputBarHeight) > 0.5
@@ -607,13 +627,18 @@ struct LiveRoomView: View {
             GeometryReader { _ in
                 Color.clear
                     .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
+                        if DeviceCapability.supportsOrientationLock,
+                           player.isFullscreenPresentationActive {
+                            pendingInlineContainerSize = size
+                            return
+                        }
                         if inlineContainerSize != size { inlineContainerSize = size }
                     }
             }
             .ignoresSafeArea(.all, edges: .vertical)
         }
         .background {
-            if player.isFullscreen || usesImmersivePortraitLayout {
+            if usesImmersivePortraitLayout {
                 Color.black.ignoresSafeArea()
             } else {
                 CinematicBackdrop(
@@ -624,7 +649,6 @@ struct LiveRoomView: View {
                 )
             }
         }
-        .animation(nil, value: player.isFullscreen)
         .appSurface(.cinematic)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .navigationBar)
@@ -685,7 +709,7 @@ struct LiveRoomView: View {
                 player.scheduleHideControls()
             }
         }
-        .onChange(of: usesImmersivePortraitLayout) { _, isImmersive in
+        .onChange(of: shouldUseImmersiveFillScale) { _, isImmersive in
             guard let lease = viewModel.playerOwnerLease, player.isCurrentOwner(lease) else {
                 scaleModeBeforeImmersivePortrait = nil
                 return
@@ -954,19 +978,18 @@ struct LiveRoomView: View {
                 .scrollClipDisabled()
                 .frame(width: primaryWidth, height: playerHeight, alignment: .topLeading)
                 .overlay(alignment: .topLeading) {
-                    if !player.isFullscreen, !isImmersive {
+                    if !player.isFullscreenPresentationActive, !isImmersive {
                         inlineNavigationOverlay(width: primaryWidth, height: playerHeight)
                     }
                 }
 
                 ScrollView([]) {
-                    if !player.isFullscreen && !isImmersive {
+                    if !isImmersive {
                         standardRoomCompanion(
                             boxHeight: boxHeight, chromeBoxHeight: chromeBoxHeight,
                             chatHeight: chatHeight, layout: layout, screenSource: screenSource
                         )
                         .frame(width: companionWidth)
-                        .animation(nil, value: player.isFullscreen)
                     }
                 }
                 .frame(
@@ -986,51 +1009,64 @@ struct LiveRoomView: View {
         width: CGFloat, height: CGFloat, isImmersive: Bool,
         hostChrome: LiveHostChromeExtent, cornerRadius: CGFloat = 0
     ) -> some View {
-        if isRouteActivated, !player.isFullscreen {
-            PlayerView(
-                owner: PlayerViewModel.liveOwner(roomID),
-                liveQualityControl: inlineQualityControl,
-                container: isImmersive
-                    ? .inlineFullBleed(
-                        hostChromeTop: hostChrome.top, hostChromeBottom: hostChrome.bottom,
-                        hostOwnsTransportRow: true
+        Group {
+            if isRouteActivated {
+                if hostOwnsInlineSurface {
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .fill(Color.black)
+                        .frame(width: width, height: height)
+                } else {
+                    PlayerView(
+                        owner: PlayerViewModel.liveOwner(roomID),
+                        liveQualityControl: inlineQualityControl,
+                        container: isImmersive
+                            ? .inlineFullBleed(
+                                hostChromeTop: hostChrome.top, hostChromeBottom: hostChrome.bottom,
+                                hostOwnsTransportRow: true
+                            )
+                            : .inlineSafeArea,
+                        pageNavigationActions: isImmersive ? nil : playerPageNavigation,
+                        inlineViewportSize: CGSize(width: width, height: height),
+                        inlineCornerRadius: cornerRadius,
+                        screenLease: viewModel.playerOwnerLease
                     )
-                    : .inlineSafeArea,
-                pageNavigationActions: isImmersive ? nil : playerPageNavigation,
-                inlineViewportSize: CGSize(width: width, height: height),
-                inlineCornerRadius: cornerRadius,
-                screenLease: viewModel.playerOwnerLease
-            )
-            .frame(width: width, height: height)
-            .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { frame in
-                lastBandRect = frame
-                if isRouteActivated, !player.isFullscreen,
-                   let lease = viewModel.playerOwnerLease, player.isCurrentOwner(lease),
-                   player.surfaceLease(matching: lease, role: .inline) != nil {
-                    player.refreshInlineVideoRect()
+                    .frame(width: width, height: height)
+                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { frame in
+                        lastBandRect = frame
+                        if isRouteActivated, !player.isFullscreenPresentationActive,
+                           let lease = viewModel.playerOwnerLease, player.isCurrentOwner(lease),
+                           player.surfaceLease(matching: lease, role: .inline) != nil {
+                            player.refreshInlineVideoRect()
+                        }
+                        guard PlayerLog.isCapturing else { return }
+                        logBandEdge("move", rect: frame)
+                    }
+                    .overlay {
+                        if let refusal = viewModel.streamUnavailable {
+                            unavailablePlayerOverlay(refusal)
+                        } else if isRoomOffline {
+                            offlinePlayerOverlay
+                        }
+                    }
+                    .background {
+                        (isImmersive ? Color.black : Color.clear)
+                            .ignoresSafeArea(edges: .top)
+                    }
                 }
-                guard PlayerLog.isCapturing else { return }
-                logBandEdge("move", rect: frame)
+            } else {
+                RouteActivationPlaceholderView(
+                    still: player.outgoingRouteStill(for: PlayerViewModel.liveOwner(roomID)),
+                    coverURL: viewModel.roomInfo?.coverURL(for: .roomPoster),
+                    height: height,
+                    cornerRadius: cornerRadius
+                )
+                .frame(width: width, height: height)
             }
-            .overlay {
-                if let refusal = viewModel.streamUnavailable {
-                    unavailablePlayerOverlay(refusal)
-                } else if isRoomOffline {
-                    offlinePlayerOverlay
-                }
-            }
-            .background {
-                (isImmersive ? Color.black : Color.clear)
-                    .ignoresSafeArea(edges: .top)
-            }
-        } else if !player.isFullscreen {
-            RouteActivationPlaceholderView(
-                still: player.outgoingRouteStill(for: PlayerViewModel.liveOwner(roomID)),
-                coverURL: viewModel.roomInfo?.coverURL(for: .roomPoster),
-                height: height,
-                cornerRadius: cornerRadius
-            )
-            .frame(width: width, height: height)
+        }
+        .background {
+            PlayerInlineSlotProbe(cornerRadius: cornerRadius)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
         }
     }
 
@@ -1097,26 +1133,24 @@ struct LiveRoomView: View {
         let playerShape = RoundedRectangle(cornerRadius: DetailStageLayout.playerCornerRadius, style: .continuous)
         let barShape = RoundedRectangle(cornerRadius: AppRadius.panel, style: .continuous)
         return VStack(spacing: AppSpacing.l) {
-            if !player.isFullscreen {
-                inlinePlayerContent(
-                    width: metrics.playerSize.width, height: metrics.playerSize.height,
-                    isImmersive: false,
-                    hostChrome: LiveHostChromeExtent(top: 0, bottom: 0, bottomInterceptsTouches: false),
-                    cornerRadius: DetailStageLayout.playerCornerRadius
-                )
-                .frame(width: metrics.playerSize.width, height: metrics.playerSize.height)
-                .clipShape(playerShape)
-                .overlay(alignment: .topLeading) {
-                    if !player.isFullscreen {
-                        inlineNavigationOverlay(
-                            width: metrics.playerSize.width, height: metrics.playerSize.height
-                        )
-                        .clipShape(playerShape)
-                    }
+            inlinePlayerContent(
+                width: metrics.playerSize.width, height: metrics.playerSize.height,
+                isImmersive: false,
+                hostChrome: LiveHostChromeExtent(top: 0, bottom: 0, bottomInterceptsTouches: false),
+                cornerRadius: DetailStageLayout.playerCornerRadius
+            )
+            .frame(width: metrics.playerSize.width, height: metrics.playerSize.height)
+            .clipShape(playerShape)
+            .overlay(alignment: .topLeading) {
+                if !player.isFullscreenPresentationActive {
+                    inlineNavigationOverlay(
+                        width: metrics.playerSize.width, height: metrics.playerSize.height
+                    )
+                    .clipShape(playerShape)
                 }
-                .frame(maxWidth: .infinity)
             }
-            if let info = viewModel.roomInfo, !player.isFullscreen {
+            .frame(maxWidth: .infinity)
+            if let info = viewModel.roomInfo {
                 roomInfoBar(info, showsDivider: false, isWideStage: true)
                     .fixedSize(horizontal: false, vertical: true)
                     .background {

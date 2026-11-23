@@ -36,7 +36,7 @@ private struct VideoDetailInlineNavigation: View {
     let actions: PlayerPageNavigationActions
 
     var body: some View {
-        if !player.isFullscreen, isActiveVideoRoute {
+        if !player.isFullscreenPresentationActive, isActiveVideoRoute {
             let showsNavigation = !hasUsableInlinePlayerChrome || player.showControls
             ZStack(alignment: .topLeading) {
                 if showsNavigation && (!isRouteActivated || !player.showControls) {
@@ -174,7 +174,7 @@ struct VideoDetailView: View {
 
     private var playerAreaHeight: CGFloat {
         DetailPlayerGeometry.pinnedHeaderHeight(
-            videoHeight: playerVideoHeight, isFullscreen: player.isFullscreen
+            videoHeight: playerVideoHeight, isFullscreen: false
         )
     }
     @State private var containerWidth: CGFloat
@@ -182,6 +182,7 @@ struct VideoDetailView: View {
     @State private var usesCompactPhoneActions: Bool
     @State private var wideContainerHeight: CGFloat
     @State private var restingContainerHeight: CGFloat
+    @State private var pendingContainerSize: CGSize?
     @State private var isKeyboardDocked = false
     @State private var stage = DetailStageState()
     private var stagePresentation: DetailStagePresentation { stage.presentation }
@@ -224,7 +225,14 @@ struct VideoDetailView: View {
 
     private var wideVideoSize: CGSize { stageGeometry.playerSize }
 
-    private var showsWideChrome: Bool { isWideLayout && !player.isFullscreen }
+    private var showsWideChrome: Bool { isWideLayout }
+    private var hostOwnsInlineSurface: Bool {
+        guard player.isFullscreenPresentationActive,
+              let lease = viewModel.playerLease,
+              player.isCurrentOwner(lease) else { return false }
+        return player.activeSurfaceLease?.ownerLease == lease
+            && player.activeSurfaceLease?.role == .fullscreen
+    }
     private static var compactCapsuleMinimumWidth: CGFloat { 600 }
     private static var phoneShelfCardWidth: CGFloat { 220 }
 
@@ -303,40 +311,53 @@ struct VideoDetailView: View {
 
     var body: some View {
         let _ = UIHitchMonitor.countBody("detail")
+        let inlineCornerRadius = showsWideChrome ? DetailStageLayout.playerCornerRadius : 0
         ZStack(alignment: .bottom) {
             containerGeometryProbes
 
             ZStack(alignment: .topLeading) {
-                if !player.isFullscreen {
-                    if isWideLayout {
-                        wideContent(bottomInset: pagerBottomInset)
-                            .animation(nil, value: player.isFullscreen)
-                    } else {
-                        compactContent()
-                    }
+                if isWideLayout {
+                    wideContent(bottomInset: pagerBottomInset)
+                } else {
+                    compactContent()
                 }
 
                 VStack(spacing: 0) {
-                    if !player.isFullscreen, isRouteActivated {
-                        PlayerView(
-                            owner: screenOwner,
-                            surfaceRole: .inline,
-                            pageNavigationActions: playerPageNavigation,
-                            inlineViewportSize: CGSize(
-                                width: isWideLayout ? wideVideoSize.width : containerWidth,
-                                height: playerVideoHeight
-                            ),
-                            inlineCornerRadius: showsWideChrome ? DetailStageLayout.playerCornerRadius : 0,
-                            screenLease: viewModel.playerLease
-                        )
-                    } else if !player.isFullscreen {
+                    if isRouteActivated {
+                        if hostOwnsInlineSurface {
+                            RoundedRectangle(cornerRadius: inlineCornerRadius, style: .continuous)
+                                .fill(Color.black)
+                                .frame(
+                                    width: isWideLayout ? wideVideoSize.width : nil,
+                                    height: playerVideoHeight
+                                )
+                                .frame(maxWidth: isWideLayout ? nil : .infinity)
+                        } else {
+                            PlayerView(
+                                owner: screenOwner,
+                                surfaceRole: .inline,
+                                pageNavigationActions: playerPageNavigation,
+                                inlineViewportSize: CGSize(
+                                    width: isWideLayout ? wideVideoSize.width : containerWidth,
+                                    height: playerVideoHeight
+                                ),
+                                inlineCornerRadius: inlineCornerRadius,
+                                screenLease: viewModel.playerLease
+                            )
+                        }
+                    } else {
                         RouteActivationPlaceholderView(
                             still: player.outgoingRouteStill(for: screenOwner),
                             coverURL: placeholderCoverURL,
                             height: playerVideoHeight,
-                            cornerRadius: showsWideChrome ? DetailStageLayout.playerCornerRadius : 0
+                            cornerRadius: inlineCornerRadius
                         )
                     }
+                }
+                .background {
+                    PlayerInlineSlotProbe(cornerRadius: inlineCornerRadius)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
                 }
                 .frame(width: showsWideChrome ? wideVideoSize.width : nil)
                 .overlay(alignment: .topLeading) {
@@ -346,7 +367,7 @@ struct VideoDetailView: View {
                         isActiveVideoRoute: isActiveVideoRoute,
                         isRouteActivated: isRouteActivated,
                         isPageAvailable: viewModel.error == nil && viewModel.unavailability == nil,
-                        cornerRadius: showsWideChrome ? DetailStageLayout.playerCornerRadius : 0,
+                        cornerRadius: inlineCornerRadius,
                         actions: playerPageNavigation
                     )
                 }
@@ -354,12 +375,12 @@ struct VideoDetailView: View {
                     isActive: showsWideChrome, geometry: stageGeometry, presentation: stagePresentation
                 )
                 .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
-                .padding(.bottom, DetailPlayerGeometry.headerBottomInset(isFullscreen: player.isFullscreen))
+                .padding(.bottom, DetailPlayerGeometry.headerBottomInset(isFullscreen: false))
             }
             .ignoresSafeArea(.keyboard, edges: .bottom)
             .frame(minWidth: 0, maxWidth: .infinity)
 
-            if !player.isFullscreen, !isWideLayout {
+            if !isWideLayout {
                 compactCommentsOverlay
             }
 
@@ -377,20 +398,22 @@ struct VideoDetailView: View {
 
             rootCommentToast
         }
-        .guardIPadTopSafeArea(when: !player.isFullscreen)
-        .background {
-            if player.isFullscreen {
-                Color.black.ignoresSafeArea()
-            } else {
-                CinematicBackdrop(
-                    coverURL: placeholderCoverURL,
-                    player: player,
-                    ownerLease: viewModel.playerLease,
-                    isRouteActive: isRouteActivated && isActiveVideoRoute
-                )
-            }
+        .allowsHitTesting(!player.isFullscreenPresentationActive)
+        .accessibilityHidden(player.isFullscreenPresentationActive)
+        .onChange(of: player.isFullscreenPresentationActive) { _, active in
+            guard !active, let pending = pendingContainerSize else { return }
+            pendingContainerSize = nil
+            updateContainerGeometry(pending)
         }
-        .animation(nil, value: player.isFullscreen)
+        .guardIPadTopSafeArea(when: true)
+        .background {
+            CinematicBackdrop(
+                coverURL: placeholderCoverURL,
+                player: player,
+                ownerLease: viewModel.playerLease,
+                isRouteActive: isRouteActivated && isActiveVideoRoute
+            )
+        }
         .appSurface(.cinematic)
         .background(alignment: .topLeading) {
             if let presentationContext {
@@ -506,6 +529,10 @@ struct VideoDetailView: View {
 
     private func updateContainerGeometry(_ size: CGSize) {
         UIHitchMonitor.count("geom")
+        if DeviceCapability.supportsOrientationLock, player.isFullscreenPresentationActive {
+            pendingContainerSize = size
+            return
+        }
         if size.width.isFinite, size.width > 0, containerWidth != size.width {
             containerWidth = size.width
         }
@@ -581,8 +608,7 @@ struct VideoDetailView: View {
     }
 
     private var isInlineCommentInputEligible: Bool {
-        !player.isFullscreen
-            && AuthManager.shared.isLoggedIn && !viewModel.commentsClosed
+        AuthManager.shared.isLoggedIn && !viewModel.commentsClosed
     }
 
     private func statsLine(_ info: VideoInfo) -> some View {
@@ -1144,7 +1170,7 @@ struct VideoDetailView: View {
     }
 
     private func updatePlayerCondensation() {
-        guard !isWideLayout, player.isPortraitContent, !player.isFullscreen,
+        guard !isWideLayout, player.isPortraitContent, !player.isFullscreenPresentationActive,
               player.ownerKey == screenOwner else { return }
         if player.portraitCondenseLocked { return }
         let now = CACurrentMediaTime()

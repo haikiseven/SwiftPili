@@ -351,6 +351,12 @@ extension PlayerViewModel {
             guard let self, !self.invalidatedBackendResources,
                   ObjectIdentifier(self.backend as AnyObject) == callbackBackendIdentity else { return }
             self.pendingBufferHealth = consumeTime
+            if !self.isPlaying, !self.terminalOpenFailure {
+                self.publishBufferedTime(
+                    self.backend.playableTime, display: { self.backend.bufferDisplaySample },
+                    at: CACurrentMediaTime()
+                )
+            }
         }
     }
 }

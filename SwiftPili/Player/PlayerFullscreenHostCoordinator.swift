@@ -11,10 +11,14 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
     private var reservedHost: PlayerFullscreenHostController?
     private enum Phase { case inline, entering, fullscreen, leaving, retired }
     private var phase: Phase = .inline
+    private var presentInFlight = false
     private var dismissalInFlight = false
+    private var activeAnimationPhase: Phase?
     private var pendingMask: UIInterfaceOrientationMask?
     private var pendingMaskLabel: String?
     private var rotationInFlight = false
+    private var rotationGeneration: UInt64 = 0
+    private var rotationFallbackTask: Task<Void, Never>?
 
     init(
         context: PlayerScreenPresentationContext,
@@ -103,43 +107,86 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
     }
 
     func reserveHost(receipt: PlayerPresentationReceipt) -> Bool {
-        guard self.receipt == receipt, isCurrent, host == nil,
-              !dismissalInFlight, presentedViewController == nil,
+        guard self.receipt == receipt, isCurrent, !dismissalInFlight else { return false }
+        if let existingHost = host,
+           phase == .leaving,
+           existingHost.presentingViewController != nil {
+            rotationGeneration &+= 1
+            rotationFallbackTask?.cancel()
+            rotationFallbackTask = nil
+            existingHost.cancelActiveTransition()
+            phase = .entering
+            activeAnimationPhase = nil
+            PlayerFullscreenTransitionState.shared.update(hostID: existingHost.identity, phase: .entering)
+            return true
+        }
+        guard host == nil,
+              presentedViewController == nil,
               let presenter = modalPresentingAncestor,
               presenter.viewIfLoaded?.window != nil,
               presenter.presentedViewController == nil,
               !presenter.isBeingPresented,
               !presenter.isBeingDismissed else { return false }
         let controller = PlayerFullscreenHostController(
-            receipt: receipt, presenter: self, liveRoom: liveRoom
+            receipt: receipt,
+            presenter: self,
+            liveRoom: liveRoom,
+            initialInlineSnapshot: PlayerViewModel.shared.inlineStageSnapshot
         )
         controller.transitioningDelegate = self
         reservedHost = controller
         host = controller
         phase = .entering
+        activeAnimationPhase = nil
+        PlayerFullscreenTransitionState.shared.update(hostID: controller.identity, phase: .entering)
         return true
     }
 
     func cancelReservedHost(receipt: PlayerPresentationReceipt) {
         guard self.receipt == receipt, isCurrent, phase == .entering,
-              host?.presentingViewController == nil else { return }
+              let controller = host,
+              controller.presentingViewController == nil else { return }
+        rotationFallbackTask?.cancel()
+        rotationFallbackTask = nil
         host = nil
         reservedHost = nil
+        presentInFlight = false
+        activeAnimationPhase = nil
         phase = .inline
         pendingMask = nil
         pendingMaskLabel = nil
+        PlayerFullscreenTransitionState.shared.clear(matching: controller.identity)
     }
 
     func reconcile() {
         guard isCurrent else { return }
         if PlayerViewModel.shared.isFullscreen {
-            presentHostIfNeeded()
-        } else {
-            if let controller = host {
-                phase = .leaving
-                controller.enterLeavingState()
+            if reservedHost != nil {
+                presentHostIfNeeded()
+            } else if let controller = host,
+                      phase == .entering,
+                      !presentInFlight,
+                      !rotationInFlight,
+                      pendingMask == nil,
+                      activeAnimationPhase != .entering {
+                beginEnterAnimationIfNeeded(controller)
             }
-            dismissHostWhenSceneSettled()
+        } else if let controller = host {
+            if phase != .leaving, phase != .retired {
+                rotationGeneration &+= 1
+                phase = .leaving
+                activeAnimationPhase = nil
+                controller.cancelActiveTransition()
+                PlayerFullscreenTransitionState.shared.update(hostID: controller.identity, phase: .leaving)
+            }
+            if phase == .leaving,
+               !presentInFlight,
+               !rotationInFlight,
+               pendingMask == nil,
+               activeAnimationPhase != .leaving,
+               !dismissalInFlight {
+                beginLeaveAnimationIfNeeded(controller)
+            }
         }
     }
 
@@ -153,10 +200,14 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
         }
         pendingMask = mask
         pendingMaskLabel = label
-        if phase == .leaving || !PlayerViewModel.shared.isFullscreen {
-            host?.enterLeavingState()
+        if !PlayerViewModel.shared.isFullscreen, let controller = host, phase != .leaving, phase != .retired {
+            rotationGeneration &+= 1
+            phase = .leaving
+            activeAnimationPhase = nil
+            controller.cancelActiveTransition()
+            PlayerFullscreenTransitionState.shared.update(hostID: controller.identity, phase: .leaving)
         }
-        if phase == .fullscreen || phase == .leaving {
+        if !presentInFlight, (phase == .fullscreen || phase == .leaving || (phase == .entering && reservedHost == nil)) {
             commitPendingOrientation(reason: "hostPresented")
         } else if !PlayerViewModel.shared.isFullscreen {
             commitPendingOrientation(reason: "entryCancelled")
@@ -164,12 +215,30 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
     }
 
     func relinquishForOwnerReplacement() {
+        let outgoingHost = host
+        rotationGeneration &+= 1
         phase = .retired
+        presentInFlight = false
+        activeAnimationPhase = nil
         pendingMask = nil
         pendingMaskLabel = nil
         rotationInFlight = false
+        rotationFallbackTask?.cancel()
+        rotationFallbackTask = nil
         reservedHost = nil
-        guard let controller = host else { return }
+        outgoingHost?.cancelActiveTransition()
+        if UIDevice.current.userInterfaceIdiom == .phone, AppOrientation.shared.mask != .portrait {
+            AppOrientation.shared.set(.portrait)
+            let window = outgoingHost?.viewIfLoaded?.window ?? AppWindowMetrics.current
+            window?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+            window?.windowScene?.requestGeometryUpdate(.iOS(interfaceOrientations: .portrait)) { _ in }
+        }
+        if PlayerViewModel.shared.isCurrentOwner(context.ownerLease),
+           PlayerViewModel.shared.activeSurfaceLease?.role == .fullscreen {
+            _ = PlayerViewModel.shared.handoffSurfaceSlot(ownerLease: context.ownerLease, to: .inline)
+        }
+        PlayerFullscreenTransitionState.shared.clear(matching: outgoingHost?.identity)
+        guard let controller = outgoingHost else { return }
         if controller.presentingViewController == nil {
             host = nil
         } else {
@@ -191,34 +260,90 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
             reconcile()
             return
         }
-        logEvent("presentRequested", detail: "style:fullScreen")
+        logEvent("presentRequested", detail: "style:overFullScreen")
         reservedHost = nil
+        presentInFlight = true
         present(controller, animated: false) { [weak self, weak controller] in
-            guard let self, let controller, self.accepts(controller) else { return }
+            guard let self, let controller else { return }
+            self.presentInFlight = false
+            guard self.accepts(controller) else {
+                if controller.presentingViewController != nil, !controller.isBeingDismissed {
+                    controller.dismiss(animated: false)
+                }
+                return
+            }
             guard controller.presentingViewController != nil,
                   controller.viewIfLoaded?.window != nil else {
                 PlayerViewModel.shared.exitFullscreen(presentation: self, receipt: receipt)
-                self.hostDidDismiss(controller, source: "presentationRefused")
+                self.completeLeaveAndDismiss(controller, source: "presentationRefused")
                 return
             }
-            self.phase = PlayerViewModel.shared.isFullscreen ? .fullscreen : .leaving
+            if !PlayerViewModel.shared.isFullscreen {
+                self.phase = .leaving
+                PlayerFullscreenTransitionState.shared.update(hostID: controller.identity, phase: .leaving)
+            }
             self.logEvent("hostPresented")
             self.commitPendingOrientation(reason: "presented")
             self.reconcile()
         }
         if controller.presentingViewController == nil, accepts(controller) {
+            presentInFlight = false
             PlayerViewModel.shared.exitFullscreen(presentation: self, receipt: receipt)
-            hostDidDismiss(controller, source: "presentationRefused")
+            completeLeaveAndDismiss(controller, source: "presentationRefused")
         }
     }
 
-    private func dismissHostWhenSceneSettled() {
-        guard let controller = host, pendingMask == nil, !rotationInFlight else { return }
+    private func beginEnterAnimationIfNeeded(_ controller: PlayerFullscreenHostController) {
+        guard accepts(controller), phase == .entering, activeAnimationPhase != .entering else { return }
+        activeAnimationPhase = .entering
+        controller.animateEnter { [weak self, weak controller] completed in
+            guard let self, let controller, self.accepts(controller) else { return }
+            if self.activeAnimationPhase == .entering {
+                self.activeAnimationPhase = nil
+            }
+            if completed, self.phase == .entering, PlayerViewModel.shared.isFullscreen {
+                self.phase = .fullscreen
+                PlayerFullscreenTransitionState.shared.update(hostID: controller.identity, phase: .fullscreen)
+                self.logEvent("enterSettled")
+            } else {
+                self.reconcile()
+            }
+        }
+    }
+
+    private func beginLeaveAnimationIfNeeded(_ controller: PlayerFullscreenHostController) {
+        guard accepts(controller), phase == .leaving, activeAnimationPhase != .leaving, !dismissalInFlight else { return }
         if controller.presentingViewController == nil {
-            hostDidDismiss(controller, source: "unsubmitted")
+            completeLeaveAndDismiss(controller, source: "unsubmitted")
             return
         }
-        requestHostDismissal(controller, animated: true)
+        activeAnimationPhase = .leaving
+        let snapshot = PlayerViewModel.shared.inlineStageSnapshot
+        controller.animateLeave(to: snapshot) { [weak self, weak controller] completed in
+            guard let self, let controller, self.accepts(controller) else { return }
+            if self.activeAnimationPhase == .leaving {
+                self.activeAnimationPhase = nil
+            }
+            if completed, self.phase == .leaving, !PlayerViewModel.shared.isFullscreen {
+                self.completeLeaveAndDismiss(controller, source: "leaveAnimation")
+            } else {
+                self.reconcile()
+            }
+        }
+    }
+
+    private func completeLeaveAndDismiss(_ controller: PlayerFullscreenHostController, source: String) {
+        guard host === controller, !dismissalInFlight else { return }
+        if let receipt,
+           PlayerViewModel.shared.isCurrentOwner(receipt.context.ownerLease),
+           PlayerViewModel.shared.activeSurfaceLease?.role == .fullscreen {
+            _ = PlayerViewModel.shared.handoffSurfaceSlot(ownerLease: receipt.context.ownerLease, to: .inline)
+        }
+        if controller.presentingViewController == nil {
+            hostDidDismiss(controller, source: source)
+        } else {
+            requestHostDismissal(controller, animated: false)
+        }
     }
 
     private func requestHostDismissal(_ controller: PlayerFullscreenHostController, animated: Bool) {
@@ -231,14 +356,23 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
 
     func hostDidDismiss(_ controller: PlayerFullscreenHostController, source: String) {
         guard host === controller else { return }
+        rotationFallbackTask?.cancel()
+        rotationFallbackTask = nil
         let current = accepts(controller)
         if current, let receipt {
+            if PlayerViewModel.shared.isCurrentOwner(receipt.context.ownerLease),
+               PlayerViewModel.shared.activeSurfaceLease?.role == .fullscreen {
+                _ = PlayerViewModel.shared.handoffSurfaceSlot(ownerLease: receipt.context.ownerLease, to: .inline)
+            }
             PlayerViewModel.shared.exitFullscreen(presentation: self, receipt: receipt)
         }
         host = nil
         reservedHost = nil
+        presentInFlight = false
         dismissalInFlight = false
+        activeAnimationPhase = nil
         rotationInFlight = false
+        PlayerFullscreenTransitionState.shared.clear(matching: controller.identity)
         if current {
             phase = .inline
             pendingMask = nil
@@ -252,15 +386,109 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
         hostDidDismiss(controller, source: "viewDidDisappear")
     }
 
-    func hostRotationDidBegin(_ controller: PlayerFullscreenHostController) {
-        guard accepts(controller), !PlayerViewModel.shared.isFullscreen else { return }
-        controller.enterLeavingState()
+    func acceptsRotationPinning(_ controller: PlayerFullscreenHostController, generation: UInt64) -> Bool {
+        accepts(controller) && generation != 0 && generation == rotationGeneration
     }
 
-    func hostDidCompleteRotation(_ controller: PlayerFullscreenHostController) {
+    func hostRotationWillBegin(
+        _ controller: PlayerFullscreenHostController,
+        to size: CGSize
+    ) -> PlayerFullscreenHostController.RotationPlan {
+        guard accepts(controller) else {
+            return .init(generation: 0, mode: .steadyFullscreen)
+        }
+        let isPhone = UIDevice.current.userInterfaceIdiom == .phone
+        let isLandscapeSize = size.width > size.height
+
+        if !PlayerViewModel.shared.isFullscreen {
+            if isPhone, isLandscapeSize {
+                return .init(generation: 0, mode: .steadyFullscreen)
+            }
+            rotationFallbackTask?.cancel()
+            rotationFallbackTask = nil
+            phase = .leaving
+            activeAnimationPhase = .leaving
+            PlayerFullscreenTransitionState.shared.update(hostID: controller.identity, phase: .leaving)
+            return .init(
+                generation: rotationGeneration,
+                mode: .leaving(PlayerViewModel.shared.inlineStageSnapshot)
+            )
+        }
+        if phase == .entering {
+            if isPhone, !PlayerViewModel.shared.isPortraitContent, !isLandscapeSize {
+                return .init(generation: 0, mode: .steadyFullscreen)
+            }
+            rotationFallbackTask?.cancel()
+            rotationFallbackTask = nil
+            activeAnimationPhase = .entering
+            return .init(generation: rotationGeneration, mode: .entering)
+        }
+        rotationFallbackTask?.cancel()
+        rotationFallbackTask = nil
+        return .init(generation: rotationGeneration, mode: .steadyFullscreen)
+    }
+
+    func hostDidCompleteRotation(
+        _ controller: PlayerFullscreenHostController,
+        completedMode: PlayerFullscreenHostController.RotationTransitionKind,
+        generation: UInt64,
+        cancelled: Bool
+    ) {
         guard accepts(controller) else { return }
-        rotationInFlight = false
-        reconcile()
+        let isCurrentRotation = generation != 0 && generation == rotationGeneration
+        if isCurrentRotation {
+            rotationFallbackTask?.cancel()
+            rotationFallbackTask = nil
+            rotationInFlight = false
+            if (completedMode == .entering && activeAnimationPhase == .entering)
+                || (completedMode == .leaving && activeAnimationPhase == .leaving) {
+                activeAnimationPhase = nil
+            }
+        }
+        if pendingMask != nil {
+            commitPendingOrientation(reason: "rotationCompleted")
+        }
+        if PlayerViewModel.shared.isFullscreen {
+            if UIDevice.current.userInterfaceIdiom == .phone,
+               !PlayerViewModel.shared.isPortraitContent,
+               sceneWillRotate(to: .landscape) {
+                if !rotationInFlight {
+                    pendingMask = .landscape
+                    pendingMaskLabel = "landscape"
+                    commitPendingOrientation(reason: "reenterToLandscape")
+                }
+                return
+            }
+            if isCurrentRotation, !cancelled, completedMode == .entering,
+               !rotationInFlight, phase == .entering {
+                phase = .fullscreen
+                PlayerFullscreenTransitionState.shared.update(hostID: controller.identity, phase: .fullscreen)
+                logEvent("enterRotationSettled")
+                return
+            }
+            if !rotationInFlight {
+                reconcile()
+            }
+            return
+        }
+        if phase == .leaving {
+            if UIDevice.current.userInterfaceIdiom == .phone, sceneWillRotate(to: .portrait) {
+                if !rotationInFlight {
+                    pendingMask = .portrait
+                    pendingMaskLabel = "portrait"
+                    commitPendingOrientation(reason: "reverseToPortrait")
+                }
+                return
+            }
+            if isCurrentRotation, !cancelled, completedMode == .leaving,
+               !rotationInFlight, pendingMask == nil, !dismissalInFlight {
+                completeLeaveAndDismiss(controller, source: "rotationCompletion")
+                return
+            }
+        }
+        if !rotationInFlight {
+            reconcile()
+        }
     }
 
     func hostWillDisappear(_ controller: PlayerFullscreenHostController) {
@@ -282,7 +510,12 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
         let label = pendingMaskLabel ?? PlayerPresentationCensus.maskLabel(mask)
         pendingMask = nil
         pendingMaskLabel = nil
-        rotationInFlight = sceneWillRotate(to: mask)
+        rotationFallbackTask?.cancel()
+        rotationFallbackTask = nil
+        rotationGeneration &+= 1
+        let expectedGeneration = rotationGeneration
+        let willRotate = sceneWillRotate(to: mask)
+        rotationInFlight = willRotate
         AppOrientation.shared.set(mask)
         host?.setNeedsUpdateOfSupportedInterfaceOrientations()
         let window = host?.viewIfLoaded?.window ?? AppWindowMetrics.current
@@ -290,12 +523,34 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
         FullscreenTransitionDiagnostics.recordSceneGeometryRequest(mask: label, windowResolved: window != nil)
         logEvent("sceneRotationRequested", detail: "mask:\(label),why:\(reason)")
         let rotatingHost = host
+        if willRotate, let rotatingHost {
+            scheduleRotationFallback(for: rotatingHost, expectedGeneration: expectedGeneration)
+        }
         window?.windowScene?.requestGeometryUpdate(
             .iOS(interfaceOrientations: mask)
         ) { [weak self, weak rotatingHost] error in
             guard let self, self.receipt == receipt, self.isCurrent,
-                  let rotatingHost, self.accepts(rotatingHost) else { return }
+                  let rotatingHost, self.accepts(rotatingHost),
+                  self.rotationGeneration == expectedGeneration else { return }
             PlayerLog.log("[Fullscreen] scene rotation rejected mask=\(label) error=\(error.localizedDescription)")
+            self.rotationFallbackTask?.cancel()
+            self.rotationFallbackTask = nil
+            self.rotationInFlight = false
+            self.reconcile()
+        }
+    }
+
+    private func scheduleRotationFallback(
+        for rotatingHost: PlayerFullscreenHostController,
+        expectedGeneration: UInt64
+    ) {
+        rotationFallbackTask = Task { @MainActor [weak self, weak rotatingHost] in
+            try? await Task.sleep(for: .milliseconds(450))
+            guard !Task.isCancelled, let self, let rotatingHost,
+                  self.accepts(rotatingHost), self.rotationInFlight,
+                  self.rotationGeneration == expectedGeneration else { return }
+            PlayerLog.log("[Fullscreen] rotation fallback triggered phase=\(self.phase)")
+            self.rotationFallbackTask = nil
             self.rotationInFlight = false
             self.reconcile()
         }

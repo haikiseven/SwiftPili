@@ -5,8 +5,6 @@ actor PathAAdaptiveDemuxer: MediaDemuxing {
     private let makeChild: (@Sendable (MediaOpenRequest) -> any MediaDemuxing)?
     private let session: URLSession?
     private let byteStore: MediaByteRangeStore?
-    private let displayEvidence =
-        OSAllocatedUnfairLock<(any MediaDisplayEvidenceQuerying)?>(initialState: nil)
     private var active: (any MediaDemuxing)?
     private var activeGeneration: UInt64 = 0
     private var openedChildGeneration: UInt64?
@@ -60,7 +58,6 @@ actor PathAAdaptiveDemuxer: MediaDemuxing {
         let previous = active
         openedChildGeneration = nil
         active = demux
-        displayEvidence.withLock { $0 = nil }
         await previous?.close()
         guard activeGeneration == childGeneration, active === demux else { throw CancellationError() }
         await demux.setPacketRelay(packetRelay)
@@ -72,12 +69,10 @@ actor PathAAdaptiveDemuxer: MediaDemuxing {
             try Task.checkCancellation()
             guard activeGeneration == childGeneration, active === demux else { throw CancellationError() }
             openedChildGeneration = childGeneration
-            displayEvidence.withLock { $0 = demux.displayEvidenceQuery }
         } catch {
             guard !Task.isCancelled, activeGeneration == childGeneration, active === demux else {
                 throw CancellationError()
             }
-            displayEvidence.withLock { $0 = nil }
             if let source = request.liveSource, source.kind == .hlsMPEGTS || source.kind == .httpFLV,
                let engineError = error as? MediaEngineError,
                case .notImplemented(let diagnostic) = engineError {
@@ -172,10 +167,6 @@ actor PathAAdaptiveDemuxer: MediaDemuxing {
 
     nonisolated var measuresCachedContentAhead: Bool { byteStore != nil }
 
-    nonisolated var displayEvidenceQuery: (any MediaDisplayEvidenceQuerying)? {
-        displayEvidence.withLock { $0 }
-    }
-
     func multiConnectionTelemetry() async -> MultiConnectionTelemetry {
         guard let child = active else { return .unsupported }
         let childGeneration = activeGeneration
@@ -184,11 +175,6 @@ actor PathAAdaptiveDemuxer: MediaDemuxing {
             return .unsupported
         }
         return result
-    }
-
-    func retireResidentDisplay(video: Bool, audio: Bool) async {
-        guard let child = active else { return }
-        await child.retireResidentDisplay(video: video, audio: audio)
     }
 
     func cachedContentAhead() async -> MediaCachedContentAhead {
@@ -220,7 +206,6 @@ actor PathAAdaptiveDemuxer: MediaDemuxing {
         if activeGeneration == 0 { activeGeneration = 1 }
         let childGeneration = activeGeneration
         openedChildGeneration = nil
-        displayEvidence.withLock { $0 = nil }
         await active.close()
         guard activeGeneration == childGeneration,
               let current = self.active,
@@ -228,7 +213,6 @@ actor PathAAdaptiveDemuxer: MediaDemuxing {
             return
         }
         self.active = nil
-        displayEvidence.withLock { $0 = nil }
     }
 
     func videoTrackConfiguration() async -> MediaVideoTrackConfiguration? {

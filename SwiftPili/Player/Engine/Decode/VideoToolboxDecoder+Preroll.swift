@@ -247,15 +247,7 @@ extension VideoToolboxDecoder {
                     if let image = record.imageBuffer {
                         result.noteOutput(
                             MediaVideoFrame(
-                                pts: pts, duration: duration, pixelBuffer: image,
-                                displayCoverage: VideoToolboxOutputRecord(
-                                    event: record.event, imageBuffer: image,
-                                    callbackPTS: record.callbackPTS, callbackDuration: record.callbackDuration
-                                ).displayCoverage(
-                                    packet: entry.packet,
-                                    resolution: resolved,
-                                    submitted: entry.nativeTiming
-                                )
+                                pts: pts, duration: duration, pixelBuffer: image
                             ),
                             keep: true
                         )

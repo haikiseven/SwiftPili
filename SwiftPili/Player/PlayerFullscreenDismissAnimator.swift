@@ -23,7 +23,7 @@ final class PlayerFullscreenDismissAnimator: NSObject, UIViewControllerAnimatedT
         let originalBackgroundColor = fromView.backgroundColor
 
         UIView.performWithoutAnimation {
-            if let toView = context.view(forKey: .to) {
+            if let toView = context.view(forKey: .to), toView.superview == nil {
                 toView.frame = context.finalFrame(for: toViewController)
                 container.insertSubview(toView, belowSubview: fromView)
                 toView.layoutIfNeeded()

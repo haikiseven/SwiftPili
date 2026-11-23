@@ -1,17 +1,6 @@
 import Foundation
 
 actor PathAFMP4Demuxer: MediaDemuxing {
-    nonisolated let displayAvailability = MediaDisplayAvailability()
-
-    private struct ResidentDisplayOwnership: Sendable {
-        let nextOffset: Int
-        let leases: [MediaDisplayLease]
-    }
-
-    private var futureDisplayLeases: [MediaTrackKind: [Int64: ResidentDisplayOwnership]] = [:]
-    private var residentDisplayChanges: MediaByteRangeStore.ResidentChanges?
-    private var residentDisplayRefreshTask: Task<Void, Never>?
-
     private struct FragmentIndexEntry: Sendable {
         let offset: Int
         let startPTS: TimeInterval
@@ -55,13 +44,6 @@ actor PathAFMP4Demuxer: MediaDemuxing {
         }
     }
 
-    private struct ParsedDisplayFragment: Sendable {
-        let bytes: Range<Int64>
-        let metadataResidency: MediaByteRangeStore.ResidentValidity
-        let lower: TimeInterval
-        let upper: TimeInterval
-    }
-
     private struct TrackReader: Sendable {
         let source: PathAHTTPMediaSource
         let track: PathAFMP4.TrackInfo
@@ -80,10 +62,6 @@ actor PathAFMP4Demuxer: MediaDemuxing {
         var activeFragment: ActiveFragmentStream? = nil
         var armFragmentTrace = true
         var storeBinding: PathAByteStoreBinding?
-        var displayUsability = MediaResidentDisplayUsability()
-        var parsedDisplayFragment: ParsedDisplayFragment?
-        var displayTrack: MediaDisplayTrack?
-        var displayResidentBytes: [MediaDisplayLease] = []
     }
 
     private struct ActiveFragmentStream: Sendable {
@@ -238,13 +216,11 @@ actor PathAFMP4Demuxer: MediaDemuxing {
     private var video: TrackReader? {
         didSet {
             readerProgressRevision &+= 1
-            residentDisplayChanges?.requestRefresh()
         }
     }
     private var audio: TrackReader? {
         didSet {
             readerProgressRevision &+= 1
-            residentDisplayChanges?.requestRefresh()
         }
     }
     private var readerProgressRevision: UInt64 = 0
@@ -253,24 +229,7 @@ actor PathAFMP4Demuxer: MediaDemuxing {
     private var openGeneration: UInt64 = 0
     private var readerMutationGeneration: UInt64 = 0
     private var activeForwardReceipt: MediaVideoForwardReceipt?
-    private var latchedParseFailure: MediaEngineError? {
-        didSet {
-            if latchedParseFailure != nil { retireDisplayUsability() }
-        }
-    }
-
-    private func retireDisplayUsability() {
-        video?.displayUsability.revoke()
-        audio?.displayUsability.revoke()
-        video?.displayTrack?.clearLayouts()
-        audio?.displayTrack?.clearLayouts()
-        futureDisplayLeases.removeAll()
-    }
-
-    private func retireDisplayTracks() {
-        video?.displayTrack?.retire()
-        audio?.displayTrack?.retire()
-    }
+    private var latchedParseFailure: MediaEngineError?
 
     private var packetRelay: DemuxPacketRelay?
 
@@ -329,8 +288,6 @@ actor PathAFMP4Demuxer: MediaDemuxing {
     }
 
     deinit {
-        residentDisplayRefreshTask?.cancel()
-        residentDisplayChanges?.finish()
         if let store = byteStore, let token = activeStorePathsToken {
             Task { await store.unregisterActivePaths(token) }
         }
@@ -360,17 +317,13 @@ actor PathAFMP4Demuxer: MediaDemuxing {
 
     func open(_ request: MediaOpenRequest) async throws {
         openGeneration &+= 1
-        stopResidentDisplayObservation()
         let generation = openGeneration
         activeForwardReceipt = nil
         readerMutationGeneration &+= 1
         let readerGeneration = readerMutationGeneration
-        retireDisplayUsability()
-        retireDisplayTracks()
         await retireOpenPrefetchAndStoreProtection(closeStreams: true, resetReaders: true)
         let loadSession = makeLoadSession()
         var stagedSources: (video: PathAHTTPMediaSource, audio: PathAHTTPMediaSource?)?
-        var stagedDisplayTracks: [MediaDisplayTrack] = []
 
         do {
             let opened = try await Self.openRequiredTracks(
@@ -415,17 +368,6 @@ actor PathAFMP4Demuxer: MediaDemuxing {
                 }
                 stagedDuration = indexedDuration
             }
-            if !stagedVideo.isFileSource, !stagedVideo.requiresExactFragmentTrackID,
-               stagedVideo.storeBinding != nil, stagedVideo.track.timescale > 0,
-               stagedAudio == nil || stagedAudio?.storeBinding != nil {
-                stagedVideo.displayTrack = displayAvailability.makeTrack(.video)
-                let audioDisplayTrack = stagedAudio?.storeBinding != nil
-                    ? displayAvailability.makeTrack(.audio) : nil
-                stagedAudio?.displayTrack = audioDisplayTrack
-                stagedDisplayTracks = [stagedVideo.displayTrack, audioDisplayTrack].compactMap { $0 }
-                await stagedVideo.source.setDisplayTrack(stagedVideo.displayTrack)
-                if let stagedAudio { await stagedAudio.source.setDisplayTrack(stagedAudio.displayTrack) }
-            }
             try checkOpenFence(generation, readerGeneration: readerGeneration)
             video = stagedVideo
             audio = stagedAudio
@@ -437,11 +379,7 @@ actor PathAFMP4Demuxer: MediaDemuxing {
             try await registerActiveStorePaths(generation: generation, readerGeneration: readerGeneration)
             await openMultiConnectionPrefetcher(request, generation: generation)
             try checkOpenFence(generation, readerGeneration: readerGeneration)
-            await startResidentDisplayObservation(generation: generation)
-            try checkOpenFence(generation, readerGeneration: readerGeneration)
         } catch {
-            if generation == openGeneration { stopResidentDisplayObservation() }
-            stagedDisplayTracks.forEach { $0.retire() }
             if let stagedSources {
                 await stagedSources.video.closeActiveChunkStream()
                 await stagedSources.audio?.closeActiveChunkStream()
@@ -810,7 +748,6 @@ actor PathAFMP4Demuxer: MediaDemuxing {
         }
         let pumpVideo = videoBudget > 0.000_5
         let pumpAudio = audioBudget > 0.000_5
-        prepareResidentDisplayForPump(video: pumpVideo, audio: pumpAudio)
         let stagedVideo = pumpVideo ? video : nil
         let stagedAudio = pumpAudio ? audio : nil
         guard stagedVideo != nil || stagedAudio != nil else { return [] }
@@ -865,8 +802,6 @@ actor PathAFMP4Demuxer: MediaDemuxing {
                 || Self.isCancellation(error) {
                 throw MediaEngineError.stopped
             }
-            stagedVideo?.displayUsability.revoke()
-            stagedAudio?.displayUsability.revoke()
             if let parserError = error as? PathAFMP4.ParseError {
                 let mapped = Self.mediaError(for: parserError, context: "fragment")
                 latchedParseFailure = mapped
@@ -999,8 +934,6 @@ actor PathAFMP4Demuxer: MediaDemuxing {
         var pacing: PumpPacing? = PlayerLog.isCapturing ? PumpPacing() : nil
 
         while produced < budget || r.activeFragment?.assembler.isComplete == true {
-            let displayBytes = r.displayTrack.map(MediaDisplayByteOwner.init)
-            defer { displayBytes?.release() }
             try checkWaitBudget(trackWaitBudget)
             if r.eof { break }
             if let continuityReferenceEnd, r.activeFragment == nil,
@@ -1032,7 +965,7 @@ actor PathAFMP4Demuxer: MediaDemuxing {
             packets.discardReadObservation()
             let probeWaitStart = pacing != nil ? ContinuousClock.now : nil
             let probe = try await r.source.read(
-                offset: Int64(r.cursor), count: probeCount, waitBudget: trackWaitBudget, displayOwner: displayBytes
+                offset: Int64(r.cursor), count: probeCount, waitBudget: trackWaitBudget
             )
             try checkWaitBudget(trackWaitBudget)
             if let probeWaitStart { pacing?.recordWait(since: probeWaitStart) }
@@ -1044,7 +977,6 @@ actor PathAFMP4Demuxer: MediaDemuxing {
             }
             guard let rawHeader = Self.parseBoxHeader(probe, at: 0) else {
                 if probe.isEmpty {
-                    if readEnd > 0, r.cursor < readEnd { r.displayUsability.revoke() }
                     r.eof = true
                     break
                 }
@@ -1079,7 +1011,7 @@ actor PathAFMP4Demuxer: MediaDemuxing {
                     let extra = try await r.source.read(
                         offset: Int64(readOffsetResult.partialValue),
                         count: throughMdatHeader - buffered.count,
-                        waitBudget: trackWaitBudget, displayOwner: displayBytes
+                        waitBudget: trackWaitBudget
                     )
                     try checkWaitBudget(trackWaitBudget)
                     if let spillWaitStart { pacing?.recordWait(since: spillWaitStart) }
@@ -1194,42 +1126,11 @@ actor PathAFMP4Demuxer: MediaDemuxing {
                     timingResolution = nil
                 }
                 let timescale = timingResolution?.effectiveTimescale ?? ts
-                var parsedResidency: MediaByteRangeStore.ResidentValidity?
-                if let binding = r.storeBinding, !r.isFileSource {
-                    let held = await binding.store.residentRun(
-                        binding.key, from: Int64(r.cursor),
-                        matchingPrefix: Data(buffered.prefix(mdatPayloadStart - r.cursor))
-                    )
-                    parsedResidency = held?.validity.narrowed(to: Int64(r.cursor)..<Int64(mdatPayloadStart))
-                }
-                let displaySamples = Self.displaySamples(
-                    emittable, kind: r.track.kind, fragment: r.cursor, timescale: timescale
-                )
-                r.parsedDisplayFragment = parsedResidency.flatMap { residency in
-                    guard r.displayUsability.isValid else { return nil }
-                    return Self.parsedDisplayFragment(
-                        samples: displaySamples, expectedSampleCount: emittable.count,
-                        bytes: Int64(r.cursor)..<Int64(fragmentEnd),
-                        declaredTimescale: r.track.timescale, residency: residency
-                    )
-                }
 
-                r.displayTrack?.install(displaySamples, fragment: Int64(r.cursor))
-                if let binding = r.storeBinding, let displayTrack = r.displayTrack {
-                    let receipts = await binding.store.displayResidentSpans(
-                        binding.key, ranges: displaySamples.map(\.bytes)
-                    )
-                    r.displayResidentBytes = receipts.compactMap {
-                        displayTrack.own(bytes: $0.range, residency: $0)
-                    }
-                }
-
-                if !r.isFileSource, var liveAssembler = PathAMdatStreamAssembler(
+                if !r.isFileSource, let liveAssembler = PathAMdatStreamAssembler(
                     samples: emittable.map { ($0.offset, $0.size) },
                     streamStart: r.cursor
                 ) {
-                    liveAssembler.displayTrack = r.displayTrack
-                    liveAssembler.displaySamples = Dictionary(uniqueKeysWithValues: displaySamples.map { ($0.ordinal, $0) })
                     var af = ActiveFragmentStream(
                         streamID: nil,
                         fragmentStart: r.cursor,
@@ -1287,7 +1188,7 @@ actor PathAFMP4Demuxer: MediaDemuxing {
                     let tail = try await r.source.read(
                         offset: Int64(readOffsetResult.partialValue),
                         count: fragmentTotal - buffered.count,
-                        waitBudget: trackWaitBudget, displayOwner: displayBytes
+                        waitBudget: trackWaitBudget
                     )
                     try checkWaitBudget(trackWaitBudget)
                     if let tailWaitStart { pacing?.recordWait(since: tailWaitStart) }
@@ -1309,7 +1210,7 @@ actor PathAFMP4Demuxer: MediaDemuxing {
                 }
                 var synthesizedInFragment = 0
                 let base = segment.startIndex
-                for (ordinal, sample) in emittable.enumerated() {
+                for sample in emittable {
                     let localStartResult = sample.offset.subtractingReportingOverflow(r.cursor)
                     guard !localStartResult.overflow else {
                         throw PathAFMP4.ParseError.malformed(PathAFMP4.ParseFailure(
@@ -1337,8 +1238,7 @@ actor PathAFMP4Demuxer: MediaDemuxing {
                         data: segment.subdata(in: (base + localStart)..<(base + localEnd)),
                         kind: kind,
                         trackTimescale: r.track.timescale,
-                        effectiveTimescale: timescale,
-                        displayCoverage: displaySamples.first { $0.ordinal == ordinal }.flatMap { r.displayTrack?.own($0.interval) }
+                        effectiveTimescale: timescale
                     ), payloadRange: Int64(sample.offset)..<Int64(sample.offset + sample.size))
                     produced += Double(sample.durationTicks) / timescale
                 }
@@ -1532,8 +1432,6 @@ actor PathAFMP4Demuxer: MediaDemuxing {
         }
         var reopenBudget = FragmentReopenBudget(initialOffset: Int64(af.assembler.resumeOffset))
         while true {
-            let displayBytes = r.displayTrack.map(MediaDisplayByteOwner.init)
-            defer { displayBytes?.release() }
             try checkWaitBudget(waitBudget)
             let fragmentEndResult = af.fragmentStart.addingReportingOverflow(af.fragmentTotal)
             guard !fragmentEndResult.overflow else {
@@ -1619,7 +1517,7 @@ actor PathAFMP4Demuxer: MediaDemuxing {
             let step: PathAHTTPMediaSource.ChunkStreamStep
             do {
                 step = try await r.source.nextChunkStep(
-                    af.streamID ?? 0, waitBudget: waitBudget, displayOwner: displayBytes
+                    af.streamID ?? 0, waitBudget: waitBudget
                 )
                 try checkWaitBudget(waitBudget)
                 if let chunkWaitStart { pacing?.recordWait(since: chunkWaitStart) }
@@ -1757,7 +1655,6 @@ actor PathAFMP4Demuxer: MediaDemuxing {
         kind: MediaTrackKind,
         truncated: Bool
     ) async {
-        if truncated { r.displayUsability.revoke() }
         if let streamID = af.streamID {
             await r.source.closeChunkStream(streamID)
         }
@@ -1809,8 +1706,7 @@ actor PathAFMP4Demuxer: MediaDemuxing {
                 data: entry.data,
                 kind: kind,
                 trackTimescale: r.track.timescale,
-                effectiveTimescale: af.effectiveTimescale,
-                displayCoverage: entry.displayCoverage
+                effectiveTimescale: af.effectiveTimescale
             ), payloadRange: Int64(sample.offset)..<Int64(sample.offset + sample.size))
             if af.trace != nil, !af.trace!.loggedFirstPacket {
                 af.trace!.loggedFirstPacket = true
@@ -1820,84 +1716,12 @@ actor PathAFMP4Demuxer: MediaDemuxing {
         }
     }
 
-    private static func displaySamples(
-        _ samples: [PathAFMP4.Sample], kind: PathAFMP4.TrackKind, fragment: Int, timescale: Double
-    ) -> [MediaDisplaySample] {
-        guard let scale = Int64(exactly: timescale), scale > 0 else { return [] }
-        let declared = samples.enumerated().compactMap { ordinal, sample -> MediaDisplaySample? in
-            let end = sample.ptsTicks.addingReportingOverflow(Int64(sample.durationTicks))
-            let byteEnd = sample.offset.addingReportingOverflow(sample.size)
-            guard !sample.durationIsSynthesized, sample.durationTicks > 0, sample.size > 0,
-                  !end.overflow, !byteEnd.overflow,
-                  let interval = MediaDisplayInterval(
-                    MediaDisplayTime(sample.ptsTicks, scale: scale),
-                    MediaDisplayTime(end.partialValue, scale: scale)
-                  ) else { return nil }
-            return MediaDisplaySample(fragment: Int64(fragment), ordinal: ordinal,
-                                      bytes: Int64(sample.offset)..<Int64(byteEnd.partialValue), interval: interval)
-        }
-        guard kind == .video else { return declared }
-        let presentationEnds = videoPresentationEnds(samples, validOrdinals: Set(declared.map(\.ordinal)))
-        return declared.map { sample in
-            guard let end = presentationEnds[sample.ordinal],
-                  let interval = MediaDisplayInterval(
-                    sample.interval.lower, MediaDisplayTime(end, scale: scale)
-                  ) else { return sample }
-            return MediaDisplaySample(fragment: sample.fragment, ordinal: sample.ordinal,
-                                      bytes: sample.bytes, interval: interval)
-        }
-    }
-
-    private static func videoPresentationEnds(
-        _ samples: [PathAFMP4.Sample], validOrdinals: Set<Int>
-    ) -> [Int: Int64] {
-        var ends: [Int: Int64] = [:]
-        let tracks = Dictionary(grouping: samples.indices, by: { samples[$0].trackID })
-        for ordinals in tracks.values {
-            let ordered = ordinals.sorted { samples[$0].ptsTicks < samples[$1].ptsTicks }
-            let neighbors = zip(ordered, ordered.dropFirst())
-            guard neighbors.allSatisfy({ samples[$0.0].ptsTicks < samples[$0.1].ptsTicks }) else { continue }
-            let successors = Dictionary(uniqueKeysWithValues: neighbors)
-            var run: [Int] = []
-            var nextDTS: Int64?
-            for ordinal in ordinals {
-                let sample = samples[ordinal]
-                let decodeEnd = sample.dtsTicks.addingReportingOverflow(Int64(sample.durationTicks))
-                guard validOrdinals.contains(ordinal), !decodeEnd.overflow else {
-                    appendVideoPresentationEnds(run, successors: successors, samples: samples, to: &ends)
-                    run.removeAll(keepingCapacity: true)
-                    nextDTS = nil
-                    continue
-                }
-                if let nextDTS, sample.dtsTicks != nextDTS {
-                    appendVideoPresentationEnds(run, successors: successors, samples: samples, to: &ends)
-                    run.removeAll(keepingCapacity: true)
-                }
-                run.append(ordinal)
-                nextDTS = decodeEnd.partialValue
-            }
-            appendVideoPresentationEnds(run, successors: successors, samples: samples, to: &ends)
-        }
-        return ends
-    }
-
-    private static func appendVideoPresentationEnds(
-        _ ordinals: [Int], successors: [Int: Int], samples: [PathAFMP4.Sample], to ends: inout [Int: Int64]
-    ) {
-        let run = Set(ordinals)
-        for ordinal in ordinals {
-            guard let next = successors[ordinal], run.contains(next) else { continue }
-            ends[ordinal] = samples[next].ptsTicks
-        }
-    }
-
     private static func mediaPacket(
         for sample: PathAFMP4.Sample,
         data: Data,
         kind: MediaTrackKind,
         trackTimescale: UInt32,
-        effectiveTimescale: Double,
-        displayCoverage: MediaDisplayLease? = nil
+        effectiveTimescale: Double
     ) -> MediaPacket {
         MediaPacket(
             track: kind,
@@ -1914,7 +1738,6 @@ actor PathAFMP4Demuxer: MediaDemuxing {
                 effectiveTimescale: effectiveTimescale
             ) : nil,
             emittedAt: ContinuousClock.now,
-            displayCoverage: displayCoverage,
             containerSampleIndex: sample.sampleIndex,
             containerFragmentSequence: sample.fragmentSequence,
             containerSampleOffset: sample.offset
@@ -2259,17 +2082,12 @@ actor PathAFMP4Demuxer: MediaDemuxing {
         activeForwardReceipt = nil
         readerMutationGeneration &+= 1
         let mutation = readerMutationGeneration
-        current.displayUsability.revoke()
-        current.displayTrack?.clearLayouts()
-        futureDisplayLeases[.video] = nil
         if let streamID = current.activeFragment?.streamID {
             await current.source.closeChunkStream(streamID)
         }
         try Task.checkCancellation()
         guard mutation == readerMutationGeneration else { throw MediaEngineError.stopped }
         var staged = current
-        staged.displayUsability = MediaResidentDisplayUsability()
-        staged.parsedDisplayFragment = nil
         staged.activeFragment = nil
         staged.armFragmentTrace = true
         staged.eof = false
@@ -2310,8 +2128,6 @@ actor PathAFMP4Demuxer: MediaDemuxing {
                 madeProgress: false
             ))
         }
-
-        prepareResidentDisplayForPump(video: true, audio: false)
         let mutationGeneration = readerMutationGeneration
         guard let currentVideo = video else {
             return .unsupported(.unavailable)
@@ -2337,7 +2153,6 @@ actor PathAFMP4Demuxer: MediaDemuxing {
         } catch {
             try Task.checkCancellation()
             guard mutationGeneration == readerMutationGeneration else { throw MediaEngineError.stopped }
-            currentVideo.displayUsability.revoke()
             if let parserError = error as? PathAFMP4.ParseError {
                 let mapped = Self.mediaError(for: parserError, context: "fragment")
                 latchedParseFailure = mapped
@@ -2455,9 +2270,6 @@ actor PathAFMP4Demuxer: MediaDemuxing {
         readerMutationGeneration &+= 1
         let generation = readerMutationGeneration
         guard let currentVideo = video else { return false }
-        currentVideo.displayUsability.revoke()
-        currentVideo.displayTrack?.clearLayouts()
-        futureDisplayLeases[.video] = nil
         do {
             let stagedVideo: TrackReader?
             switch position {
@@ -2500,7 +2312,6 @@ actor PathAFMP4Demuxer: MediaDemuxing {
         readerMutationGeneration &+= 1
         let generation = readerMutationGeneration
         prefetchSeekGeneration = generation
-        retireDisplayUsability()
         await multiConnectionPrefetcher?.park()
         let currentVideo = video
         let currentAudio = audio
@@ -2560,8 +2371,6 @@ actor PathAFMP4Demuxer: MediaDemuxing {
         kind: String
     ) async throws -> TrackReader {
         var r = reader
-        r.displayUsability = MediaResidentDisplayUsability()
-        r.parsedDisplayFragment = nil
         await r.source.closeActiveChunkStream()
         r.activeFragment = nil
         r.armFragmentTrace = true
@@ -2607,8 +2416,6 @@ actor PathAFMP4Demuxer: MediaDemuxing {
         before excludedAnchorPTS: TimeInterval
     ) async throws -> TrackReader? {
         var r = reader
-        r.displayUsability = MediaResidentDisplayUsability()
-        r.parsedDisplayFragment = nil
         await r.source.closeActiveChunkStream()
         r.activeFragment = nil
         r.armFragmentTrace = true
@@ -3007,34 +2814,6 @@ actor PathAFMP4Demuxer: MediaDemuxing {
 
     nonisolated var measuresCachedContentAhead: Bool { byteStore != nil }
 
-    nonisolated var displayEvidenceQuery: (any MediaDisplayEvidenceQuerying)? {
-        displayAvailability.hasTracks ? displayAvailability : nil
-    }
-
-    private func prepareResidentDisplayForPump(video prepareVideo: Bool, audio prepareAudio: Bool) {
-        if prepareVideo, video?.displayUsability.isValid == false {
-            video?.parsedDisplayFragment = nil
-            video?.displayUsability = MediaResidentDisplayUsability()
-        }
-        if prepareAudio, audio?.displayUsability.isValid == false {
-            audio?.parsedDisplayFragment = nil
-            audio?.displayUsability = MediaResidentDisplayUsability()
-        }
-    }
-
-    func retireResidentDisplay(video retireVideo: Bool, audio retireAudio: Bool) async {
-        if retireVideo {
-            video?.displayUsability.revoke()
-            video?.displayUsability = MediaResidentDisplayUsability()
-            video?.parsedDisplayFragment = nil
-        }
-        if retireAudio {
-            audio?.displayUsability.revoke()
-            audio?.displayUsability = MediaResidentDisplayUsability()
-            audio?.parsedDisplayFragment = nil
-        }
-    }
-
     func cachedContentAhead() async -> MediaCachedContentAhead {
         let generation = readerMutationGeneration
         let progress = readerProgressRevision
@@ -3042,152 +2821,8 @@ actor PathAFMP4Demuxer: MediaDemuxing {
         let audio = self.audio
         let videoAhead = await Self.cachedSecondsAhead(video)
         let audioAhead = await Self.cachedSecondsAhead(audio)
-        let videoDisplay = await Self.residentDisplayFragment(video)
-        let audioDisplay = await Self.residentDisplayFragment(audio)
         guard generation == readerMutationGeneration, progress == readerProgressRevision else { return .empty }
-        residentDisplayChanges?.requestRefresh()
-        return MediaCachedContentAhead(
-            video: videoAhead, audio: audioAhead, videoDisplay: videoDisplay, audioDisplay: audioDisplay
-        )
-    }
-
-    private func startResidentDisplayObservation(generation: UInt64) async {
-        guard let byteStore, displayAvailability.hasTracks else { return }
-        let keys = Set([video?.storeBinding?.key, audio?.storeBinding?.key].compactMap { $0 })
-        let changes = await byteStore.observeResidentChanges(for: keys)
-        guard generation == openGeneration, !Task.isCancelled else {
-            changes.finish()
-            return
-        }
-        residentDisplayChanges = changes
-        let stream = changes.stream
-        residentDisplayRefreshTask = Task { [weak self] in
-            for await _ in stream {
-                guard !Task.isCancelled else { return }
-                while await self?.refreshFutureDisplayEvidence(generation: generation) == true {
-                    await Task.yield()
-                    if Task.isCancelled { return }
-                }
-            }
-        }
-    }
-
-    private func stopResidentDisplayObservation() {
-        residentDisplayRefreshTask?.cancel()
-        residentDisplayRefreshTask = nil
-        residentDisplayChanges?.finish()
-        residentDisplayChanges = nil
-    }
-
-    private func refreshFutureDisplayEvidence(generation open: UInt64) async -> Bool {
-        guard open == openGeneration, !Task.isCancelled else { return false }
-        let generation = readerMutationGeneration
-        let progress = readerProgressRevision
-        let video = self.video
-        let audio = self.audio
-        let videoFuture = await inspectResidentDisplayFragments(
-            video, limit: 4, existing: futureDisplayLeases[.video] ?? [:],
-            generation: generation, progress: progress
-        )
-        let audioFuture = await inspectResidentDisplayFragments(
-            audio, limit: 4, existing: futureDisplayLeases[.audio] ?? [:],
-            generation: generation, progress: progress
-        )
-        guard open == openGeneration, !Task.isCancelled else { return false }
-        guard generation == readerMutationGeneration, progress == readerProgressRevision else { return true }
-        futureDisplayLeases[.video] = videoFuture.roster.isEmpty ? nil : videoFuture.roster
-        futureDisplayLeases[.audio] = audioFuture.roster.isEmpty ? nil : audioFuture.roster
-        return videoFuture.reachedLimit || audioFuture.reachedLimit
-    }
-
-    private func inspectResidentDisplayFragments(
-        _ reader: TrackReader?, limit: Int, existing: [Int64: ResidentDisplayOwnership],
-        generation: UInt64, progress: UInt64
-    ) async -> (roster: [Int64: ResidentDisplayOwnership], reachedLimit: Bool) {
-        guard let source = residentDisplaySource(reader) else { return ([:], false) }
-        let snapshot = source.snapshot
-        let track = source.track
-        let binding = source.binding
-        guard residentEvidenceIsCurrent(generation: generation, progress: progress, snapshot: snapshot)
-        else { return ([:], false) }
-        let containingEnd = snapshot.endByte > 0 ? snapshot.endByte : nil
-        var cursor = snapshot.activeFragment.map { $0.fragmentStart + $0.fragmentTotal } ?? snapshot.cursor
-        guard cursor >= 0 else { return ([:], false) }
-        let retentionFloor = snapshot.activeFragment?.fragmentStart ?? snapshot.cursor
-        track.removeLayouts(below: Int64(retentionFloor))
-        var roster = existing.filter { $0.key >= Int64(cursor) && $0.value.leases.allSatisfy(\.isCurrent) }
-        var parsedCount = 0
-        while parsedCount < limit {
-            if let held = roster[Int64(cursor)] {
-                cursor = held.nextOffset
-                continue
-            }
-            switch await residentBoxStep(
-                binding: binding, cursor: cursor, containingEnd: containingEnd
-            ) {
-            case .stop:
-                return (roster, false)
-            case .advance(let next):
-                cursor = next
-            case .fragment(let moof, let payload):
-                cursor = payload.upperBound
-                parsedCount += 1
-                guard let evidence = await residentDisplaySamples(
-                    binding: binding, moof: moof, payload: payload, snapshot: snapshot
-                ), residentEvidenceIsCurrent(
-                    generation: generation, progress: progress, snapshot: snapshot
-                ) else { return (roster, false) }
-                track.install(
-                    evidence.samples, fragment: Int64(moof.lowerBound),
-                    metadataResidency: evidence.metadata
-                )
-                let range = Int64(payload.lowerBound)..<Int64(payload.upperBound)
-                if let lease = track.own(
-                    bytes: range, residency: evidence.payload, metadataResidency: evidence.metadata
-                ) {
-                    roster[Int64(moof.lowerBound)] = ResidentDisplayOwnership(
-                        nextOffset: payload.upperBound, leases: [lease]
-                    )
-                } else {
-                    return (roster, false)
-                }
-            }
-        }
-        return (roster, true)
-    }
-
-    private static func parsedDisplayFragment(
-        samples: [MediaDisplaySample], expectedSampleCount: Int, bytes: Range<Int64>,
-        declaredTimescale: UInt32, residency: MediaByteRangeStore.ResidentValidity
-    ) -> ParsedDisplayFragment? {
-        guard residency.isValid, bytes.lowerBound >= 0, !bytes.isEmpty, declaredTimescale > 0,
-              !samples.isEmpty, samples.count == expectedSampleCount else { return nil }
-        let sorted = samples.map(\.interval).sorted { $0.lower < $1.lower }
-        guard let first = sorted.first else { return nil }
-        var end = first.upper
-        for interval in sorted.dropFirst() {
-            guard interval.lower <= end else { return nil }
-            end = max(end, interval.upper)
-        }
-        let lower = first.lower.seconds
-        let upper = end.seconds
-        guard lower.isFinite, upper.isFinite, upper > lower else { return nil }
-        return ParsedDisplayFragment(
-            bytes: bytes, metadataResidency: residency, lower: lower, upper: upper
-        )
-    }
-
-    private static func residentDisplayFragment(_ reader: TrackReader?) async -> MediaResidentDisplayFragment? {
-        guard let reader, !reader.isFileSource, reader.displayUsability.isValid,
-              let binding = reader.storeBinding, let parsed = reader.parsedDisplayFragment,
-              parsed.metadataResidency.isValid,
-              let held = await binding.store.residentRun(binding.key, from: parsed.bytes.lowerBound),
-              parsed.metadataResidency.isValid, reader.displayUsability.isValid,
-              held.validity.sharesIncarnation(with: parsed.metadataResidency),
-              let payloadResidency = held.validity.narrowed(to: parsed.bytes) else { return nil }
-        return MediaResidentDisplayFragment(
-            lower: parsed.lower, upper: parsed.upper, residency: payloadResidency, usability: reader.displayUsability
-        )
+        return MediaCachedContentAhead(video: videoAhead, audio: audioAhead)
     }
 
     private static func cachedSecondsAhead(_ reader: TrackReader?) async -> MediaCachedTrackContentAhead {
@@ -3208,15 +2843,66 @@ actor PathAFMP4Demuxer: MediaDemuxing {
         startingAt start: Int64,
         heldBytes: Int64
     ) -> [PathACachedFragmentRunway.Fragment] {
-        let heldEnd = MediaByteRange.checkedEndExclusive(offset: start, length: heldBytes) ?? start
-        let inWindow = { (offset: Int) in Int64(offset) >= start && Int64(offset) < heldEnd }
-        if !reader.segments.isEmpty {
-            return reader.segments.filter { inWindow($0.offset) }.map {
-                .init(offset: Int64($0.offset), size: Int64($0.size), duration: $0.durationSeconds)
+        guard let heldEnd = MediaByteRange.checkedEndExclusive(offset: start, length: heldBytes) else {
+            return []
+        }
+        var result: [PathACachedFragmentRunway.Fragment] = []
+        var tailStart = start
+        if let af = reader.activeFragment {
+            let fragEndResult = af.fragmentStart.addingReportingOverflow(af.fragmentTotal)
+            if !fragEndResult.overflow {
+                let fragmentStart = Int64(af.fragmentStart)
+                let fragmentEnd = Int64(fragEndResult.partialValue)
+                if start >= fragmentStart, start < fragmentEnd {
+                    let timescale = af.effectiveTimescale > 0 ? af.effectiveTimescale : 1
+                    if heldEnd >= fragmentEnd {
+                        var remainingDuration: TimeInterval = 0
+                        for sample in af.samples {
+                            let byteEnd = sample.offset.addingReportingOverflow(sample.size)
+                            guard !byteEnd.overflow else { continue }
+                            if Int64(byteEnd.partialValue) > start {
+                                remainingDuration += Double(sample.durationTicks) / timescale
+                            }
+                        }
+                        result.append(.init(
+                            offset: start,
+                            size: fragmentEnd - start,
+                            duration: max(0, remainingDuration)
+                        ))
+                        tailStart = fragmentEnd
+                    } else {
+                        var residentDuration: TimeInterval = 0
+                        var residentEnd = start
+                        for sample in af.samples {
+                            let byteEnd = sample.offset.addingReportingOverflow(sample.size)
+                            guard !byteEnd.overflow else { continue }
+                            let sampleEnd = Int64(byteEnd.partialValue)
+                            guard sampleEnd > start else { continue }
+                            guard sampleEnd <= heldEnd else { break }
+                            residentDuration += Double(sample.durationTicks) / timescale
+                            residentEnd = max(residentEnd, sampleEnd)
+                        }
+                        if residentDuration > 0, residentEnd > start {
+                            result.append(.init(
+                                offset: start,
+                                size: residentEnd - start,
+                                duration: residentDuration
+                            ))
+                        }
+                        return result
+                    }
+                }
             }
         }
+        let inWindow = { (offset: Int) in Int64(offset) >= tailStart && Int64(offset) < heldEnd }
+        if !reader.segments.isEmpty {
+            result.append(contentsOf: reader.segments.filter { inWindow($0.offset) }.map {
+                .init(offset: Int64($0.offset), size: Int64($0.size), duration: $0.durationSeconds)
+            })
+            return result
+        }
         let index = reader.fragmentIndex
-        return index.indices.filter { inWindow(index[$0].offset) }.map { position in
+        result.append(contentsOf: index.indices.filter { inWindow(index[$0].offset) }.map { position in
             let entry = index[position]
             let end = position + 1 < index.count ? index[position + 1].offset : reader.fragmentIndexCursor
             return .init(
@@ -3224,16 +2910,14 @@ actor PathAFMP4Demuxer: MediaDemuxing {
                 size: Int64(end - entry.offset),
                 duration: entry.endPTS - entry.startPTS
             )
-        }
+        })
+        return result
     }
 
     func close() async {
         openGeneration &+= 1
-        stopResidentDisplayObservation()
         activeForwardReceipt = nil
         readerMutationGeneration &+= 1
-        retireDisplayUsability()
-        retireDisplayTracks()
         await retireOpenPrefetchAndStoreProtection(closeStreams: true, resetReaders: true)
     }
 
@@ -3585,140 +3269,5 @@ extension PathAFMP4Demuxer {
         await videoSource?.setTailAssistHint(nil)
         await audioSource?.setTailAssistHint(nil)
         await prefetcher?.cancel()
-    }
-}
-
-private extension PathAFMP4Demuxer {
-    private struct ResidentDisplaySource {
-        let snapshot: TrackReader
-        let track: MediaDisplayTrack
-        let binding: PathAByteStoreBinding
-    }
-
-    private struct ResidentDisplayEvidence {
-        let samples: [MediaDisplaySample]
-        let payload: MediaByteRangeStore.ResidentValidity
-        let metadata: MediaByteRangeStore.ResidentValidity
-    }
-
-    private enum ResidentBoxStep {
-        case advance(Int)
-        case fragment(moof: Range<Int>, payload: Range<Int>)
-        case stop
-    }
-
-    private func residentDisplaySource(_ reader: TrackReader?) -> ResidentDisplaySource? {
-        guard let snapshot = reader, !snapshot.isFileSource, snapshot.displayUsability.isValid,
-              let track = snapshot.displayTrack, let binding = snapshot.storeBinding,
-              snapshot.track.timescale > 0 else { return nil }
-        return ResidentDisplaySource(snapshot: snapshot, track: track, binding: binding)
-    }
-
-    private func residentEvidenceIsCurrent(
-        generation: UInt64, progress: UInt64, snapshot: TrackReader
-    ) -> Bool {
-        generation == readerMutationGeneration
-            && progress == readerProgressRevision
-            && !Task.isCancelled
-            && snapshot.displayUsability.isValid
-    }
-
-    private static func readResidentBoxHeader(
-        binding: PathAByteStoreBinding, at offset: Int, containingEnd: Int?
-    ) async -> BoxHeader? {
-        guard offset >= 0,
-              let (bytes, _) = await binding.store.displayPrefix(
-                  binding.key, offset: Int64(offset), count: 16
-              ),
-              bytes.count >= 8,
-              let header = parseBoxHeader(bytes, at: 0) else { return nil }
-        return try? resolveBoxHeader(header, at: offset, containingEnd: containingEnd)
-    }
-
-    private func residentPayloadRange(
-        binding: PathAByteStoreBinding, after moofEnd: Int, containingEnd: Int?
-    ) async -> Range<Int>? {
-        guard let mdat = await Self.readResidentBoxHeader(
-            binding: binding, at: moofEnd, containingEnd: containingEnd
-        ), mdat.type == "mdat", mdat.size >= mdat.headerLength else { return nil }
-        let payloadStart = moofEnd.addingReportingOverflow(mdat.headerLength)
-        let fragmentEnd = moofEnd.addingReportingOverflow(mdat.size)
-        guard !payloadStart.overflow, !fragmentEnd.overflow else { return nil }
-        if let containingEnd, fragmentEnd.partialValue > containingEnd { return nil }
-        return payloadStart.partialValue..<fragmentEnd.partialValue
-    }
-
-    private func residentBoxStep(
-        binding: PathAByteStoreBinding, cursor: Int, containingEnd: Int?
-    ) async -> ResidentBoxStep {
-        guard let header = await Self.readResidentBoxHeader(
-            binding: binding, at: cursor, containingEnd: containingEnd
-        ), header.size > 0 else { return .stop }
-        if header.type != "moof" {
-            let next = cursor.addingReportingOverflow(header.size)
-            return next.overflow ? .stop : .advance(next.partialValue)
-        }
-        guard header.size <= Self.headMaxBytes else { return .stop }
-        let end = cursor.addingReportingOverflow(header.size)
-        guard !end.overflow else { return .stop }
-        let moofEnd = end.partialValue
-        guard let payload = await residentPayloadRange(
-            binding: binding, after: moofEnd, containingEnd: containingEnd
-        ) else { return .stop }
-        return .fragment(moof: cursor..<moofEnd, payload: payload)
-    }
-
-    private func residentPayloadReceipt(
-        binding: PathAByteStoreBinding, range: Range<Int64>
-    ) async -> MediaByteRangeStore.ResidentValidity? {
-        guard let held = await binding.store.residentRun(binding.key, from: range.lowerBound),
-              held.byteCount >= Int64(range.count),
-              let receipt = held.validity.narrowed(to: range) else { return nil }
-        return receipt
-    }
-
-    private func residentDisplaySamples(
-        binding: PathAByteStoreBinding, moof: Range<Int>, payload: Range<Int>,
-        snapshot: TrackReader
-    ) async -> ResidentDisplayEvidence? {
-        let metadataCount = payload.lowerBound - moof.lowerBound
-        guard metadataCount > moof.count, metadataCount <= Self.headMaxBytes,
-              let (moofData, metadata) = await binding.store.displayPrefix(
-                  binding.key, offset: Int64(moof.lowerBound), count: metadataCount
-              ), moofData.count == metadataCount,
-              let header = Self.parseBoxHeader(moofData, at: moof.count), header.type == "mdat",
-              let resolved = try? Self.resolveBoxHeader(
-                  header, at: moof.upperBound,
-                  containingEnd: snapshot.endByte > 0 ? snapshot.endByte : nil
-              ), resolved.headerLength == metadataCount - moof.count,
-              resolved.size == payload.upperBound - moof.upperBound else { return nil }
-        guard case .success(let parsed) = PathAFMP4.parseFragmentResult(
-            moofData,
-            segmentByteOffset: moof.lowerBound,
-            moofRange: 0..<moof.count,
-            tracks: [snapshot.track],
-            sampleDataRange: payload
-        ) else { return nil }
-        let kept = snapshot.requiresExactFragmentTrackID
-            ? parsed.filter { $0.trackID == snapshot.track.trackID }
-            : parsed
-        guard !kept.isEmpty else { return nil }
-        let timescale: Double
-        if var audioTiming = snapshot.audioTiming {
-            guard let resolution = try? audioTiming.observe(kept.map(\.durationTicks)) else { return nil }
-            timescale = resolution.effectiveTimescale
-        } else {
-            timescale = Double(snapshot.track.timescale)
-        }
-        let samples = Self.displaySamples(
-            kept, kind: snapshot.track.kind, fragment: moof.lowerBound, timescale: timescale
-        )
-        guard samples.count == kept.count else { return nil }
-        let range = Int64(payload.lowerBound)..<Int64(payload.upperBound)
-        guard let receipt = await residentPayloadReceipt(binding: binding, range: range),
-              metadata.isValid, receipt.isValid, metadata.sharesIncarnation(with: receipt) else {
-            return nil
-        }
-        return ResidentDisplayEvidence(samples: samples, payload: receipt, metadata: metadata)
     }
 }

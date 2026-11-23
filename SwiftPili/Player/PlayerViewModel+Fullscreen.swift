@@ -1,7 +1,43 @@
 import AVFoundation
 import Foundation
+import Observation
 import SwiftUI
 import UIKit
+
+@MainActor
+@Observable
+final class PlayerFullscreenTransitionState {
+    static let shared = PlayerFullscreenTransitionState()
+
+    enum Phase: Equatable, Sendable {
+        case idle
+        case entering
+        case fullscreen
+        case leaving
+    }
+
+    private(set) var activeHostID: UUID?
+    private(set) var phase: Phase = .idle
+
+    var isHostActive: Bool {
+        activeHostID != nil && phase != .idle
+    }
+
+    var isGeometryTransitioning: Bool {
+        phase == .entering || phase == .leaving
+    }
+
+    func update(hostID: UUID?, phase: Phase) {
+        if self.activeHostID != hostID { self.activeHostID = hostID }
+        if self.phase != phase { self.phase = phase }
+    }
+
+    func clear(matching hostID: UUID? = nil) {
+        if let hostID, activeHostID != nil, activeHostID != hostID { return }
+        activeHostID = nil
+        phase = .idle
+    }
+}
 
 @MainActor
 final class FullscreenOrientationLatch {
@@ -122,23 +158,33 @@ extension PlayerViewModel {
         }
     }
 
+    var isFullscreenPresentationActive: Bool {
+        isFullscreen || PlayerFullscreenTransitionState.shared.isHostActive
+    }
+
     func enterFullscreen() {
         guard !isFullscreen else { return }
         guard let presentation = fullscreenPresentation,
               let receipt = fullscreenPresentationReceipt,
               isCurrentPresentation(presentation, receipt: receipt),
-              currentURL != nil, error == nil, !terminalOpenFailure,
-              presentation.reserveHost(receipt: receipt) else {
+              currentURL != nil, error == nil, !terminalOpenFailure else {
             settleFullscreenPresentation(actualState: false)
             return
         }
         refreshInlineVideoRect()
+        guard presentation.reserveHost(receipt: receipt) else {
+            settleFullscreenPresentation(actualState: false)
+            return
+        }
         guard prepareSurfaceHandoff(ownerLease: receipt.context.ownerLease, to: .fullscreen) else {
             presentation.cancelReservedHost(receipt: receipt)
             settleFullscreenPresentation(actualState: false)
             return
         }
         FullscreenLoginHandoff.shared.cancel()
+        if UIDevice.current.userInterfaceIdiom == .phone {
+            AppWindowMetrics.current?.endEditing(true)
+        }
         if fullscreenPresentation != nil {
             isFullscreen = true
         } else {
@@ -147,7 +193,8 @@ extension PlayerViewModel {
             }
         }
         if UIDevice.current.userInterfaceIdiom == .phone {
-            applyOrientation(.landscape)
+            let targetMask: UIInterfaceOrientationMask = isPortraitContent ? .portrait : .landscape
+            applyOrientation(targetMask)
         }
         presentation.reconcile()
         settleFullscreenPresentation(actualState: isFullscreen)
@@ -166,7 +213,8 @@ extension PlayerViewModel {
         setDanmakuSettingsHold(false)
         fullscreenDanmakuComposerPresented = false
         PlayerLog.log("[Fullscreen] exit: portrait=\(isPortraitContent) condensed=\(inlineCondensed) showControls=\(showControls)")
-        if let ownerLease = currentOwnerLease {
+        let hasActiveHost = fullscreenPresentation?.hasPresentedHost == true
+        if !hasActiveHost, let ownerLease = currentOwnerLease {
             _ = handoffSurfaceSlot(ownerLease: ownerLease, to: .inline)
         }
         if fullscreenPresentation != nil {
@@ -179,6 +227,7 @@ extension PlayerViewModel {
         if UIDevice.current.userInterfaceIdiom == .phone {
             applyOrientation(.portrait)
         }
+        fullscreenPresentation?.reconcile()
         settleFullscreenPresentation(actualState: false)
     }
 

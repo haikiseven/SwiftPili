@@ -289,15 +289,6 @@ final class PCMFloatRingRouter: @unchecked Sendable {
         outputGate.load(ordering: .acquiring) != 0
     }
 
-    func retireAllDisplayContent() {
-        for slot in 0..<Self.slotCount {
-            ring(at: slot).retireDisplayContent()
-        }
-        for overflow in overflowRetainedRings {
-            overflow.retireDisplayContent()
-        }
-    }
-
     func replaceRingInSlot(_ slot: Int) {
         let index = slot & 0x3
         let fresh = PCMFloatRing(capacity: capacity)
@@ -598,6 +589,14 @@ final class EngineAudioRenderer: MediaAudioRendering {
         )
     }
 
+    var ringBufferedSeconds: TimeInterval {
+        let snapshot = ringRouter.ring(at: activeSlotIndex).drainSnapshot(
+            channels: Self.engineChannels
+        )
+        let unconsumedFrames = max(0, snapshot.writtenFrames - snapshot.consumedFrames)
+        return TimeInterval(unconsumedFrames) / Self.engineSampleRate
+    }
+
     var renderDiagnosticsSnapshot: AudioRenderDiagnosticsSnapshot {
         renderDiagnostics.snapshot()
     }
@@ -871,7 +870,6 @@ final class EngineAudioRenderer: MediaAudioRendering {
         standDownFeederForTransaction()
 
         assertSeekOutputGate()
-        ringRouter.retireAllDisplayContent()
 
         if let oldSlot = stagedSeekSlot, !stagedSeekWasPublished,
            isSlotSafeToReset(oldSlot, excludingStaged: false) {
@@ -920,10 +918,7 @@ final class EngineAudioRenderer: MediaAudioRendering {
             let frames = max(0, min(result.frames, requestFrames))
             let written = ringRouter.ring(at: slot).write(
                 buffer,
-                count: frames * Self.engineChannels,
-                displaySpans: result.displaySpans,
-                sampleRate: Self.engineSampleRate,
-                channels: Self.engineChannels
+                count: frames * Self.engineChannels
             ) / Self.engineChannels
             buffer.deallocate()
             transactionPullCallCount += 1
@@ -2418,7 +2413,6 @@ final class EngineAudioRenderer: MediaAudioRendering {
         if preserveCommittedContent {
             preserveCommittedSlotOnNextStart = false
         } else {
-            ringRouter.retireAllDisplayContent()
             let nextSlot = acquireSafeIdleSlot()
             let publication = publishSlot(nextSlot)
             activeSlotIndex = nextSlot
@@ -2440,7 +2434,6 @@ final class EngineAudioRenderer: MediaAudioRendering {
         revokeAudioMaintenancePermission()
         equalizerHistoryDirty = true
         standDownFeederForTransaction()
-        ringRouter.retireAllDisplayContent()
         activeSeekToken = nil
         stagedSeekSlot = nil
         stagedSeekWasPublished = false
@@ -2689,21 +2682,13 @@ final class EngineAudioRenderer: MediaAudioRendering {
         }
         let ring = ringRouter.ring(at: activeSlotIndex)
         let snapshot = ring.drainSnapshot(channels: Self.engineChannels)
-        let previouslyReportedFrames = slotDrainProgress[activeSlotIndex].reportedFrames
         let delta = slotDrainProgress[activeSlotIndex].advance(
             totalPulledFrames: snapshot.writtenFrames,
             pendingFrames: snapshot.pendingFrames
         )
-        let displayObservation = ring.observeAndRetireDisplayContent(
-            using: snapshot,
-            previouslyReportedFrames: previouslyReportedFrames,
-            sampleRate: Self.engineSampleRate,
-            publication: AudioRingPublication(slot: activeSlotIndex, epoch: activeEpoch)
-        )
         if delta > 0 {
             pullSource.renderedContentDidAdvance(
-                bySeconds: Double(delta) / Self.engineSampleRate,
-                displayObservation: displayObservation
+                bySeconds: Double(delta) / Self.engineSampleRate
             )
         }
         drainFeederReport()
@@ -2735,10 +2720,7 @@ final class EngineAudioRenderer: MediaAudioRendering {
         guard frames > 0 else { return }
         ringRouter.ring(at: slotIndex).write(
             buffer,
-            count: frames * Self.engineChannels,
-            displaySpans: result.displaySpans,
-            sampleRate: Self.engineSampleRate,
-            channels: Self.engineChannels
+            count: frames * Self.engineChannels
         )
     }
 
@@ -3018,7 +3000,6 @@ final class PCMFloatRing: @unchecked Sendable {
     private let writeIndex = Atomic<Int>(0)
     private let readIndex = Atomic<Int>(0)
     private let shortReadCount = Atomic<Int>(0)
-    private let displayCustody = AudioRingDisplayCustody()
 
     init(capacity: Int = PCMFloatRing.defaultCapacitySamples) {
         let cap = max(capacity, 2)
@@ -3030,17 +3011,13 @@ final class PCMFloatRing: @unchecked Sendable {
     deinit { backing.deallocate() }
 
     func reset() {
-        displayCustody.retireAll()
         readIndex.store(0, ordering: .relaxed)
         writeIndex.store(0, ordering: .relaxed)
         shortReadCount.store(0, ordering: .relaxed)
     }
 
     @discardableResult
-    func write(
-        _ ptr: UnsafePointer<Float>, count: Int,
-        displaySpans: [AudioDisplayLeaseSpan] = [], sampleRate: Double = 0, channels: Int = 0
-    ) -> Int {
+    func write(_ ptr: UnsafePointer<Float>, count: Int) -> Int {
         guard count > 0 else { return 0 }
         let w = writeIndex.load(ordering: .relaxed)
         let r = readIndex.load(ordering: .acquiring)
@@ -3053,30 +3030,8 @@ final class PCMFloatRing: @unchecked Sendable {
         if n > firstLen {
             backing.baseAddress!.update(from: ptr.advanced(by: firstLen), count: n - firstLen)
         }
-        if channels > 0 {
-            displayCustody.record(
-                startFrame: w / channels, frames: n / channels,
-                spans: displaySpans, sampleRate: sampleRate
-            )
-        }
         writeIndex.store(w + n, ordering: .releasing)
         return n
-    }
-
-    func observeAndRetireDisplayContent(
-        using snapshot: PCMRingDrainSnapshot,
-        previouslyReportedFrames: Int,
-        sampleRate: Double,
-        publication: AudioRingPublication
-    ) -> AudioRenderedDisplayObservation? {
-        displayCustody.observeAndRetireConsumed(
-            using: snapshot, previouslyReportedFrames: previouslyReportedFrames,
-            sampleRate: sampleRate, publication: publication
-        )
-    }
-
-    func retireDisplayContent() {
-        displayCustody.retireAll()
     }
 
     func write(_ floats: [Float]) {

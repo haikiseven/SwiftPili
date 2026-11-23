@@ -46,9 +46,7 @@ final class PassThroughAudioDecoder: MediaAudioDecoding, @unchecked Sendable {
         framesProduced = 0
     }
 
-    func decode(
-        _ packet: MediaPacket, pendingDisplaySupport _: AudioPendingDisplaySupport
-    ) async throws -> [MediaAudioFrame] {
+    func decode(_ packet: MediaPacket) async throws -> [MediaAudioFrame] {
         guard opened else { throw MediaEngineError.stopped }
         guard packet.track == .audio, !packet.data.isEmpty else {
             return []

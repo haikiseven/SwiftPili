@@ -44,29 +44,13 @@ extension PlayerViewModel {
         var text = " bufUI=\(displayed) bufObs=sample bufAgeMs=\(String(format: "%.0f", age))"
         text += " bufRaw=\(Self.bufferDisplayEndpointText(observation.rawEndpoint))"
         guard let sample = observation.display else { return text + " bufPath=raw" }
-        text += " bufPath=\(sample.evidence == nil ? "established" : "evidence")"
         text += " bufAt=\(Self.bufferDisplayEndpointText(sample.position))"
         text += " bufOut=\(Self.bufferDisplayEndpointText(sample.bufferedThrough))"
         text += " bufTracks=\(sample.videoPresent ? "v" : "-")\(sample.audioPresent ? "a" : "-")"
         text += " bufWarm=\(sample.videoWarmSuspended ? 1 : 0)"
-        text += " bufVE=\(Self.bufferDisplayEndpointText(sample.evidence?.video))"
-        text += " bufAE=\(Self.bufferDisplayEndpointText(sample.evidence?.audio))"
-        text += " bufV=\(Self.bufferDisplayEndpointText(sample.resolved.video))"
-        text += " bufA=\(Self.bufferDisplayEndpointText(sample.resolved.audio))"
-        return text + audioDisplayJoinLogText(sample.evidence?.audioJoin)
-    }
-
-    private func audioDisplayJoinLogText(_ join: MediaAudioDisplayJoin?) -> String {
-        guard let join else { return "" }
-        let pcm = Self.exactBufferTimeText(join.pcmEnd)
-        let source = Self.exactBufferTimeText(join.sourceEnd)
-        let append = join.appendEnd.map { String(format: "%.9f", $0) } ?? "-"
-        return " bufAJoin=\(join.result.rawValue) bufAPCM=\(pcm) bufASrc=\(source) bufAAppend=\(append)"
-    }
-
-    private static func exactBufferTimeText(_ time: MediaDisplayTime?) -> String {
-        guard let time else { return "-" }
-        return "\(time.value)/\(time.scale)"
+        text += " bufV=\(Self.bufferDisplayEndpointText(sample.videoEnd))"
+        text += " bufA=\(Self.bufferDisplayEndpointText(sample.audioEnd))"
+        return text
     }
 
     private static func bufferDisplayEndpointText(_ value: TimeInterval?) -> String {

@@ -1294,6 +1294,9 @@ final class DemandPacedPlayerBackend: PlayerBackend {
         case .tick(let t, let d, _):
             onTickWithGeneration?(t, d, runtimeGeneration, startupTraceToken)
             publishDeliveryRunway()
+        case .buffered:
+            guard !terminalFailure, parkedTicket == nil else { return }
+            publishDeliveryRunway()
         }
     }
 }

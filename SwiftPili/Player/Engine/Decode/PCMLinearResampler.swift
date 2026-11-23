@@ -1,13 +1,6 @@
 import Foundation
 
 struct PCMLinearResampler: Sendable {
-    struct Output: Sendable {
-        let pcm: [Float]
-        let verifiedSourceEnd: MediaDisplayTime?
-
-        static let empty = Output(pcm: [], verifiedSourceEnd: nil)
-    }
-
     private final class PolyphaseKernel: Sendable {
         static let taps = 32
         static let halfTaps = taps / 2
@@ -69,13 +62,6 @@ struct PCMLinearResampler: Sendable {
     private var initialPadRemaining: Int
     private var buffer: [Float]
     private var position: Double
-    private struct InputSpan: Sendable {
-        var frames: Range<Int>
-        let track: UUID
-        let interval: MediaDisplayInterval
-    }
-
-    private var verifiedInput: [InputSpan] = []
 
     init(inputSampleRate: Double, outputSampleRate: Double, channelCount: Int) {
         self.inputSampleRate = inputSampleRate
@@ -108,51 +94,38 @@ struct PCMLinearResampler: Sendable {
         }
         initialPadRemaining = initialPadFrames
         position = Double(initialPadFrames)
-        verifiedInput.removeAll(keepingCapacity: true)
     }
 
-    mutating func process(
-        _ pcm: [Float], frameCount: Int, verifiedSource: MediaDisplayLease? = nil
-    ) -> Output {
+    mutating func process(_ pcm: [Float], frameCount: Int) -> [Float] {
         guard frameCount > 0,
               channelCount > 0,
               inputSampleRate.isFinite,
               inputSampleRate > 0,
               outputSampleRate.isFinite,
               outputSampleRate > 0
-        else { return .empty }
+        else { return [] }
 
         let sampleCount = min(frameCount * channelCount, pcm.count)
-        guard sampleCount >= channelCount else { return .empty }
+        guard sampleCount >= channelCount else { return [] }
 
         if abs(inputSampleRate - outputSampleRate) <= 0.5 {
-            return Output(pcm: Array(pcm.prefix(sampleCount)), verifiedSourceEnd: nil)
+            return Array(pcm.prefix(sampleCount))
         }
 
-        if let verifiedSource, verifiedSource.isCurrent, let interval = verifiedSource.interval,
-           sampleCount == frameCount * channelCount {
-            let start = buffer.count / channelCount
-            verifiedInput.append(InputSpan(
-                frames: start..<(start + frameCount), track: verifiedSource.trackIdentity, interval: interval
-            ))
-        }
         buffer.append(contentsOf: pcm.prefix(sampleCount))
 
         let step = inputSampleRate / outputSampleRate
         let availableFrames = buffer.count / channelCount
         let halfTaps = PolyphaseKernel.halfTaps
         let taps = PolyphaseKernel.taps
-        guard step.isFinite, step > 0, let kernel, availableFrames >= taps else { return .empty }
+        guard step.isFinite, step > 0, let kernel, availableFrames >= taps else { return [] }
 
         let firstCenter = Int(position.rounded(.towardZero))
-        guard firstCenter + halfTaps < availableFrames else { return .empty }
+        guard firstCenter + halfTaps < availableFrames else { return [] }
 
         let estimatedFrames = Int(ceil((Double(availableFrames - halfTaps) - position) / step)) + 1
         var output: [Float] = []
         output.reserveCapacity(max(1, estimatedFrames) * channelCount)
-
-        let firstSupportFrame = max(initialPadRemaining, firstCenter - (halfTaps - 1))
-        var supportEnd = firstSupportFrame
 
         let phaseScale = Double(PolyphaseKernel.phaseCount)
         let channels = channelCount
@@ -209,37 +182,13 @@ struct PCMLinearResampler: Sendable {
                         }
                     }
 
-                    supportEnd = lastTapFrame + 1
                     position += step
                 }
             }
         }
 
-        let verifiedSourceEnd: MediaDisplayTime? = verifiedSource.flatMap { source in
-            guard !output.isEmpty, supportEnd == availableFrames else { return nil }
-            return verifiedEnd(in: firstSupportFrame..<supportEnd, source: source)
-        }
         discardConsumedInput(availableFrames: availableFrames)
-        return Output(pcm: output, verifiedSourceEnd: verifiedSourceEnd)
-    }
-
-    private func verifiedEnd(in inputFrames: Range<Int>, source: MediaDisplayLease) -> MediaDisplayTime? {
-        guard !inputFrames.isEmpty, source.isCurrent, let expectedEnd = source.interval?.upper else { return nil }
-        var nextFrame = inputFrames.lowerBound
-        var previousEnd: MediaDisplayTime?
-        for span in verifiedInput where span.frames.upperBound > nextFrame {
-            let upper = min(inputFrames.upperBound, span.frames.upperBound)
-            guard span.frames.lowerBound <= nextFrame, upper > nextFrame, span.track == source.trackIdentity,
-                  let start = span.interval.lower.adding(
-                      frames: nextFrame - span.frames.lowerBound, sampleRate: inputSampleRate
-                  ), previousEnd.map({ $0 == start }) ?? true,
-                  let end = start.adding(frames: upper - nextFrame, sampleRate: inputSampleRate)
-            else { return nil }
-            if upper == inputFrames.upperBound { return end == expectedEnd ? end : nil }
-            nextFrame = upper
-            previousEnd = end
-        }
-        return nil
+        return output
     }
 
     private mutating func discardConsumedInput(availableFrames: Int) {
@@ -251,11 +200,6 @@ struct PCMLinearResampler: Sendable {
             minNeededStart
         )
         guard discardFrames > 0 else { return }
-        verifiedInput.removeAll { $0.frames.upperBound <= discardFrames }
-        for index in verifiedInput.indices {
-            let frames = verifiedInput[index].frames
-            verifiedInput[index].frames = (frames.lowerBound - discardFrames)..<(frames.upperBound - discardFrames)
-        }
         buffer.removeFirst(discardFrames * channelCount)
         position -= Double(discardFrames)
         initialPadRemaining = max(0, initialPadRemaining - discardFrames)

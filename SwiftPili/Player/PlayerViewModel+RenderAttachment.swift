@@ -21,6 +21,9 @@ struct PlayerWindowGeometry: Equatable {
 
 struct PlayerInlineReturnTarget: Equatable {
     let frameInScreen: CGRect
+    let frameInWindow: CGRect
+    let windowSize: CGSize
+    let cornerRadius: CGFloat
     let window: PlayerWindowGeometry
     let receipt: PlayerPresentationReceipt
 }
@@ -33,6 +36,9 @@ extension PlayerViewModel {
     }
 
     func noteInlineVideoRect(from attachment: any PlayerRenderAttachment) {
+        if UIDevice.current.userInterfaceIdiom == .phone, isFullscreenPresentationActive {
+            return
+        }
         guard !isFullscreen, renderAttachment === attachment,
               let lease = renderAttachmentSurfaceLease,
               lease == activeSurfaceLease, lease.role == .inline,
@@ -42,15 +48,65 @@ extension PlayerViewModel {
               isCurrentPresentation(presentation, receipt: receipt)
         else { return }
         guard let measured = attachment.frameInScreen,
-              let window = PlayerWindowGeometry(window: measured.window),
+              let windowGeometry = PlayerWindowGeometry(window: measured.window),
+              let attachmentView = attachment as? UIView,
               measured.rect.minX.isFinite, measured.rect.minY.isFinite,
               measured.rect.width.isFinite, measured.rect.height.isFinite,
               measured.rect.width > 1, measured.rect.height > 1 else {
             if inlineReturnTarget != nil { inlineReturnTarget = nil }
             return
         }
-        let target = PlayerInlineReturnTarget(frameInScreen: measured.rect, window: window, receipt: receipt)
+        let frameInWindow = attachmentView.convert(attachmentView.bounds, to: measured.window)
+        let cornerRadius = (attachment as? PlayerContainerView)?.currentPresentationCornerRadius ?? 0
+        let target = PlayerInlineReturnTarget(
+            frameInScreen: measured.rect,
+            frameInWindow: frameInWindow,
+            windowSize: measured.window.bounds.size,
+            cornerRadius: cornerRadius,
+            window: windowGeometry,
+            receipt: receipt
+        )
         if inlineReturnTarget != target { inlineReturnTarget = target }
+    }
+
+    func noteInlineSlotGeometry(from view: UIView, cornerRadius: CGFloat) {
+        if UIDevice.current.userInterfaceIdiom == .phone, isFullscreenPresentationActive {
+            return
+        }
+        guard let window = view.window,
+              let windowGeometry = PlayerWindowGeometry(window: window),
+              let presentation = fullscreenPresentation,
+              let receipt = fullscreenPresentationReceipt,
+              isCurrentPresentation(presentation, receipt: receipt),
+              view.bounds.width > 1, view.bounds.height > 1 else { return }
+        let frameInScreen = view.convert(view.bounds, to: window.screen.coordinateSpace)
+        let frameInWindow = view.convert(view.bounds, to: window)
+        guard frameInScreen.minX.isFinite, frameInScreen.minY.isFinite,
+              frameInScreen.width > 1, frameInScreen.height > 1,
+              frameInWindow.minX.isFinite, frameInWindow.minY.isFinite,
+              frameInWindow.width > 1, frameInWindow.height > 1 else { return }
+        let target = PlayerInlineReturnTarget(
+            frameInScreen: frameInScreen,
+            frameInWindow: frameInWindow,
+            windowSize: window.bounds.size,
+            cornerRadius: max(0, cornerRadius),
+            window: windowGeometry,
+            receipt: receipt
+        )
+        if inlineReturnTarget != target { inlineReturnTarget = target }
+    }
+
+    var inlineStageSnapshot: PlayerFullscreenStageGeometry.InlineSnapshot? {
+        guard let target = inlineReturnTarget,
+              let receipt = fullscreenPresentationReceipt,
+              target.receipt == receipt else { return nil }
+        return PlayerFullscreenStageGeometry.InlineSnapshot(
+            frameInWindow: target.frameInWindow,
+            frameInScreen: target.frameInScreen,
+            windowSize: target.windowSize,
+            windowFrameInScreen: target.window.frameInScreen,
+            cornerRadius: target.cornerRadius
+        )
     }
 
     func refreshInlineVideoRect() {

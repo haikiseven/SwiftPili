@@ -21,9 +21,7 @@ actor StubAudioDecoder: MediaAudioDecoding {
         throw MediaEngineError.notImplemented("audio decoder")
     }
 
-    func decode(
-        _ packet: MediaPacket, pendingDisplaySupport _: AudioPendingDisplaySupport
-    ) async throws -> [MediaAudioFrame] {
+    func decode(_ packet: MediaPacket) async throws -> [MediaAudioFrame] {
         _ = packet
         return []
     }

@@ -127,12 +127,9 @@ actor MediaByteRangeStore {
         entry(for: key)?.coalescedRanges ?? []
     }
 
-    func prefix(
-        _ key: Key, offset: Int64, count: Int, displayOwner: MediaDisplayByteOwner? = nil
-    ) -> Data? {
+    func prefix(_ key: Key, offset: Int64, count: Int) -> Data? {
         guard count > 0, offset >= 0, let entry = entry(for: key),
               let data = entry.copyPrefix(offset: offset, count: count) else { return nil }
-        displayOwner?.hold(offset..<(offset + Int64(data.count)))
         entries[key.path]?.lastUse = tick()
         return data
     }

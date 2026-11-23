@@ -959,17 +959,7 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
                             MediaVideoFrame(
                                 pts: pts,
                                 duration: duration,
-                                pixelBuffer: pixelBuffer,
-                                displayCoverage: VideoToolboxOutputRecord(
-                                    event: record.event,
-                                    imageBuffer: pixelBuffer,
-                                    callbackPTS: record.callbackPTS,
-                                    callbackDuration: record.callbackDuration
-                                ).displayCoverage(
-                                    packet: entry.packet,
-                                    resolution: resolvedOutput,
-                                    submitted: entry.nativeTiming
-                                )
+                                pixelBuffer: pixelBuffer
                             )
                         )
                         framesProduced += 1

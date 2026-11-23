@@ -34,6 +34,13 @@ struct PlayerRenderView: UIViewRepresentable {
                 generation: attachedGeneration,
                 presentationCornerRadius: presentationCornerRadius
             )
+            container.syncHostedSurfaceLayoutIfNeeded()
+            if container.window != nil {
+                Task { @MainActor [weak player, weak container] in
+                    guard let player, let container else { return }
+                    player.renderAttachmentDidChange(container)
+                }
+            }
         } else {
             container.update(
                 hostedVC: nil,
@@ -58,6 +65,8 @@ final class PlayerContainerView: UIView, PlayerRenderAttachment {
     private var attachedGeneration: Int?
     private var presentationCornerRadius: CGFloat = 0
     private var lastLoggedSurface: CGRect = .zero
+
+    var currentPresentationCornerRadius: CGFloat { presentationCornerRadius }
 
     private var recoveryCoverView: UIImageView?
     private var recoveryCoverIdentity: UInt64?
@@ -257,7 +266,17 @@ final class PlayerContainerView: UIView, PlayerRenderAttachment {
             detail: "window=\(window != nil ? 1 : 0)"
         )
         embedIfNeeded()
+        syncHostedSurfaceLayoutIfNeeded()
         PlayerViewModel.shared.renderAttachmentDidChange(self)
+    }
+
+    func syncHostedSurfaceLayoutIfNeeded() {
+        guard window != nil, bounds.width > 1, bounds.height > 1 else { return }
+        embedIfNeeded()
+        if let hostedView = hostedVC?.view, hostedView.superview === self, hostedView.bounds.size != bounds.size {
+            hostedView.frame = bounds
+            layoutIfNeeded()
+        }
     }
 
     override func layoutSubviews() {
@@ -339,5 +358,55 @@ final class PlayerContainerView: UIView, PlayerRenderAttachment {
             responder = next
         }
         return nil
+    }
+}
+
+struct PlayerInlineSlotProbe: UIViewRepresentable {
+    let cornerRadius: CGFloat
+
+    func makeUIView(context _: Context) -> InlineSlotProbeView {
+        InlineSlotProbeView(cornerRadius: cornerRadius)
+    }
+
+    func updateUIView(_ uiView: InlineSlotProbeView, context _: Context) {
+        uiView.cornerRadius = cornerRadius
+        uiView.scheduleGeometryReport()
+    }
+}
+
+final class InlineSlotProbeView: UIView {
+    var cornerRadius: CGFloat
+
+    init(cornerRadius: CGFloat) {
+        self.cornerRadius = cornerRadius
+        super.init(frame: .zero)
+        isUserInteractionEnabled = false
+        backgroundColor = .clear
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        fatalError("InlineSlotProbeView is created in code only")
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        reportGeometry()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        reportGeometry()
+    }
+
+    func scheduleGeometryReport() {
+        Task { @MainActor [weak self] in
+            self?.reportGeometry()
+        }
+    }
+
+    private func reportGeometry() {
+        guard window != nil, bounds.width > 1, bounds.height > 1 else { return }
+        PlayerViewModel.shared.noteInlineSlotGeometry(from: self, cornerRadius: cornerRadius)
     }
 }

@@ -9,8 +9,8 @@ final class PlayerFullscreenHostGeometry {
     var frameInScreen: CGRect?
     var windowGeometry: PlayerWindowGeometry?
 
-    func update(from view: UIView) {
-        let size = view.bounds.size
+    func update(from view: UIView, stageSize: CGSize? = nil) {
+        let size = stageSize ?? view.bounds.size
         if size.width.isFinite, size.height.isFinite, size.width > 1, size.height > 1, containerSize != size {
             containerSize = size
         }
@@ -77,66 +77,27 @@ struct PlayerFullscreenHostContent: View {
     @State private var fullscreenDanmakuSend = DanmakuComposerSendGate()
     private var fullscreenDanmakuSendInFlight: Bool { fullscreenDanmakuSend.isSending }
 
-    private var inlineRectInScreen: CGRect? {
-        player.inlineVideoRect(for: receipt, hostIdentity: hostIdentity, window: geometry.windowGeometry)
-    }
-
-    private var inlineTargetFrame: CGRect? {
-        guard UIDevice.current.userInterfaceIdiom == .pad,
-              !player.isFullscreen,
-              let inlineRect = inlineRectInScreen,
-              let windowFrame = geometry.frameInScreen,
-              windowFrame.minX.isFinite, windowFrame.minY.isFinite
-        else { return nil }
-        return CGRect(
-            x: inlineRect.minX - windowFrame.minX,
-            y: inlineRect.minY - windowFrame.minY,
-            width: inlineRect.width,
-            height: inlineRect.height
-        )
-    }
-
-    private var inlineTopInset: CGFloat? {
-        guard UIDevice.current.userInterfaceIdiom != .pad,
-              !player.isFullscreen,
-              let rect = inlineRectInScreen,
-              let windowFrame = geometry.frameInScreen,
-              rect.minY.isFinite, windowFrame.minY.isFinite
-        else { return nil }
-        let hostY = rect.minY - windowFrame.minY
-        return hostY.isFinite ? hostY : nil
-    }
-
     var body: some View {
         GeometryReader { proxy in
             let resolvedSize = geometry.containerSize.width > 1 && geometry.containerSize.height > 1
                 ? geometry.containerSize
                 : proxy.size
             let viewportAspect = PlayerFullscreenViewportPolicy.aspect(for: resolvedSize)
-            ZStack(alignment: inlineTargetFrame == nil && inlineTopInset == nil ? .center : .topLeading) {
-                player.isFullscreen ? Color.black : Color.clear
-                let playerSafeArea = EdgeInsets(
-                    top: geometry.safeAreaInsets.top,
-                    leading: geometry.safeAreaInsets.leading,
-                    bottom: min(geometry.safeAreaInsets.bottom, AppWindowMetrics.safeAreaInsets.bottom),
-                    trailing: geometry.safeAreaInsets.trailing
-                )
-                PlayerView(
-                    owner: receipt.context.ownerLease.owner, surfaceRole: .fullscreen,
-                    liveQualityControl: liveControls.qualityControl,
-                    fullscreenViewportAspect: viewportAspect,
-                    inlineViewportSize: inlineRectInScreen?.size,
-                    fullscreenSafeAreaInsets: playerSafeArea,
-                    screenLease: receipt.context.ownerLease,
-                    presentationReceipt: receipt, fullscreenHostIdentity: hostIdentity
-                )
-                    .frame(width: inlineTargetFrame?.width, height: inlineTargetFrame?.height)
-                    .frame(maxWidth: inlineTargetFrame == nil ? .infinity : nil,
-                           maxHeight: inlineTargetFrame == nil ? .infinity : nil)
-                    .offset(x: inlineTargetFrame?.minX ?? 0,
-                            y: inlineTargetFrame?.minY ?? inlineTopInset ?? 0)
-                    .opacity(player.isFullscreen ? 1 : 0)
-            }
+            let playerSafeArea = EdgeInsets(
+                top: geometry.safeAreaInsets.top,
+                leading: geometry.safeAreaInsets.leading,
+                bottom: min(geometry.safeAreaInsets.bottom, AppWindowMetrics.safeAreaInsets.bottom),
+                trailing: geometry.safeAreaInsets.trailing
+            )
+            PlayerView(
+                owner: receipt.context.ownerLease.owner, surfaceRole: .fullscreen,
+                liveQualityControl: liveControls.qualityControl,
+                fullscreenViewportAspect: viewportAspect,
+                fullscreenSafeAreaInsets: playerSafeArea,
+                screenLease: receipt.context.ownerLease,
+                presentationReceipt: receipt, fullscreenHostIdentity: hostIdentity
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .ignoresSafeArea()
         .overlay(alignment: .bottom) {

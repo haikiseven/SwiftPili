@@ -58,7 +58,6 @@ struct MediaPacket: @unchecked Sendable {
     var audioTiming: MediaAudioPacketTiming? = nil
     var emittedAt: ContinuousClock.Instant? = nil
     var sourcePrimaryObservation: MediaSourcePrimaryObservation?
-    var displayCoverage: MediaDisplayLease? = nil
     var containerSampleIndex: Int? = nil
     var containerFragmentSequence: UInt32? = nil
     var containerSampleOffset: Int? = nil
@@ -68,7 +67,6 @@ struct MediaVideoFrame {
     var pts: TimeInterval
     var duration: TimeInterval
     var pixelBuffer: CVPixelBuffer
-    var displayCoverage: MediaDisplayLease? = nil
 }
 
 struct MediaAudioFrame: Sendable {
@@ -397,54 +395,17 @@ struct MediaVideoContinuityCandidateAuthority: Equatable, Sendable {
     }
 }
 
-struct MediaDisplayEndpoints: Sendable {
-    let video: TimeInterval?
-    let audio: TimeInterval?
-    let audioJoin: MediaAudioDisplayJoin?
-
-    init(video: TimeInterval?, audio: TimeInterval?, audioJoin: MediaAudioDisplayJoin? = nil) {
-        self.video = video
-        self.audio = audio
-        self.audioJoin = audioJoin
-    }
-}
-
-struct MediaAudioDisplayJoin: Sendable {
-    enum Result: String, Sendable {
-        case appendWouldDiscontinue
-        case successorUnavailable
-        case joined
-    }
-
-    let pcmEnd: MediaDisplayTime
-    let sourceEnd: MediaDisplayTime?
-    let appendEnd: TimeInterval?
-    let result: Result
-}
-
 struct MediaBufferDisplaySample: Sendable {
     let position: TimeInterval
     let videoPresent: Bool
     let audioPresent: Bool
     let videoWarmSuspended: Bool
-    let evidence: MediaDisplayEndpoints?
-    let resolved: MediaDisplayEndpoints
+    let videoEnd: TimeInterval?
+    let audioEnd: TimeInterval?
     let bufferedThrough: TimeInterval?
 }
 
-struct MediaAudioDisplayPosition: Sendable {
-    let track: UUID
-    let time: MediaDisplayTime
-}
-
-protocol MediaDisplayEvidenceQuerying: Sendable {
-    func qualifiedEndpoints(
-        at seconds: Double, audioPosition: MediaAudioDisplayPosition?
-    ) -> MediaDisplayEndpoints
-}
-
 protocol MediaDemuxing: AnyObject, Sendable {
-    nonisolated var displayEvidenceQuery: (any MediaDisplayEvidenceQuerying)? { get }
     func open(_ request: MediaOpenRequest) async throws
     var duration: TimeInterval { get async }
     func pump(contentBudget: TimeInterval) async throws -> [MediaPacket]
@@ -483,7 +444,6 @@ protocol MediaDemuxing: AnyObject, Sendable {
     func interruptActiveIO() async -> MediaDemuxIOInterruptResult
 
     func cachedContentAhead() async -> MediaCachedContentAhead
-    func retireResidentDisplay(video: Bool, audio: Bool) async
 
     func multiConnectionTelemetry() async -> MultiConnectionTelemetry
     func setMultiConnectionQuiet(_ quiet: Bool) async
@@ -494,7 +454,6 @@ protocol MediaDemuxing: AnyObject, Sendable {
 }
 
 extension MediaDemuxing {
-    nonisolated var displayEvidenceQuery: (any MediaDisplayEvidenceQuerying)? { nil }
     func multiConnectionTelemetry() async -> MultiConnectionTelemetry { .unsupported }
     var providesAudioTrack: Bool { false }
     var videoContinuityTopology: MediaVideoContinuityTopology { .unsupported }
@@ -648,9 +607,7 @@ extension MediaVideoDecoding {
 protocol MediaAudioDecoding: AnyObject, Sendable {
     func open(formatHint: Data?) async throws
     func open(codec: String?, formatHint: Data?) async throws
-    func decode(
-        _ packet: MediaPacket, pendingDisplaySupport: AudioPendingDisplaySupport
-    ) async throws -> [MediaAudioFrame]
+    func decode(_ packet: MediaPacket) async throws -> [MediaAudioFrame]
     func decodeDiagnostics() async -> MediaAudioDecodeDiagnostics
     func flush() async
     func close() async
@@ -707,12 +664,18 @@ protocol MediaVideoRendering: AnyObject {
     func setScaleMode(_ mode: VideoScaleMode)
     func present(_ frame: MediaVideoFrame) throws
     func setDisplayPlayback(rate: Float, mediaTime: TimeInterval)
+    func enqueuedAheadSeconds(from mediaTime: TimeInterval) -> TimeInterval
     func flush()
     func invalidate()
 }
 
 extension MediaVideoRendering {
     var demandLivenessRenderer: DemandLivenessRenderer { .ready }
+
+    func enqueuedAheadSeconds(from mediaTime: TimeInterval) -> TimeInterval {
+        _ = mediaTime
+        return 0
+    }
 
     func setDisplayPlayback(rate: Float, mediaTime: TimeInterval) {
         _ = rate
@@ -745,6 +708,7 @@ protocol MediaAudioRendering: AnyObject {
     var isMuted: Bool { get set }
     var launchReserveContentSeconds: TimeInterval { get }
     var seekTransitionReserveContentSeconds: TimeInterval { get }
+    var ringBufferedSeconds: TimeInterval { get }
     var presentationTiming: MediaAudioPresentationTiming { get }
     var contentTimePresentationOffset: TimeInterval { get }
     func start(source: AudioPullSource) throws
@@ -816,6 +780,7 @@ extension MediaAudioRendering {
     var seekTransitionReserveContentSeconds: TimeInterval {
         launchReserveContentSeconds
     }
+    var ringBufferedSeconds: TimeInterval { 0 }
 
     func prewarmHardwareGraph() {}
 
@@ -921,9 +886,7 @@ protocol AudioPullSource: AnyObject {
         into buffer: UnsafeMutablePointer<Float>
     ) -> AudioRendererPull
 
-    func renderedContentDidAdvance(
-        bySeconds seconds: TimeInterval, displayObservation: AudioRenderedDisplayObservation?
-    )
+    func renderedContentDidAdvance(bySeconds seconds: TimeInterval)
 
     nonisolated var audioSupply: any AudioSupplySource { get }
 
@@ -932,12 +895,8 @@ protocol AudioPullSource: AnyObject {
 
 extension AudioPullSource {
     func renderedContentDidAdvance(bySeconds seconds: TimeInterval) {
-        renderedContentDidAdvance(bySeconds: seconds, displayObservation: nil)
+        _ = seconds
     }
-
-    func renderedContentDidAdvance(
-        bySeconds seconds: TimeInterval, displayObservation: AudioRenderedDisplayObservation?
-    ) {}
 
     func audioSupplyDidReport(_ report: AudioFeederPullReport) {}
 }
@@ -953,6 +912,7 @@ enum MediaSessionEvent: Sendable {
     case failed(MediaEngineError)
     case runtimeFault(MediaRuntimeFault)
     case tick(mediaTime: TimeInterval, duration: TimeInterval, buffered: TimeInterval)
+    case buffered(TimeInterval)
 }
 
 struct MediaFrameRateSample: Sendable, Equatable {

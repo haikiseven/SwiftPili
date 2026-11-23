@@ -24,6 +24,7 @@ struct BangumiDetailView: View {
     @State private var previewImages: ImagePreviewItem?
     @State private var containerWidth: CGFloat
     @State private var containerSize: CGSize
+    @State private var pendingContainerSize: CGSize?
     @State private var isKeyboardDocked = false
     @State private var wideComposerExpanded = false
     @State private var compactComposerPresentation = CommentComposerPresentation()
@@ -64,8 +65,15 @@ struct BangumiDetailView: View {
         )
     }
     private var wideVideoSize: CGSize { stageGeometry.playerSize }
-    private var showsWideChrome: Bool { isWideLayout && !player.isFullscreen }
+    private var showsWideChrome: Bool { isWideLayout }
     private var showsHeroBar: Bool { isWideLayout && stage.presentation == .hero }
+    private var hostOwnsInlineSurface: Bool {
+        guard player.isFullscreenPresentationActive,
+              let lease = viewModel.playerLease,
+              player.isCurrentOwner(lease) else { return false }
+        return player.activeSurfaceLease?.ownerLease == lease
+            && player.activeSurfaceLease?.role == .fullscreen
+    }
 
     private var pgcOwner: String { PlayerViewModel.pgcOwner(seasonId) }
 
@@ -118,7 +126,7 @@ struct BangumiDetailView: View {
 
     private var playerAreaHeight: CGFloat {
         DetailPlayerGeometry.pinnedHeaderHeight(
-            videoHeight: playerVideoHeight, isFullscreen: player.isFullscreen
+            videoHeight: playerVideoHeight, isFullscreen: false
         )
     }
 
@@ -148,8 +156,7 @@ struct BangumiDetailView: View {
     }
 
     private var isInlineCommentInputEligible: Bool {
-        !player.isFullscreen
-            && AuthManager.shared.isLoggedIn && !viewModel.commentsClosed
+        AuthManager.shared.isLoggedIn && !viewModel.commentsClosed
     }
 
     private var showsCommentInput: Bool {
@@ -158,47 +165,58 @@ struct BangumiDetailView: View {
     }
 
     var body: some View {
+        let inlineCornerRadius = showsWideChrome ? DetailStageLayout.playerCornerRadius : 0
         ZStack(alignment: .bottom) {
             containerGeometryProbes
 
             ZStack(alignment: .topLeading) {
-                if !player.isFullscreen {
-                    Group {
-                        if isWideLayout {
-                            wideStage
-                        } else {
-                            compactDetailsPage
-                        }
-                    }
-                    .animation(nil, value: player.isFullscreen)
+                if isWideLayout {
+                    wideStage
+                } else {
+                    compactDetailsPage
                 }
 
                 VStack(spacing: 0) {
-                    if !player.isFullscreen, isRouteActivated {
-                        PlayerView(
-                            owner: pgcOwner,
-                            surfaceRole: .inline,
-                            pageNavigationActions: playerPageNavigation,
-                            showsAnimeOptions: true,
-                            inlineViewportSize: CGSize(
-                                width: isWideLayout ? wideVideoSize.width : containerWidth,
-                                height: playerVideoHeight
-                            ),
-                            inlineCornerRadius: showsWideChrome ? DetailStageLayout.playerCornerRadius : 0,
-                            screenLease: viewModel.playerLease
-                        )
-                    } else if !player.isFullscreen {
+                    if isRouteActivated {
+                        if hostOwnsInlineSurface {
+                            RoundedRectangle(cornerRadius: inlineCornerRadius, style: .continuous)
+                                .fill(Color.black)
+                                .frame(
+                                    width: isWideLayout ? wideVideoSize.width : nil,
+                                    height: playerVideoHeight
+                                )
+                                .frame(maxWidth: isWideLayout ? nil : .infinity)
+                        } else {
+                            PlayerView(
+                                owner: pgcOwner,
+                                surfaceRole: .inline,
+                                pageNavigationActions: playerPageNavigation,
+                                showsAnimeOptions: true,
+                                inlineViewportSize: CGSize(
+                                    width: isWideLayout ? wideVideoSize.width : containerWidth,
+                                    height: playerVideoHeight
+                                ),
+                                inlineCornerRadius: inlineCornerRadius,
+                                screenLease: viewModel.playerLease
+                            )
+                        }
+                    } else {
                         RouteActivationPlaceholderView(
                             still: player.outgoingRouteStill(for: pgcOwner),
                             coverURL: placeholderCoverURL,
                             height: playerVideoHeight,
-                            cornerRadius: showsWideChrome ? DetailStageLayout.playerCornerRadius : 0
+                            cornerRadius: inlineCornerRadius
                         )
                     }
                 }
+                .background {
+                    PlayerInlineSlotProbe(cornerRadius: inlineCornerRadius)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
                 .frame(width: showsWideChrome ? wideVideoSize.width : nil)
                 .overlay(alignment: .topLeading) {
-                    if !player.isFullscreen, isActiveBangumiRoute {
+                    if !player.isFullscreenPresentationActive, isActiveBangumiRoute {
                         let showsNavigation = !hasInlineExitChrome || player.showControls
                         ZStack(alignment: .topLeading) {
                             if showsNavigation && (!isRouteActivated || !player.showControls) {
@@ -206,7 +224,7 @@ struct BangumiDetailView: View {
                                     .frame(height: playerVideoHeight)
                                     .clipShape(
                                         RoundedRectangle(
-                                            cornerRadius: showsWideChrome ? DetailStageLayout.playerCornerRadius : 0,
+                                            cornerRadius: inlineCornerRadius,
                                             style: .continuous
                                         )
                                     )
@@ -224,12 +242,12 @@ struct BangumiDetailView: View {
                     isActive: showsWideChrome, geometry: stageGeometry, presentation: stage.presentation
                 )
                 .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
-                .padding(.bottom, DetailPlayerGeometry.headerBottomInset(isFullscreen: player.isFullscreen))
+                .padding(.bottom, DetailPlayerGeometry.headerBottomInset(isFullscreen: false))
             }
             .ignoresSafeArea(.keyboard, edges: .bottom)
 
             Group {
-                if !player.isFullscreen, viewModel.showContinueBanner,
+                if viewModel.showContinueBanner,
                    let ep = viewModel.resumeEpisode {
                     continueBanner(ep)
                 }
@@ -241,7 +259,7 @@ struct BangumiDetailView: View {
             .frame(maxWidth: .infinity, alignment: showsWideChrome ? .leading : .center)
             .ignoresSafeArea(.keyboard, edges: .bottom)
 
-            if !player.isFullscreen, !isWideLayout {
+            if !isWideLayout {
                 compactCommentsOverlay
             }
 
@@ -268,20 +286,22 @@ struct BangumiDetailView: View {
             }
             .animation(motion.feedbackAnimation(normal: .spring(duration: 0.3)), value: viewModel.toast)
         }
-        .guardIPadTopSafeArea(when: !player.isFullscreen)
-        .background {
-            if player.isFullscreen {
-                Color.black.ignoresSafeArea()
-            } else {
-                CinematicBackdrop(
-                    coverURL: placeholderCoverURL,
-                    player: player,
-                    ownerLease: viewModel.playerLease,
-                    isRouteActive: isRouteActivated && isActiveBangumiRoute
-                )
-            }
+        .allowsHitTesting(!player.isFullscreenPresentationActive)
+        .accessibilityHidden(player.isFullscreenPresentationActive)
+        .onChange(of: player.isFullscreenPresentationActive) { _, active in
+            guard !active, let pending = pendingContainerSize else { return }
+            pendingContainerSize = nil
+            updateContainerGeometry(pending)
         }
-        .animation(nil, value: player.isFullscreen)
+        .guardIPadTopSafeArea(when: true)
+        .background {
+            CinematicBackdrop(
+                coverURL: placeholderCoverURL,
+                player: player,
+                ownerLease: viewModel.playerLease,
+                isRouteActive: isRouteActivated && isActiveBangumiRoute
+            )
+        }
         .appSurface(.cinematic)
         .navigationBarTitleDisplayMode(.inline)
         .statusBarHidden(player.isFullscreen)
@@ -426,6 +446,10 @@ struct BangumiDetailView: View {
 
     private func updateContainerGeometry(_ size: CGSize) {
         guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else { return }
+        if DeviceCapability.supportsOrientationLock, player.isFullscreenPresentationActive {
+            pendingContainerSize = size
+            return
+        }
         if containerWidth != size.width { containerWidth = size.width }
         if containerSize != size { containerSize = size }
         if !isWideLayout, isKeyboardDocked { isKeyboardDocked = false }

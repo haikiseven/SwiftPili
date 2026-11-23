@@ -5,7 +5,6 @@ struct PathAMdatStreamAssembler: Sendable {
     struct Emitted: Sendable {
         let sampleIndex: Int
         let data: Data
-        let displayCoverage: MediaDisplayLease?
     }
 
     private struct Span: Sendable {
@@ -18,9 +17,6 @@ struct PathAMdatStreamAssembler: Sendable {
     private var nextSpan = 0
     private(set) var cursor: Int
     private var partial = Data()
-    private var displayPartial: MediaDisplayLease?
-    var displayTrack: MediaDisplayTrack?
-    var displaySamples: [Int: MediaDisplaySample] = [:]
     private(set) var isMalformed = false
 
     var isComplete: Bool { nextSpan >= spans.count }
@@ -102,8 +98,7 @@ struct PathAMdatStreamAssembler: Sendable {
                 }
                 emitted.append(Emitted(
                     sampleIndex: span.index,
-                    data: chunk.subdata(in: position..<nextPosition.partialValue),
-                    displayCoverage: displaySamples[span.index].flatMap { displayTrack?.own($0.interval) }
+                    data: chunk.subdata(in: position..<nextPosition.partialValue)
                 ))
             } else {
                 let appendedCount = partial.count.addingReportingOverflow(take)
@@ -120,15 +115,10 @@ struct PathAMdatStreamAssembler: Sendable {
                     return []
                 }
                 partial.append(chunk.subdata(in: position..<nextPosition.partialValue))
-                displayPartial = displayTrack?.own(
-                    bytes: Int64(span.start)..<Int64(cursor + take)
-                )
                 if take == needed {
                     emitted.append(Emitted(
-                        sampleIndex: span.index, data: partial,
-                        displayCoverage: displaySamples[span.index].flatMap { displayTrack?.own($0.interval) }
+                        sampleIndex: span.index, data: partial
                     ))
-                    displayPartial = nil
                     partial = Data()
                 }
             }
@@ -167,7 +157,6 @@ struct PathAMdatStreamAssembler: Sendable {
     mutating func finishTruncated() -> Bool {
         let truncated = !isComplete
         partial = Data()
-        displayPartial = nil
         nextSpan = spans.count
         return truncated
     }

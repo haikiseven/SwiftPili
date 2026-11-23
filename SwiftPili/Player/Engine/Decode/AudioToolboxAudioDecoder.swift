@@ -42,7 +42,6 @@ actor AudioToolboxAudioDecoder: MediaAudioDecoding {
     private struct PendingAccessUnit {
         let pts: TimeInterval
         let timing: MediaAudioPacketTiming?
-        let displayCoverage: MediaDisplayLease?
     }
 
     private final class InputBox: @unchecked Sendable {
@@ -314,9 +313,7 @@ actor AudioToolboxAudioDecoder: MediaAudioDecoding {
         )
     }
 
-    func decode(
-        _ packet: MediaPacket, pendingDisplaySupport: AudioPendingDisplaySupport
-    ) async throws -> [MediaAudioFrame] {
+    func decode(_ packet: MediaPacket) async throws -> [MediaAudioFrame] {
         try Task.checkCancellation()
         guard opened, let converter else { throw MediaEngineError.stopped }
         guard packet.track == .audio, !packet.data.isEmpty else { return [] }
@@ -389,13 +386,10 @@ actor AudioToolboxAudioDecoder: MediaAudioDecoding {
             && (convStatus == noErr || (convStatus == converterNoInputDataAvailable && box.toldToWait))
         pendingAccessUnits.append(PendingAccessUnit(
             pts: packet.pts,
-            timing: packet.audioTiming,
-            displayCoverage: currentInputWasAccepted ? packet.displayCoverage : nil
+            timing: packet.audioTiming
         ))
         nativeAccessUnitBoundaryKnown = nativeAccessUnitBoundaryKnown && currentInputWasAccepted
             && (frames == 0 || frames == expectedConfigurationFrames)
-        let hasCompleteNativeAccessUnit = hasVerifiedNativePCMFormat && nativeAccessUnitBoundaryKnown
-            && frames == expectedConfigurationFrames && !pendingAccessUnits.isEmpty
         if convStatus != noErr, convStatus != converterNoInputDataAvailable, packetSize == 0 {
             recordDiagnostics(
                 status: .converterError,
@@ -435,18 +429,11 @@ actor AudioToolboxAudioDecoder: MediaAudioDecoding {
         let emitted = pendingAccessUnits[0]
         let outputPCM: [Float]
         let outputFrames: Int
-        let verifiedTail: AudioDisplayDecodedTail?
         if abs(nativeDecodedSampleRate - outSampleRate) <= 0.5 {
             outputPCM = Array(pcm.prefix(frames * Int(outChannels)))
             outputFrames = frames
-            verifiedTail = hasCompleteNativeAccessUnit && nativeDecodedSampleRate == outSampleRate
-                ? emitted.displayCoverage?.interval.map { .native($0.upper) } : nil
         } else {
-            let verifiedInput = hasCompleteNativeAccessUnit && hasVerifiedSRCLayout
-                ? verifiedResamplerInput(emitted, frames: frames) : nil
-            let output = pcmResampler.process(pcm, frameCount: frames, verifiedSource: verifiedInput)
-            outputPCM = output.pcm
-            verifiedTail = output.verifiedSourceEnd.map { .resampled($0) }
+            outputPCM = pcmResampler.process(pcm, frameCount: frames)
             outputFrames = outputPCM.count / Int(outChannels)
         }
         guard outputFrames > 0 else {
@@ -472,14 +459,6 @@ actor AudioToolboxAudioDecoder: MediaAudioDecoding {
             )
             return []
         }
-        let displayInterval = MediaDisplayInterval.pcm(
-            start: emitted.displayCoverage?.interval?.lower, frames: outputFrames, rate: outSampleRate
-        )
-        pendingDisplaySupport.install(
-            source: emitted.displayCoverage,
-            interval: displayInterval,
-            verifiedTail: verifiedTail
-        )
         if !pendingAccessUnits.isEmpty { pendingAccessUnits.removeFirst() }
         if framesProduced < 4 {
             PlayerLog.log(
@@ -647,20 +626,6 @@ actor AudioToolboxAudioDecoder: MediaAudioDecoding {
             pendingAccessUnits: pendingAccessUnits.count,
             noPCMReturns: noPCMReturns
         )
-    }
-
-    private func verifiedResamplerInput(_ unit: PendingAccessUnit, frames: Int) -> MediaDisplayLease? {
-        guard let source = unit.displayCoverage, source.isCurrent,
-              let interval = source.interval, let timing = unit.timing,
-              timing.effectiveTimescale == Double(timing.trackTimescale) else { return nil }
-        let scale = Int64(timing.trackTimescale)
-        let declaredEnd = timing.ptsTicks.addingReportingOverflow(Int64(timing.durationTicks))
-        guard !declaredEnd.overflow,
-              MediaDisplayTime(timing.ptsTicks, scale: scale) == interval.lower,
-              MediaDisplayTime(declaredEnd.partialValue, scale: scale) == interval.upper,
-              interval.lower.adding(frames: frames, sampleRate: nativeDecodedSampleRate) == interval.upper
-        else { return nil }
-        return source
     }
 
     private func resetResampler() {

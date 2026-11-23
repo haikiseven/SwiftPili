@@ -244,10 +244,7 @@ final class AudioRingFeeder: @unchecked Sendable {
         nonisolated(unsafe) let writeBase = base
         nonisolated(unsafe) var wroteFrames = 0
         let refusal = gate.withAdmittedWrite(pass) {
-            wroteFrames = ring.write(
-                writeBase, count: usable * channels, displaySpans: pull.displaySpans,
-                sampleRate: sampleRate, channels: channels
-            ) / channels
+            wroteFrames = ring.write(writeBase, count: usable * channels) / channels
         }
         commitReport(
             passes: 1, requestedFrames: frameCount, writtenFrames: wroteFrames,

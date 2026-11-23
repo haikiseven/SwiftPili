@@ -44,7 +44,16 @@ extension PlayerViewModel {
     }
 
     var seekStripBufferedEnd: TimeInterval? {
-        displayedBufferedRange.map { clampedSeekableDisplayTime($0.end) }
+        guard canPublishBufferedDisplay else { return nil }
+        let published = displayedBufferedRange.map { clampedSeekableDisplayTime($0.end) }
+        guard !isSeekInFlight, pendingSeekTarget == nil else { return published }
+        let actualMediaPosition = max(
+            displayTime,
+            canSampleSeekStripClock && nativeSeekSettledPosition.isFinite ? nativeSeekSettledPosition : 0
+        )
+        let floor = clampedSeekableDisplayTime(actualMediaPosition)
+        guard let published else { return floor > 0 ? floor : nil }
+        return max(published, floor)
     }
 
     func displayedBufferAhead(gestureDisplay: PlayerGestureDisplay) -> TimeInterval? {
@@ -253,7 +262,8 @@ extension PlayerViewModel {
         if let sample, let end = sample.bufferedThrough {
             return BufferedDisplayRange(start: sample.position, end: end)
         }
-        return BufferedDisplayRange(start: backend.currentTime, end: rawEndpoint)
+        let start = min(Self.normalizedBufferedTime(backend.currentTime), rawEndpoint)
+        return BufferedDisplayRange(start: start, end: rawEndpoint)
     }
 
     func applyVideoGeometry(_ size: CGSize) {

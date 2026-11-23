@@ -552,14 +552,14 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         )
     }
 
-    // MARK: - A2-α display
+    // MARK: - Presentation horizon
 
-    private struct DisplayNativeSample {
-        let owner: MediaDisplayLease
-        let presentationTime: CMTime
-        let presentationDuration: CMTime
+    private var maxEnqueuedPresentationEnd: TimeInterval = 0
+
+    func enqueuedAheadSeconds(from mediaTime: TimeInterval) -> TimeInterval {
+        guard mediaTime.isFinite, maxEnqueuedPresentationEnd.isFinite else { return 0 }
+        return max(0, maxEnqueuedPresentationEnd - max(0, mediaTime))
     }
-    private var displayNative: [DisplayNativeSample] = []
 
     var videoEnhancementConfiguration: VideoEnhancementConfiguration {
         get { postProcessor.configuration }
@@ -586,10 +586,9 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
     }
 
     func setDisplayPlayback(rate: Float, mediaTime: TimeInterval) {
-        displayNative.removeAll { ($0.owner.interval?.upper.seconds ?? mediaTime) <= mediaTime }
         let native = displayView.sampleBufferLayer.sampleBufferRenderer
         let rendererFault = native.status == .failed || native.requiresFlushToResumeDecoding
-        if rendererFault { displayNative.removeAll() }
+        if rendererFault { maxEnqueuedPresentationEnd = 0 }
         attachSynchronizerIfNeeded()
         let safeRate = rate.isFinite ? max(0, rate) : 0
         if rendererFault || displayRate != safeRate {
@@ -640,7 +639,7 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
     private func recoverFaultedRenderer(_ renderer: AVSampleBufferVideoRenderer) -> Bool {
         guard renderer.status == .failed || renderer.requiresFlushToResumeDecoding else { return false }
         retireEnhancement()
-        displayNative.removeAll()
+        maxEnqueuedPresentationEnd = 0
         renderer.flush()
         flushCount += 1
         consecutiveRendererFaultCount = 0
@@ -700,11 +699,8 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
             SurfaceMoveProbe.noteFrameEnqueued()
             return .enqueued
         }
-        if let owner = frame.displayCoverage {
-            displayNative.append(DisplayNativeSample(
-                owner: owner, presentationTime: CMSampleBufferGetPresentationTimeStamp(sample),
-                presentationDuration: CMSampleBufferGetDuration(sample)
-            ))
+        if let end = finitePresentationIntervalEnd(start: frame.pts, duration: frame.duration) {
+            maxEnqueuedPresentationEnd = max(maxEnqueuedPresentationEnd, end)
         }
         SurfaceMoveProbe.noteFrameEnqueued()
         presentCount += 1
@@ -746,24 +742,6 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
 
     var displayClockSeconds: TimeInterval {
         CMTimeGetSeconds(synchronizer.currentTime())
-    }
-
-    func sampleDisplayClockAndRetireCompletedEvidence() -> TimeInterval {
-        let displayTime = synchronizer.currentTime()
-        let seconds = CMTimeGetSeconds(displayTime)
-        guard displayTime.isValid, displayTime.isNumeric, seconds.isFinite else { return seconds }
-        displayNative.removeAll { sample in
-            let duration = sample.presentationDuration
-            guard sample.presentationTime.isValid, sample.presentationTime.isNumeric,
-                  sample.presentationTime.epoch == displayTime.epoch,
-                  duration.isValid, duration.isNumeric, duration.epoch == 0,
-                  duration.value > 0 else { return false }
-            let end = CMTimeAdd(sample.presentationTime, duration)
-            guard end.isValid, end.isNumeric, end.epoch == displayTime.epoch,
-                  CMTimeGetSeconds(end).isFinite else { return false }
-            return CMTimeCompare(end, displayTime) <= 0
-        }
-        return seconds
     }
 
     var isReadyForMoreMediaData: Bool {
@@ -950,7 +928,7 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         retireEnhancement()
         presentationProofState.clear()
         let renderer = displayView.sampleBufferLayer.sampleBufferRenderer
-        displayNative.removeAll()
+        maxEnqueuedPresentationEnd = 0
         renderer.flush(
             removingDisplayedImage: false,
             completionHandler: nil
@@ -990,7 +968,7 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         if generationChanged
             || renderer.status == .failed
             || renderer.requiresFlushToResumeDecoding {
-            displayNative.removeAll()
+            maxEnqueuedPresentationEnd = 0
             renderer.flush()
             flushCount += 1
             consecutiveRendererFaultCount = 0
@@ -1026,7 +1004,7 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         ))
         displayRate = 0
         lastDisplayMediaTime = pinned
-        displayNative.removeAll()
+        maxEnqueuedPresentationEnd = 0
         renderer.flush()
         flushCount += 1
         consecutiveRendererFaultCount = 0
@@ -1207,7 +1185,7 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         }
         synchronizer.setRate(0, time: pinTime)
         displayRate = 0
-        displayNative.removeAll()
+        maxEnqueuedPresentationEnd = 0
         latestAmbientPixelBuffer = nil
         flushRenderer(displayView.sampleBufferLayer.sampleBufferRenderer)
         flushCount += 1
@@ -1227,7 +1205,7 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         displayRate = 0
         lastDisplayMediaTime = 0
         consecutiveRendererFaultCount = 0
-        displayNative.removeAll()
+        maxEnqueuedPresentationEnd = 0
         latestAmbientPixelBuffer = nil
         hasAmbientAccumulation = false
         displayView.sampleBufferLayer.sampleBufferRenderer.flush(

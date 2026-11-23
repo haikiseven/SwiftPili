@@ -121,25 +121,4 @@ extension MediaByteRangeStore {
             observer.continuation.yield(())
         }
     }
-
-    func displayPrefix(_ key: Key, offset: Int64, count: Int) -> (Data, ResidentValidity)? {
-        guard count > 0, let entry = entry(for: key),
-              let data = entry.copyPrefix(offset: offset, count: count),
-              let end = MediaByteRange.checkedEndExclusive(offset: offset, length: Int64(data.count)),
-              let receipt = entry.residentIncarnation.issue(for: offset..<end) else { return nil }
-        return (data, receipt)
-    }
-
-    func displayResidentSpans(_ key: Key, ranges: [Range<Int64>]) -> [ResidentValidity] {
-        guard let entry = entry(for: key) else { return [] }
-        let held = entry.coalescedRanges
-        return ranges.flatMap { wanted in
-            held.compactMap { available in
-                let start = max(wanted.lowerBound, available.lowerBound)
-                let end = min(wanted.upperBound, available.upperBound)
-                return start < end ? entry.residentIncarnation.issue(for: start..<end) : nil
-            }
-        }
-    }
-
 }

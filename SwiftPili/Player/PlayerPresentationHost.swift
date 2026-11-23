@@ -108,3 +108,72 @@ enum PlayerPresentationHostPresence {
         return entering && controller.isBeingPresented ? .enteringCurrentHost : .none
     }
 }
+
+enum PlayerFullscreenStageGeometry {
+    struct InlineSnapshot: Equatable, Sendable {
+        let frameInWindow: CGRect
+        let frameInScreen: CGRect
+        let windowSize: CGSize
+        let windowFrameInScreen: CGRect
+        let cornerRadius: CGFloat
+    }
+
+    struct ResolvedStageTarget: Equatable, Sendable {
+        let rect: CGRect
+        let cornerRadius: CGFloat
+    }
+
+    static func resolvedInlineStageRect(
+        snapshot: InlineSnapshot?,
+        containerSize: CGSize,
+        hostFrameInScreen: CGRect?
+    ) -> ResolvedStageTarget? {
+        guard let snapshot,
+              isUsableSize(containerSize),
+              isUsableRect(snapshot.frameInWindow)
+        else { return nil }
+
+        let cornerRadius = snapshot.cornerRadius.isFinite ? max(0, snapshot.cornerRadius) : 0
+        if isUsableSize(snapshot.windowSize),
+           abs(snapshot.windowSize.width - containerSize.width) <= 2,
+           abs(snapshot.windowSize.height - containerSize.height) <= 2,
+           rectIntersectsContainer(snapshot.frameInWindow, containerSize: containerSize) {
+            return ResolvedStageTarget(rect: snapshot.frameInWindow, cornerRadius: cornerRadius)
+        }
+
+        if let hostFrameInScreen,
+           isUsableSize(snapshot.windowSize),
+           abs(snapshot.windowSize.width - containerSize.width) <= 2,
+           abs(snapshot.windowSize.height - containerSize.height) <= 2,
+           hostFrameInScreen.minX.isFinite, hostFrameInScreen.minY.isFinite,
+           isUsableSize(hostFrameInScreen.size),
+           abs(hostFrameInScreen.width - containerSize.width) <= 2,
+           abs(hostFrameInScreen.height - containerSize.height) <= 2,
+           isUsableRect(snapshot.frameInScreen) {
+            let local = CGRect(
+                x: snapshot.frameInScreen.minX - hostFrameInScreen.minX,
+                y: snapshot.frameInScreen.minY - hostFrameInScreen.minY,
+                width: snapshot.frameInScreen.width,
+                height: snapshot.frameInScreen.height
+            )
+            if rectIntersectsContainer(local, containerSize: containerSize) {
+                return ResolvedStageTarget(rect: local, cornerRadius: cornerRadius)
+            }
+        }
+
+        return nil
+    }
+
+    private static func isUsableSize(_ size: CGSize) -> Bool {
+        size.width.isFinite && size.height.isFinite && size.width > 1 && size.height > 1
+    }
+
+    private static func isUsableRect(_ rect: CGRect) -> Bool {
+        rect.minX.isFinite && rect.minY.isFinite && isUsableSize(rect.size)
+    }
+
+    private static func rectIntersectsContainer(_ rect: CGRect, containerSize: CGSize) -> Bool {
+        let bounds = CGRect(origin: .zero, size: containerSize).insetBy(dx: -4, dy: -4)
+        return bounds.intersects(rect)
+    }
+}

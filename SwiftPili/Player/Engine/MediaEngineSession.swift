@@ -159,12 +159,9 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
     private let audioRender: any MediaAudioRendering
 
     private var clock = MediaClock()
-    private var audioDisplayObservation = AudioDisplayObservationChain()
-    private struct PendingAudioDisplaySupport {
-        let support: AudioPendingDisplaySupport
-        let operationID: UInt64?
-    }
-    private var pendingAudioDisplaySupport: [ObjectIdentifier: PendingAudioDisplaySupport] = [:]
+    private var pausedRunwayRefreshTask: Task<Void, Never>?
+    private var nextPausedRunwayRefreshID: UInt64 = 0
+    private var activePausedRunwayRefreshID: UInt64?
     private var videoPacketQueue = ContentSecondQueue(highWater: 20, lowWater: 4)
     private var audioPacketQueue = ContentSecondQueue(highWater: 20, lowWater: 4)
     private var videoPackets: [MediaPacket] = []
@@ -547,8 +544,6 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
             usefulPrimarySamples.removeAll()
             unresolvedPrimaryTransportFailure = nil
             renderedAudioOutput = nil
-            retirePendingAudioDisplaySupport()
-            audioDisplayObservation.invalidate()
         }
     }
     private var demuxOpenCount = 0
@@ -676,7 +671,6 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
     private func beginSeekTransaction(token: MediaAudioSeekToken) {
         seekTransaction.begin(token: token)
         invalidateSourceWaitBudget()
-        audioDisplayObservation.invalidate()
     }
 
     private func clearSeekTransaction() {
@@ -911,48 +905,77 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
     }
 
     var bufferedTime: TimeInterval {
-        clock.mediaTime + (deliveryRunway ?? 0)
+        resolvedBufferEndpoints(at: clock.mediaTime).bufferedThrough ?? clock.mediaTime
     }
 
     var bufferDisplaySample: MediaBufferDisplaySample? {
         let time = clock.mediaTime
         guard time.isFinite else { return nil }
-        if let query = demux.displayEvidenceQuery {
-            let evidence = query.qualifiedEndpoints(at: time, audioPosition: audioDisplayObservation.position)
-            let video = videoDecoderOpened ? (
-                isVideoLaneWarmSuspended
-                    ? time + (videoDeliveryRunway ?? 0)
-                    : evidence.video ?? time
-            ) : nil
-            let audio = hasAudioTrack ? evidence.audio ?? time : nil
-            return MediaBufferDisplaySample(
-                position: time, videoPresent: videoDecoderOpened, audioPresent: hasAudioTrack,
-                videoWarmSuspended: isVideoLaneWarmSuspended, evidence: evidence,
-                resolved: MediaDisplayEndpoints(video: video, audio: audio),
-                bufferedThrough: bindingDeliveryRunway(video: video, audio: audio)
-            )
-        }
-        let established = establishedDisplayEndpoints(at: time)
+        let resolved = resolvedBufferEndpoints(at: time)
         return MediaBufferDisplaySample(
-            position: time, videoPresent: videoDecoderOpened, audioPresent: hasAudioTrack,
-            videoWarmSuspended: isVideoLaneWarmSuspended, evidence: nil, resolved: established,
-            bufferedThrough: bindingDeliveryRunway(video: established.video, audio: established.audio)
+            position: time,
+            videoPresent: videoDecoderOpened,
+            audioPresent: hasAudioTrack,
+            videoWarmSuspended: isVideoLaneWarmSuspended,
+            videoEnd: resolved.videoEnd,
+            audioEnd: resolved.audioEnd,
+            bufferedThrough: resolved.bufferedThrough
         )
     }
 
-    private func establishedDisplayEndpoints(at time: TimeInterval) -> MediaDisplayEndpoints {
-        let video = videoDeliveryRunway
-        let audio = audioDeliveryRunway
-        let videoEnd = video.map { time + $0 }
-        let audioEnd = audio.map { time + $0 }
-        let supplementedVideo = videoEnd.map { endpoint in
-            isVideoLaneWarmSuspended ? endpoint
-                : residentVideoDisplay?.supplement(endpoint, at: time) ?? endpoint
+    private var tracksDrainedAtEOF: Bool {
+        guard demuxReachedEOF else { return false }
+        let videoDrained = !videoDecoderOpened || isVideoLaneWarmSuspended || (
+            videoPacketQueue.contentSeconds <= 0
+                && pendingVideoContentSeconds <= 0
+                && cachedVideoRunwaySeconds <= 0
+        )
+        let audioDrained = !hasAudioTrack || (
+            audioPacketQueue.contentSeconds <= 0
+                && pendingAudioContentSeconds <= 0
+                && cachedAudioRunwaySeconds <= 0
+        )
+        return videoDrained && audioDrained
+    }
+
+    private func resolvedBufferEndpoints(at time: TimeInterval) -> (
+        videoEnd: TimeInterval?,
+        audioEnd: TimeInterval?,
+        bufferedThrough: TimeInterval?
+    ) {
+        guard time.isFinite else { return (nil, nil, nil) }
+        var videoEnd = videoDeliveryRunway.map { time + $0 }
+        var audioEnd = audioDeliveryRunway.map { time + $0 }
+        let duration = clock.duration
+        let hasFiniteDuration = duration.isFinite && duration > 0
+        if demuxReachedEOF, hasFiniteDuration {
+            if videoDecoderOpened, !isVideoLaneWarmSuspended,
+               videoPacketQueue.contentSeconds <= 0,
+               pendingVideoContentSeconds <= 0,
+               cachedVideoRunwaySeconds <= 0,
+               videoRender.enqueuedAheadSeconds(from: time) <= 0 {
+                videoEnd = max(time, duration)
+            }
+            if hasAudioTrack,
+               audioPacketQueue.contentSeconds <= 0,
+               pendingAudioContentSeconds <= 0,
+               cachedAudioRunwaySeconds <= 0,
+               audioRender.ringBufferedSeconds <= 0 {
+                audioEnd = max(time, duration)
+            }
         }
-        let supplementedAudio = audioEnd.map { endpoint in
-            residentAudioDisplay?.supplement(endpoint, at: time) ?? endpoint
+        if hasFiniteDuration {
+            videoEnd = videoEnd.map { min($0, duration) }
+            audioEnd = audioEnd.map { min($0, duration) }
         }
-        return MediaDisplayEndpoints(video: supplementedVideo, audio: supplementedAudio)
+        var bufferedThrough = bindingDeliveryRunway(video: videoEnd, audio: audioEnd)
+        if demuxReachedEOF, hasFiniteDuration, tracksDrainedAtEOF {
+            bufferedThrough = max(bufferedThrough ?? time, duration)
+        }
+        if let through = bufferedThrough, hasFiniteDuration {
+            bufferedThrough = min(through, duration)
+        }
+        return (videoEnd, audioEnd, bufferedThrough)
     }
 
     // MARK: - Delivery runway
@@ -971,12 +994,16 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
     var queuedVideoRunway: TimeInterval? {
         guard videoDecoderOpened else { return nil }
         if isVideoLaneWarmSuspended { return suspendedVideoRunway }
-        return max(0, videoPacketQueue.contentSeconds + pendingVideoContentSeconds)
+        let enqueuedAhead = videoRender.enqueuedAheadSeconds(from: clock.mediaTime)
+        return max(0, enqueuedAhead + videoPacketQueue.contentSeconds + pendingVideoContentSeconds)
     }
 
     var queuedAudioRunway: TimeInterval? {
         guard hasAudioTrack else { return nil }
-        return max(0, audioPacketQueue.contentSeconds + pendingAudioContentSeconds)
+        return max(
+            0,
+            audioRender.ringBufferedSeconds + audioPacketQueue.contentSeconds + pendingAudioContentSeconds
+        )
     }
 
     var pipelineRunway: TimeInterval? {
@@ -1041,10 +1068,6 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
 
     private var cachedVideoRunway: MediaCachedTrackContentAhead = .empty
     private var cachedAudioRunway: MediaCachedTrackContentAhead = .empty
-    private var residentVideoDisplay: MediaResidentDisplayFragment?
-    private var residentAudioDisplay: MediaResidentDisplayFragment?
-    private var retireVideoDisplayBeforeRefresh = false
-    private var retireAudioDisplayBeforeRefresh = false
     var cachedVideoRunwaySeconds: TimeInterval { cachedVideoRunway.seconds }
     var cachedAudioRunwaySeconds: TimeInterval { cachedAudioRunway.seconds }
     private var cachedRunwayEpoch: UInt64 = 0
@@ -1053,45 +1076,98 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         resetCachedRunway(video: true, audio: true)
     }
 
-    private func resetCachedRunway(video: Bool, audio: Bool, preservingDisplay: Bool = false) {
-        if preservingDisplay {
-            cachedRunwayEpoch &+= 1
-        } else {
-            clearResidentDisplay(video: video, audio: audio)
-        }
+    private func resetCachedRunway(video: Bool, audio: Bool) {
+        cachedRunwayEpoch &+= 1
         if video { cachedVideoRunway = .empty }
         if audio { cachedAudioRunway = .empty }
-    }
-
-    private func clearResidentDisplay(video: Bool, audio: Bool) {
-        cachedRunwayEpoch &+= 1
-        if video {
-            residentVideoDisplay = nil
-            retireVideoDisplayBeforeRefresh = true
-        }
-        if audio {
-            residentAudioDisplay = nil
-            retireAudioDisplayBeforeRefresh = true
-        }
     }
 
     private func refreshCachedRunway(generation gen: Int) async {
         guard demux.measuresCachedContentAhead else { return }
         let epoch = cachedRunwayEpoch
-        let retireVideo = retireVideoDisplayBeforeRefresh
-        let retireAudio = retireAudioDisplayBeforeRefresh
-        retireVideoDisplayBeforeRefresh = false
-        retireAudioDisplayBeforeRefresh = false
-        if retireVideo || retireAudio {
-            await demux.retireResidentDisplay(video: retireVideo, audio: retireAudio)
-            guard isCurrentGeneration(gen), epoch == cachedRunwayEpoch else { return }
-        }
         let ahead = await demux.cachedContentAhead()
         guard isCurrentGeneration(gen), epoch == cachedRunwayEpoch else { return }
         cachedVideoRunway = ahead.video
         cachedAudioRunway = ahead.audio
-        residentVideoDisplay = ahead.videoDisplay
-        residentAudioDisplay = ahead.audioDisplay
+    }
+
+    private func cancelPausedRunwayRefresh() {
+        activePausedRunwayRefreshID = nil
+        pausedRunwayRefreshTask?.cancel()
+        pausedRunwayRefreshTask = nil
+    }
+
+    private func isPausedPrefetchQuiet(_ telemetry: MultiConnectionTelemetry) -> Bool {
+        if !hasMultiConnectionHelpers || demuxReachedEOF { return true }
+        return telemetry.activeRequests == 0
+            && telemetry.state != .downloading
+            && telemetry.state != .pending
+    }
+
+    private func startPausedRunwayRefreshIfNeeded() {
+        guard isReady, !isPlaying, !hasEmittedEnded,
+              !isSeekInFlight, demux.measuresCachedContentAhead else {
+            cancelPausedRunwayRefresh()
+            return
+        }
+        guard pausedRunwayRefreshTask == nil else { return }
+        let gen = generation
+        nextPausedRunwayRefreshID &+= 1
+        let taskID = nextPausedRunwayRefreshID
+        activePausedRunwayRefreshID = taskID
+        pausedRunwayRefreshTask = Task { @MainActor [weak self] in
+            defer {
+                if let self, self.activePausedRunwayRefreshID == taskID {
+                    self.activePausedRunwayRefreshID = nil
+                    self.pausedRunwayRefreshTask = nil
+                }
+            }
+            guard let self else { return }
+            var lastBuffered = self.bufferedTime
+            var stagnantQuietCount = 0
+            while !Task.isCancelled,
+                  self.isCurrentGeneration(gen),
+                  self.activePausedRunwayRefreshID == taskID,
+                  self.isReady, !self.isPlaying, !self.hasEmittedEnded,
+                  !self.isSeekInFlight {
+                do {
+                    try await Task.sleep(for: .milliseconds(255))
+                } catch {
+                    break
+                }
+                guard !Task.isCancelled,
+                      self.isCurrentGeneration(gen),
+                      self.activePausedRunwayRefreshID == taskID,
+                      self.isReady, !self.isPlaying, !self.hasEmittedEnded,
+                      !self.isSeekInFlight else { break }
+
+                let telemetry = await self.demux.multiConnectionTelemetry()
+                guard !Task.isCancelled,
+                      self.isCurrentGeneration(gen),
+                      self.activePausedRunwayRefreshID == taskID,
+                      self.isReady, !self.isPlaying, !self.hasEmittedEnded,
+                      !self.isSeekInFlight else { break }
+
+                await self.refreshCachedRunway(generation: gen)
+                guard !Task.isCancelled,
+                      self.isCurrentGeneration(gen),
+                      self.activePausedRunwayRefreshID == taskID,
+                      self.isReady, !self.isPlaying, !self.hasEmittedEnded,
+                      !self.isSeekInFlight else { break }
+
+                let currentBuffered = self.bufferedTime
+                if abs(currentBuffered - lastBuffered) > 0.005 {
+                    lastBuffered = currentBuffered
+                    stagnantQuietCount = 0
+                    self.onEvent?(.buffered(currentBuffered))
+                } else if self.isPausedPrefetchQuiet(telemetry) {
+                    stagnantQuietCount += 1
+                    if stagnantQuietCount >= 2 { break }
+                } else {
+                    stagnantQuietCount = 0
+                }
+            }
+        }
     }
 
     var deliveryRunway: TimeInterval? {
@@ -1381,6 +1457,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         multiConnectionQuietGate.setParked(true)
         cancelWarmVideoImageHoldRefresh()
         supersedeWarmVideoPreparationRun()
+        cancelPausedRunwayRefresh()
         cancelSupplyLoop()
         cancelDecode()
         clearPiPEventSource()
@@ -1461,7 +1538,6 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         audioEOFDrain.reset()
         clearSeekTransaction()
         consecutiveVideoPresentErrorCount = 0
-        audioDisplayObservation.reset(to: outputMediaFloor)
         videoDecoderOpened = false
         videoDecoderRepairAttempted = false
         audioDecoderOpened = false
@@ -1626,6 +1702,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
             return
         }
         multiConnectionQuietGate.setParked(false)
+        cancelPausedRunwayRefresh()
         isPlaying = true
         isBuffering = false
         updateMultiConnectionPlayback()
@@ -1656,6 +1733,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
               activeVideoSuspendToken == token,
               token.sessionGeneration == runtimeGeneration,
               token.ownerGeneration == activeOwnerGeneration else { return false }
+        cancelPausedRunwayRefresh()
         isPlaying = true
         isBuffering = false
         resetFlowGapTracking()
@@ -1702,30 +1780,14 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
             (videoRender as? SampleBufferVideoRenderer)?.capturePausedPresentationImage()
         }
         if wasSeekingAtEntry {
-            audioDisplayObservation.invalidate()
             audioRender.stop()
         } else {
-            let rewindSeconds = hasAudioTrack ? audioRender.presentationTiming.contentTimeOffset : 0
-            audioDisplayObservation.suspendForPause(fallbackTime: clock.mediaTime)
-            if rewindSeconds > 0 {
-                let pulledEndPTS = (audioTimelineBuffer.endPTS ?? clock.mediaTime)
-                    - audioTimelineBuffer.contentSeconds
-                let ringBuffered = max(0, pulledEndPTS - clock.mediaTime)
-                audioRender.pause()
-                audioRender.flush()
-                let rolledBack = audioTimelineBuffer.rollback(seconds: ringBuffered + rewindSeconds)
-                if rolledBack > 0 {
-                    clock.seek(to: max(0, pulledEndPTS - rolledBack))
-                    updatePiPPlaybackState()
-                    resetDisplayTimeline(to: clock.mediaTime)
-                }
-            } else {
-                audioRender.pause()
-            }
+            audioRender.pause()
         }
         cancelSupplyLoop()
         cancelDecode()
         onEvent?(.paused)
+        startPausedRunwayRefreshIfNeeded()
     }
 
     func parkForReuse() -> Bool {
@@ -1746,8 +1808,8 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         updatePiPPlaybackState()
         disarmPresentFeed()
         applyDisplayPlayback(rate: 0)
-        audioDisplayObservation.suspendForPause(fallbackTime: clock.mediaTime)
         audioRender.pause()
+        cancelPausedRunwayRefresh()
         cancelSupplyLoop()
         cancelDecode()
         let parkedGeneration = generation
@@ -1811,6 +1873,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         cancelWarmVideoImageHoldRefresh()
         activeWarmVideoImageHold = nil
         supersedeWarmVideoPreparationRun()
+        cancelPausedRunwayRefresh()
         cancelSupplyLoop()
         revokeAudioMaintenancePermission()
         await audioRender.awaitAudioMaintenanceSettlement()
@@ -1896,7 +1959,6 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
             clearPacketBuffers()
             clearPendingVideoFrames()
             clearPendingPCM()
-            audioDisplayObservation.reset(to: outputMediaFloor)
             seekFirstPacketLogged = false
             await videoDecoder.flush()
             guard isCurrentGeneration(gen), activeSeekToken == token else {
@@ -2165,6 +2227,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
             scheduleAudioDecodeIfNeeded()
         } else {
             applyDisplayPlayback(rate: 0)
+            startPausedRunwayRefreshIfNeeded()
         }
         phase.result = true
         return true
@@ -2524,6 +2587,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         pausedCaptureSeekPreparationReceipt = nil
         helperTelemetry.invalidate(.parked)
         multiConnectionQuietGate.setParked(true)
+        cancelPausedRunwayRefresh()
         cancelSupplyLoop()
         cancelDecode()
         disarmPresentFeed()
@@ -2683,6 +2747,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
                 && !hasObservedPiPLease ? .currentVideoFault : nil
         publishedRuntimeFaultGeneration = gen
         runtimeFaultedGeneration = gen
+        cancelPausedRunwayRefresh()
         cancelSupplyLoop()
         cancelDecode()
         disarmPresentFeed()
@@ -5913,7 +5978,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         into buffer: UnsafeMutablePointer<Float>
     ) -> AudioRendererPull {
         guard frameCount > 0, channels > 0, sampleRate > 0 else {
-            return AudioRendererPull(frames: 0, contentSeconds: 0, displaySpans: [])
+            return AudioRendererPull(frames: 0, contentSeconds: 0)
         }
         let pull = audioTimelineBuffer.pullContent(
             frameCount: frameCount,
@@ -5926,7 +5991,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         let contentSeconds = TimeInterval(framesWritten) / sampleRate
         noteAudioSupplyPull(requested: frameCount, written: framesWritten)
         return AudioRendererPull(
-            frames: framesWritten, contentSeconds: contentSeconds, displaySpans: pull.displaySpans
+            frames: framesWritten, contentSeconds: contentSeconds
         )
     }
 
@@ -5951,11 +6016,8 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         )
     }
 
-    func renderedContentDidAdvance(
-        bySeconds seconds: TimeInterval, displayObservation: AudioRenderedDisplayObservation?
-    ) {
+    func renderedContentDidAdvance(bySeconds seconds: TimeInterval) {
         guard !isSeekInFlight else {
-            audioDisplayObservation.invalidate()
             return
         }
         guard isPlaying, !videoStarvationHoldIsActive(), seconds > 0 else {
@@ -5963,12 +6025,8 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         }
         let sessionSpan = UIHitchMonitor.beginSpan("tick.sess")
         defer { UIHitchMonitor.endSpan(sessionSpan) }
-        audioDisplayObservation.accept(seconds.isFinite ? displayObservation : nil)
         noteFlowStage(&flowClock, "clock")
         clock.advanceContent(by: seconds)
-        if clock.duration > 0, clock.mediaTime >= clock.duration {
-            audioDisplayObservation.invalidate()
-        }
         if seconds.isFinite, clock.mediaTime.isFinite, audioRender.outputAvailability == .available {
             renderedAudioOutput = RenderedAudioOutput(
                 sessionGeneration: runtimeGeneration, ownerGeneration: activeOwnerGeneration, position: clock.mediaTime
@@ -6126,11 +6184,11 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         isBuffering = false
         audioEOFDrain.reset()
         audioRender.stop()
+        cancelPausedRunwayRefresh()
         cancelSupplyLoop()
         cancelDecode()
         disarmPresentFeed()
         if clock.duration > 0, clock.mediaTime < clock.duration {
-            audioDisplayObservation.invalidate()
             clock.seek(to: clock.duration)
         }
         updatePiPPlaybackState()
@@ -6347,10 +6405,6 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
     }
 
     private func cancelAudioDecode(clearHandle: Bool) {
-        if let operationID = activeAudioDecodeOperationID {
-            let pending = pendingAudioDisplaySupport.values.filter { $0.operationID == operationID }
-            for entry in pending { retirePendingAudioDisplaySupport(entry.support) }
-        }
         activeAudioDecodeOperationID = nil
         audioDecodeTask?.cancel()
         if clearHandle {
@@ -6967,21 +7021,9 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
     }
 
     private func clearPendingPCM() {
-        retirePendingAudioDisplaySupport()
-        audioDisplayObservation.invalidate()
         audioTimelineBuffer.reset()
         audioTimelineAdjustmentLogCount = 0
         audioDecodeTimingLogCount = 0
-    }
-
-    private func retirePendingAudioDisplaySupport() {
-        for entry in pendingAudioDisplaySupport.values { entry.support.retire() }
-        pendingAudioDisplaySupport.removeAll()
-    }
-
-    private func retirePendingAudioDisplaySupport(_ support: AudioPendingDisplaySupport) {
-        support.retire()
-        pendingAudioDisplaySupport.removeValue(forKey: ObjectIdentifier(support))
     }
 
     private var lastPresentNotReadyLogAt: TimeInterval = 0
@@ -7681,8 +7723,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
 
     private func maybeResyncDisplaySlave() {
         guard isPlaying, !isBuffering, !isSeekInFlight else { return }
-        let displayClock = (videoRender as? SampleBufferVideoRenderer)?
-            .sampleDisplayClockAndRetireCompletedEvidence()
+        let displayClock = (videoRender as? SampleBufferVideoRenderer)?.displayClockSeconds
         let sample = sampleAudioPresentation()
         if effectiveDisplayRate == 0 {
             applyDisplayPlayback(rate: 0, presentation: sample)
@@ -8035,7 +8076,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
                 ? beginVideoReadGeneration()
                 : nil
             resetCachedRunway(
-                video: videoBudget > 0.000_5, audio: audioBudget > 0.000_5, preservingDisplay: true
+                video: videoBudget > 0.000_5, audio: audioBudget > 0.000_5
             )
             var sourceWaitBudget: MediaSourceWaitBudget?
             defer {
@@ -8086,7 +8127,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
                       warmPreparationTransaction.orphan == nil else {
                     return
                 }
-                clearResidentDisplay(video: videoBudget > 0.000_5, audio: audioBudget > 0.000_5)
+                resetCachedRunway(video: videoBudget > 0.000_5, audio: audioBudget > 0.000_5)
                 if Self.isExpectedCancelledPumpExit(
                     error,
                     taskWasCancelled: Task.isCancelled
@@ -8152,7 +8193,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
                       warmPreparationTransaction.orphan == nil else {
                     return
                 }
-                clearResidentDisplay(video: videoBudget > 0.000_5, audio: audioBudget > 0.000_5)
+                resetCachedRunway(video: videoBudget > 0.000_5, audio: audioBudget > 0.000_5)
                 if isCurrentGeneration(gen) {
                     diagnostics.log("[PathA] pump failed: \(error.localizedDescription)")
                 }
@@ -9675,53 +9716,41 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         _ packet: MediaPacket, generation gen: Int, operationID: UInt64?
     ) async -> Bool {
         guard isCurrentGeneration(gen), isCurrentAudioDecodeOperation(operationID) else { return false }
-        let support = AudioPendingDisplaySupport()
-        let supportID = ObjectIdentifier(support)
-        pendingAudioDisplaySupport[supportID] = PendingAudioDisplaySupport(support: support, operationID: operationID)
         audioDecodePacketsSubmitted += 1
 
         func isCurrent() -> Bool {
             isCurrentGeneration(gen) && isCurrentAudioDecodeOperation(operationID)
-                && pendingAudioDisplaySupport[supportID] != nil
         }
 
-        return await withTaskCancellationHandler {
-            defer { retirePendingAudioDisplaySupport(support) }
-            let frames: [MediaAudioFrame]
-            do {
-                frames = try await audioDecoder.decode(packet, pendingDisplaySupport: support)
-            } catch {
-                support.retire()
-                guard isCurrent() else { return false }
-                let snapshot = await audioDecoder.decodeDiagnostics()
-                guard isCurrent() else { return false }
-                lastAudioDecodeError = error.localizedDescription
-                lastAudioDecodeDiagnostics = snapshot
-                diagnostics.log("[PathA] audio decode failed: \(error.localizedDescription)")
-                return true
-            }
+        let frames: [MediaAudioFrame]
+        do {
+            frames = try await audioDecoder.decode(packet)
+        } catch {
             guard isCurrent() else { return false }
-            if frames.isEmpty { support.retire() }
             let snapshot = await audioDecoder.decodeDiagnostics()
             guard isCurrent() else { return false }
+            lastAudioDecodeError = error.localizedDescription
             lastAudioDecodeDiagnostics = snapshot
-            audioDecodePCMFramesProduced += frames.reduce(into: 0) { total, frame in
-                guard frame.duration.isFinite, frame.duration > 0,
-                      frame.sampleRate.isFinite, frame.sampleRate > 0 else { return }
-                total += Int((frame.duration * frame.sampleRate).rounded())
-            }
-            let displayCoverage = frames.count == 1 ? support.decodedCoverage : nil
-            for frame in frames {
-                appendPCM(frame, displayCoverage: displayCoverage)
-                decodedAudioFrameCount += 1
-            }
+            diagnostics.log("[PathA] audio decode failed: \(error.localizedDescription)")
             return true
-        } onCancel: {
-            support.retire()
         }
+        guard isCurrent() else { return false }
+        let snapshot = await audioDecoder.decodeDiagnostics()
+        guard isCurrent() else { return false }
+        lastAudioDecodeDiagnostics = snapshot
+        audioDecodePCMFramesProduced += frames.reduce(into: 0) { total, frame in
+            guard frame.duration.isFinite, frame.duration > 0,
+                  frame.sampleRate.isFinite, frame.sampleRate > 0 else { return }
+            total += Int((frame.duration * frame.sampleRate).rounded())
+        }
+        for frame in frames {
+            appendPCM(frame)
+            decodedAudioFrameCount += 1
+        }
+        return true
     }
 
-    private func appendPCM(_ frame: MediaAudioFrame, displayCoverage: MediaDisplayLease?) {
+    private func appendPCM(_ frame: MediaAudioFrame) {
         noteFlowStage(
             &flowPCM,
             "pcmA",
@@ -9735,8 +9764,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
             context: AudioPCMAppend(
                 sampleRate: frame.sampleRate,
                 channels: frame.channelCount,
-                outputFloor: outputMediaFloor,
-                displayCoverage: displayCoverage
+                outputFloor: outputMediaFloor
             )
         )
         if let timing = frame.decodeTiming, audioDecodeTimingLogCount < 8 {
