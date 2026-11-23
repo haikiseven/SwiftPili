@@ -3,8 +3,8 @@ import UIKit
 
 extension UIKitCommentFeedViewController {
     private var resolvedRowColumnWidth: CGFloat? {
-        guard currentColumnWidth > 1 else { return hostEnvironment.rowCardColumnWidth }
-        if let outer = hostEnvironment.rowCardColumnWidth, outer.isFinite, outer > 1 {
+        guard currentColumnWidth > 1 else { return hostEnvironment.snapshot.rowCardColumnWidth }
+        if let outer = hostEnvironment.snapshot.rowCardColumnWidth, outer.isFinite, outer > 1 {
             return min(outer, currentColumnWidth)
         }
         return currentColumnWidth
@@ -200,7 +200,7 @@ extension UIKitCommentFeedViewController {
     }
 
     private func shouldReconfigureAllItems(for input: CommentFeedSnapshotDiffInput) -> Bool {
-        environmentsDiffer(input.oldEnv, input.newEnv)
+        input.oldEnv != input.newEnv
             || input.oldConfig.showsItemDividers != input.newConfig.showsItemDividers
             || input.oldConfig.dividerLeadingInset != input.newConfig.dividerLeadingInset
             || (input.newConfig.showsItemDividers && input.oldConfig.itemSpacing != input.newConfig.itemSpacing)
@@ -322,10 +322,20 @@ private extension UIKitCommentFeedViewController {
         }
         let env = hostEnvironment
         let width = resolvedRowColumnWidth
+        let openURL = OpenURLAction { [weak self] url in
+            guard let action = self?.hostEnvironment.openURL else { return .systemAction }
+            action(url)
+            return .handled
+        }
         cell.contentConfiguration = UIHostingConfiguration {
             body
-                .environment(\.self, env)
-                .rowCardColumnWidth(width)
+                .modifier(CommentFeedHostedEnvironmentModifier(
+                    snapshot: env.snapshot,
+                    resolvedColumnWidth: width,
+                    coordinator: env.coordinator,
+                    contentLinkContext: env.contentLinkContext,
+                    openURL: openURL
+                ))
         }
         .margins(.all, 0)
         .background(.clear)
@@ -357,13 +367,30 @@ private extension UIKitCommentFeedViewController {
             }
         }
     }
+}
 
-    func environmentsDiffer(_ lhs: EnvironmentValues, _ rhs: EnvironmentValues) -> Bool {
-        lhs.colorScheme != rhs.colorScheme
-            || lhs.dynamicTypeSize != rhs.dynamicTypeSize
-            || lhs.horizontalSizeClass != rhs.horizontalSizeClass
-            || lhs.appSurface != rhs.appSurface
-            || lhs.layoutDirection != rhs.layoutDirection
-            || lhs.rowCardColumnWidth != rhs.rowCardColumnWidth
+private struct CommentFeedHostedEnvironmentModifier: ViewModifier {
+    let snapshot: CommentFeedEnvironmentSnapshot
+    let resolvedColumnWidth: CGFloat?
+    let coordinator: AppCoordinator?
+    let contentLinkContext: ContentLinkContext?
+    let openURL: OpenURLAction
+
+    func body(content: Content) -> some View {
+        content
+            .environment(\.colorScheme, snapshot.colorScheme)
+            .environment(\.dynamicTypeSize, snapshot.dynamicTypeSize)
+            .environment(\.horizontalSizeClass, snapshot.horizontalSizeClass)
+            .environment(\.appSurface, snapshot.appSurface)
+            .environment(\.layoutDirection, snapshot.layoutDirection)
+            .environment(\.displayScale, snapshot.displayScale)
+            .environment(\.locale, snapshot.locale)
+            .environment(\.imageDiagnosticsScreen, snapshot.imageDiagnosticsScreen)
+            .environment(\.contentLinkDefersToParent, snapshot.contentLinkDefersToParent)
+            .environment(\.navigationZoomNamespace, snapshot.navigationZoomNamespace)
+            .environment(\.contentLinkContext, contentLinkContext)
+            .environment(\.openURL, openURL)
+            .rowCardColumnWidth(resolvedColumnWidth)
+            .environment(coordinator)
     }
 }

@@ -28,11 +28,50 @@ struct UIKitCommentFeedConfiguration {
     var onWillDisplayItemAt: ((Int) -> Void)?
 }
 
+struct CommentFeedEnvironmentSnapshot: Equatable {
+    var colorScheme: ColorScheme = .light
+    var dynamicTypeSize: DynamicTypeSize = .large
+    var horizontalSizeClass: UserInterfaceSizeClass?
+    var appSurface: AppSurface = .standard
+    var layoutDirection: LayoutDirection = .leftToRight
+    var rowCardColumnWidth: CGFloat?
+    var displayScale: CGFloat = 2
+    var locale: Locale = .autoupdatingCurrent
+    var accessibilityReduceMotion: Bool = false
+    var accessibilityReduceTransparency: Bool = false
+    var imageDiagnosticsScreen: String = "-"
+    var contentLinkDefersToParent: Bool = false
+    var navigationZoomNamespace: Namespace.ID?
+}
+
+@MainActor
+struct CommentFeedEnvironment {
+    var snapshot = CommentFeedEnvironmentSnapshot()
+    var coordinator: AppCoordinator?
+    var openURL: OpenURLAction?
+    var contentLinkContext: ContentLinkContext?
+}
+
 @MainActor
 struct UIKitCommentFeedCollectionView: View {
     private var config: UIKitCommentFeedConfiguration
 
-    @Environment(\.self) private var hostEnvironment
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.appSurface) private var appSurface
+    @Environment(\.layoutDirection) private var layoutDirection
+    @Environment(\.rowCardColumnWidth) private var rowCardColumnWidth
+    @Environment(\.displayScale) private var displayScale
+    @Environment(\.locale) private var locale
+    @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var accessibilityReduceTransparency
+    @Environment(\.imageDiagnosticsScreen) private var imageDiagnosticsScreen
+    @Environment(\.contentLinkDefersToParent) private var contentLinkDefersToParent
+    @Environment(\.navigationZoomNamespace) private var navigationZoomNamespace
+    @Environment(AppCoordinator.self) private var coordinator: AppCoordinator?
+    @Environment(\.openURL) private var openURL
+    @Environment(\.contentLinkContext) private var contentLinkContext
     @State private var bottomSafeAreaInset: CGFloat = 0
 
     init(
@@ -175,10 +214,33 @@ struct UIKitCommentFeedCollectionView: View {
         }
     }
 
+    private var feedEnvironment: CommentFeedEnvironment {
+        CommentFeedEnvironment(
+            snapshot: CommentFeedEnvironmentSnapshot(
+                colorScheme: colorScheme,
+                dynamicTypeSize: dynamicTypeSize,
+                horizontalSizeClass: horizontalSizeClass,
+                appSurface: appSurface,
+                layoutDirection: layoutDirection,
+                rowCardColumnWidth: rowCardColumnWidth,
+                displayScale: displayScale,
+                locale: locale,
+                accessibilityReduceMotion: accessibilityReduceMotion,
+                accessibilityReduceTransparency: accessibilityReduceTransparency,
+                imageDiagnosticsScreen: imageDiagnosticsScreen,
+                contentLinkDefersToParent: contentLinkDefersToParent,
+                navigationZoomNamespace: navigationZoomNamespace
+            ),
+            coordinator: coordinator,
+            openURL: openURL,
+            contentLinkContext: contentLinkContext
+        )
+    }
+
     private func representable(bottomInset: CGFloat) -> UIKitCommentFeedRepresentable {
         UIKitCommentFeedRepresentable(
             config: config,
-            hostEnvironment: hostEnvironment,
+            environment: feedEnvironment,
             externalBottomSafeAreaInset: bottomInset
         )
     }
@@ -192,14 +254,14 @@ struct UIKitCommentFeedCollectionView: View {
 
 private struct UIKitCommentFeedRepresentable: UIViewControllerRepresentable {
     let config: UIKitCommentFeedConfiguration
-    let hostEnvironment: EnvironmentValues
+    let environment: CommentFeedEnvironment
     let externalBottomSafeAreaInset: CGFloat
 
     func makeUIViewController(context: Context) -> UIKitCommentFeedViewController {
         let controller = UIKitCommentFeedViewController()
         controller.apply(
             config: config,
-            hostEnvironment: hostEnvironment,
+            environment: environment,
             externalBottomSafeAreaInset: externalBottomSafeAreaInset
         )
         return controller
@@ -208,7 +270,7 @@ private struct UIKitCommentFeedRepresentable: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIKitCommentFeedViewController, context: Context) {
         uiViewController.apply(
             config: config,
-            hostEnvironment: hostEnvironment,
+            environment: environment,
             externalBottomSafeAreaInset: externalBottomSafeAreaInset
         )
     }

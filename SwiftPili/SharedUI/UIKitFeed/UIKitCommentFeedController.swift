@@ -15,8 +15,8 @@ enum CommentFeedCellKey: Hashable, Sendable {
 struct CommentFeedSnapshotDiffInput {
     let oldConfig: UIKitCommentFeedConfiguration
     let newConfig: UIKitCommentFeedConfiguration
-    let oldEnv: EnvironmentValues
-    let newEnv: EnvironmentValues
+    let oldEnv: CommentFeedEnvironmentSnapshot
+    let newEnv: CommentFeedEnvironmentSnapshot
     let oldOrderedIDs: [AnyHashableSendable]
     let oldItemByID: [AnyHashableSendable: UIKitCommentFeedItem]
     let oldHeaderByID: [AnyHashableSendable: UIKitCommentFeedItem]
@@ -40,7 +40,7 @@ final class UIKitCommentFeedViewController: UIViewController,
     var dataSource: UICollectionViewDiffableDataSource<CommentFeedSectionKey, CommentFeedCellKey>?
 
     var config = UIKitCommentFeedConfiguration()
-    var hostEnvironment = EnvironmentValues()
+    var hostEnvironment = CommentFeedEnvironment()
     var orderedHeaderIDs: [AnyHashableSendable] = []
     var headerByID: [AnyHashableSendable: UIKitCommentFeedItem] = [:]
     var orderedItemIDs: [AnyHashableSendable] = []
@@ -132,14 +132,14 @@ final class UIKitCommentFeedViewController: UIViewController,
 
     func apply(
         config newConfig: UIKitCommentFeedConfiguration,
-        hostEnvironment newEnv: EnvironmentValues,
+        environment newEnv: CommentFeedEnvironment,
         externalBottomSafeAreaInset newBottomInset: CGFloat
     ) {
         let diffInput = CommentFeedSnapshotDiffInput(
             oldConfig: config,
             newConfig: newConfig,
-            oldEnv: hostEnvironment,
-            newEnv: newEnv,
+            oldEnv: hostEnvironment.snapshot,
+            newEnv: newEnv.snapshot,
             oldOrderedIDs: orderedItemIDs,
             oldItemByID: itemByID,
             oldHeaderByID: headerByID
@@ -147,7 +147,7 @@ final class UIKitCommentFeedViewController: UIViewController,
 
         config = newConfig
         hostEnvironment = newEnv
-        applyEnvironmentTraits(newEnv)
+        applyEnvironmentTraits(newEnv.snapshot)
         collectionView.showsVerticalScrollIndicator = newConfig.showsScrollIndicators
         collectionView.keyboardDismissMode = newConfig.keyboardDismissMode
 
@@ -269,8 +269,8 @@ private extension UIKitCommentFeedViewController {
         itemIndexByID = indexMap
     }
 
-    func applyEnvironmentTraits(_ env: EnvironmentValues) {
-        let style: UIUserInterfaceStyle = env.colorScheme == .dark ? .dark : .light
+    func applyEnvironmentTraits(_ snapshot: CommentFeedEnvironmentSnapshot) {
+        let style: UIUserInterfaceStyle = snapshot.colorScheme == .dark ? .dark : .light
         if overrideUserInterfaceStyle != style {
             overrideUserInterfaceStyle = style
         }

@@ -1,9 +1,8 @@
 import Observation
 import SwiftUI
 import UIKit
-import WebKit
 
-private struct VideoDetailCommentPresentationReader<Content: View>: View {
+struct VideoDetailCommentPresentationReader<Content: View>: View {
     let presentation: CommentZoomPresentation
     let content: (Bool) -> Content
 
@@ -70,38 +69,53 @@ struct VideoDetailView: View {
     @State private var screenOwner: String
     @State private var activationCoordinator = VideoDetailActivationCoordinator()
     @State private var viewModel = VideoDetailViewModel()
-    @State private var commentPresentation = CommentZoomPresentation()
-    @State private var replyPresentation = CommentZoomPresentation()
-    @State private var replyCommentSource: VideoDetailViewModel.CommentSource?
-    @State private var commentText = ""
-    @State private var commentPictures: [ComposedPicture] = []
-    @State private var commentSubmission = CommentComposerSubmission()
-    @State private var sendCommentTask: Task<Void, Never>?
+    private enum DetailSheet: Identifiable {
+        enum ID: Hashable {
+            case report(Int)
+            case favorite
+            case music(MusicDestination.ID)
+            case download(UUID)
+        }
 
-    private struct CommentComposerCapture {
-        let model: VideoDetailViewModel
-        let requestedID: VideoID
-        let source: VideoDetailViewModel.CommentSource?
-        let context: CommentComposerUploadOwner.Context
-        let sessionGeneration: UUID
+        case report(aid: Int)
+        case favorite
+        case music(MusicDestination)
+        case download(DownloadQualityPresentation)
+
+        var id: ID {
+            switch self {
+            case .report(let aid): .report(aid)
+            case .favorite: .favorite
+            case .music(let destination): .music(destination.id)
+            case .download(let presentation): .download(presentation.id)
+            }
+        }
     }
 
-    @State private var showShareSheet = false
-    @State private var shareImage: UIImage?
-    @State private var shareRequestID: UUID?
-    @State private var sharePreparation: Task<Void, Never>?
-    @State private var replyTarget: CommentResult.CommentItem?
+    private enum DetailDialog: Equatable {
+        case coin
+        case descriptionActions
+    }
+
+    private struct VideoShareState {
+        var isPresenting = false
+        var image: UIImage?
+        var requestID: UUID?
+        var preparation: Task<Void, Never>?
+    }
+
+    @State private var commentPresentation = CommentZoomPresentation()
+    @State private var replyPresentation = CommentZoomPresentation()
+    @State private var composer = VideoCommentComposerState()
+    @State private var activeSheet: DetailSheet?
+    @State private var activeDialog: DetailDialog?
+    @State private var shareState = VideoShareState()
     @State private var showThread: CommentThreadTarget?
-    @State private var musicSheetDestination: MusicDestination?
     @State private var commentTargetRpid: Int?
     @State private var highlightedCommentRpid: Int?
     @State private var previewImages: ImagePreviewItem?
     @State private var isDescExpanded = false
-    @State private var showDescActions = false
-    @State private var showFavoriteSheet = false
-    @State private var downloadPresentation: DownloadQualityPresentation?
     @State private var downloadRequestSerial: UInt64 = 0
-    @State private var showCoinDialog = false
     @State private var coinRequestInFlight = false
     @State private var favoriteRequestInFlight = false
     @State private var followRequestInFlight = false
@@ -115,9 +129,24 @@ struct VideoDetailView: View {
     @State private var pageOffsetStore = PageOffsetStore()
     @State private var lastCondenseFlipAt: CFTimeInterval = 0
 
+    private static var fallbackContainerBounds: CGRect {
+        if let bounds = AppWindowMetrics.current?.bounds {
+            return bounds
+        }
+        if let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first {
+            if let windowBounds = scene.windows.first(where: { !$0.isHidden })?.bounds {
+                return windowBounds
+            }
+            return scene.coordinateSpace.bounds
+        }
+        return CGRect(x: 0, y: 0, width: 393, height: 852)
+    }
+
     private var playerVideoHeight: CGFloat {
         if isWideLayout { return wideVideoSize.height }
-        let fallbackBounds = AppWindowMetrics.current?.bounds ?? UIScreen.main.bounds
+        let fallbackBounds = Self.fallbackContainerBounds
         let base = containerWidth > 0 ? containerWidth : min(fallbackBounds.width, fallbackBounds.height)
         let shapeIsCurrent = playerShapeIsCurrent
         return DetailPlayerGeometry.videoHeight(
@@ -148,7 +177,6 @@ struct VideoDetailView: View {
             videoHeight: playerVideoHeight, isFullscreen: player.isFullscreen
         )
     }
-    @State private var showReportSheet = false
     @State private var containerWidth: CGFloat
     @State private var isWideLayout: Bool
     @State private var usesCompactPhoneActions: Bool
@@ -157,8 +185,6 @@ struct VideoDetailView: View {
     @State private var isKeyboardDocked = false
     @State private var stage = DetailStageState()
     private var stagePresentation: DetailStagePresentation { stage.presentation }
-    @State private var composerPresentation = CommentComposerPresentation()
-    @State private var commentFocus = CommentComposerFocus()
     @Environment(AppCoordinator.self) private var coordinator
     @Environment(\.horizontalSizeClass) private var sizeClass
     @Environment(\.scenePhase) private var scenePhase
@@ -170,7 +196,7 @@ struct VideoDetailView: View {
     @State private var routePosition: PlayerRoutePosition?
 
     init(target: VideoRouteTarget, routePosition: PlayerRoutePosition? = nil) {
-        let initialBounds = AppWindowMetrics.current?.bounds ?? UIScreen.main.bounds
+        let initialBounds = Self.fallbackContainerBounds
         self.target = target
         _routePosition = State(initialValue: routePosition)
         _screenOwner = State(initialValue: "vod-detail-\(UUID().uuidString)")
@@ -262,13 +288,13 @@ struct VideoDetailView: View {
                 coordinator.goHome()
             },
             onDownload: viewModel.videoInfo.map { info in { offerDownload(info) } },
-            onReport: viewModel.videoInfo != nil ? { showReportSheet = true } : nil,
+            onReport: viewModel.videoInfo.map { info in { activeSheet = .report(aid: info.aid) } },
             pageOwnsInlineNavigation: true
         )
     }
 
     private var pageWidth: CGFloat {
-        containerWidth > 0 ? containerWidth : (AppWindowMetrics.current?.bounds.width ?? UIScreen.main.bounds.width)
+        containerWidth > 0 ? containerWidth : Self.fallbackContainerBounds.width
     }
 
     private var pagerBottomInset: CGFloat {
@@ -337,15 +363,11 @@ struct VideoDetailView: View {
                 compactCommentsOverlay
             }
 
-            if showsWideChrome, composerPresentation.isExpanded, stagePresentation == .stage, showThread == nil {
-                Color.clear
-                    .contentShape(Rectangle())
-                    .ignoresSafeArea()
-                    .onTapGesture {
-                        commentFocus.dismiss()
-                        collapseComposer()
-                    }
-            }
+            VideoDetailComposerDismissScrim(
+                composer: composer,
+                isActive: showsWideChrome && stagePresentation == .stage && showThread == nil,
+                ignoresSafeArea: true
+            )
 
             if showsWideChrome {
                 ObservedModel(viewModel) { model in
@@ -400,7 +422,7 @@ struct VideoDetailView: View {
         .onDisappear {
             cancelSharePreparation()
             downloadRequestSerial &+= 1
-            downloadPresentation = nil
+            if case .download = activeSheet { activeSheet = nil }
             if scenePhase == .active, !isActiveVideoRoute {
                 coordinator.cancelVideoNavigation(videoID)
             }
@@ -418,47 +440,39 @@ struct VideoDetailView: View {
         }
         .statusBarHidden(player.isFullscreen)
         .imagePreview(item: $previewImages)
-        .sheet(isPresented: $showReportSheet) {
-            if let aid = viewModel.videoInfo?.aid {
+        .sheet(item: $activeSheet) { sheet in
+            switch sheet {
+            case .report(let aid):
                 VideoReportSheet(aid: aid)
-            }
-        }
-        .sheet(isPresented: $showFavoriteSheet) {
-            FavoriteFolderSheet(
-                folders: viewModel.favFolders,
-                selection: Set(viewModel.favFolders.filter(\.containsVideo).map(\.id))
-            ) { selected in
-                Task {
-                    favoriteRequestInFlight = true
-                    await viewModel.applyFavorite(selectedIds: selected)
-                    favoriteRequestInFlight = false
+            case .favorite:
+                FavoriteFolderSheet(
+                    folders: viewModel.favFolders,
+                    selection: Set(viewModel.favFolders.filter(\.containsVideo).map(\.id))
+                ) { selected in
+                    Task {
+                        favoriteRequestInFlight = true
+                        await viewModel.applyFavorite(selectedIds: selected)
+                        favoriteRequestInFlight = false
+                    }
                 }
+            case .music(let destination):
+                MusicDetailSheet(destination: destination) { activeSheet = nil }
+            case .download(let presentation):
+                DownloadQualitySheet(qualities: presentation.qualities) { quality in
+                    activeSheet = nil
+                    startDownload(presentation.info, cid: presentation.cid, quality: quality)
+                }
+                .appAdaptiveSheet(compactDetents: [.medium], padSizing: .form)
             }
-        }
-        .sheet(item: $musicSheetDestination) { destination in
-            MusicDetailSheet(destination: destination) { musicSheetDestination = nil }
-        }
-        .sheet(item: $downloadPresentation) { presentation in
-            DownloadQualitySheet(qualities: presentation.qualities) { quality in
-                downloadPresentation = nil
-                startDownload(presentation.info, cid: presentation.cid, quality: quality)
-            }
-            .appAdaptiveSheet(compactDetents: [.medium], padSizing: .form)
         }
         .modifier(CommentSourceChange(model: viewModel) { source in
-            if source == nil, composerPresentation.isExpanded {
-                var transaction = Transaction()
-                transaction.disablesAnimations = true
-                withTransaction(transaction) {
-                    composerPresentation.isExpanded = false
-                }
-            }
-            if let showThread, showThread.type != 1 || showThread.oid != source?.aid || replyCommentSource != source {
+            composer.collapseImmediatelyIfSourceCleared(source)
+            if let showThread, showThread.type != 1 || showThread.oid != source?.aid || composer.replyCommentSource != source {
                 commentPresentation.cancelPendingAction()
                 replyPresentation.cancelPendingAction()
                 replyPresentation.isPresented = false
                 self.showThread = nil
-                replyCommentSource = nil
+                composer.replyCommentSource = nil
                 replyPresentation.anchors.sourceProvider = nil
             }
         })
@@ -529,111 +543,46 @@ struct VideoDetailView: View {
         }
     }
 
-    private func commentFeedbackAndComposer(isCompactOverlay: Bool) -> some View {
-        VideoDetailCommentPresentationReader(presentation: commentPresentation) { commentsPresented in
-            let showsToast = isCompactOverlay
-                || (showsWideChrome && stagePresentation == .stage && showThread == nil)
-            let showsInput = (isCompactOverlay || showsWideChrome)
-                && showsCommentInput(for: commentsPresented)
-            let usesFeedWidth = !showsWideChrome && UIDevice.current.userInterfaceIdiom == .pad
-            VStack(spacing: 10) {
-                Group {
-                    if showsToast, let toast = viewModel.toast {
-                        ToastView(message: toast)
-                    }
+    private func dialogBinding(_ dialog: DetailDialog) -> Binding<Bool> {
+        Binding(
+            get: { activeDialog == dialog },
+            set: { isPresented in
+                if !isPresented, activeDialog == dialog {
+                    activeDialog = nil
                 }
-                .animation(motion.feedbackAnimation(normal: .spring(duration: 0.3)), value: viewModel.toast)
-
-                if showsInput {
-                    CommentComposerMorphContainer(
-                        isExpanded: composerPresentation.isExpanded,
-                        hasDraft: composerHasDraft,
-                        sourceIdentity: AnyHashable(commentComposerCapture.context.sourceIdentity),
-                        onExpand: openComposer,
-                        expandedComposer: { expandedCommentComposer() }
-                    )
-                    .frame(maxWidth: usesFeedWidth ? ReadableWidth.feed : .infinity)
-                    .frame(maxWidth: .infinity)
-                }
-            }
-        }
-    }
-
-    private func expandedCommentComposer() -> some View {
-        let composer = commentComposerCapture
-        return CommentComposerBar(
-            text: commentTextBinding(for: composer),
-            pictures: commentPicturesBinding(for: composer),
-            placeholder: replyTarget.map { CommentComposerBar.replyPlaceholder(to: $0.member.uname) }
-            ?? String(localized: "Write a comment..."),
-            replyBanner: replyTarget.map { CommentComposerBar.replyBannerText(for: $0.member.uname) },
-            isSending: commentSubmission.isSending,
-            focus: commentFocus,
-            autoFocusOnAppear: composerPresentation.isExpanded && !commentSubmission.isSending,
-            usesExternalMorphSurface: true,
-            onCancelReply: {
-                guard composerIsCurrent(composer) else { return }
-                PlayerLog.log(
-                    "[Composer] reply target cleared (explicit ✕) "
-                    + "was rpid=\(replyTarget?.rpid ?? 0)"
-                )
-                setCommentReplyTarget(nil)
-                commentFocus.dismiss()
-                if !composerHasDraft { collapseComposer() }
-            },
-            onCollapse: collapseComposer,
-            onSend: {
-                guard composerPresentation.isExpanded, composerIsCurrent(composer) else { return }
-                sendComment()
-            },
-            onCancelSend: { sendCommentTask?.cancel() },
-            uploadScope: commentUploadScope(for: composer),
-            isInteractionCurrent: {
-                showsCommentInput(for: commentPresentation.isPresented)
-                    && composerIsCurrent(composer)
             }
         )
-        .id(composer.context.sourceIdentity)
-        .id(composer.sessionGeneration)
+    }
+
+    private func commentFeedbackAndComposer(isCompactOverlay: Bool) -> some View {
+        let model = viewModel
+        let requestedID = videoID
+        return VideoDetailCommentComposerOverlay(
+            composer: composer,
+            model: model,
+            commentPresentation: commentPresentation,
+            requestedVideoID: requestedID,
+            isCompactOverlay: isCompactOverlay,
+            showsWideChrome: showsWideChrome,
+            isWideLayout: isWideLayout,
+            stagePresentation: stagePresentation,
+            hasActiveThread: showThread != nil,
+            isInlineCommentInputEligible: isInlineCommentInputEligible,
+            isModelCurrent: { viewModel === model && videoID == requestedID },
+            onRevealPostedComment: { postedRpid, target, model, sourceIsCurrent in
+                revealAcceptedComment(
+                    postedRpid,
+                    replyingTo: target,
+                    model: model,
+                    sourceIsCurrent: sourceIsCurrent
+                )
+            }
+        )
     }
 
     private var isInlineCommentInputEligible: Bool {
         !player.isFullscreen
             && AuthManager.shared.isLoggedIn && !viewModel.commentsClosed
-    }
-
-    private func showsCommentInput(for commentsPresented: Bool) -> Bool {
-        showThread == nil && isInlineCommentInputEligible
-            && (isWideLayout ? stagePresentation == .stage : commentsPresented)
-    }
-
-    private func openComposer() {
-        guard !composerPresentation.isExpanded else {
-            commentFocus.request()
-            return
-        }
-        PlayerLog.log("[Composer] expanding from launcher")
-        withAnimation(motion.animation(normal: CollapsibleComposer.composerExpandAnimation)) {
-            composerPresentation.isExpanded = true
-        }
-        commentFocus.request()
-    }
-
-    private func collapseComposer() {
-        commentFocus.dismiss()
-        guard composerPresentation.isExpanded else { return }
-        PlayerLog.log(
-            "[Composer] collapsing to launcher draft=\(composerHasDraft ? 1 : 0)"
-        )
-        withAnimation(motion.animation(normal: CollapsibleComposer.composerCollapseAnimation)) {
-            composerPresentation.isExpanded = false
-        }
-    }
-
-    private var composerHasDraft: Bool {
-        !commentText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || !commentPictures.isEmpty
-            || replyTarget != nil
     }
 
     private func statsLine(_ info: VideoInfo) -> some View {
@@ -672,10 +621,10 @@ struct VideoDetailView: View {
                         }
                     }
                     .onLongPressGesture(minimumDuration: 0.4) {
-                        showDescActions = true
+                        activeDialog = .descriptionActions
                     }
                     .confirmationDialog(
-                        "", isPresented: $showDescActions, titleVisibility: .hidden
+                        "", isPresented: dialogBinding(.descriptionActions), titleVisibility: .hidden
                     ) {
                         Button {
                             UIPasteboard.general.string = info.desc
@@ -807,12 +756,12 @@ struct VideoDetailView: View {
             accessibilityTitle: "Coin"
         ) {
             if viewModel.maxCoins - viewModel.coinCount >= 2 {
-                showCoinDialog = true
+                activeDialog = .coin
             } else {
                 await viewModel.addCoin(multiply: 1)
             }
         }
-        .confirmationDialog("Coin this video", isPresented: $showCoinDialog, titleVisibility: .visible) {
+        .confirmationDialog("Coin this video", isPresented: dialogBinding(.coin), titleVisibility: .visible) {
             Button("Give 1 Coin") { addCoinFromDialog(1) }
             Button("Give 2 Coins") { addCoinFromDialog(2) }
         }
@@ -826,7 +775,7 @@ struct VideoDetailView: View {
             accessibilityTitle: "Favorite"
         ) {
             await viewModel.loadFavFolders()
-            showFavoriteSheet = true
+            activeSheet = .favorite
         }
         DetailActionButton(
             icon: viewModel.isInWatchLater ? "clock.fill" : "clock",
@@ -928,9 +877,9 @@ struct VideoDetailView: View {
                       viewModel.videoInfo?.aid == info.aid,
                       (viewModel.currentCid ?? viewModel.videoInfo?.cid) == cid
                 else { return }
-                downloadPresentation = DownloadQualityPresentation(
+                activeSheet = .download(DownloadQualityPresentation(
                     info: info, cid: cid, qualities: qualities
-                )
+                ))
             } catch {
                 guard !Task.isCancelled, downloadRequestSerial == serial else { return }
                 viewModel.showToast(error.localizedDescription, style: .error)
@@ -939,13 +888,13 @@ struct VideoDetailView: View {
     }
 
     private func shareItems(for info: VideoInfo) -> [Any] {
-        if let shareImage { return [shareImage] }
+        if let shareImage = shareState.image { return [shareImage] }
         if let url = URL(string: "https://www.bilibili.com/video/\(info.bvid)") { return [url] }
         return [info.title]
     }
 
     private func prepareShareCard(_ info: VideoInfo) {
-        guard shareRequestID == nil, !showShareSheet, isRouteActivated else { return }
+        guard shareState.requestID == nil, !shareState.isPresenting, isRouteActivated else { return }
         let id = UUID()
         let model = viewModel
         let request = ShareCardRenderer.Request(
@@ -954,21 +903,21 @@ struct VideoDetailView: View {
             linkDisplay: "bilibili.com/video/\(info.bvid)",
             accent: UIColor(Color.biliAccent).resolvedColor(with: UITraitCollection.current)
         )
-        shareRequestID = id
-        sharePreparation = Task {
+        shareState.requestID = id
+        shareState.preparation = Task {
             defer {
-                if shareRequestID == id {
-                    shareRequestID = nil
-                    sharePreparation = nil
+                if shareState.requestID == id {
+                    shareState.requestID = nil
+                    shareState.preparation = nil
                 }
             }
             guard let image = try? await ShareCardRenderer.prepare(request),
-                  !Task.isCancelled, shareRequestID == id,
+                  !Task.isCancelled, shareState.requestID == id,
                   isRouteActivated, viewModel === model, model.videoInfo?.bvid == info.bvid else { return }
-            shareImage = image
-            showShareSheet = true
+            shareState.image = image
+            shareState.isPresenting = true
             ActivitySharePresenter.present(items: shareItems(for: info)) { completed in
-                showShareSheet = false
+                shareState.isPresenting = false
                 guard completed else { return }
                 Task { await viewModel.shareVideo() }
             }
@@ -976,9 +925,9 @@ struct VideoDetailView: View {
     }
 
     private func cancelSharePreparation() {
-        sharePreparation?.cancel()
-        sharePreparation = nil
-        shareRequestID = nil
+        shareState.preparation?.cancel()
+        shareState.preparation = nil
+        shareState.requestID = nil
     }
 
     private func startDownload(_ info: VideoInfo, cid: Int, quality: Int) {
@@ -1010,8 +959,7 @@ struct VideoDetailView: View {
             onPresentationChanged: { isPresented in
                 if isPresented { updatePlayerCondensation() }
                 if !isPresented {
-                    commentFocus.dismiss()
-                    collapseComposer()
+                    composer.collapse(motion: motion)
                 }
             },
             allowsInteractiveDismissal: showThread == nil,
@@ -1035,8 +983,7 @@ struct VideoDetailView: View {
     private func closeComments() {
         commentPresentation.cancelPendingAction()
         replyPresentation.cancelPendingAction()
-        commentFocus.dismiss()
-        collapseComposer()
+        composer.collapse(motion: motion)
         if commentPresentation.isPresented {
             commentPresentation.isPresented = false
         } else {
@@ -1051,7 +998,7 @@ struct VideoDetailView: View {
         replyPresentation.cancelPendingAction()
         replyPresentation.isPresented = false
         showThread = nil
-        replyCommentSource = nil
+        composer.replyCommentSource = nil
         replyPresentation.anchors.sourceProvider = nil
     }
 
@@ -1062,10 +1009,9 @@ struct VideoDetailView: View {
         replyPresentation.cancelPendingAction()
         commentLinkLifetime.invalidate()
         coordinator.contentLinks.cancel()
-        commentFocus.dismiss()
-        collapseComposer()
+        composer.collapse(motion: motion)
         replyPresentation.anchors.sourceProvider = { nil }
-        replyCommentSource = source
+        composer.replyCommentSource = source
         showThread = target
         replyPresentation.isPresented = true
     }
@@ -1080,7 +1026,7 @@ struct VideoDetailView: View {
     private func finishCommentThreadDismissal(_ threadID: CommentThreadTarget.Identity?) {
         guard !replyPresentation.isPresented, showThread?.id == threadID else { return }
         showThread = nil
-        replyCommentSource = nil
+        composer.replyCommentSource = nil
         replyPresentation.anchors.sourceProvider = nil
     }
 
@@ -1099,15 +1045,14 @@ struct VideoDetailView: View {
         let model = viewModel
         let requestedID = videoID
         guard isActiveVideoRoute, replyPresentation.isPresented, showThread?.id == target.id,
-              let source = model.currentCommentSource, source == replyCommentSource,
+              let source = model.currentCommentSource, source == composer.replyCommentSource,
               source.aid == target.oid, target.type == 1,
               model.hasCommentSource(for: requestedID) else { return }
         let navigationRevision = coordinator.contentLinkNavigationRevision
         let accountRevision = AccountManager.shared.identityRevision
         commentPresentation.cancelPendingAction()
         replyPresentation.cancelPendingAction()
-        commentFocus.dismiss()
-        collapseComposer()
+        composer.collapse(motion: motion)
         replyPresentation.dismissThenPerform {
             finishCommentThreadDismissal(target.id)
             commentPresentation.dismissThenPerform {
@@ -1584,7 +1529,7 @@ struct VideoDetailView: View {
             })
             .contentLinks(isCurrent: {
                 isActiveVideoRoute && replyPresentation.isPresented && showThread?.id == target.id
-                    && replyCommentSource == viewModel.currentCommentSource
+                    && composer.replyCommentSource == viewModel.currentCommentSource
             })
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -1605,14 +1550,10 @@ struct VideoDetailView: View {
                         .transaction(value: stagePresentation) { $0.animation = nil }
                         .allowsHitTesting(showThread == nil)
                         .accessibilityHidden(showThread != nil)
-                    if composerPresentation.isExpanded, stagePresentation == .stage, showThread == nil {
-                        Color.clear
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                commentFocus.dismiss()
-                                collapseComposer()
-                            }
-                    }
+                    VideoDetailComposerDismissScrim(
+                        composer: composer,
+                        isActive: stagePresentation == .stage && showThread == nil
+                    )
                 }
                 .overlay(alignment: .bottom) {
                     commentFeedbackAndComposer(isCompactOverlay: false)
@@ -1792,14 +1733,10 @@ struct VideoDetailView: View {
                     }
                     .allowsHitTesting(showThread == nil)
                     .accessibilityHidden(showThread != nil)
-                    if composerPresentation.isExpanded, showThread == nil {
-                        Color.clear
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                commentFocus.dismiss()
-                                collapseComposer()
-                            }
-                    }
+                    VideoDetailComposerDismissScrim(
+                        composer: composer,
+                        isActive: showThread == nil
+                    )
                 }
                 .overlay(alignment: .bottom) {
                     commentFeedbackAndComposer(isCompactOverlay: true)
@@ -1868,13 +1805,11 @@ struct VideoDetailView: View {
             isRouteActive: { isActiveVideoRoute },
             currentVideoID: { videoID },
             reply: { target in
-                setCommentReplyTarget(target)
-                let aid = viewModel.videoInfo?.aid ?? 0
-                PlayerLog.log(
-                    "[Composer] reply target set rpid=\(target.rpid) "
-                    + "aid=\(aid)"
+                composer.beginReply(
+                    to: target,
+                    aid: viewModel.videoInfo?.aid ?? 0,
+                    motion: motion
                 )
-                openComposer()
             },
             openThread: { target in
                 openCommentThread(target)
@@ -1897,7 +1832,7 @@ struct VideoDetailView: View {
                         guard isActiveVideoRoute,
                               let current = viewModel.musicDestination(for: music, source: tagSource) else { return }
                         coordinator.contentLinks.cancel()
-                        musicSheetDestination = current
+                        activeSheet = .music(current)
                     } label: {
                         HStack(spacing: 6) {
                             Image(systemName: "music.note")
@@ -1947,118 +1882,6 @@ struct VideoDetailView: View {
                     .buttonStyle(.appControl)
                 }
             }
-        }
-    }
-
-    private var commentComposerCapture: CommentComposerCapture {
-        let model = viewModel
-        return CommentComposerCapture(
-            model: model, requestedID: videoID, source: model.currentCommentSource,
-            context: model.commentComposerContext, sessionGeneration: AuthManager.shared.sessionGeneration
-        )
-    }
-
-    private func composerIsCurrent(_ captured: CommentComposerCapture) -> Bool {
-        guard let source = captured.source else { return false }
-        return viewModel === captured.model && videoID == captured.requestedID
-            && captured.model.hasCommentSource(for: captured.requestedID)
-            && captured.model.currentCommentSource == source
-            && captured.model.commentComposerContext == captured.context
-            && AuthManager.shared.isLoggedIn
-            && AuthManager.shared.sessionGeneration == captured.sessionGeneration
-    }
-
-    private func commentUploadScope(for captured: CommentComposerCapture) -> CommentComposerUploadScope {
-        CommentComposerUploadScope(
-            owner: captured.model.commentUpload, context: captured.context,
-            isCurrent: { composerIsCurrent(captured) },
-            onAdmission: { commentSubmission.draftDidChange() }
-        )
-    }
-
-    private func commentTextBinding(for captured: CommentComposerCapture) -> Binding<String> {
-        Binding(get: { commentText }, set: { text in
-            guard composerIsCurrent(captured) else { return }
-            commentTextBinding.wrappedValue = text
-        })
-    }
-
-    private func commentPicturesBinding(for captured: CommentComposerCapture) -> Binding<[ComposedPicture]> {
-        Binding(get: { commentPictures }, set: { pictures in
-            guard composerIsCurrent(captured) else { return }
-            commentPicturesBinding.wrappedValue = pictures
-        })
-    }
-
-    private var commentTextBinding: Binding<String> {
-        Binding(get: { commentText }, set: { text in
-            commentSubmission.draftDidChange()
-            commentText = text
-        })
-    }
-
-    private var commentPicturesBinding: Binding<[ComposedPicture]> {
-        Binding(get: { commentPictures }, set: { pictures in
-            guard pictures != commentPictures else { return }
-            commentSubmission.draftDidChange()
-            commentPictures = pictures
-        })
-    }
-
-    private func setCommentReplyTarget(_ target: CommentResult.CommentItem?) {
-        if replyTarget?.rpid != target?.rpid { commentSubmission.draftDidChange() }
-        replyTarget = target
-    }
-
-    private func clearCommentDraft() {
-        commentTextBinding.wrappedValue = ""
-        commentPicturesBinding.wrappedValue = []
-        setCommentReplyTarget(nil)
-        viewModel.commentDraftWasReplaced()
-    }
-
-    private func finishCommentSubmission(_ attempt: CommentComposerSubmission.Attempt) {
-        if commentSubmission.finish(attempt) { sendCommentTask = nil }
-    }
-
-    private func sendComment() {
-        let msg = commentText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let requestedVideoID = videoID
-        guard !msg.isEmpty || !commentPictures.isEmpty,
-              !viewModel.commentUpload.isUploading,
-              viewModel.hasCommentSource(for: requestedVideoID),
-              let aid = viewModel.videoInfo?.aid,
-              let attempt = commentSubmission.begin() else { return }
-        let target = replyTarget
-        let pictures = commentPictures
-        let model = viewModel
-        let generation = model.commentSourceGeneration
-        let sourceIsCurrent = {
-            viewModel === model && videoID == requestedVideoID
-                && model.hasCommentSource(for: requestedVideoID)
-                && model.videoInfo?.aid == aid && model.commentSourceGeneration == generation
-        }
-        let canApply = {
-            !Task.isCancelled && sourceIsCurrent() && commentSubmission.canApply(attempt)
-        }
-        sendCommentTask = Task {
-            guard !Task.isCancelled, sourceIsCurrent() else {
-                finishCommentSubmission(attempt)
-                return
-            }
-            let postedRpid = await model.postComment(
-                message: msg,
-                root: target?.rpid,
-                parent: target?.rpid,
-                pictures: pictures
-            )
-            finishCommentSubmission(attempt)
-            guard let postedRpid, canApply() else { return }
-            clearCommentDraft()
-            collapseComposer()
-            revealAcceptedComment(
-                postedRpid, replyingTo: target, model: model, sourceIsCurrent: sourceIsCurrent
-            )
         }
     }
 
@@ -2241,43 +2064,6 @@ private struct VideoReportSheet: View {
         }
         .appAdaptiveSheet(compactDetents: [.large], padSizing: .page)
     }
-}
-
-private struct AuthedBiliWebView: UIViewRepresentable {
-    let url: URL
-
-    func makeUIView(context _: Context) -> WKWebView {
-        let config = WKWebViewConfiguration()
-        config.websiteDataStore = .nonPersistent()
-        let webView = WKWebView(frame: .zero, configuration: config)
-
-        let cookies: [(name: String, value: String?)] = [
-            ("SESSDATA", AuthManager.shared.sessData),
-            ("bili_jct", AuthManager.shared.biliJct),
-            ("DedeUserID", AuthManager.shared.dedeUserID),
-        ]
-        let store = config.websiteDataStore.httpCookieStore
-        let group = DispatchGroup()
-        for (name, value) in cookies {
-            guard let value,
-                  let cookie = HTTPCookie(properties: [
-                      .domain: ".bilibili.com",
-                      .path: "/",
-                      .name: name,
-                      .value: value,
-                      .secure: true,
-                  ])
-            else { continue }
-            group.enter()
-            store.setCookie(cookie) { group.leave() }
-        }
-        group.notify(queue: .main) {
-            webView.load(URLRequest(url: url))
-        }
-        return webView
-    }
-
-    func updateUIView(_: WKWebView, context _: Context) {}
 }
 
 // MARK: - Comment list
