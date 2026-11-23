@@ -3,6 +3,7 @@ import SwiftUI
 import UIKit
 struct RootView: View {
     @Environment(AppCoordinator.self) var coordinator
+    @Environment(AppNoticeCenter.self) private var noticeCenter: AppNoticeCenter?
     @Environment(\.horizontalSizeClass) var horizontalSizeClass
     @AppMotion private var motion
     @AppStorage("sidebar-customization") var tabCustomization: TabViewCustomization
@@ -40,32 +41,29 @@ struct RootView: View {
     private var hasBottomChrome: Bool {
         coordinator.clipboardSuggestion != nil || DownloadManager.shared.hasInFlightDownloads
     }
+    private var usesRegularDetailHost: Bool {
+        showsSidebar
+    }
     private var detailPresentationInput: RootDetailPresentationState.Input {
-        let isPad = UIDevice.current.userInterfaceIdiom == .pad
+        let eligible = usesRegularDetailHost
         return .init(
-            navigation: isPad ? coordinator.detailNavigation : nil,
-            navigationRevision: isPad ? coordinator.contentLinkNavigationRevision : 0,
+            navigation: eligible ? coordinator.detailNavigation : nil,
+            navigationRevision: eligible ? coordinator.contentLinkNavigationRevision : 0,
             accountRevision: AccountManager.shared.identityRevision,
-            isEligible: isPad
+            isEligible: eligible
         )
     }
     var hidesDetailInRootShell: Bool {
         detailPresentation.hidesDetailInRootShell(for: detailPresentationInput)
     }
-    private var isPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
 
-    @ViewBuilder
     private var navigationContent: some View {
-        if isPad {
-            rootShell
-                .fullScreenCover(
-                    isPresented: detailCoverPresented,
-                    onDismiss: { retainedCoverRoot = nil },
-                    content: { detailCover }
-                )
-        } else {
-            rootShell
-        }
+        rootShell
+            .fullScreenCover(
+                isPresented: detailCoverPresented,
+                onDismiss: { retainedCoverRoot = nil },
+                content: { detailCover }
+            )
     }
 
     @ViewBuilder
@@ -105,6 +103,8 @@ struct RootView: View {
                 .accessibilityHidden(true)
             }
             .environment(coordinator)
+            .environment(noticeCenter)
+            .environment(\.appNoticeCenter, noticeCenter)
             .environment(\.navigationZoomNamespace, navigationZoomNamespace)
             .modifier(CoverZoom(
                 sourceID: motion.reducesGeometry ? nil : root.route.zoomSourceID,
@@ -133,7 +133,7 @@ struct RootView: View {
             }
             .allowsHitTesting(!detailPresentation.projectionHeld)
             .accessibilityHidden(detailPresentation.projectionHeld)
-            .appNoticeOverlay(bottomPadding: UIDevice.current.userInterfaceIdiom == .phone ? 54 : 8)
+            .appNoticeOverlay(bottomPadding: showsSidebar ? 8 : 54)
     }
 
     private var detailCoverPresented: Binding<Bool> {
@@ -237,7 +237,6 @@ struct RootView: View {
             #endif
         }
         .tint(navigationTint)
-        .id(AccountManager.shared.activeMid ?? "logged-out")
         .onOpenURL { url in
             coordinator.handle(url: url, context: contentLinkLifetime.capture())
         }
@@ -277,7 +276,6 @@ struct RootView: View {
             contentLinkLifetime.deactivate()
             coordinator.contentLinks.cancel(lifetimeID: contentLinkLifetime.id)
         }
-        .onChange(of: AccountManager.shared.identityRevision) { coordinator.contentLinks.cancel() }
         .preferredColorScheme((AppearanceMode(rawValue: appearanceRaw) ?? .system).colorScheme)
         .onChange(of: FullscreenLoginHandoff.shared.isReady) { _, ready in
             if ready, FullscreenLoginHandoff.shared.consume() {

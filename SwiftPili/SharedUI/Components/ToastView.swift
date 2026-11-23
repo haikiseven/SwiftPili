@@ -55,7 +55,7 @@ final class AppNoticeCenter {
     private(set) var message: ToastMessage?
     @ObservationIgnored private var dismissTask: Task<Void, Never>?
 
-    private init() {}
+    init() {}
 
     func showError(_ text: String) {
         show(text, style: .error)
@@ -72,12 +72,40 @@ final class AppNoticeCenter {
     }
 }
 
+private struct AppNoticeCenterKey: EnvironmentKey {
+    static let defaultValue: AppNoticeCenter? = nil
+}
+
+extension EnvironmentValues {
+    var appNoticeCenter: AppNoticeCenter? {
+        get { self[AppNoticeCenterKey.self] }
+        set { self[AppNoticeCenterKey.self] = newValue }
+    }
+}
+
 private struct AppNoticeOverlayModifier: ViewModifier {
     let bottomPadding: CGFloat
     @AppMotion private var motion
+    @Environment(AppNoticeCenter.self) private var environmentNoticeCenter: AppNoticeCenter?
+    @Environment(\.appNoticeCenter) private var keyNoticeCenter
+
+    private var activeNoticeCenter: AppNoticeCenter {
+        environmentNoticeCenter ?? keyNoticeCenter ?? .shared
+    }
+
+    private var currentMessage: ToastMessage? {
+        let center = activeNoticeCenter
+        if let message = center.message {
+            return message
+        }
+        if center !== AppNoticeCenter.shared {
+            return AppNoticeCenter.shared.message
+        }
+        return nil
+    }
 
     func body(content: Content) -> some View {
-        let currentMessage = AppNoticeCenter.shared.message
+        let currentMessage = currentMessage
         content.overlay(alignment: .bottom) {
             Group {
                 if let currentMessage {

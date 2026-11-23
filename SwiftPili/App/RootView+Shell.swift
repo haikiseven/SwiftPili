@@ -2,7 +2,7 @@ import SwiftUI
 import UIKit
 
 extension RootView {
-    private var showsSidebar: Bool {
+    var showsSidebar: Bool {
         ShellNavigationPolicy.showsSidebar(
             isPad: UIDevice.current.userInterfaceIdiom == .pad,
             isRegularWidth: horizontalSizeClass == .regular

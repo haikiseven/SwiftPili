@@ -43,8 +43,19 @@ final class AppCoordinator {
     @ObservationIgnored var rootLinkContext: ContentLinkContext?
     var contentLinkNavigationRevision: UInt64 = 0
 
-    private var routePlayer: PlayerViewModel? {
-        PlayerViewModel.existingShared
+    @ObservationIgnored
+    private let playbackHookProvider: @MainActor () -> (any NavigationPlaybackHook)?
+
+    init(
+        playbackHookProvider: @escaping @MainActor () -> (any NavigationPlaybackHook)? = {
+            PlayerViewModel.existingShared
+        }
+    ) {
+        self.playbackHookProvider = playbackHookProvider
+    }
+
+    private var routePlayer: (any NavigationPlaybackHook)? {
+        playbackHookProvider()
     }
 
     var selectedTab: AppTab = .home {
@@ -70,39 +81,15 @@ final class AppCoordinator {
         loginPresentation = LoginPresentation()
     }
 
-    var homeStack: [Route] = [] {
+    private var tabStacks: [AppTab: [Route]] = [:] {
         willSet {
-            if homeStack != newValue { noteContentLinkNavigationChange() }
-            guard selectedSidebarRow == nil, selectedTab == .home else { return }
-            notifyPlayerRouteChange(to: playerDestination(stack: newValue, tab: .home))
-        }
-    }
-    var dynamicsStack: [Route] = [] {
-        willSet {
-            if dynamicsStack != newValue { noteContentLinkNavigationChange() }
-            guard selectedSidebarRow == nil, selectedTab == .dynamics else { return }
-            notifyPlayerRouteChange(to: playerDestination(stack: newValue, tab: .dynamics))
-        }
-    }
-    var liveStack: [Route] = [] {
-        willSet {
-            if liveStack != newValue { noteContentLinkNavigationChange() }
-            guard selectedSidebarRow == nil, selectedTab == .live else { return }
-            notifyPlayerRouteChange(to: playerDestination(stack: newValue, tab: .live))
-        }
-    }
-    var mineStack: [Route] = [] {
-        willSet {
-            if mineStack != newValue { noteContentLinkNavigationChange() }
-            guard selectedSidebarRow == nil, selectedTab == .mine else { return }
-            notifyPlayerRouteChange(to: playerDestination(stack: newValue, tab: .mine))
-        }
-    }
-    var searchStack: [Route] = [] {
-        willSet {
-            if searchStack != newValue { noteContentLinkNavigationChange() }
-            guard selectedSidebarRow == nil, selectedTab == .search else { return }
-            notifyPlayerRouteChange(to: playerDestination(stack: newValue, tab: .search))
+            let changed = AppTab.allCases.contains { (tabStacks[$0] ?? []) != (newValue[$0] ?? []) }
+            if changed { noteContentLinkNavigationChange() }
+            guard selectedSidebarRow == nil else { return }
+            let oldActive = tabStacks[selectedTab] ?? []
+            let newActive = newValue[selectedTab] ?? []
+            guard oldActive != newActive else { return }
+            notifyPlayerRouteChange(to: playerDestination(stack: newActive, tab: selectedTab))
         }
     }
 
@@ -239,25 +226,13 @@ final class AppCoordinator {
             && stack.count < old.count
         if shouldPark {
             let departedOwner = routePlayer?.parkOutgoingRouteStill()
-            switch tab {
-            case .home: homeStack = stack
-            case .dynamics: dynamicsStack = stack
-            case .live: liveStack = stack
-            case .mine: mineStack = stack
-            case .search: searchStack = stack
-            }
+            tabStacks[tab] = stack
             if let departedOwner {
                 routePlayer?.retireDepartedRouteStill(owner: departedOwner)
             }
             return
         }
-        switch tab {
-        case .home: homeStack = stack
-        case .dynamics: dynamicsStack = stack
-        case .live: liveStack = stack
-        case .mine: mineStack = stack
-        case .search: searchStack = stack
-        }
+        tabStacks[tab] = stack
     }
 
     private func setSidebarRowStack(_ stack: [Route], for row: SidebarDestination) {
@@ -308,13 +283,7 @@ final class AppCoordinator {
     }
 
     func stack(for tab: AppTab) -> [Route] {
-        switch tab {
-        case .home: homeStack
-        case .dynamics: dynamicsStack
-        case .live: liveStack
-        case .mine: mineStack
-        case .search: searchStack
-        }
+        tabStacks[tab] ?? []
     }
 
     private var activeTopRoute: Route? {
@@ -369,30 +338,8 @@ final class AppCoordinator {
     }
 
     func handleTabReselect(_ tab: AppTab) {
-        var popping = false
-        switch tab {
-        case .home:
-            guard !homeStack.isEmpty else { break }
-            popping = true
-            setStack([], for: .home)
-        case .dynamics:
-            guard !dynamicsStack.isEmpty else { break }
-            popping = true
-            setStack([], for: .dynamics)
-        case .live:
-            guard !liveStack.isEmpty else { break }
-            popping = true
-            setStack([], for: .live)
-        case .mine:
-            guard !mineStack.isEmpty else { break }
-            popping = true
-            setStack([], for: .mine)
-        case .search:
-            guard !searchStack.isEmpty else { break }
-            popping = true
-            setStack([], for: .search)
-        }
-        if popping {
+        if !stack(for: tab).isEmpty {
+            setStack([], for: tab)
             videoNavigationAdmission.cancel()
             pendingCommentNavigation = nil
             return
@@ -431,17 +378,26 @@ final class AppCoordinator {
         pendingCommentNavigation = nil
         routePlayer?.endCurrentOwnerPlayback()
         routePlayer?.clearAllOutgoingRouteStills()
+        if selectedTab != .home {
+            tabStacks[selectedTab] = []
+        }
+        tabStacks[.home] = []
         selectedSidebarRow = nil
         sidebarRowStacks.removeAll()
-        switch selectedTab {
-        case .home: break
-        case .dynamics: dynamicsStack = []
-        case .live: liveStack = []
-        case .mine: mineStack = []
-        case .search: searchStack = []
-        }
-        homeStack = []
         selectedTab = .home
+    }
+
+    func resetForAccountChange() {
+        contentLinks.cancel()
+        videoNavigationAdmission.cancel()
+        pendingCommentNavigation = nil
+        routePlayer?.endCurrentOwnerPlayback()
+        routePlayer?.clearAllOutgoingRouteStills()
+        tabStacks.removeAll()
+        selectedSidebarRow = nil
+        sidebarRowStacks.removeAll()
+        selectedTab = .home
+        loginPresentation = nil
     }
 
     func navigate(to route: Route) {
@@ -464,13 +420,7 @@ final class AppCoordinator {
             sidebarRowStacks[row.id, default: []].append(route)
             return
         }
-        switch selectedTab {
-        case .home: homeStack.append(route)
-        case .dynamics: dynamicsStack.append(route)
-        case .live: liveStack.append(route)
-        case .mine: mineStack.append(route)
-        case .search: searchStack.append(route)
-        }
+        tabStacks[selectedTab, default: []].append(route)
     }
 
     @discardableResult

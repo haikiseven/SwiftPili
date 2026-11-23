@@ -55,8 +55,23 @@ targets:
           - $(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)
         basedOnDependencyAnalysis: false
 
+  SwiftPiliTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - SwiftPiliTests
+    dependencies:
+      - target: SwiftPili
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: "YES"
+
 schemes:
   SwiftPili:
     build:
       targets:
         SwiftPili: all
+        SwiftPiliTests: [test]
+    test:
+      targets:
+        - SwiftPiliTests

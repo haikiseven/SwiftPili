@@ -4,7 +4,6 @@ import SwiftData
 @main
 struct SwiftPiliApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @State private var coordinator = AppCoordinator()
     private let modelContainer: ModelContainer
 
     init() {
@@ -23,30 +22,57 @@ struct SwiftPiliApp: App {
 
     var body: some Scene {
         WindowGroup {
-            RootView()
-                .environment(coordinator)
-                .modelContainer(modelContainer)
-                .task {
-                    MainThreadIdentity.adopt()
-                    ExperimentalDiagnosticsRuntime.activateScene()
-                    ExperimentalDiagnosticsRuntime.applyPolicy()
-                    ImageDiagnostics.applyLaunchState()
-                    KeyboardAnimation.beginObserving()
-                    HangDiagnosticsReporter.start()
-                    DownloadManager.shared.container = modelContainer
-                    OfflineProgressStore.shared.container = modelContainer
-                    ExperimentalDiagnosticsRuntime.applyPolicy()
-                    if ExperimentalSettingsPolicy.isAllowed(.decoderPrewarm) {
-                        VideoHardwareCapabilities.prewarm()
-                    }
-                    PlayerViewModel.prewarmPlaybackEngine()
-                    SmartCDNSelector.shared.launch()
-                    await BuvidManager.syncServerBuvid()
-                    await BuvidManager.activateBuvid()
-                }
-                .task(id: AccountManager.shared.identityRevision) {
-                    await BlocklistManager.shared.loadIfNeeded()
-                }
+            AppSceneRootView(modelContainer: modelContainer)
         }
+    }
+}
+
+@MainActor
+private enum AppProcessBootstrap {
+    private static var hasStarted = false
+
+    static func runIfNeeded(modelContainer: ModelContainer) async {
+        guard !hasStarted else { return }
+        hasStarted = true
+        MainThreadIdentity.adopt()
+        ExperimentalDiagnosticsRuntime.activateScene()
+        ExperimentalDiagnosticsRuntime.applyPolicy()
+        ImageDiagnostics.applyLaunchState()
+        KeyboardAnimation.beginObserving()
+        HangDiagnosticsReporter.start()
+        DownloadManager.shared.container = modelContainer
+        OfflineProgressStore.shared.container = modelContainer
+        ExperimentalDiagnosticsRuntime.applyPolicy()
+        if ExperimentalSettingsPolicy.isAllowed(.decoderPrewarm) {
+            VideoHardwareCapabilities.prewarm()
+        }
+        PlayerViewModel.prewarmPlaybackEngine()
+        SmartCDNSelector.shared.launch()
+        await BuvidManager.syncServerBuvid()
+        await BuvidManager.activateBuvid()
+    }
+}
+
+private struct AppSceneRootView: View {
+    let modelContainer: ModelContainer
+    @State private var coordinator = AppCoordinator()
+    @State private var noticeCenter = AppNoticeCenter()
+
+    var body: some View {
+        RootView()
+            .id(AccountManager.shared.identityRevision)
+            .environment(coordinator)
+            .environment(noticeCenter)
+            .environment(\.appNoticeCenter, noticeCenter)
+            .modelContainer(modelContainer)
+            .onChange(of: AccountManager.shared.identityRevision) { _, _ in
+                coordinator.resetForAccountChange()
+            }
+            .task {
+                await AppProcessBootstrap.runIfNeeded(modelContainer: modelContainer)
+            }
+            .task(id: AccountManager.shared.identityRevision) {
+                await BlocklistManager.shared.loadIfNeeded()
+            }
     }
 }
