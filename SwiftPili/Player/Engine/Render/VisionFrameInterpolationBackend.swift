@@ -7,13 +7,15 @@ final class VisionFrameInterpolationBackend {
     private var previousFrame: MediaVideoFrame?
     private var resources: VisionInterpolationMetal?
 
-    private static let minimumSourceInterval: TimeInterval = 1 / 30.5
+    private static let minimumSourceInterval: TimeInterval = 1 / 32.5
 
-    /// Vision optical flow + Metal synthesis supports arbitrary phases in `(0, 1)` (2×–5×),
-    /// constrained to progressive SDR sources ≤ 30 fps within the configured input resolution cap.
+    /// Vision optical flow + Metal synthesis supports arbitrary phases in `(0, 1)` (2×–5× and
+    /// CFR resampling), constrained to progressive SDR sources ≤ ~32 fps within the configured
+    /// input resolution cap.
     static func inputBypassReason(
         _ frame: MediaVideoFrame,
-        maxInputResolution: VideoEnhancementMaxInputResolution = .p1080
+        maxInputResolution: VideoEnhancementMaxInputResolution = .p1080,
+        cadenceInterval: TimeInterval? = nil
     ) -> String? {
         if !VideoEnhancementGuardrails.isWithin(
             width: CVPixelBufferGetWidth(frame.pixelBuffer),
@@ -22,8 +24,11 @@ final class VisionFrameInterpolationBackend {
         ) {
             return "Vision FI \(maxInputResolution.bypassReason.lowercased())"
         }
-        guard VideoFrameInterpolationTiming.sourceFPS(frame) != nil,
-              frame.duration + VideoFrameInterpolationTiming.tolerance >= minimumSourceInterval else {
+        guard VideoFrameInterpolationTiming.sourceFPS(frame) != nil else {
+            return "Vision FI invalid duration"
+        }
+        let effectiveInterval = cadenceInterval.flatMap { $0.isFinite && $0 > 0 ? $0 : nil } ?? frame.duration
+        guard effectiveInterval + VideoFrameInterpolationTiming.tolerance >= minimumSourceInterval else {
             return "Vision FI source > 30fps or invalid duration"
         }
         return nil
@@ -52,15 +57,26 @@ final class VisionFrameInterpolationBackend {
         #if targetEnvironment(simulator)
         return .bypassed(reason: "Vision FI device required")
         #else
-        if let reason = Self.inputBypassReason(frame, maxInputResolution: maxInputResolution) {
+        if !VideoEnhancementGuardrails.isWithin(
+            width: CVPixelBufferGetWidth(frame.pixelBuffer),
+            height: CVPixelBufferGetHeight(frame.pixelBuffer),
+            limit: maxInputResolution
+        ) {
             flush()
-            return .bypassed(reason: reason)
+            return .bypassed(reason: "Vision FI \(maxInputResolution.bypassReason.lowercased())")
         }
         let buffer = frame.pixelBuffer
         guard VideoFrameInterpolationTiming.sourceFPS(frame) != nil,
               let format = VisionInterpolationFormat(buffer) else {
             flush()
             return .bypassed(reason: "Vision FI input format or timing")
+        }
+        if let plan,
+           let reason = Self.inputBypassReason(
+               frame, maxInputResolution: maxInputResolution, cadenceInterval: plan.sourceInterval
+           ) {
+            flush()
+            return .bypassed(reason: reason)
         }
         guard !Task.isCancelled else {
             flush()
@@ -69,8 +85,12 @@ final class VisionFrameInterpolationBackend {
         let previous = previousFrame
         previousFrame = frame
         guard let plan, let previous else { return .passthrough }
+        guard !plan.phases.isEmpty else { return .passthrough }
         guard let timing = VideoFrameInterpolationTiming(
-            previousPTS: previous.pts, previousDuration: previous.duration, current: frame
+            previousPTS: previous.pts,
+            previousDuration: previous.duration,
+            current: frame,
+            expectedInterval: plan.sourceInterval
         ), Self.acceptsPairDelta(timing.delta) else {
             return .bypassed(reason: "Vision FI discontinuous or > 30fps pair")
         }

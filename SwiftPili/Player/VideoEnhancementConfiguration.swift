@@ -217,6 +217,33 @@ enum VideoSuperResolutionScale: Int, CaseIterable, Identifiable, Sendable {
     }
 }
 
+enum VideoSuperResolutionSharpness: String, CaseIterable, Identifiable, Sendable {
+    case off
+    case light
+    case standard
+    case strong
+
+    var id: Self { self }
+
+    var label: String {
+        switch self {
+        case .off: String(localized: "Off")
+        case .light: String(localized: "VideoEnhancementSharpnessLight", defaultValue: "Light")
+        case .standard: String(localized: "Standard")
+        case .strong: String(localized: "Strong")
+        }
+    }
+
+    var rcasStrength: Float {
+        switch self {
+        case .off: 0
+        case .light: 0.35
+        case .standard: 0.65
+        case .strong: 0.90
+        }
+    }
+}
+
 struct VideoSuperResolutionDimensions: Equatable, Hashable, Sendable {
     let width: Int
     let height: Int
@@ -316,11 +343,11 @@ enum VideoSuperResolutionTargetResolution: Equatable, Hashable, Sendable {
         }
     }
 
-    /// Steps down high manual target resolutions under adaptive performance or memory pressure.
+    /// Steps down high manual target resolutions (> 1440p) under adaptive performance or memory pressure.
+    /// Keeps 1440p intact so 1080p streams do not collapse to 1080p and self-disable super resolution.
     var degradedForPerformance: Self {
         guard let edge = shortEdge else { return .auto }
         if edge > 1440 { return .p1440 }
-        if edge > 1080 { return .p1080 }
         return self
     }
 
@@ -483,6 +510,7 @@ struct VideoEnhancementConfiguration: Equatable, Sendable {
     var interpolationRate: VideoInterpolationRate = .doubleRate
     var superResolutionScale: VideoSuperResolutionScale = .two
     var superResolutionTargetResolution: VideoSuperResolutionTargetResolution = .auto
+    var superResolutionSharpness: VideoSuperResolutionSharpness = .standard
     var maxInputResolution: VideoEnhancementMaxInputResolution = .p1080
     var isLiveStream: Bool = false
     /// When enabled, the runtime governor may reduce quality if the device cannot keep up,
@@ -596,7 +624,7 @@ enum VideoEnhancementBypassDisplay {
         (["warming"], { String(localized: "Warming up") }),
         (["memory"], { String(localized: "Memory limited") }),
         (["target resolution"], { String(localized: "Target resolution reached") }),
-        (["target frame rate", "no eligible interpolation"], { String(localized: "Target FPS reached") }),
+        (["target frame rate"], { String(localized: "Target FPS reached") }),
         (["display resolution"], { String(localized: "Screen resolution reached") }),
         (["raster budget"], { String(localized: "Max output size") }),
         (["performance", "worker busy"], { String(localized: "Performance limited") }),
@@ -612,6 +640,9 @@ enum VideoEnhancementBypassDisplay {
         (["downloading"], { String(localized: "Model downloading") }),
         (["download required"], { String(localized: "Model required") }),
         (["scene cut"], { String(localized: "Scene cut") }),
+        (["ratio unsupported"], { String(localized: "Ratio unsupported") }),
+        (["timing gap", "timing invalid"], { String(localized: "Frame timing gap") }),
+        (["format changed"], { String(localized: "Format changed") }),
         (["unsupported", "unavailable"], { String(localized: "Unsupported") }),
     ]
 
@@ -738,6 +769,8 @@ enum VideoEnhancementPreferences {
     private static let superResolutionScaleKey = "experimental_video_enhancement_super_resolution_scale"
     private static let superResolutionTargetResolutionKey =
         "experimental_video_enhancement_super_resolution_target_resolution"
+    private static let superResolutionSharpnessKey =
+        "experimental_video_enhancement_super_resolution_sharpness"
     private static let maxInputResolutionKey = "experimental_video_enhancement_max_input_resolution"
 
     static var interpolationRate: VideoInterpolationRate {
@@ -764,6 +797,14 @@ enum VideoEnhancementPreferences {
         set {
             UserDefaults.standard.set(newValue.persistedValue, forKey: superResolutionTargetResolutionKey)
         }
+    }
+
+    static var superResolutionSharpness: VideoSuperResolutionSharpness {
+        get {
+            UserDefaults.standard.string(forKey: superResolutionSharpnessKey)
+                .flatMap(VideoSuperResolutionSharpness.init(rawValue:)) ?? .standard
+        }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: superResolutionSharpnessKey) }
     }
 
     static var maxInputResolution: VideoEnhancementMaxInputResolution {

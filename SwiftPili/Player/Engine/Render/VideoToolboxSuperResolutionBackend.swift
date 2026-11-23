@@ -3,6 +3,97 @@ import CoreVideo
 import Foundation
 import VideoToolbox
 
+/// Pure, simulator-testable dimension and pixel-format negotiation helpers for VideoToolbox ML SR.
+enum VTSRNegotiation {
+    static let preferredFallbackFormats: [OSType] = [
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        kCVPixelFormatType_32BGRA,
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    ]
+
+    /// Extracts pixel formats listed under `kCVPixelBufferPixelFormatTypeKey` (single value or array).
+    static func attributeFormats(from attributes: [String: Any]) -> [OSType] {
+        let key = kCVPixelBufferPixelFormatTypeKey as String
+        if let values = attributes[key] as? [NSNumber] { return values.map(\.uint32Value) }
+        if let values = attributes[key] as? [OSType] { return values }
+        if let value = attributes[key] as? NSNumber { return [value.uint32Value] }
+        if let value = attributes[key] as? OSType { return [value] }
+        return []
+    }
+
+    /// Resolves destination dimensions from `destinationAttributes` when explicit `Width`/`Height`
+    /// are provided and exceed the input; otherwise computes even-aligned `input * scale`.
+    static func resolveOutputDimensions(
+        inputWidth: Int,
+        inputHeight: Int,
+        scale: Float,
+        destinationAttributes: [String: Any]
+    ) -> (width: Int, height: Int)? {
+        guard inputWidth > 0, inputHeight > 0, scale.isFinite, scale > 1 else { return nil }
+        let widthKey = kCVPixelBufferWidthKey as String
+        let heightKey = kCVPixelBufferHeightKey as String
+        let explicitWidth = (destinationAttributes[widthKey] as? NSNumber)?.intValue
+        let explicitHeight = (destinationAttributes[heightKey] as? NSNumber)?.intValue
+        if let explicitWidth, let explicitHeight {
+            guard explicitWidth > inputWidth, explicitHeight > inputHeight else { return nil }
+            return (explicitWidth, explicitHeight)
+        }
+        func evenNearest(_ value: Double) -> Int { max(2, Int((value / 2.0).rounded()) * 2) }
+        let width = explicitWidth ?? evenNearest(Double(inputWidth) * Double(scale))
+        let height = explicitHeight ?? evenNearest(Double(inputHeight) * Double(scale))
+        guard width > inputWidth, height > inputHeight else { return nil }
+        return (width, height)
+    }
+
+    /// Returns all preferred formats in priority order that satisfy `nativeSupported` (when non-empty)
+    /// and `attributeFormats` (when non-empty).
+    static func candidateFormats(
+        preferred: [OSType],
+        nativeSupported: [OSType],
+        attributeFormats: [OSType]
+    ) -> [OSType] {
+        var ordered: [OSType] = []
+        for format in preferred where !ordered.contains(format) {
+            ordered.append(format)
+        }
+        return ordered.filter { format in
+            let matchesNative = nativeSupported.isEmpty || nativeSupported.contains(format)
+            let matchesAttributes = attributeFormats.isEmpty || attributeFormats.contains(format)
+            return matchesNative && matchesAttributes
+        }
+    }
+
+    /// Selects the highest-priority pixel format compatible with `nativeSupported` and `attributeFormats`.
+    static func selectFormat(
+        preferred: [OSType],
+        nativeSupported: [OSType],
+        attributeFormats: [OSType]
+    ) -> OSType? {
+        candidateFormats(
+            preferred: preferred, nativeSupported: nativeSupported, attributeFormats: attributeFormats
+        ).first
+    }
+
+    static func sourceFormatPriority(for inputFormat: OSType) -> [OSType] {
+        [inputFormat] + preferredFallbackFormats
+    }
+
+    static func destinationFormatPriority(for sourceFormat: OSType) -> [OSType] {
+        [sourceFormat] + preferredFallbackFormats
+    }
+
+    static func fourCC(_ format: OSType) -> String {
+        let bytes = [24, 16, 8, 0].map { UInt8(truncatingIfNeeded: format >> $0) }
+        let hex = "0x\(String(format, radix: 16))"
+        guard bytes.allSatisfy({ (32...126).contains($0) }) else { return hex }
+        return String(bytes: bytes, encoding: .ascii) ?? hex
+    }
+
+    static func formatsDescription(_ formats: [OSType]) -> String {
+        formats.isEmpty ? "unspecified" : formats.map(fourCC).joined(separator: ",")
+    }
+}
+
 final class VideoToolboxSuperResolutionBackend {
     #if !targetEnvironment(simulator)
     private var contextStorage: AnyObject?
@@ -16,6 +107,7 @@ final class VideoToolboxSuperResolutionBackend {
 
     func tearDown() {
         #if !targetEnvironment(simulator)
+        if #available(iOS 26.0, *) { (contextStorage as? VTSRContext)?.tearDown() }
         contextStorage = nil
         #endif
     }
@@ -56,10 +148,12 @@ final class VideoToolboxSuperResolutionBackend {
         _ input: CVPixelBuffer, pts: CMTime, maxScale: Float, hasTimeRemaining: @Sendable () -> Bool
     ) async throws -> CVPixelBuffer {
         let inputRaster = VTInterpolationRaster(input)
-        let context = if let current = contextStorage as? VTSRContext, current.raster == inputRaster {
-            current
+        let context: VTSRContext
+        if let current = contextStorage as? VTSRContext, current.raster == inputRaster {
+            context = current
         } else {
-            VTSRContext(raster: inputRaster, maxScale: maxScale)
+            (contextStorage as? VTSRContext)?.tearDown()
+            context = VTSRContext(raster: inputRaster, maxScale: maxScale)
         }
         contextStorage = context
         context.updateScaleCap(maxScale)
@@ -76,6 +170,7 @@ private final class VTSRContext {
     private var candidates: [VTSRConfiguration]
     private var configurationFailure: String
     private var session: VTSRSession?
+    private let pixelConverter = MetalNV12PixelConverter()
     private var nativeRejections: [VTSRConfiguration.Identifier: String] = [:]
     private var nextModelDownloadRequests: [VTSRConfiguration.Identifier: ContinuousClock.Instant] = [:]
 
@@ -83,6 +178,10 @@ private final class VTSRContext {
         self.raster = raster
         self.maxScale = maxScale
         (candidates, configurationFailure) = VTSRConfiguration.candidates(for: raster, maxScale: maxScale)
+    }
+
+    deinit {
+        tearDown()
     }
 
     func updateScaleCap(_ maxScale: Float) {
@@ -94,21 +193,30 @@ private final class VTSRContext {
         }
     }
 
-    func flush() { session?.flush() }
+    func flush() {
+        session?.flush()
+        pixelConverter.flush()
+    }
+
+    func tearDown() {
+        session = nil
+        pixelConverter.tearDown()
+    }
 
     func upscale(
         _ input: CVPixelBuffer, pts: CMTime, hasTimeRemaining: @Sendable () -> Bool
     ) async throws -> CVPixelBuffer {
         var bypassReason = configurationFailure
         var modelBypassReason: String?
-        for candidate in candidates {
+        for candidate in orderedCandidates() {
             try VTSRFailure.checkDeadline(hasTimeRemaining)
             if let rejection = nativeRejections[candidate.id] {
                 bypassReason = rejection
                 continue
             }
-            let canStage = raster.format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            let targetFormat = candidate.source.raster.format
             let isDirect = candidate.source.accepts(input)
+            let canStage = VTSRSession.canStage(inputFormat: raster.format, targetFormat: targetFormat)
             guard isDirect || canStage else {
                 bypassReason = "VT SR decoded buffer layout unsupported (\(raster.description))"
                 continue
@@ -118,18 +226,73 @@ private final class VTSRContext {
                 modelBypassReason = modelBypassReason ?? reason
                 continue
             }
+            if case .lowLatency = candidate.id {
+                triggerBackgroundLegacyDownloadIfNeeded()
+            }
             if session?.configuration.id != candidate.id { session = nil }
             let active = session ?? VTSRSession(configuration: candidate)
             session = active
             do {
-                return try await active.upscale(input, pts: pts, isDirect: isDirect, hasTimeRemaining: hasTimeRemaining)
+                return try await active.upscale(
+                    input, pts: pts, isDirect: isDirect, pixelConverter: pixelConverter,
+                    hasTimeRemaining: hasTimeRemaining
+                )
             } catch let failure as VTSRFailure where failure.rejectsConfiguration {
+                PlayerLog.log("[VT SR] rejected at runtime id=\(candidate.id.diagnosticLabel) reason=\(failure.reason)")
                 session = nil
                 nativeRejections[candidate.id] = failure.reason
                 bypassReason = failure.reason
             }
         }
         throw VTSRFailure(modelBypassReason ?? bypassReason)
+    }
+
+    /// Priority order:
+    /// 1. Full ML (`VTSuperResolutionScalerConfiguration`) whose model is already `.ready`
+    /// 2. Low-latency ML (`VTLowLatencySuperResolutionScalerConfiguration`, zero download wait)
+    /// 3. Full ML needing or performing a background model download
+    private func orderedCandidates() -> [VTSRConfiguration] {
+        var readyLegacy: [VTSRConfiguration] = []
+        var lowLatency: [VTSRConfiguration] = []
+        var pendingLegacy: [VTSRConfiguration] = []
+        for candidate in candidates {
+            if let legacy = candidate.native as? VTSuperResolutionScalerConfiguration {
+                if legacy.configurationModelStatus == .ready {
+                    readyLegacy.append(candidate)
+                } else {
+                    pendingLegacy.append(candidate)
+                }
+            } else {
+                lowLatency.append(candidate)
+            }
+        }
+        return readyLegacy + lowLatency + pendingLegacy
+    }
+
+    private func triggerBackgroundLegacyDownloadIfNeeded() {
+        for candidate in candidates where nativeRejections[candidate.id] == nil {
+            guard let legacy = candidate.native as? VTSuperResolutionScalerConfiguration,
+                  legacy.configurationModelStatus == .downloadRequired else { continue }
+            requestModelDownload(for: candidate.id, configuration: legacy)
+            return
+        }
+    }
+
+    private func requestModelDownload(
+        for id: VTSRConfiguration.Identifier, configuration: VTSuperResolutionScalerConfiguration
+    ) {
+        let now = ContinuousClock.now
+        guard nextModelDownloadRequests[id].map({ now >= $0 }) ?? true else { return }
+        nextModelDownloadRequests[id] = now.advanced(by: .seconds(30))
+        let label = id.diagnosticLabel
+        PlayerLog.log("[VT SR] requesting background model download id=\(label)")
+        configuration.downloadConfigurationModel { error in
+            if let error {
+                PlayerLog.log("[VT SR] model download failed id=\(label) error=\(error)")
+            } else {
+                PlayerLog.log("[VT SR] model download completed id=\(label)")
+            }
+        }
     }
 
     private func legacyModelBypassReason(for candidate: VTSRConfiguration) -> String? {
@@ -140,11 +303,7 @@ private final class VTSRContext {
         case .downloading:
             return "VT SR legacy model downloading"
         case .downloadRequired:
-            let now = ContinuousClock.now
-            if nextModelDownloadRequests[candidate.id].map({ now >= $0 }) ?? true {
-                nextModelDownloadRequests[candidate.id] = now.advanced(by: .seconds(30))
-                legacy.downloadConfigurationModel { _ in }
-            }
+            requestModelDownload(for: candidate.id, configuration: legacy)
             return "VT SR legacy model download required"
         @unknown default:
             return "VT SR legacy model unavailable"
@@ -177,7 +336,7 @@ private extension VTInterpolationRaster {
 
 @available(iOS 26.0, *)
 private struct VTSRConfiguration {
-    enum Identifier: Hashable {
+    enum Identifier: Hashable, Sendable {
         case lowLatency(Float)
         case legacyVideo(Int)
         case legacyImage(Int)
@@ -186,6 +345,14 @@ private struct VTSRConfiguration {
             switch self {
             case let .lowLatency(scale): scale
             case let .legacyVideo(scale), let .legacyImage(scale): Float(scale)
+            }
+        }
+
+        var diagnosticLabel: String {
+            switch self {
+            case let .lowLatency(scale): "lowLatency(\(scale)x)"
+            case let .legacyVideo(scale): "legacyVideo(\(scale)x)"
+            case let .legacyImage(scale): "legacyImage(\(scale)x)"
             }
         }
     }
@@ -211,20 +378,27 @@ private struct VTSRConfiguration {
             frameWidth: raster.width, frameHeight: raster.height
         ) : []
         let rawLegacy = legacy ? VTSuperResolutionScalerConfiguration.supportedScaleFactors : []
+        let llMin = lowLatency
+            ? configurationMinimumDimensions(VTLowLatencySuperResolutionScalerConfiguration.self) : nil
+        let llMax = lowLatency
+            ? configurationMaximumDimensions(VTLowLatencySuperResolutionScalerConfiguration.self) : nil
         PlayerLog.log(
             "[VT SR] input=\(raster.description) maxScale=\(maxScale)x " +
-            "rawLowLatency=\(rawLowLatency) rawLegacy=\(rawLegacy)"
+            "llSupported=\(lowLatency) llDims=\(dimensionsText(llMin))..\(dimensionsText(llMax)) " +
+            "rawLowLatency=\(rawLowLatency) legacySupported=\(legacy) rawLegacy=\(rawLegacy)"
         )
-        let lowLatencyIDs = Set(rawLowLatency.filter { $0.isFinite && $0 > 1 }).sorted(by: >).map(Identifier.lowLatency)
+
         let legacyIDs = Set(rawLegacy.filter { $0 > 1 }).sorted(by: >).flatMap {
             [Identifier.legacyVideo($0), .legacyImage($0)]
         }
-        let ids = lowLatencyIDs + legacyIDs
+        let lowLatencyIDs = Set(rawLowLatency.filter { $0.isFinite && $0 > 1 }).sorted(by: >).map(Identifier.lowLatency)
+        let ids = legacyIDs + lowLatencyIDs
         guard !ids.isEmpty else { return ([], "No native VT SR scale (\(raster.description))") }
-        let admitted = ids.filter { $0.scale <= maxScale }
+        let admitted = ids.filter { $0.scale <= maxScale + 0.001 }
         guard !admitted.isEmpty else {
             return ([], "VT SR native scales exceed \(maxScale)x cap (\(raster.description))")
         }
+
         var rejections: Set<CandidateRejection> = []
         let configurations = admitted.compactMap { id -> Self? in
             do throws(CandidateRejection) {
@@ -234,6 +408,7 @@ private struct VTSRConfiguration {
                 return nil
             }
         }
+        logAcceptedSummary(configurations, raster: raster)
         let rejection = [CandidateRejection.format, .rasterBudget, .raster, .scaleCap].first(where: rejections.contains)
         let failure = "\((rejection ?? .raster).rawValue) (\(raster.description))"
         return (configurations, failure)
@@ -242,12 +417,64 @@ private struct VTSRConfiguration {
     private static func makeConfiguration(
         _ id: Identifier, raster: VTInterpolationRaster, maxScale: Float
     ) throws(CandidateRejection) -> Self {
-        let native: any VTFrameProcessorConfiguration
+        let (native, nativeSupported) = try makeNativeConfiguration(id, raster: raster)
+        let source = native.sourcePixelBufferAttributes
+        let destination = native.destinationPixelBufferAttributes
+        let sourceAttrFormats = VTSRNegotiation.attributeFormats(from: source)
+        let destAttrFormats = VTSRNegotiation.attributeFormats(from: destination)
+
+        func logRejection(_ detail: String) {
+            PlayerLog.log(
+                "[VT SR] reject id=\(id.diagnosticLabel) input=\(raster.description) maxScale=\(maxScale)x " +
+                "supported=\(VTSRNegotiation.formatsDescription(nativeSupported)) " +
+                "srcAttrs=\(VTSRNegotiation.formatsDescription(sourceAttrFormats)) " +
+                "dstAttrs=\(VTSRNegotiation.formatsDescription(destAttrFormats)) reason=\(detail)"
+            )
+        }
+
+        let widthKey = kCVPixelBufferWidthKey as String
+        let heightKey = kCVPixelBufferHeightKey as String
+        let sourceWidth = (source[widthKey] as? NSNumber)?.intValue ?? raster.width
+        let sourceHeight = (source[heightKey] as? NSNumber)?.intValue ?? raster.height
+        guard sourceWidth == raster.width, sourceHeight == raster.height else {
+            logRejection("source attrs dims \(sourceWidth)x\(sourceHeight) != input")
+            throw .raster
+        }
+        guard let outputSize = VTSRNegotiation.resolveOutputDimensions(
+            inputWidth: raster.width, inputHeight: raster.height,
+            scale: id.scale, destinationAttributes: destination
+        ) else {
+            logRejection("dest dims invalid for scale \(id.scale)x")
+            throw .raster
+        }
+        guard VideoSuperResolutionRasterBudget.contains(width: outputSize.width, height: outputSize.height) else {
+            logRejection("dest \(outputSize.width)x\(outputSize.height) exceeds raster budget")
+            throw .rasterBudget
+        }
+        guard Double(outputSize.width) <= Double(raster.width) * Double(maxScale) + 2.0,
+              Double(outputSize.height) <= Double(raster.height) * Double(maxScale) + 2.0 else {
+            logRejection("dest \(outputSize.width)x\(outputSize.height) exceeds maxScale \(maxScale)x")
+            throw .scaleCap
+        }
+
+        let (inputReq, outputReq) = try resolveBufferRequirements(
+            source: source, destination: destination,
+            nativeSupported: nativeSupported,
+            sourceAttrFormats: sourceAttrFormats, destAttrFormats: destAttrFormats,
+            raster: raster, outputSize: outputSize, logRejection: logRejection
+        )
+        return Self(id: id, native: native, source: inputReq, destination: outputReq)
+    }
+
+    private static func makeNativeConfiguration(
+        _ id: Identifier, raster: VTInterpolationRaster
+    ) throws(CandidateRejection) -> (any VTFrameProcessorConfiguration, [OSType]) {
         switch id {
         case let .lowLatency(scale):
-            native = VTLowLatencySuperResolutionScalerConfiguration(
+            let config = VTLowLatencySuperResolutionScalerConfiguration(
                 frameWidth: raster.width, frameHeight: raster.height, scaleFactor: scale
             )
+            return (config, config.supportedPixelFormats)
         case let .legacyVideo(scale), let .legacyImage(scale):
             let inputType: VTSuperResolutionScalerConfiguration.InputType = switch id {
             case .legacyVideo: .video
@@ -257,27 +484,110 @@ private struct VTSRConfiguration {
                 frameWidth: raster.width, frameHeight: raster.height, scaleFactor: scale, inputType: inputType,
                 usePrecomputedFlow: false, qualityPrioritization: .normal,
                 revision: VTSuperResolutionScalerConfiguration.defaultRevision
-            ) else { throw .raster }
-            native = config
+            ) else {
+                PlayerLog.log(
+                    "[VT SR] reject id=\(id.diagnosticLabel) input=\(raster.description) reason=init returned nil"
+                )
+                throw .raster
+            }
+            return (config, config.supportedPixelFormats)
         }
+    }
 
-        let source = native.sourcePixelBufferAttributes
-        let destination = native.destinationPixelBufferAttributes
-        let widthKey = kCVPixelBufferWidthKey as String
-        let heightKey = kCVPixelBufferHeightKey as String
-        guard (source[widthKey] as? Int ?? raster.width) == raster.width,
-              (source[heightKey] as? Int ?? raster.height) == raster.height,
-              let width = destination[widthKey] as? Int, let height = destination[heightKey] as? Int,
-              width > raster.width, height > raster.height else { throw .raster }
-        guard VideoSuperResolutionRasterBudget.contains(width: width, height: height) else { throw .rasterBudget }
-        guard Double(width) <= Double(raster.width) * Double(maxScale),
-              Double(height) <= Double(raster.height) * Double(maxScale) else { throw .scaleCap }
-        let outputRaster = VTInterpolationRaster(width: width, height: height, format: raster.format)
-        guard let input = VTInterpolationBufferRequirements.resolve(source, for: raster).requirements,
-              let output = VTInterpolationBufferRequirements.resolve(destination, for: outputRaster).requirements else {
+    // swiftlint:disable:next function_parameter_count
+    private static func resolveBufferRequirements(
+        source: [String: Any],
+        destination: [String: Any],
+        nativeSupported: [OSType],
+        sourceAttrFormats: [OSType],
+        destAttrFormats: [OSType],
+        raster: VTInterpolationRaster,
+        outputSize: (width: Int, height: Int),
+        logRejection: (String) -> Void
+    ) throws(CandidateRejection) -> (VTInterpolationBufferRequirements, VTInterpolationBufferRequirements) {
+        let sourceCandidates = VTSRNegotiation.candidateFormats(
+            preferred: VTSRNegotiation.sourceFormatPriority(for: raster.format),
+            nativeSupported: nativeSupported,
+            attributeFormats: sourceAttrFormats
+        )
+        var lastSourceStatus: CVReturn = kCVReturnInvalidPixelFormat
+        var resolvedSource: VTInterpolationBufferRequirements?
+        for format in sourceCandidates {
+            let candidateRaster = VTInterpolationRaster(width: raster.width, height: raster.height, format: format)
+            let result = VTInterpolationBufferRequirements.resolve(source, for: candidateRaster)
+            lastSourceStatus = result.status
+            if let requirements = result.requirements {
+                resolvedSource = requirements
+                break
+            }
+        }
+        guard let inputReq = resolvedSource else {
+            let desc = VTSRNegotiation.formatsDescription(sourceCandidates)
+            logRejection("no compatible source format (candidates=\(desc) status=\(lastSourceStatus))")
             throw .format
         }
-        return Self(id: id, native: native, source: input, destination: output)
+
+        let destCandidates = VTSRNegotiation.candidateFormats(
+            preferred: VTSRNegotiation.destinationFormatPriority(for: inputReq.raster.format),
+            nativeSupported: destAttrFormats.isEmpty ? nativeSupported : [],
+            attributeFormats: destAttrFormats
+        )
+        var lastDestStatus: CVReturn = kCVReturnInvalidPixelFormat
+        var resolvedDest: VTInterpolationBufferRequirements?
+        for format in destCandidates {
+            let candidateRaster = VTInterpolationRaster(
+                width: outputSize.width, height: outputSize.height, format: format
+            )
+            let result = VTInterpolationBufferRequirements.resolve(destination, for: candidateRaster)
+            lastDestStatus = result.status
+            if let requirements = result.requirements {
+                resolvedDest = requirements
+                break
+            }
+        }
+        guard let outputReq = resolvedDest else {
+            let desc = VTSRNegotiation.formatsDescription(destCandidates)
+            logRejection("no compatible dest format (candidates=\(desc) status=\(lastDestStatus))")
+            throw .format
+        }
+        return (inputReq, outputReq)
+    }
+
+    private static func logAcceptedSummary(_ configurations: [Self], raster: VTInterpolationRaster) {
+        guard !configurations.isEmpty else { return }
+        let summary = configurations.map { config in
+            let modelStatus: String
+            if let legacy = config.native as? VTSuperResolutionScalerConfiguration {
+                switch legacy.configurationModelStatus {
+                case .ready: modelStatus = "ready"
+                case .downloading: modelStatus = "downloading"
+                case .downloadRequired: modelStatus = "downloadRequired"
+                @unknown default: modelStatus = "unknown"
+                }
+            } else {
+                modelStatus = "builtin"
+            }
+            return "\(config.id.diagnosticLabel)[\(config.source.raster.description)->" +
+                "\(config.destination.raster.description) model=\(modelStatus)]"
+        }.joined(separator: ", ")
+        PlayerLog.log("[VT SR] accepted for \(raster.description): \(summary)")
+    }
+
+    private static func configurationMaximumDimensions<T: VTFrameProcessorConfiguration>(
+        _ type: T.Type
+    ) -> CMVideoDimensions? {
+        type.maximumDimensions
+    }
+
+    private static func configurationMinimumDimensions<T: VTFrameProcessorConfiguration>(
+        _ type: T.Type
+    ) -> CMVideoDimensions? {
+        type.minimumDimensions
+    }
+
+    private static func dimensionsText(_ dimensions: CMVideoDimensions?) -> String {
+        guard let dimensions else { return "nil" }
+        return "\(dimensions.width)x\(dimensions.height)"
     }
 }
 
@@ -310,12 +620,28 @@ private final class VTSRSession {
         configuration.id == id && processor != nil && (lastSubmittedPTS.map { pts > $0 } ?? true)
     }
 
+    static func canStage(inputFormat: OSType, targetFormat: OSType) -> Bool {
+        if MetalNV12PixelConverter.isNV12(inputFormat) {
+            return MetalNV12PixelConverter.isNV12(targetFormat) || targetFormat == kCVPixelFormatType_32BGRA
+        }
+        if inputFormat == kCVPixelFormatType_32BGRA {
+            return targetFormat == kCVPixelFormatType_32BGRA
+        }
+        return false
+    }
+
     func upscale(
-        _ input: CVPixelBuffer, pts: CMTime, isDirect: Bool, hasTimeRemaining: @Sendable () -> Bool
+        _ input: CVPixelBuffer,
+        pts: CMTime,
+        isDirect: Bool,
+        pixelConverter: MetalNV12PixelConverter,
+        hasTimeRemaining: @Sendable () -> Bool
     ) async throws -> CVPixelBuffer {
         try VTSRFailure.checkDeadline(hasTimeRemaining)
         if let lastSubmittedPTS, pts <= lastSubmittedPTS { endSession() }
-        let pair = try prepareFrames(input, pts: pts, isDirect: isDirect, hasTimeRemaining: hasTimeRemaining)
+        let pair = try await prepareFrames(
+            input, pts: pts, isDirect: isDirect, pixelConverter: pixelConverter, hasTimeRemaining: hasTimeRemaining
+        )
         try VTSRFailure.checkDeadline(hasTimeRemaining)
         guard let parameters = makeParameters(pair) else { throw VTSRFailure("VT SR parameters invalid") }
         let processor = try startIfNeeded(hasTimeRemaining: hasTimeRemaining)
@@ -328,17 +654,27 @@ private final class VTSRSession {
         }
         try VTSRFailure.checkDeadline(hasTimeRemaining)
         let output = pair.output.buffer
-        ScaledVideoOutputMetadata.copy(from: input, to: output, colorSpace: .yuvSameAsSource)
+        let outputColorSpace: ScaledVideoOutputMetadata.OutputColorSpace =
+            configuration.destination.raster.format == kCVPixelFormatType_32BGRA ? .rgbConverted : .yuvSameAsSource
+        ScaledVideoOutputMetadata.copy(from: input, to: output, colorSpace: outputColorSpace)
         try VTSRFailure.checkDeadline(hasTimeRemaining)
         if case .legacyVideo = configuration.id { history = pair }
         return output
     }
 
     private func prepareFrames(
-        _ input: CVPixelBuffer, pts: CMTime, isDirect: Bool, hasTimeRemaining: @Sendable () -> Bool
-    ) throws -> FramePair {
+        _ input: CVPixelBuffer,
+        pts: CMTime,
+        isDirect: Bool,
+        pixelConverter: MetalNV12PixelConverter,
+        hasTimeRemaining: @Sendable () -> Bool
+    ) async throws -> FramePair {
         try VTSRFailure.checkDeadline(hasTimeRemaining)
-        let source = isDirect ? input : try stage(input, hasTimeRemaining: hasTimeRemaining)
+        let source = if isDirect {
+            input
+        } else {
+            try await stage(input, pixelConverter: pixelConverter, hasTimeRemaining: hasTimeRemaining)
+        }
         try VTSRFailure.checkDeadline(hasTimeRemaining)
         let requirements = configuration.destination
         let pool = try destinationPool ?? VideoSuperResolutionPool(
@@ -356,22 +692,67 @@ private final class VTSRSession {
         return FramePair(source: sourceFrame, output: outputFrame)
     }
 
-    private func stage(_ input: CVPixelBuffer, hasTimeRemaining: @Sendable () -> Bool) throws -> CVPixelBuffer {
+    private func stage(
+        _ input: CVPixelBuffer,
+        pixelConverter: MetalNV12PixelConverter,
+        hasTimeRemaining: @Sendable () -> Bool
+    ) async throws -> CVPixelBuffer {
         let requirements = configuration.source
-        let pool = try stagingPool ?? VideoSuperResolutionPool(
-            attributes: requirements.poolAttributes, label: "VT SR staging", limit: 2,
-            isCompatible: requirements.accepts
-        )
+        let inputFormat = CVPixelBufferGetPixelFormatType(input)
+        let targetFormat = requirements.raster.format
+        let sameNV12 = inputFormat == targetFormat && MetalNV12PixelConverter.isNV12(inputFormat)
+        let pool = try stagingPool ?? makeStagingPool(requirements: requirements, needsMetal: !sameNV12)
         stagingPool = pool
         try VTSRFailure.checkDeadline(hasTimeRemaining)
         let staged = try pool.allocate()
         try VTSRFailure.checkDeadline(hasTimeRemaining)
-        do {
-            try VTNV12StagingCopy.copy(from: input, to: staged)
-        } catch {
-            throw VTSRFailure("VT SR NV12 staging failed")
+        if sameNV12 {
+            do {
+                try VTNV12StagingCopy.copy(from: input, to: staged)
+            } catch {
+                throw VTSRFailure("VT SR NV12 staging failed")
+            }
+            return staged
         }
+        let converted = await pixelConverter.convert(from: input, to: staged)
+        guard converted else {
+            let srcCC = VTSRNegotiation.fourCC(inputFormat)
+            let dstCC = VTSRNegotiation.fourCC(targetFormat)
+            throw VTSRFailure("VT SR GPU staging failed (\(srcCC)->\(dstCC))")
+        }
+        try VTSRFailure.checkDeadline(hasTimeRemaining)
+        if !VTInterpolationPadding(staged).isEmpty {
+            let status = CVPixelBufferFillExtendedPixels(staged)
+            guard status == kCVReturnSuccess else {
+                throw VTSRFailure("VT SR staging padding failed (\(status))")
+            }
+        }
+        let stagedColorSpace: ScaledVideoOutputMetadata.OutputColorSpace =
+            targetFormat == kCVPixelFormatType_32BGRA ? .rgbConverted : .yuvSameAsSource
+        ScaledVideoOutputMetadata.copy(from: input, to: staged, colorSpace: stagedColorSpace)
         return staged
+    }
+
+    private func makeStagingPool(
+        requirements: VTInterpolationBufferRequirements, needsMetal: Bool
+    ) throws -> VideoSuperResolutionPool {
+        if needsMetal {
+            var resolved: CFDictionary?
+            let metalAttrs = [kCVPixelBufferMetalCompatibilityKey as String: true] as CFDictionary
+            let status = CVPixelBufferCreateResolvedAttributesDictionary(
+                kCFAllocatorDefault, [requirements.poolAttributes, metalAttrs] as CFArray, &resolved
+            )
+            if status == kCVReturnSuccess, let resolved,
+               let pool = try? VideoSuperResolutionPool(
+                attributes: resolved, label: "VT SR staging", limit: 6, isCompatible: requirements.accepts
+               ) {
+                return pool
+            }
+        }
+        return try VideoSuperResolutionPool(
+            attributes: requirements.poolAttributes, label: "VT SR staging", limit: 6,
+            isCompatible: requirements.accepts
+        )
     }
 
     private func makeParameters(_ pair: FramePair) -> (any VTFrameProcessorParameters)? {

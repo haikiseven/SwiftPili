@@ -36,6 +36,23 @@ struct VideoFrameEnhancementResult: Sendable {
     let telemetry: VideoEnhancementTelemetry
     let interpolationBypassReason: String?
     let originalSuperResolutionBypassReason: String?
+    let midpointsUpscaled: Bool
+
+    init(
+        midpoints: [PostProcessFrameBox],
+        enhancedOriginal: PostProcessFrameBox?,
+        telemetry: VideoEnhancementTelemetry,
+        interpolationBypassReason: String?,
+        originalSuperResolutionBypassReason: String?,
+        midpointsUpscaled: Bool = false
+    ) {
+        self.midpoints = midpoints
+        self.enhancedOriginal = enhancedOriginal
+        self.telemetry = telemetry
+        self.interpolationBypassReason = interpolationBypassReason
+        self.originalSuperResolutionBypassReason = originalSuperResolutionBypassReason
+        self.midpointsUpscaled = midpointsUpscaled
+    }
 }
 
 enum VideoFrameEnhancementUpdate: Sendable {
@@ -43,16 +60,92 @@ enum VideoFrameEnhancementUpdate: Sendable {
     case finished(VideoFrameEnhancementResult)
 }
 
+/// Tracks actual inter-frame presentation cadence from decoded PTS deltas, insulating
+/// interpolation decisions from misdeclared container durations (e.g. 30 fps content in a 60 fps
+/// track) and single-tick timescale quantization jitter (e.g. 19/600s on a 30 fps stream).
+struct VideoFrameCadenceEstimator: Sendable {
+    private static let maxSamples = 16
+    private static let minimumDelta: TimeInterval = 1.0 / 240.0
+    private static let maximumDelta: TimeInterval = 0.25
+
+    private var lastObservedPTS: TimeInterval?
+    private var deltas: [TimeInterval] = []
+
+    var sampleCount: Int { deltas.count }
+
+    mutating func reset() {
+        lastObservedPTS = nil
+        deltas.removeAll(keepingCapacity: true)
+    }
+
+    mutating func observe(pts: TimeInterval) {
+        guard pts.isFinite else { return }
+        if lastObservedPTS == pts { return }
+        defer { lastObservedPTS = pts }
+        guard let previous = lastObservedPTS else { return }
+        let delta = pts - previous
+        guard delta.isFinite, delta >= Self.minimumDelta, delta <= Self.maximumDelta else {
+            if delta < 0 || delta > 0.5 {
+                deltas.removeAll(keepingCapacity: true)
+            }
+            return
+        }
+        if deltas.count == Self.maxSamples {
+            deltas.removeFirst()
+        }
+        deltas.append(delta)
+    }
+
+    var medianInterval: TimeInterval? {
+        guard !deltas.isEmpty else { return nil }
+        let sorted = deltas.sorted()
+        let mid = sorted.count / 2
+        if sorted.count.isMultiple(of: 2) {
+            return (sorted[mid - 1] + sorted[mid]) * 0.5
+        }
+        return sorted[mid]
+    }
+
+    /// True when observed deltas behave like constant-frame-rate content (interquartile spread
+    /// within 8% of the median). Returns `true` before 4 deltas are collected so standard CFR
+    /// streams can immediately enter the fast dyadic path when their declared duration matches.
+    var isConstantRate: Bool {
+        guard deltas.count >= 4, let median = medianInterval, median > 0 else { return true }
+        let sorted = deltas.sorted()
+        let q1 = sorted[sorted.count / 4]
+        let q3 = sorted[(sorted.count * 3) / 4]
+        return (q3 - q1) / median <= 0.08
+    }
+
+    func estimatedInterval(fallbackDuration: TimeInterval) -> TimeInterval? {
+        if let median = medianInterval {
+            return median
+        }
+        guard fallbackDuration.isFinite, fallbackDuration > 0 else { return nil }
+        return fallbackDuration
+    }
+}
+
 struct VideoFrameInterpolationTiming {
     static let tolerance: TimeInterval = 1e-9
+    static let maximumDelta: TimeInterval = 0.25
     let delta: TimeInterval
 
-    init?(previousPTS: TimeInterval, previousDuration: TimeInterval, current: MediaVideoFrame) {
+    init?(
+        previousPTS: TimeInterval,
+        previousDuration: TimeInterval,
+        current: MediaVideoFrame,
+        expectedInterval: TimeInterval? = nil
+    ) {
         guard Self.sourceFPS(current) != nil, previousPTS.isFinite,
               previousDuration.isFinite, previousDuration > 0 else { return nil }
         let delta = current.pts - previousPTS
         let midpointPTS = previousPTS + delta * 0.5
-        guard delta.isFinite, delta > 0, delta <= previousDuration * 1.5 + Self.tolerance,
+        let referenceInterval = max(previousDuration, expectedInterval ?? previousDuration)
+        // Permit normal VFR swings and misdeclared container durations (e.g. 30 fps frames inside
+        // a 60 fps timebase) while still rejecting genuine multi-frame gaps / discontinuities.
+        let allowedDelta = min(Self.maximumDelta, max(referenceInterval * 1.75, 0.055))
+        guard delta.isFinite, delta > 0, delta <= allowedDelta + Self.tolerance,
               midpointPTS > previousPTS, midpointPTS < current.pts else { return nil }
         self.delta = delta
     }
@@ -64,24 +157,45 @@ struct VideoFrameInterpolationTiming {
     }
 }
 
+enum VideoInterpolationPlanOutcome: Sendable {
+    case plan(VideoFrameInterpolationPlan)
+    case bypass(String)
+}
+
 struct VideoFrameInterpolationPlan: Sendable {
     static let maximumMultiplier = 5
+    static let maximumPhasesPerPair = 6
     /// Multipliers supported by arbitrary-phase backends (`VTFrameRateConversionConfiguration` on
     /// iOS 26+ and `VisionFrameInterpolationBackend`'s optical-flow Metal shader on iOS 18–25).
     static let fullMultipliers = [5, 4, 3, 2]
     /// Dyadic-only multipliers supported by `VTLowLatencyFrameInterpolationConfiguration`
     /// (`numberOfInterpolatedFrames = 1` → 2× `[0.5]`, `2` → 4× `[0.25, 0.5, 0.75]`).
     static let dyadicMultipliers = [4, 2]
-    /// Small relative interval tolerance covering 1 ms container PTS quantization (e.g. 33/34 ms for
-    /// 30 fps or 41/42 ms for 24 fps) so `phaseCount` stays constant and avoids VT session churn.
+    /// Relative tolerance for treating a stream as already at or above the requested target FPS
+    /// (e.g. 59.4–60.0 fps for a 60 fps target).
+    static let targetReachedTolerance: Double = 1.015
+    /// Relative tolerance for taking the exact integer fast path (2×/3×/4×/5×), keeping all
+    /// original frames and using low-latency LLFI for 2×/4× (e.g. 29.97/30→60, 23.976/24→48/96).
+    static let exactIntegerTolerance: Double = 0.012
+    /// Small relative interval tolerance covering 1 ms container PTS quantization (used by dyadic fallback).
     static let jitterFactor: Double = 1.0165
 
     let phases: [Float]
     let pts: [TimeInterval]
     let sourceInterval: TimeInterval
+    /// True only for exact uniform dyadic plans (`[0.5]` / `[0.25, 0.5, 0.75]`), eligible for LLFI.
+    let allowsLowLatency: Bool
+    /// Whether the renderer should also present `current` after the synthesized frames.
+    let emitsOriginal: Bool
+    /// Presentation duration for each synthesized frame.
+    let outputFrameDuration: TimeInterval
+    /// Next CFR grid timestamp to commit once this frame pair is admitted; `nil` in integer mode.
+    let nextGridPTS: TimeInterval?
+    /// Nominal output frame rate produced by this plan.
+    let targetOutputFPS: Double
 
-    /// Whether the active interpolation backend supports arbitrary uniform phases (such as 3×
-    /// `[1/3, 2/3]` for 30→90 / 24→72 fps and 5× `[0.2, 0.4, 0.6, 0.8]` for 24→120 fps).
+    /// Whether the active interpolation backend supports arbitrary phases in `(0, 1)` (used for
+    /// 3×/5× integer multiples as well as non-integer CFR resampling such as 24/30.6/40/50→60 fps).
     static var supportsArbitraryPhases: Bool {
         #if targetEnvironment(simulator)
         return true
@@ -101,6 +215,34 @@ struct VideoFrameInterpolationPlan: Sendable {
         supportsArbitraryPhases ? fullMultipliers : dyadicMultipliers
     }
 
+    static func normalizedPlaybackRate(_ playbackRate: Double) -> Double {
+        (playbackRate.isFinite && playbackRate > 0) ? playbackRate : 1.0
+    }
+
+    /// Checks whether a stream with the given source cadence is eligible for interpolation under
+    /// `rate` at the given `playbackRate`, returning a diagnostic bypass reason only when genuinely
+    /// ineligible.
+    static func streamEligibilityBypassReason(
+        sourceInterval: TimeInterval,
+        rate: VideoInterpolationRate,
+        playbackRate: Double = 1.0,
+        supportsArbitraryPhases: Bool = Self.supportsArbitraryPhases
+    ) -> String? {
+        guard sourceInterval.isFinite, sourceInterval > 0 else { return "Frame timing invalid" }
+        guard let targetFPS = rate.targetFPS else { return nil }
+        let speed = normalizedPlaybackRate(playbackRate)
+        let wallCadence = sourceInterval / speed
+        let targetPeriod = 1.0 / Double(targetFPS)
+        if wallCadence <= targetPeriod * targetReachedTolerance {
+            return "Target frame rate reached"
+        }
+        if !supportsArbitraryPhases,
+           bestMultiplier(forInterval: wallCadence, rate: rate, allowedMultipliers: dyadicMultipliers) == nil {
+            return "Interpolation ratio unsupported"
+        }
+        return nil
+    }
+
     static func bestMultiplier(
         forInterval interval: TimeInterval,
         rate: VideoInterpolationRate,
@@ -116,34 +258,267 @@ struct VideoFrameInterpolationPlan: Sendable {
             .first { effectiveInterval >= Double($0) / cap }
     }
 
+    static func plan(
+        previousPTS: TimeInterval,
+        currentPTS: TimeInterval,
+        interval: TimeInterval,
+        cadenceInterval: TimeInterval? = nil,
+        isCadenceStable: Bool = true,
+        gridNextPTS: TimeInterval? = nil,
+        rate: VideoInterpolationRate,
+        playbackRate: Double = 1.0,
+        supportsArbitraryPhases: Bool = Self.supportsArbitraryPhases
+    ) -> VideoInterpolationPlanOutcome {
+        guard interval.isFinite, interval > 0, previousPTS.isFinite, currentPTS.isFinite,
+              currentPTS > previousPTS else {
+            return .bypass("Frame timing gap")
+        }
+        let speed = normalizedPlaybackRate(playbackRate)
+        guard let targetFPS = rate.targetFPS else {
+            return makeIntegerPlan(
+                previousPTS: previousPTS,
+                currentPTS: currentPTS,
+                interval: interval,
+                cadenceInterval: cadenceInterval,
+                playbackRate: speed,
+                multiplier: 2
+            )
+        }
+        let cap = Double(targetFPS)
+        let targetPeriod = 1.0 / cap
+        let effectiveCadence = (cadenceInterval.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }) ?? interval
+        let wallCadence = effectiveCadence / speed
+        if wallCadence <= targetPeriod * targetReachedTolerance {
+            return .bypass("Target frame rate reached")
+        }
+
+        let allowedMultipliers = supportsArbitraryPhases ? fullMultipliers : dyadicMultipliers
+        let ratio = cap * wallCadence
+        if gridNextPTS == nil, isCadenceStable,
+           let exactMultiplier = allowedMultipliers.first(where: { multiplier in
+               let target = Double(multiplier)
+               return abs(ratio - target) / target <= exactIntegerTolerance
+           }) {
+            return makeIntegerPlan(
+                previousPTS: previousPTS,
+                currentPTS: currentPTS,
+                interval: interval,
+                cadenceInterval: effectiveCadence,
+                playbackRate: speed,
+                multiplier: exactMultiplier
+            )
+        }
+
+        guard supportsArbitraryPhases else {
+            if let multiplier = bestMultiplier(
+                forInterval: wallCadence, rate: rate, allowedMultipliers: dyadicMultipliers
+            ) {
+                return makeIntegerPlan(
+                    previousPTS: previousPTS,
+                    currentPTS: currentPTS,
+                    interval: interval,
+                    cadenceInterval: effectiveCadence,
+                    playbackRate: speed,
+                    multiplier: multiplier
+                )
+            }
+            return .bypass("Interpolation ratio unsupported")
+        }
+
+        // Convert wall-clock target period into media time so display cadence hits `cap` fps at any playback speed.
+        let mediaTargetPeriod = targetPeriod * speed
+        return makeCFRGridPlan(
+            previousPTS: previousPTS,
+            currentPTS: currentPTS,
+            interval: interval,
+            targetPeriod: mediaTargetPeriod,
+            targetFPS: cap,
+            gridNextPTS: gridNextPTS
+        )
+    }
+
+    /// Synthesizes a non-empty plan preceding `currentPTS` so backends can prewarm the exact
+    /// session mode (dyadic LLFI vs persistent arbitrary-phase FRC) before real playback frames.
+    static func prewarmPlan(
+        before currentPTS: TimeInterval,
+        interval: TimeInterval,
+        cadenceInterval: TimeInterval? = nil,
+        isCadenceStable: Bool = true,
+        rate: VideoInterpolationRate,
+        playbackRate: Double = 1.0,
+        supportsArbitraryPhases: Bool = Self.supportsArbitraryPhases
+    ) -> VideoFrameInterpolationPlan? {
+        guard interval.isFinite, interval > 0, currentPTS.isFinite else { return nil }
+        let previousPTS = currentPTS - 2 * interval
+        let pairEndPTS = currentPTS - interval
+        guard case let .plan(resolved) = plan(
+            previousPTS: previousPTS,
+            currentPTS: pairEndPTS,
+            interval: interval,
+            cadenceInterval: cadenceInterval,
+            isCadenceStable: isCadenceStable,
+            gridNextPTS: nil,
+            rate: rate,
+            playbackRate: playbackRate,
+            supportsArbitraryPhases: supportsArbitraryPhases
+        ) else {
+            return nil
+        }
+        if !resolved.phases.isEmpty {
+            return resolved
+        }
+        guard !resolved.allowsLowLatency else { return nil }
+        let midpointPTS = previousPTS + interval * 0.5
+        guard midpointPTS > previousPTS, midpointPTS < pairEndPTS else { return nil }
+        return VideoFrameInterpolationPlan(
+            phases: [0.5],
+            pts: [midpointPTS],
+            sourceInterval: interval,
+            allowsLowLatency: false,
+            emitsOriginal: false,
+            outputFrameDuration: resolved.outputFrameDuration,
+            nextGridPTS: resolved.nextGridPTS,
+            targetOutputFPS: resolved.targetOutputFPS
+        )
+    }
+
+    private static func makeIntegerPlan(
+        previousPTS: TimeInterval,
+        currentPTS: TimeInterval,
+        interval: TimeInterval,
+        cadenceInterval: TimeInterval? = nil,
+        playbackRate: Double = 1.0,
+        multiplier: Int
+    ) -> VideoInterpolationPlanOutcome {
+        let phases = (1..<multiplier).map { Float($0) / Float(multiplier) }
+        let pts = phases.map { previousPTS + interval * Double($0) }
+        var lastPTS = previousPTS
+        for point in pts {
+            guard point > lastPTS, point < currentPTS else { return .bypass("Frame timing gap") }
+            lastPTS = point
+        }
+        let fpsInterval = (cadenceInterval.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }) ?? interval
+        let speed = normalizedPlaybackRate(playbackRate)
+        return .plan(VideoFrameInterpolationPlan(
+            phases: phases,
+            pts: pts,
+            sourceInterval: interval,
+            allowsLowLatency: multiplier == 2 || multiplier == 4,
+            emitsOriginal: true,
+            outputFrameDuration: interval / Double(multiplier),
+            nextGridPTS: nil,
+            targetOutputFPS: (Double(multiplier) / fpsInterval) * speed
+        ))
+    }
+
+    private static func makeCFRGridPlan(
+        previousPTS: TimeInterval,
+        currentPTS: TimeInterval,
+        interval: TimeInterval,
+        targetPeriod: TimeInterval,
+        targetFPS: Double,
+        gridNextPTS: TimeInterval?
+    ) -> VideoInterpolationPlanOutcome {
+        // Keep snapEpsilon dependent solely on targetPeriod so consecutive VFR pairs share the
+        // exact same snap threshold at their shared boundary without ever dropping a grid tick.
+        let snapEpsilon = max(0.001, targetPeriod * 0.12)
+        var tick: TimeInterval
+        if let anchor = gridNextPTS,
+           anchor.isFinite,
+           anchor > previousPTS - snapEpsilon,
+           anchor <= currentPTS + targetPeriod + snapEpsilon {
+            tick = anchor
+        } else {
+            tick = previousPTS + targetPeriod
+        }
+        while tick <= previousPTS + snapEpsilon {
+            tick += targetPeriod
+        }
+
+        var phases: [Float] = []
+        var pts: [TimeInterval] = []
+        var emitsOriginal = false
+        var lastPTS = previousPTS
+
+        while tick <= currentPTS + snapEpsilon {
+            if tick >= currentPTS - snapEpsilon {
+                emitsOriginal = true
+                tick += targetPeriod
+                break
+            }
+            let phase = Float((tick - previousPTS) / interval)
+            if phase > 0.001, phase < 0.999, tick > lastPTS, tick < currentPTS {
+                phases.append(phase)
+                pts.append(tick)
+                lastPTS = tick
+            }
+            tick += targetPeriod
+            if phases.count >= maximumPhasesPerPair {
+                emitsOriginal = true
+                tick = currentPTS + targetPeriod
+                break
+            }
+        }
+
+        return .plan(VideoFrameInterpolationPlan(
+            phases: phases,
+            pts: pts,
+            sourceInterval: interval,
+            allowsLowLatency: false,
+            emitsOriginal: emitsOriginal,
+            outputFrameDuration: targetPeriod,
+            nextGridPTS: tick,
+            targetOutputFPS: targetFPS
+        ))
+    }
+
     init?(
         previousPTS: TimeInterval,
         currentPTS: TimeInterval,
         interval: TimeInterval,
         rate: VideoInterpolationRate,
-        allowedMultipliers: [Int] = Self.defaultMultipliers
+        supportsArbitraryPhases: Bool = Self.supportsArbitraryPhases
     ) {
-        guard let multiplier = Self.bestMultiplier(
-            forInterval: interval, rate: rate, allowedMultipliers: allowedMultipliers
-        ) else { return nil }
-        let phases = (1..<multiplier).map { Float($0) / Float(multiplier) }
-        let pts = phases.map { previousPTS + interval * Double($0) }
-        var lastPTS = previousPTS
-        for point in pts {
-            guard point > lastPTS, point < currentPTS else { return nil }
-            lastPTS = point
+        switch Self.plan(
+            previousPTS: previousPTS,
+            currentPTS: currentPTS,
+            interval: interval,
+            rate: rate,
+            supportsArbitraryPhases: supportsArbitraryPhases
+        ) {
+        case let .plan(resolved):
+            self = resolved
+        case .bypass:
+            return nil
         }
+    }
+
+    private init(
+        phases: [Float],
+        pts: [TimeInterval],
+        sourceInterval: TimeInterval,
+        allowsLowLatency: Bool,
+        emitsOriginal: Bool,
+        outputFrameDuration: TimeInterval,
+        nextGridPTS: TimeInterval?,
+        targetOutputFPS: Double
+    ) {
         self.phases = phases
         self.pts = pts
-        sourceInterval = interval
+        self.sourceInterval = sourceInterval
+        self.allowsLowLatency = allowsLowLatency
+        self.emitsOriginal = emitsOriginal
+        self.outputFrameDuration = outputFrameDuration
+        self.nextGridPTS = nextGridPTS
+        self.targetOutputFPS = targetOutputFPS
     }
 
     var sourceFPS: Double { 1 / sourceInterval }
+    var isCFRResampling: Bool { nextGridPTS != nil }
 
     func makeFrames(buffers: [CVPixelBuffer]) -> [MediaVideoFrame] {
         precondition(buffers.count == pts.count)
-        let duration = sourceInterval / Double(pts.count + 1)
-        return zip(pts, buffers).map { MediaVideoFrame(pts: $0, duration: duration, pixelBuffer: $1) }
+        return zip(pts, buffers).map { MediaVideoFrame(pts: $0, duration: outputFrameDuration, pixelBuffer: $1) }
     }
 
     static func outputPoolLimit(phaseCount: Int) -> Int {

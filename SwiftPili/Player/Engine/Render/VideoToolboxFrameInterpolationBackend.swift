@@ -90,18 +90,30 @@ private extension VideoToolboxFrameInterpolationBackend {
         }
         guard let plan, let previous = previousFrame,
               VideoFrameInterpolationTiming(
-                previousPTS: previous.pts, previousDuration: previous.duration, current: frame
+                previousPTS: previous.pts,
+                previousDuration: previous.duration,
+                current: frame,
+                expectedInterval: plan.sourceInterval
               ) != nil, VideoFramePairFormat.matches(previous.pixelBuffer, frame.pixelBuffer) else {
             flush()
             previousFrame = StoredFrame(frame)
             return .passthrough
         }
+        guard !plan.phases.isEmpty else {
+            previousFrame = StoredFrame(frame)
+            hasSubmittedPair = false
+            return .passthrough
+        }
 
         let raster = VTInterpolationRaster(frame.pixelBuffer)
-        let key = VTInterpolationSessionKey(raster: raster, phaseCount: plan.phases.count)
+        let key = VTInterpolationSessionKey(raster: raster, plan: plan)
         do {
             let session = try ensureSession(
-                key, input: frame.pixelBuffer, previousPTS: previous.pts, hasTimeRemaining: hasTimeRemaining
+                key,
+                input: frame.pixelBuffer,
+                initialPhaseCount: plan.phases.count,
+                previousPTS: previous.pts,
+                hasTimeRemaining: hasTimeRemaining
             )
             return try await synthesize(
                 previous: previous, current: frame, plan: plan, session: session, hasTimeRemaining: hasTimeRemaining
@@ -148,6 +160,7 @@ private extension VideoToolboxFrameInterpolationBackend {
     func ensureSession(
         _ key: VTInterpolationSessionKey,
         input: CVPixelBuffer,
+        initialPhaseCount: Int,
         previousPTS: TimeInterval,
         hasTimeRemaining: @Sendable () -> Bool
     ) throws -> VTInterpolationSession {
@@ -167,10 +180,14 @@ private extension VideoToolboxFrameInterpolationBackend {
             do {
                 let configuration = try kind.negotiate(key).get()
                 let session = try VTInterpolationSession(
-                    key: key, kind: kind, configuration: configuration, hasTimeRemaining: hasTimeRemaining
+                    key: key,
+                    kind: kind,
+                    configuration: configuration,
+                    initialPhaseCount: initialPhaseCount,
+                    hasTimeRemaining: hasTimeRemaining
                 )
                 sessionStorage = session
-                logOnce(raster, event: "\(kind.rawValue) negotiation phases=\(key.phaseCount)",
+                logOnce(raster, event: "\(kind.rawValue) negotiation mode=\(key.mode.diagnosticLabel)",
                         "\(configuration.detail) startup=0 " +
                     "sourcePadding=\(configuration.source.padding) " +
                     "destinationPadding=\(configuration.destination.padding) " +
@@ -183,7 +200,7 @@ private extension VideoToolboxFrameInterpolationBackend {
                 rejected.append(detail)
             }
         }
-        logOnce(raster, event: "negotiation phases=\(key.phaseCount)", rejected.joined(separator: " | "))
+        logOnce(raster, event: "negotiation mode=\(key.mode.diagnosticLabel)", rejected.joined(separator: " | "))
         throw VTInterpolationFailure.unsupported
     }
 
@@ -208,6 +225,7 @@ private extension VideoToolboxFrameInterpolationBackend {
                 previous: previous.pixelBuffer, current: current.pixelBuffer
             ))
         }
+        session.recordPhaseCount(plan.phases.count)
         let destinations = try plan.phases.map { _ in
             guard hasTimeRemaining() else { throw VTInterpolationFailure.deadline }
             let output = try session.destination.allocate()
@@ -244,16 +262,55 @@ private extension VideoToolboxFrameInterpolationBackend {
     }
 }
 
+private enum VTInterpolationSessionMode: Equatable {
+    /// Exact uniform dyadic plans (`[0.5]` → level 1, `[0.25, 0.5, 0.75]` → level 2),
+    /// eligible for `VTLowLatencyFrameInterpolationConfiguration`.
+    case dyadic(lowLatencyLevel: Int)
+    /// Arbitrary phases in `(0, 1)` (non-dyadic integer multiples 3×/5× and CFR resampling),
+    /// routed exclusively to a single persistent `VTFrameRateConversionConfiguration` session
+    /// even when `plan.phases.count` varies across consecutive pairs.
+    case arbitraryPhases
+
+    var diagnosticLabel: String {
+        switch self {
+        case let .dyadic(level): "dyadic(\(level))"
+        case .arbitraryPhases: "arbitrary"
+        }
+    }
+}
+
 private struct VTInterpolationSessionKey: Equatable {
     let raster: VTInterpolationRaster
-    let phaseCount: Int
+    let mode: VTInterpolationSessionMode
+
+    init(raster: VTInterpolationRaster, plan: VideoFrameInterpolationPlan) {
+        self.raster = raster
+        if plan.allowsLowLatency, let level = Self.lowLatencyLevel(forPhaseCount: plan.phases.count) {
+            mode = .dyadic(lowLatencyLevel: level)
+        } else {
+            mode = .arbitraryPhases
+        }
+    }
 
     /// `VTLowLatencyFrameInterpolationConfiguration` exposes `2^x - 1` dyadic points
-    /// (`1` → `[0.5]`, `2` → `[0.25, 0.5, 0.75]`). Non-dyadic uniform counts (`2` for 3× `[1/3, 2/3]`
-    /// and `4` for 5× `[0.2, 0.4, 0.6, 0.8]`) return `nil` and use `VTFrameRateConversionConfiguration`,
-    /// which natively supports arbitrary float phases in `(0, 1)`.
+    /// (`1` → `[0.5]`, `2` → `[0.25, 0.5, 0.75]`). Plans with `allowsLowLatency == false`
+    /// (including single-phase CFR pairs like `[0.42]`) always return `nil` and use
+    /// `VTFrameRateConversionConfiguration`.
     var lowLatencyLevel: Int? {
-        switch phaseCount {
+        if case let .dyadic(level) = mode { return level }
+        return nil
+    }
+
+    var expectedLowLatencyPhaseCount: Int? {
+        switch lowLatencyLevel {
+        case 1: 1
+        case 2: 3
+        default: nil
+        }
+    }
+
+    private static func lowLatencyLevel(forPhaseCount count: Int) -> Int? {
+        switch count {
         case 1: 1
         case 3: 2
         default: nil
@@ -345,11 +402,17 @@ private final class VTInterpolationSession {
         }
     }
 
+    private final class PhaseCountBox {
+        var value: Int
+        init(_ value: Int) { self.value = value }
+    }
+
     let key: VTInterpolationSessionKey
     let source: VTInterpolationBufferRequirements
     let destination: VTInterpolationPool
     let kind: VTInterpolationKind
     private let processor: VTFrameProcessor
+    private let maxPhaseCount: PhaseCountBox
     private var stagingPool: VTInterpolationPool?
     private var lastLLFISourcePTS: TimeInterval?
 
@@ -357,13 +420,18 @@ private final class VTInterpolationSession {
         key: VTInterpolationSessionKey,
         kind: VTInterpolationKind,
         configuration: Configuration,
+        initialPhaseCount: Int,
         hasTimeRemaining: @Sendable () -> Bool
     ) throws {
         guard hasTimeRemaining() else { throw VTInterpolationFailure.deadline }
+        let initialLimitPhaseCount = key.mode == .arbitraryPhases
+            ? max(2, initialPhaseCount)
+            : max(1, initialPhaseCount)
+        let maxPhaseCount = PhaseCountBox(initialLimitPhaseCount)
         let destination = try VTInterpolationPool(
             requirements: configuration.destination, role: "destination",
-            dynamicLimit: { [phaseCount = key.phaseCount] in
-                VideoFrameInterpolationPlan.outputPoolLimit(phaseCount: phaseCount)
+            dynamicLimit: {
+                VideoFrameInterpolationPlan.outputPoolLimit(phaseCount: maxPhaseCount.value)
             }
         )
         let processor = VTFrameProcessor()
@@ -383,10 +451,17 @@ private final class VTInterpolationSession {
         self.source = configuration.source
         self.destination = destination
         self.processor = processor
+        self.maxPhaseCount = maxPhaseCount
     }
 
     deinit {
         processor.endSession()
+    }
+
+    func recordPhaseCount(_ count: Int) {
+        if count > maxPhaseCount.value {
+            maxPhaseCount.value = count
+        }
     }
 
     func canReuse(_ key: VTInterpolationSessionKey, previousPTS: TimeInterval) -> Bool {
@@ -395,6 +470,7 @@ private final class VTInterpolationSession {
 
     private var canStageNV12: Bool {
         key.raster.format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            || key.raster.format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
     }
 
     func layoutDetail(previous: CVPixelBuffer, current: CVPixelBuffer) -> String {
@@ -413,7 +489,7 @@ private final class VTInterpolationSession {
         guard canStageNV12 else {
             throw VTInterpolationFailure(reason: "VT FI decoded buffers do not meet source requirements")
         }
-        let pool = try stagingPool ?? VTInterpolationPool(requirements: source, role: "source staging", limit: 2)
+        let pool = try stagingPool ?? VTInterpolationPool(requirements: source, role: "source staging", limit: 6)
         stagingPool = pool
         let staged = try pool.allocate()
         try VTNV12StagingCopy.copy(from: input, to: staged)
@@ -447,11 +523,16 @@ private final class VTInterpolationSession {
         let currTime = CMTime(seconds: request.current.pts, preferredTimescale: scale)
         let plan = request.plan
         guard prevTime.isNumeric, currTime.isNumeric,
-              plan.phases.count == key.phaseCount, plan.pts.count == key.phaseCount,
-              request.destinations.count == key.phaseCount,
+              !plan.phases.isEmpty,
+              plan.phases.count == plan.pts.count,
+              request.destinations.count == plan.phases.count,
               let prev = VTFrameProcessorFrame(buffer: request.previous.buffer, presentationTimeStamp: prevTime),
               let curr = VTFrameProcessorFrame(buffer: request.current.buffer, presentationTimeStamp: currTime) else {
             return nil
+        }
+        if kind == .lowLatency {
+            guard let expectedCount = key.expectedLowLatencyPhaseCount,
+                  plan.phases.count == expectedCount else { return nil }
         }
         var lastTime = prevTime
         var output: [VTFrameProcessorFrame] = []

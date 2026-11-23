@@ -9,6 +9,7 @@ struct VideoEnhancementDefaultsSnapshot: Equatable {
     let interpolationRate: VideoInterpolationRate
     let superResolutionScale: VideoSuperResolutionScale
     let superResolutionTargetResolution: VideoSuperResolutionTargetResolution
+    let superResolutionSharpness: VideoSuperResolutionSharpness
     let maxInputResolution: VideoEnhancementMaxInputResolution
 
     @MainActor static var current: Self {
@@ -20,6 +21,7 @@ struct VideoEnhancementDefaultsSnapshot: Equatable {
             interpolationRate: store.videoEnhancementDefaultRate,
             superResolutionScale: store.videoEnhancementDefaultScale,
             superResolutionTargetResolution: store.videoEnhancementDefaultTargetResolution,
+            superResolutionSharpness: store.videoEnhancementDefaultSharpness,
             maxInputResolution: store.videoEnhancementMaxInputResolution
         )
     }
@@ -74,6 +76,7 @@ extension PlayerViewModel {
             interpolationRate: videoInterpolationRate,
             superResolutionScale: videoSuperResolutionScale,
             superResolutionTargetResolution: videoSuperResolutionTargetResolution,
+            superResolutionSharpness: videoSuperResolutionSharpness,
             maxInputResolution: videoEnhancementMaxInputResolution,
             isLiveStream: mode == .live,
             adaptiveQualityEnabled: ExperimentalSettingsStore.shared.videoEnhancementAdaptiveQuality,
@@ -119,6 +122,14 @@ extension PlayerViewModel {
               isVideoEnhancementEligibleForStream, videoSuperResolutionMode == .metalFXSpatial,
               videoSuperResolutionTargetResolution != target else { return }
         videoSuperResolutionTargetResolution = target
+        syncVideoEnhancementToBackend()
+    }
+
+    func setVideoSuperResolutionSharpness(_ sharpness: VideoSuperResolutionSharpness) {
+        guard ExperimentalSettingsStore.shared.isAllowed(.videoEnhancement),
+              isVideoEnhancementEligibleForStream, videoSuperResolutionMode == .metalFXSpatial,
+              videoSuperResolutionSharpness != sharpness else { return }
+        videoSuperResolutionSharpness = sharpness
         syncVideoEnhancementToBackend()
     }
 
@@ -173,6 +184,7 @@ extension PlayerViewModel {
             videoInterpolationRate = defaults.interpolationRate
             videoSuperResolutionScale = defaults.superResolutionScale
             videoSuperResolutionTargetResolution = defaults.superResolutionTargetResolution
+            videoSuperResolutionSharpness = defaults.superResolutionSharpness
             videoEnhancementMaxInputResolution = defaults.maxInputResolution
         } else {
             if defaults.superResolutionMode != previous.superResolutionMode {
@@ -189,6 +201,9 @@ extension PlayerViewModel {
             }
             if defaults.superResolutionTargetResolution != previous.superResolutionTargetResolution {
                 videoSuperResolutionTargetResolution = defaults.superResolutionTargetResolution
+            }
+            if defaults.superResolutionSharpness != previous.superResolutionSharpness {
+                videoSuperResolutionSharpness = defaults.superResolutionSharpness
             }
             if defaults.maxInputResolution != previous.maxInputResolution {
                 videoEnhancementMaxInputResolution = defaults.maxInputResolution

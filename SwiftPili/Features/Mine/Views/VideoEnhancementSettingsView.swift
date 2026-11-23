@@ -80,6 +80,19 @@ struct VideoEnhancementSettingsView: View {
                     guard canMutate else { return }
                     _ = experiments.setVideoEnhancementDefaultTargetResolution(target)
                 }
+
+                Picker(
+                    "Sharpness",
+                    selection: binding(
+                        \.videoEnhancementDefaultSharpness, experiments.setVideoEnhancementDefaultSharpness
+                    )
+                ) {
+                    ForEach(VideoSuperResolutionSharpness.allCases) { sharpness in
+                        Text(sharpness.label).tag(sharpness)
+                    }
+                }
+                .pickerStyle(.menu)
+                .menuOrder(.fixed)
             }
 
             Picker(

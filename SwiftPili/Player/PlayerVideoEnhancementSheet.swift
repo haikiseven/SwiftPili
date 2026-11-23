@@ -72,6 +72,20 @@ struct PlayerVideoEnhancementSheet: View {
                     guard canEdit() else { return }
                     player.setVideoSuperResolutionTargetResolution(target)
                 }
+
+                Picker("Sharpness", selection: Binding(
+                    get: { player.videoSuperResolutionSharpness },
+                    set: { sharpness in
+                        guard canEdit() else { return }
+                        player.setVideoSuperResolutionSharpness(sharpness)
+                    }
+                )) {
+                    ForEach(VideoSuperResolutionSharpness.allCases) { sharpness in
+                        Text(sharpness.label).tag(sharpness)
+                    }
+                }
+                .pickerStyle(.menu)
+                .menuOrder(.fixed)
             }
 
             Picker("Max Input Resolution", selection: Binding(

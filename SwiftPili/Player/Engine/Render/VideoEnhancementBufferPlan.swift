@@ -52,11 +52,17 @@ struct VideoEnhancementBufferPlan: Equatable, Sendable {
         upscaledBytes: Int?,
         interpolatedBytes: Int,
         budgetBytes: Int,
-        maximumLead: TimeInterval = 1.0
+        maximumLead: TimeInterval = 1.0,
+        outputFPSOverride: Double? = nil
     ) -> Self {
         guard sourceFPS.isFinite, sourceFPS > 1, sourceFPS < 240, budgetBytes > 0 else { return .default }
         let midpoints = max(0, midpointsPerSource)
-        let outputFPS = sourceFPS * Double(1 + midpoints)
+        let outputFPS: Double
+        if let override = outputFPSOverride, override.isFinite, override > 1, override < 240 {
+            outputFPS = override
+        } else {
+            outputFPS = sourceFPS * Double(1 + midpoints)
+        }
         let maximumLead = max(minimumLead, maximumLead)
         // High-multiplier interpolation (e.g. 5× = 4 midpoints + 1 original) keeps up to
         // `midpoints + 1` buffers in flight inside the worker before enqueueing to the display layer.
@@ -76,7 +82,9 @@ struct VideoEnhancementBufferPlan: Equatable, Sendable {
         } else if midpoints > 0, interpolatedBytes > 0 {
             // FI only: midpoints sit in the display queue straight from the FI pool.
             let affordable = budgetBytes / interpolatedBytes
-            let midpointFPS = sourceFPS * Double(midpoints)
+            let midpointFPS = outputFPSOverride != nil
+                ? min(outputFPS, sourceFPS * Double(midpoints))
+                : sourceFPS * Double(midpoints)
             plan.lead = leadFitting(
                 frames: affordable, fps: midpointFPS, maximumLead: maximumLead, headroom: headroom
             )

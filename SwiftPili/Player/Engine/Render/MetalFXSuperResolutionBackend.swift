@@ -5,13 +5,23 @@ import Metal
 import MetalFX
 #endif
 
-private let nv12ToBGRAMetalSource = """
+private let videoEnhancementMetalSource = """
 #include <metal_stdlib>
 using namespace metal;
 
 struct NV12ConvertParams {
     uint fullRange;
     uint colorMatrix; // 0 = BT.709, 1 = BT.601, 2 = BT.2020
+    float chromaOffsetX;
+    float chromaOffsetY;
+};
+
+struct NV12RangeConvertParams {
+    uint fullToVideo; // 1 = 420f -> 420v, 0 = 420v -> 420f
+};
+
+struct RCASParams {
+    float strength;
 };
 
 kernel void nv12ToBGRA(
@@ -28,7 +38,9 @@ kernel void nv12ToBGRA(
     }
     constexpr sampler chromaSampler(coord::normalized, address::clamp_to_edge, filter::linear);
     float y = yTexture.read(gid).r;
-    float2 uv = (float2(gid) + 0.5f) / float2(width, height);
+    // MPEG-2 / H.264 / HEVC / AV1 default left-sited 4:2:0 uses chromaOffset = (1.0, 0.5)
+    // so even columns co-site exactly with chroma texel centers (i + 0.5) / (W / 2) = (2*i + 1) / W.
+    float2 uv = (float2(gid) + float2(params.chromaOffsetX, params.chromaOffsetY)) / float2(width, height);
     float2 cbcr = cbcrTexture.sample(chromaSampler, uv).rg - float2(0.5f, 0.5f);
     float yAdj = params.fullRange != 0 ? y : clamp((y - 16.0f / 255.0f) * (255.0f / 219.0f), 0.0f, 1.0f);
     float cb = params.fullRange != 0 ? cbcr.x : cbcr.x * (255.0f / 224.0f);
@@ -60,17 +72,395 @@ kernel void nv12ToBGRA(
     float b = clamp(yAdj + cbu * cb, 0.0f, 1.0f);
     outTexture.write(float4(r, g, b, 1.0f), gid);
 }
+
+kernel void nv12RangeConvertY(
+    texture2d<float, access::read> inY [[texture(0)]],
+    texture2d<float, access::write> outY [[texture(1)]],
+    constant NV12RangeConvertParams &params [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= outY.get_width() || gid.y >= outY.get_height()) {
+        return;
+    }
+    float y = inY.read(gid).r;
+    float converted = params.fullToVideo != 0
+        ? clamp(y * (219.0f / 255.0f) + (16.0f / 255.0f), 0.0f, 1.0f)
+        : clamp((y - (16.0f / 255.0f)) * (255.0f / 219.0f), 0.0f, 1.0f);
+    outY.write(float4(converted, 0.0f, 0.0f, 1.0f), gid);
+}
+
+kernel void nv12RangeConvertCbCr(
+    texture2d<float, access::read> inCbCr [[texture(0)]],
+    texture2d<float, access::write> outCbCr [[texture(1)]],
+    constant NV12RangeConvertParams &params [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= outCbCr.get_width() || gid.y >= outCbCr.get_height()) {
+        return;
+    }
+    float2 cbcr = inCbCr.read(gid).rg;
+    const float2 center = float2(128.0f / 255.0f);
+    float2 converted = params.fullToVideo != 0
+        ? clamp((cbcr - center) * (224.0f / 255.0f) + center, 0.0f, 1.0f)
+        : clamp((cbcr - center) * (255.0f / 224.0f) + center, 0.0f, 1.0f);
+    outCbCr.write(float4(converted.x, converted.y, 0.0f, 1.0f), gid);
+}
+
+// AMD FidelityFX RCAS-style 5-tap contrast-adaptive sharpening with anti-ringing clamping
+// and isolated compression-speckle attenuation.
+kernel void rcasSharpen(
+    texture2d<float, access::read> inTexture [[texture(0)]],
+    texture2d<float, access::write> outTexture [[texture(1)]],
+    constant RCASParams &params [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    uint width = outTexture.get_width();
+    uint height = outTexture.get_height();
+    if (gid.x >= width || gid.y >= height) {
+        return;
+    }
+    uint maxX = inTexture.get_width() - 1;
+    uint maxY = inTexture.get_height() - 1;
+    uint cx = min(gid.x, maxX);
+    uint cy = min(gid.y, maxY);
+
+    float4 centerSample = inTexture.read(uint2(cx, cy));
+    float3 c = centerSample.rgb;
+    float3 n = inTexture.read(uint2(cx, cy > 0 ? cy - 1 : 0)).rgb;
+    float3 s = inTexture.read(uint2(cx, min(cy + 1, maxY))).rgb;
+    float3 w = inTexture.read(uint2(cx > 0 ? cx - 1 : 0, cy)).rgb;
+    float3 e = inTexture.read(uint2(min(cx + 1, maxX), cy)).rgb;
+
+    float3 mn4 = min(min(n, s), min(w, e));
+    float3 mx4 = max(max(n, s), max(w, e));
+    float3 mn5 = min(mn4, c);
+    float3 mx5 = max(mx4, c);
+
+    // Per-channel anti-ringing limits merged to a single RGB lobe to avoid chroma fringes.
+    float3 hitMin = mn5 / max(4.0f * mx4, float3(1e-5f));
+    float3 hitMax = (1.0f - mx5) / min(4.0f * mn4 - 4.0f, float3(-1e-5f));
+    float3 lobeRGB = max(-hitMin, hitMax);
+    float lobe = max(-0.1875f, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0f));
+
+    // Gently attenuate sharpening on isolated 1px compression speckles while preserving edges.
+    float cL = 0.25f * c.r + 0.5f * c.g + 0.25f * c.b;
+    float nL = 0.25f * n.r + 0.5f * n.g + 0.25f * n.b;
+    float sL = 0.25f * s.r + 0.5f * s.g + 0.25f * s.b;
+    float wL = 0.25f * w.r + 0.5f * w.g + 0.25f * w.b;
+    float eL = 0.25f * e.r + 0.5f * e.g + 0.25f * e.b;
+    float nz = 0.25f * (nL + sL + wL + eL) - cL;
+    float rangeL = max(max(max(nL, sL), max(wL, eL)), cL) - min(min(min(nL, sL), min(wL, eL)), cL);
+    float denoise = -0.5f * clamp(abs(nz) / max(rangeL, 1e-4f), 0.0f, 1.0f) + 1.0f;
+
+    float weight = lobe * denoise * params.strength;
+    float3 sharpened = (c + weight * (n + s + w + e)) / (1.0f + 4.0f * weight);
+    float3 result = clamp(sharpened, mn5, mx5);
+    outTexture.write(float4(result, centerSample.a), gid);
+}
 """
 
 private struct NV12ConvertParams {
     var fullRange: UInt32
     var colorMatrix: UInt32
+    var chromaOffsetX: Float
+    var chromaOffsetY: Float
+}
+
+private struct NV12RangeConvertParams {
+    var fullToVideo: UInt32
+}
+
+private struct RCASParams {
+    var strength: Float
+}
+
+/// Shared GPU pixel-format converter used by both MetalFX Spatial (NV12→BGRA input preparation)
+/// and VideoToolbox ML SR (cross-format staging such as 420v/420f→32BGRA and 420f↔420v).
+final class MetalNV12PixelConverter {
+    private var device: MTLDevice?
+    private var commandQueue: MTLCommandQueue?
+    private var nv12ToBGRAPipeline: MTLComputePipelineState?
+    private var rangeYPipeline: MTLComputePipelineState?
+    private var rangeCbCrPipeline: MTLComputePipelineState?
+    private var textureCache: CVMetalTextureCache?
+
+    deinit {
+        tearDown()
+    }
+
+    func flush() {
+        if let textureCache {
+            CVMetalTextureCacheFlush(textureCache, 0)
+        }
+    }
+
+    func tearDown() {
+        flush()
+        textureCache = nil
+        nv12ToBGRAPipeline = nil
+        rangeYPipeline = nil
+        rangeCbCrPipeline = nil
+        commandQueue = nil
+        device = nil
+    }
+
+    /// Converts `source` into `destination` on the GPU (supports NV12→BGRA, 420f↔420v, and BGRA→BGRA).
+    func convert(from source: CVPixelBuffer, to destination: CVPixelBuffer) async -> Bool {
+        let width = CVPixelBufferGetWidth(source)
+        let height = CVPixelBufferGetHeight(source)
+        guard width > 0, height > 0,
+              width == CVPixelBufferGetWidth(destination),
+              height == CVPixelBufferGetHeight(destination),
+              ensureInfrastructure(),
+              let commandQueue, let textureCache,
+              let commandBuffer = commandQueue.makeCommandBuffer() else {
+            return false
+        }
+
+        let srcFormat = CVPixelBufferGetPixelFormatType(source)
+        let dstFormat = CVPixelBufferGetPixelFormatType(destination)
+        let size = (width, height)
+        let retained: [CVMetalTexture]
+
+        if Self.isNV12(srcFormat), dstFormat == kCVPixelFormatType_32BGRA {
+            guard let textures = encodeNV12ToBGRA(
+                commandBuffer: commandBuffer, cache: textureCache,
+                source: source, destination: destination, size: size
+            ) else { return false }
+            retained = textures
+        } else if Self.isNV12(srcFormat), Self.isNV12(dstFormat), srcFormat != dstFormat {
+            guard let textures = encodeNV12RangeConvert(
+                commandBuffer: commandBuffer, cache: textureCache,
+                source: source, destination: destination, size: size,
+                fullToVideo: srcFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            ) else { return false }
+            retained = textures
+        } else if srcFormat == kCVPixelFormatType_32BGRA, dstFormat == kCVPixelFormatType_32BGRA {
+            guard let srcCV = Self.makeCVTexture(
+                cache: textureCache, buffer: source, format: .bgra8Unorm, size: size, plane: 0
+            ), let dstCV = Self.makeCVTexture(
+                cache: textureCache, buffer: destination, format: .bgra8Unorm, size: size, plane: 0
+            ), let srcTex = CVMetalTextureGetTexture(srcCV),
+            let dstTex = CVMetalTextureGetTexture(dstCV),
+            let blit = commandBuffer.makeBlitCommandEncoder() else { return false }
+            blit.copy(
+                from: srcTex, sourceSlice: 0, sourceLevel: 0,
+                sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                sourceSize: MTLSize(width: width, height: height, depth: 1),
+                to: dstTex, destinationSlice: 0, destinationLevel: 0,
+                destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+            )
+            blit.endEncoding()
+            retained = [srcCV, dstCV]
+        } else {
+            return false
+        }
+
+        let succeeded = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            commandBuffer.addCompletedHandler { buffer in
+                continuation.resume(returning: buffer.status == .completed)
+            }
+            commandBuffer.commit()
+        }
+        withExtendedLifetime(retained) {}
+        return succeeded
+    }
+
+    private func ensureInfrastructure() -> Bool {
+        if device != nil, commandQueue != nil, nv12ToBGRAPipeline != nil,
+           rangeYPipeline != nil, rangeCbCrPipeline != nil, textureCache != nil {
+            return true
+        }
+        guard let metalDevice = MTLCreateSystemDefaultDevice(),
+              let queue = metalDevice.makeCommandQueue(),
+              let library = try? metalDevice.makeLibrary(source: videoEnhancementMetalSource, options: nil),
+              let bgraFn = library.makeFunction(name: "nv12ToBGRA"),
+              let yFn = library.makeFunction(name: "nv12RangeConvertY"),
+              let cbcrFn = library.makeFunction(name: "nv12RangeConvertCbCr"),
+              let bgraPipe = try? metalDevice.makeComputePipelineState(function: bgraFn),
+              let yPipe = try? metalDevice.makeComputePipelineState(function: yFn),
+              let cbcrPipe = try? metalDevice.makeComputePipelineState(function: cbcrFn) else {
+            return false
+        }
+        var cacheOut: CVMetalTextureCache?
+        guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, metalDevice, nil, &cacheOut) == kCVReturnSuccess,
+              let cache = cacheOut else {
+            return false
+        }
+        device = metalDevice
+        commandQueue = queue
+        nv12ToBGRAPipeline = bgraPipe
+        rangeYPipeline = yPipe
+        rangeCbCrPipeline = cbcrPipe
+        textureCache = cache
+        return true
+    }
+
+    private func encodeNV12ToBGRA(
+        commandBuffer: MTLCommandBuffer,
+        cache: CVMetalTextureCache,
+        source: CVPixelBuffer,
+        destination: CVPixelBuffer,
+        size: (Int, Int)
+    ) -> [CVMetalTexture]? {
+        guard let nv12ToBGRAPipeline else { return nil }
+        let chromaSize = (max(1, size.0 / 2), max(1, size.1 / 2))
+        guard let yCV = Self.makeCVTexture(cache: cache, buffer: source, format: .r8Unorm, size: size, plane: 0),
+              let cbcrCV = Self.makeCVTexture(
+                cache: cache, buffer: source, format: .rg8Unorm, size: chromaSize, plane: 1
+              ),
+              let outCV = Self.makeCVTexture(
+                cache: cache, buffer: destination, format: .bgra8Unorm, size: size, plane: 0
+              ),
+              let yTex = CVMetalTextureGetTexture(yCV),
+              let cbcrTex = CVMetalTextureGetTexture(cbcrCV),
+              let outTex = CVMetalTextureGetTexture(outCV),
+              outTex.usage.contains(.shaderWrite),
+              let compute = commandBuffer.makeComputeCommandEncoder() else {
+            return nil
+        }
+        let chromaOffset = Self.chromaOffset(for: source)
+        var params = NV12ConvertParams(
+            fullRange: CVPixelBufferGetPixelFormatType(source) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                ? 1 : 0,
+            colorMatrix: Self.colorMatrixIndex(for: source, width: size.0, height: size.1),
+            chromaOffsetX: chromaOffset.0,
+            chromaOffsetY: chromaOffset.1
+        )
+        compute.setComputePipelineState(nv12ToBGRAPipeline)
+        compute.setTexture(yTex, index: 0)
+        compute.setTexture(cbcrTex, index: 1)
+        compute.setTexture(outTex, index: 2)
+        compute.setBytes(&params, length: MemoryLayout<NV12ConvertParams>.size, index: 0)
+        Self.dispatchThreads(encoder: compute, pipeline: nv12ToBGRAPipeline, width: size.0, height: size.1)
+        compute.endEncoding()
+        return [yCV, cbcrCV, outCV]
+    }
+
+    private func encodeNV12RangeConvert(
+        commandBuffer: MTLCommandBuffer,
+        cache: CVMetalTextureCache,
+        source: CVPixelBuffer,
+        destination: CVPixelBuffer,
+        size: (Int, Int),
+        fullToVideo: Bool
+    ) -> [CVMetalTexture]? {
+        guard let rangeYPipeline, let rangeCbCrPipeline else { return nil }
+        let chromaSize = (max(1, size.0 / 2), max(1, size.1 / 2))
+        guard let srcYCV = Self.makeCVTexture(cache: cache, buffer: source, format: .r8Unorm, size: size, plane: 0),
+              let srcCbCrCV = Self.makeCVTexture(
+                cache: cache, buffer: source, format: .rg8Unorm, size: chromaSize, plane: 1
+              ),
+              let dstYCV = Self.makeCVTexture(
+                cache: cache, buffer: destination, format: .r8Unorm, size: size, plane: 0
+              ),
+              let dstCbCrCV = Self.makeCVTexture(
+                cache: cache, buffer: destination, format: .rg8Unorm, size: chromaSize, plane: 1
+              ),
+              let srcYTex = CVMetalTextureGetTexture(srcYCV),
+              let srcCbCrTex = CVMetalTextureGetTexture(srcCbCrCV),
+              let dstYTex = CVMetalTextureGetTexture(dstYCV),
+              let dstCbCrTex = CVMetalTextureGetTexture(dstCbCrCV),
+              dstYTex.usage.contains(.shaderWrite), dstCbCrTex.usage.contains(.shaderWrite),
+              let compute = commandBuffer.makeComputeCommandEncoder() else {
+            return nil
+        }
+        var params = NV12RangeConvertParams(fullToVideo: fullToVideo ? 1 : 0)
+        compute.setComputePipelineState(rangeYPipeline)
+        compute.setTexture(srcYTex, index: 0)
+        compute.setTexture(dstYTex, index: 1)
+        compute.setBytes(&params, length: MemoryLayout<NV12RangeConvertParams>.size, index: 0)
+        Self.dispatchThreads(encoder: compute, pipeline: rangeYPipeline, width: size.0, height: size.1)
+
+        compute.setComputePipelineState(rangeCbCrPipeline)
+        compute.setTexture(srcCbCrTex, index: 0)
+        compute.setTexture(dstCbCrTex, index: 1)
+        compute.setBytes(&params, length: MemoryLayout<NV12RangeConvertParams>.size, index: 0)
+        Self.dispatchThreads(encoder: compute, pipeline: rangeCbCrPipeline, width: chromaSize.0, height: chromaSize.1)
+        compute.endEncoding()
+        return [srcYCV, srcCbCrCV, dstYCV, dstCbCrCV]
+    }
+
+    static func isNV12(_ format: OSType) -> Bool {
+        format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+    }
+
+    static func colorMatrixIndex(for pixelBuffer: CVPixelBuffer, width: Int, height: Int) -> UInt32 {
+        if let matrix = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, nil) {
+            if CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4)
+                || CFEqual(matrix, kCVImageBufferYCbCrMatrix_SMPTE_240M_1995) {
+                return 1
+            }
+            if CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_2020) {
+                return 2
+            }
+            if CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2) {
+                return 0
+            }
+        }
+        return (width <= 720 && height <= 576) ? 1 : 0
+    }
+
+    /// Returns luma-grid chroma sampling offset `(offsetX, offsetY)` for normalized sampling
+    /// `uv = (float2(gid) + offset) / float2(width, height)`. Defaults to MPEG-2 / H.264 / HEVC / AV1
+    /// left-sited 4:2:0 `(1.0, 0.5)` so even luma columns align exactly with chroma texel centers.
+    static func chromaOffset(for pixelBuffer: CVPixelBuffer) -> (Float, Float) {
+        if let loc = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferChromaLocationTopFieldKey, nil) {
+            if CFEqual(loc, kCVImageBufferChromaLocation_Center) {
+                return (0.5, 0.5)
+            }
+            if CFEqual(loc, kCVImageBufferChromaLocation_TopLeft) {
+                return (1.0, 1.0)
+            }
+            if CFEqual(loc, kCVImageBufferChromaLocation_Top) {
+                return (0.5, 1.0)
+            }
+            if CFEqual(loc, kCVImageBufferChromaLocation_BottomLeft) {
+                return (1.0, 0.0)
+            }
+            if CFEqual(loc, kCVImageBufferChromaLocation_Bottom) {
+                return (0.5, 0.0)
+            }
+        }
+        return (1.0, 0.5)
+    }
+
+    static func makeCVTexture(
+        cache: CVMetalTextureCache,
+        buffer: CVPixelBuffer,
+        format: MTLPixelFormat,
+        size: (Int, Int),
+        plane: Int
+    ) -> CVMetalTexture? {
+        var textureOut: CVMetalTexture?
+        let status = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, cache, buffer, nil, format, size.0, size.1, plane, &textureOut
+        )
+        return status == kCVReturnSuccess ? textureOut : nil
+    }
+
+    static func dispatchThreads(
+        encoder: MTLComputeCommandEncoder,
+        pipeline: MTLComputePipelineState,
+        width: Int,
+        height: Int
+    ) {
+        let tgW = min(16, pipeline.threadExecutionWidth)
+        let tgH = min(16, max(1, pipeline.maxTotalThreadsPerThreadgroup / tgW))
+        let tgSize = MTLSize(width: tgW, height: tgH, depth: 1)
+        let gridSize = MTLSize(
+            width: (width + tgW - 1) / tgW, height: (height + tgH - 1) / tgH, depth: 1
+        )
+        encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: tgSize)
+    }
 }
 
 final class MetalFXSuperResolutionBackend {
     private var device: MTLDevice?
     private var commandQueue: MTLCommandQueue?
     private var convertPipeline: MTLComputePipelineState?
+    private var rcasPipeline: MTLComputePipelineState?
     private var textureCache: CVMetalTextureCache?
     private var inputRGBATexture: MTLTexture?
     private var privateOutputTexture: MTLTexture?
@@ -101,6 +491,7 @@ final class MetalFXSuperResolutionBackend {
         outputPool = nil
         textureCache = nil
         convertPipeline = nil
+        rcasPipeline = nil
         commandQueue = nil
         device = nil
         configuredOutput = nil
@@ -111,10 +502,12 @@ final class MetalFXSuperResolutionBackend {
     ///     magnification so output never exceeds the display's pixel size.
     ///   - targetDimensions: explicit output dimensions (even, within raster budget) when the user
     ///     configured a manual MetalFX target resolution; bypasses the Auto magnification floor.
+    ///   - sharpness: AMD RCAS contrast-adaptive sharpening strength applied during the output pass.
     func upscale(
         pixelBuffer: CVPixelBuffer,
         maxScale: Float = 2,
-        targetDimensions: VideoSuperResolutionDimensions? = nil
+        targetDimensions: VideoSuperResolutionDimensions? = nil,
+        sharpness: VideoSuperResolutionSharpness = .standard
     ) async -> VideoEnhancementBackendOutcome {
         #if !canImport(MetalFX)
         return .bypassed(reason: "MetalFX unavailable")
@@ -156,7 +549,9 @@ final class MetalFXSuperResolutionBackend {
            let configReason = configureScaler(width: width, height: height, output: output) {
             return .bypassed(reason: configReason)
         }
-        return await runUpscalePass(pixelBuffer: pixelBuffer, width: width, height: height)
+        return await runUpscalePass(
+            pixelBuffer: pixelBuffer, width: width, height: height, sharpness: sharpness
+        )
         #endif
     }
 
@@ -167,7 +562,7 @@ final class MetalFXSuperResolutionBackend {
 
     #if canImport(MetalFX)
     private func ensureMetalInfrastructure() -> String? {
-        if device != nil, commandQueue != nil, convertPipeline != nil, textureCache != nil {
+        if device != nil, commandQueue != nil, convertPipeline != nil, rcasPipeline != nil, textureCache != nil {
             return nil
         }
         guard let metalDevice = MTLCreateSystemDefaultDevice() else {
@@ -179,9 +574,11 @@ final class MetalFXSuperResolutionBackend {
         guard let queue = metalDevice.makeCommandQueue() else {
             return "Metal queue unavailable"
         }
-        guard let library = try? metalDevice.makeLibrary(source: nv12ToBGRAMetalSource, options: nil),
-              let function = library.makeFunction(name: "nv12ToBGRA"),
-              let pipeline = try? metalDevice.makeComputePipelineState(function: function) else {
+        guard let library = try? metalDevice.makeLibrary(source: videoEnhancementMetalSource, options: nil),
+              let convertFunction = library.makeFunction(name: "nv12ToBGRA"),
+              let rcasFunction = library.makeFunction(name: "rcasSharpen"),
+              let convertPipe = try? metalDevice.makeComputePipelineState(function: convertFunction),
+              let rcasPipe = try? metalDevice.makeComputePipelineState(function: rcasFunction) else {
             return "Metal pipeline failed"
         }
         var cacheOut: CVMetalTextureCache?
@@ -191,7 +588,8 @@ final class MetalFXSuperResolutionBackend {
         }
         device = metalDevice
         commandQueue = queue
-        convertPipeline = pipeline
+        convertPipeline = convertPipe
+        rcasPipeline = rcasPipe
         textureCache = cache
         return nil
     }
@@ -262,7 +660,8 @@ final class MetalFXSuperResolutionBackend {
     private func runUpscalePass(
         pixelBuffer: CVPixelBuffer,
         width: Int,
-        height: Int
+        height: Int,
+        sharpness: VideoSuperResolutionSharpness
     ) async -> VideoEnhancementBackendOutcome {
         guard let commandQueue, let textureCache, let outputPool, let scaler,
               let commandBuffer = commandQueue.makeCommandBuffer() else {
@@ -275,7 +674,7 @@ final class MetalFXSuperResolutionBackend {
             return .bypassed(reason: error.isBusy ? error.reason : "BGRA output alloc failed")
         }
         let outSize = (scaler.outputWidth, scaler.outputHeight)
-        guard let outputCVTexture = Self.makeCVTexture(
+        guard let outputCVTexture = MetalNV12PixelConverter.makeCVTexture(
             cache: textureCache, buffer: destBuffer, format: .bgra8Unorm, size: outSize, plane: 0
         ), let outputMetalTexture = CVMetalTextureGetTexture(outputCVTexture) else {
             return .bypassed(reason: "Output Metal texture failed")
@@ -289,7 +688,8 @@ final class MetalFXSuperResolutionBackend {
             commandBuffer: commandBuffer,
             inputSize: (width, height),
             outputSize: outSize,
-            destination: outputMetalTexture
+            destination: outputMetalTexture,
+            sharpness: sharpness
         ) else {
             return .bypassed(reason: "MetalFX encode failed")
         }
@@ -314,7 +714,7 @@ final class MetalFXSuperResolutionBackend {
         guard let textureCache, let inputRGBATexture, let convertPipeline else { return nil }
         let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
         if pixelFormat == kCVPixelFormatType_32BGRA {
-            guard let bgraCV = Self.makeCVTexture(
+            guard let bgraCV = MetalNV12PixelConverter.makeCVTexture(
                 cache: textureCache, buffer: pixelBuffer, format: .bgra8Unorm, size: size, plane: 0
             ), let bgraTex = CVMetalTextureGetTexture(bgraCV),
             let blit = commandBuffer.makeBlitCommandEncoder() else { return nil }
@@ -330,55 +730,41 @@ final class MetalFXSuperResolutionBackend {
         }
 
         let chromaSize = (max(1, size.0 / 2), max(1, size.1 / 2))
-        guard let yCV = Self.makeCVTexture(
+        guard let yCV = MetalNV12PixelConverter.makeCVTexture(
             cache: textureCache, buffer: pixelBuffer, format: .r8Unorm, size: size, plane: 0
-        ), let cbcrCV = Self.makeCVTexture(
+        ), let cbcrCV = MetalNV12PixelConverter.makeCVTexture(
             cache: textureCache, buffer: pixelBuffer, format: .rg8Unorm, size: chromaSize, plane: 1
         ), let yTex = CVMetalTextureGetTexture(yCV),
         let cbcrTex = CVMetalTextureGetTexture(cbcrCV),
         let compute = commandBuffer.makeComputeCommandEncoder() else { return nil }
 
+        let chromaOffset = MetalNV12PixelConverter.chromaOffset(for: pixelBuffer)
         var params = NV12ConvertParams(
             fullRange: pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ? 1 : 0,
-            colorMatrix: Self.colorMatrixIndex(for: pixelBuffer, width: size.0, height: size.1)
+            colorMatrix: MetalNV12PixelConverter.colorMatrixIndex(
+                for: pixelBuffer, width: size.0, height: size.1
+            ),
+            chromaOffsetX: chromaOffset.0,
+            chromaOffsetY: chromaOffset.1
         )
         compute.setComputePipelineState(convertPipeline)
         compute.setTexture(yTex, index: 0)
         compute.setTexture(cbcrTex, index: 1)
         compute.setTexture(inputRGBATexture, index: 2)
         compute.setBytes(&params, length: MemoryLayout<NV12ConvertParams>.size, index: 0)
-        let tgW = min(16, convertPipeline.threadExecutionWidth)
-        let tgH = min(16, max(1, convertPipeline.maxTotalThreadsPerThreadgroup / tgW))
-        let tgSize = MTLSize(width: tgW, height: tgH, depth: 1)
-        let gridSize = MTLSize(
-            width: (size.0 + tgW - 1) / tgW, height: (size.1 + tgH - 1) / tgH, depth: 1
+        MetalNV12PixelConverter.dispatchThreads(
+            encoder: compute, pipeline: convertPipeline, width: size.0, height: size.1
         )
-        compute.dispatchThreadgroups(gridSize, threadsPerThreadgroup: tgSize)
         compute.endEncoding()
         return [yCV, cbcrCV]
-    }
-
-    private static func colorMatrixIndex(for pixelBuffer: CVPixelBuffer, width: Int, height: Int) -> UInt32 {
-        if let matrix = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, nil) {
-            if CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_601_4)
-                || CFEqual(matrix, kCVImageBufferYCbCrMatrix_SMPTE_240M_1995) {
-                return 1
-            }
-            if CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_2020) {
-                return 2
-            }
-            if CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2) {
-                return 0
-            }
-        }
-        return (width <= 720 && height <= 576) ? 1 : 0
     }
 
     private func encodeScaleAndBlit(
         commandBuffer: MTLCommandBuffer,
         inputSize: (Int, Int),
         outputSize: (Int, Int),
-        destination: MTLTexture
+        destination: MTLTexture,
+        sharpness: VideoSuperResolutionSharpness
     ) -> Bool {
         guard let scaler, let inputRGBATexture, let privateOutputTexture else { return false }
         scaler.colorTexture = inputRGBATexture
@@ -386,6 +772,21 @@ final class MetalFXSuperResolutionBackend {
         scaler.inputContentHeight = inputSize.1
         scaler.outputTexture = privateOutputTexture
         scaler.encode(commandBuffer: commandBuffer)
+
+        if sharpness.rcasStrength > 0.001, let rcasPipeline, destination.usage.contains(.shaderWrite) {
+            guard let compute = commandBuffer.makeComputeCommandEncoder() else { return false }
+            var params = RCASParams(strength: sharpness.rcasStrength)
+            compute.setComputePipelineState(rcasPipeline)
+            compute.setTexture(privateOutputTexture, index: 0)
+            compute.setTexture(destination, index: 1)
+            compute.setBytes(&params, length: MemoryLayout<RCASParams>.size, index: 0)
+            MetalNV12PixelConverter.dispatchThreads(
+                encoder: compute, pipeline: rcasPipeline, width: outputSize.0, height: outputSize.1
+            )
+            compute.endEncoding()
+            return true
+        }
+
         guard let blit = commandBuffer.makeBlitCommandEncoder() else { return false }
         blit.copy(
             from: privateOutputTexture, sourceSlice: 0, sourceLevel: 0,
@@ -396,20 +797,6 @@ final class MetalFXSuperResolutionBackend {
         )
         blit.endEncoding()
         return true
-    }
-
-    private static func makeCVTexture(
-        cache: CVMetalTextureCache,
-        buffer: CVPixelBuffer,
-        format: MTLPixelFormat,
-        size: (Int, Int),
-        plane: Int
-    ) -> CVMetalTexture? {
-        var textureOut: CVMetalTexture?
-        let status = CVMetalTextureCacheCreateTextureFromImage(
-            kCFAllocatorDefault, cache, buffer, nil, format, size.0, size.1, plane, &textureOut
-        )
-        return status == kCVReturnSuccess ? textureOut : nil
     }
 
     private static func makeBGRAOutputPool(width: Int, height: Int) -> VideoSuperResolutionPool? {

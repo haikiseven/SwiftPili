@@ -11,11 +11,40 @@ struct VideoEnhancementTelemetryWindow {
         let at: ContinuousClock.Instant
         let upscaled: Bool
         let midpoints: Int
+        let expectedMidpoints: Int
         let missReason: String?
         let inputWidth: Int
         let inputHeight: Int
         let outputWidth: Int
         let outputHeight: Int
+        let emittedOriginal: Bool
+        let interpolationStepActive: Bool
+
+        init(
+            at: ContinuousClock.Instant,
+            upscaled: Bool,
+            midpoints: Int,
+            expectedMidpoints: Int = 0,
+            missReason: String?,
+            inputWidth: Int,
+            inputHeight: Int,
+            outputWidth: Int,
+            outputHeight: Int,
+            emittedOriginal: Bool = true,
+            interpolationStepActive: Bool = false
+        ) {
+            self.at = at
+            self.upscaled = upscaled
+            self.midpoints = midpoints
+            self.expectedMidpoints = expectedMidpoints
+            self.missReason = missReason
+            self.inputWidth = inputWidth
+            self.inputHeight = inputHeight
+            self.outputWidth = outputWidth
+            self.outputHeight = outputHeight
+            self.emittedOriginal = emittedOriginal
+            self.interpolationStepActive = interpolationStepActive
+        }
     }
 
     var span: Duration = .seconds(1)
@@ -48,20 +77,27 @@ struct VideoEnhancementTelemetryWindow {
         let recent = samples.filter { $0.at > cutoff }
         guard let last = recent.last, let startedAt else { return nil }
         let count = recent.count
+        let emittedOriginals = recent.filter(\.emittedOriginal).count
         let upscaled = recent.filter(\.upscaled).count
-        let interpolated = recent.filter { $0.midpoints > 0 }.count
+        let hasInterpolationOutput = recent.contains { $0.midpoints > 0 || $0.interpolationStepActive }
+        let interpolationCredit = recent.reduce(0.0) { total, sample in
+            if sample.expectedMidpoints > 0 {
+                return total + min(1.0, Double(max(0, sample.midpoints)) / Double(sample.expectedMidpoints))
+            }
+            return total + ((sample.midpoints > 0 || sample.interpolationStepActive) ? 1.0 : 0.0)
+        }
         let midpoints = recent.reduce(0) { $0 + $1.midpoints }
 
         var summary = latest
         var labels: [String] = []
         if upscaled > 0 { labels.append(configuration.superResolutionMode.telemetryLabel) }
-        if interpolated > 0 { labels.append(interpolationLabel) }
+        if hasInterpolationOutput { labels.append(interpolationLabel) }
         summary.isActive = !labels.isEmpty
         summary.activeModeLabel = labels.isEmpty ? "Bypass" : labels.joined(separator: " + ")
         summary.superResolutionShare = configuration.superResolutionMode != .off
             ? Double(upscaled) / Double(count) : nil
         summary.interpolationShare = configuration.frameInterpolationEnabled
-            ? Double(interpolated) / Double(count) : nil
+            ? interpolationCredit / Double(count) : nil
 
         let reason = Self.mostCommon(recent.compactMap(\.missReason))
         summary.bypassReason = summary.isActive ? nil : (reason ?? latest.bypassReason)
@@ -78,7 +114,7 @@ struct VideoEnhancementTelemetryWindow {
         let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18
         if seconds >= 0.25 {
             summary.inputFPS = Double(count) / seconds
-            summary.outputFPS = Double(count + midpoints) / seconds
+            summary.outputFPS = Double(emittedOriginals + midpoints) / seconds
         } else {
             summary.inputFPS = 0
             summary.outputFPS = 0

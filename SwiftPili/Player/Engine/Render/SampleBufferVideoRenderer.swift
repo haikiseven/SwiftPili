@@ -671,7 +671,8 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
     private func enqueueSingleFrame(
         _ frame: MediaVideoFrame,
         renderer: AVSampleBufferVideoRenderer,
-        isMidpoint: Bool
+        isMidpoint: Bool,
+        sampleDurationOverride: TimeInterval? = nil
     ) throws -> NativeFrameAdmission {
         let makeSpan = UIHitchMonitor.beginSpan("render.makeSample")
         let sample: CMSampleBuffer
@@ -679,7 +680,7 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
             sample = try Self.makeSampleBuffer(
                 pixelBuffer: frame.pixelBuffer,
                 pts: frame.pts,
-                duration: frame.duration,
+                duration: sampleDurationOverride ?? frame.duration,
                 timescale: mediaTimescale
             )
         } catch {
@@ -1721,13 +1722,33 @@ extension SampleBufferVideoRenderer {
 
     private enum MidpointAdmission {
         case pending
-        case ready([PostProcessFrameBox])
-        case resolved(admittedCount: Int)
+        case draining(remaining: [PostProcessFrameBox], admittedCount: Int, lastAdmitted: MediaVideoFrame?)
+        case resolved(admittedCount: Int, lastAdmitted: MediaVideoFrame?)
 
         var isResolved: Bool {
             if case .resolved = self { return true }
             return false
         }
+
+        var admittedCount: Int {
+            switch self {
+            case .pending: 0
+            case let .draining(_, count, _), let .resolved(count, _): count
+            }
+        }
+
+        var lastAdmitted: MediaVideoFrame? {
+            switch self {
+            case .pending: nil
+            case let .draining(_, _, last), let .resolved(_, last): last
+            }
+        }
+    }
+
+    private enum MidpointDrainOutcome {
+        case completed
+        case blockedOnASBD
+        case rendererFault
     }
 
     private enum EnhancedOriginalAdmission {
@@ -1741,16 +1762,16 @@ extension SampleBufferVideoRenderer {
         let frame: EnhancementFrameIdentity
         let deadlines: VideoEnhancementDeadlines
         let canUpscale: Bool
+        let committedPlan: VideoFrameInterpolationPlan?
         let wake: @MainActor () -> Void
         var state = EnhancementState.processing
         var midpoint: MidpointAdmission
 
         var workDeadline: ContinuousClock.Instant { deadlines.workDeadline(upscaling: canUpscale) }
 
-        var admittedMidpointCount: Int {
-            if case let .resolved(count) = midpoint { return count }
-            return 0
-        }
+        var admittedMidpointCount: Int { midpoint.admittedCount }
+
+        var lastAdmittedMidpoint: MediaVideoFrame? { midpoint.lastAdmitted }
     }
 
     private struct EnhancementPresentation {
@@ -1760,8 +1781,13 @@ extension SampleBufferVideoRenderer {
         let playbackRate: Double
         let canUpscale: Bool
         let originalDelay: TimeInterval?
-        let hasInterpolationPlan: Bool
+        let interpolationPlan: VideoFrameInterpolationPlan?
+        let interpolationBypassReason: String?
         let midpointDelay: TimeInterval?
+
+        var hasInterpolationPlan: Bool {
+            interpolationPlan.map { !$0.phases.isEmpty } ?? false
+        }
     }
 
     private struct EnhancementDiagnostics {
@@ -1806,13 +1832,24 @@ extension SampleBufferVideoRenderer {
         discardEnhancementForReplacedHead(frame)
         guard renderer.isReadyForMoreMediaData else { return noteNativeWait() }
         guard let request = enhancementPresentation(frame, mediaTime: mediaTime, rate: playbackRate) else {
-            return try admitOriginal(frame, renderer: renderer)
+            return try admitOriginal(frame, renderer: renderer, playbackRate: playbackRate)
         }
         if let attempt = enhancementAttempt {
             return try resumeEnhancement(attempt, request: request, renderer: renderer)
         }
+        if let plan = request.interpolationPlan, plan.phases.isEmpty {
+            if !plan.emitsOriginal, lastEnqueuedPTS != nil, !request.canUpscale {
+                recordSkippedOriginalAdmission(request.original, committedPlan: plan, playbackRate: playbackRate)
+                return .enqueued
+            }
+            if plan.emitsOriginal, !request.canUpscale {
+                return try admitOriginal(
+                    frame, renderer: renderer, committedPlan: plan, playbackRate: playbackRate
+                )
+            }
+        }
         guard let deadlines = enhancementDeadlines(for: request) else {
-            return try admitOriginal(frame, renderer: renderer)
+            return try admitOriginal(frame, renderer: renderer, playbackRate: playbackRate)
         }
         startEnhancement(request, deadlines: deadlines, wake: onEnhancementWake)
         return .waitingOnEnhancement
@@ -1827,7 +1864,7 @@ extension SampleBufferVideoRenderer {
     private func enhancementPresentation(
         _ frame: MediaVideoFrame, mediaTime: TimeInterval, rate: Double
     ) -> EnhancementPresentation? {
-        let canProcess = postProcessor.canProcess(frame)
+        let canProcess = postProcessor.canProcess(frame, playbackRate: rate)
         guard canProcess, let reference = enhancementReference else {
             if tracksSuperResolutionAdmissions {
                 let reason = canProcess ? "No accepted reference" : postProcessor.frameTelemetry.bypassReason
@@ -1836,7 +1873,17 @@ extension SampleBufferVideoRenderer {
             abandonEnhancementOutput()
             return nil
         }
-        let earliestMidpointPTS = postProcessor.interpolationPlan(previous: reference, current: frame)?.pts.first
+        let plan: VideoFrameInterpolationPlan?
+        let bypassReason: String?
+        switch postProcessor.interpolationPlanOutcome(previous: reference, current: frame, playbackRate: rate) {
+        case let .plan(resolved):
+            plan = resolved
+            bypassReason = nil
+        case let .bypass(reason):
+            plan = nil
+            bypassReason = reason
+        }
+        let earliestMidpointPTS = plan?.pts.first
         guard let clock = enhancementClock(mediaTime: mediaTime, rate: rate) else {
             let canStillAdmitMidpoints = enhancementAttempt.map { !$0.midpoint.isResolved }
                 ?? (earliestMidpointPTS != nil)
@@ -1853,7 +1900,8 @@ extension SampleBufferVideoRenderer {
             original: frame, reference: reference, mediaTime: mediaTime, playbackRate: rate,
             canUpscale: postProcessor.canUpscale(frame),
             originalDelay: enhancementDelay(pts: frame.pts, clock: clock, rate: rate),
-            hasInterpolationPlan: earliestMidpointPTS != nil,
+            interpolationPlan: plan,
+            interpolationBypassReason: bypassReason,
             midpointDelay: earliestMidpointPTS.flatMap { enhancementDelay(pts: $0, clock: clock, rate: rate) }
         )
     }
@@ -1869,7 +1917,9 @@ extension SampleBufferVideoRenderer {
             return nil
         }
         guard request.midpointDelay != nil || request.canUpscale else {
-            let reason = request.hasInterpolationPlan ? generationDeadlineReason : "No eligible interpolation plan"
+            let reason = request.hasInterpolationPlan
+                ? generationDeadlineReason
+                : (request.interpolationBypassReason ?? "Frame timing gap")
             if request.hasInterpolationPlan { postProcessor.notePerformanceMiss() }
             postProcessor.noteBypass(reason)
             return nil
@@ -1914,15 +1964,23 @@ extension SampleBufferVideoRenderer {
         let id = nextEnhancementID
         let boundary = enhancementBoundary
         let attempt = EnhancementAttempt(
-            id: id, frame: EnhancementFrameIdentity(request.original), deadlines: deadlines,
-            canUpscale: request.canUpscale, wake: wake,
-            midpoint: deadlines.midpoint == nil ? .resolved(admittedCount: 0) : .pending
+            id: id,
+            frame: EnhancementFrameIdentity(request.original),
+            deadlines: deadlines,
+            canUpscale: request.canUpscale,
+            committedPlan: request.interpolationPlan,
+            wake: wake,
+            midpoint: deadlines.midpoint == nil ? .resolved(admittedCount: 0, lastAdmitted: nil) : .pending
         )
         enhancementAttempt = attempt
         let workDeadline = attempt.workDeadline
         enhancementDiagnostics.submissions += 1
         postProcessor.submit(
-            request.original, previous: request.reference, deadlines: deadlines
+            request.original,
+            previous: request.reference,
+            deadlines: deadlines,
+            interpolationPlan: request.interpolationPlan,
+            playbackRate: request.playbackRate
         ) { [weak self] update in
             guard let self, self.enhancementBoundary == boundary else { return }
             self.receiveEnhancementUpdate(update, id: id)
@@ -1950,7 +2008,7 @@ extension SampleBufferVideoRenderer {
         switch update {
         case let .midpointReady(midpoints):
             guard case .pending = attempt.midpoint, !midpoints.isEmpty else { return }
-            attempt.midpoint = .ready(midpoints)
+            attempt.midpoint = .draining(remaining: midpoints, admittedCount: 0, lastAdmitted: nil)
             enhancementAttempt = attempt
         case let .finished(result):
             receiveCompletedEnhancement(result, attempt: attempt)
@@ -1967,7 +2025,9 @@ extension SampleBufferVideoRenderer {
         }
         var completed = attempt
         if case .pending = completed.midpoint {
-            completed.midpoint = result.midpoints.isEmpty ? .resolved(admittedCount: 0) : .ready(result.midpoints)
+            completed.midpoint = result.midpoints.isEmpty
+                ? .resolved(admittedCount: 0, lastAdmitted: nil)
+                : .draining(remaining: result.midpoints, admittedCount: 0, lastAdmitted: nil)
         }
         cancelEnhancementDeadlineWake()
         let enhancedOriginal: EnhancedOriginalAdmission
@@ -1987,7 +2047,10 @@ extension SampleBufferVideoRenderer {
         var expired = attempt
         if case .pending = expired.midpoint {
             enhancementDiagnostics.noteInterpolationDeadline("Interpolation generation deadline")
-            expired.midpoint = .resolved(admittedCount: 0)
+            expired.midpoint = .resolved(admittedCount: 0, lastAdmitted: nil)
+        } else if case let .draining(_, admittedCount, lastAdmitted) = expired.midpoint {
+            expired.midpoint = .resolved(admittedCount: admittedCount, lastAdmitted: lastAdmitted)
+            if attempt.canUpscale { enhancementDiagnostics.deadlinesMissed += 1 }
         } else if attempt.canUpscale {
             enhancementDiagnostics.deadlinesMissed += 1
         }
@@ -1998,7 +2061,10 @@ extension SampleBufferVideoRenderer {
 
     private func abandonEnhancementOutput() {
         guard var attempt = enhancementAttempt else { return }
-        attempt.midpoint = .resolved(admittedCount: attempt.admittedMidpointCount)
+        attempt.midpoint = .resolved(
+            admittedCount: attempt.admittedMidpointCount,
+            lastAdmitted: attempt.lastAdmittedMidpoint
+        )
         bypassEnhancement(attempt)
     }
 
@@ -2043,10 +2109,17 @@ extension SampleBufferVideoRenderer {
         renderer: AVSampleBufferVideoRenderer
     ) throws -> DemandFramePresentationResult {
         var current = attempt
-        guard admitMidpointsIfUsable(&current, request: request, renderer: renderer) else {
-            return try admitOriginal(request.original, renderer: renderer)
+        switch admitMidpointsIfUsable(&current, request: request, renderer: renderer) {
+        case .completed:
+            enhancementAttempt = current
+        case .blockedOnASBD:
+            enhancementAttempt = current
+            return noteNativeWait()
+        case .rendererFault:
+            return try admitOriginal(
+                request.original, renderer: renderer, playbackRate: request.playbackRate
+            )
         }
-        enhancementAttempt = current
         switch current.state {
         case .processing:
             let delay = request.canUpscale ? request.originalDelay : request.midpointDelay
@@ -2059,43 +2132,71 @@ extension SampleBufferVideoRenderer {
         case .bypassed:
             break
         }
-        return try admitOriginal(request.original, renderer: renderer)
+        return try admitOriginal(
+            request.original,
+            renderer: renderer,
+            midpointCount: current.admittedMidpointCount,
+            committedPlan: current.committedPlan,
+            playbackRate: request.playbackRate
+        )
     }
 
     private func admitMidpointsIfUsable(
         _ attempt: inout EnhancementAttempt,
         request: EnhancementPresentation,
         renderer: AVSampleBufferVideoRenderer
-    ) -> Bool {
-        guard case let .ready(candidates) = attempt.midpoint else { return true }
-        var admittedCount = 0
-        var lastAdmitted: MediaVideoFrame?
-        phases: for candidate in candidates {
-            let midpoint = candidate.frame
+    ) -> MidpointDrainOutcome {
+        guard case let .draining(remaining, initialAdmittedCount, initialLastAdmitted) = attempt.midpoint else {
+            return .completed
+        }
+        var admittedCount = initialAdmittedCount
+        var lastAdmitted = initialLastAdmitted
+        var newlyAdmitted = 0
+        for index in remaining.indices {
+            let midpoint = remaining[index].frame
             let previousPTS = lastAdmitted?.pts ?? request.reference.pts
             guard isUsableMidpoint(midpoint, after: previousPTS, before: request.original.pts) else { continue }
             guard isMidpointTimely(midpoint, request: request) else { continue }
             switch enqueueOptionalFrame(midpoint, renderer: renderer, isMidpoint: true) {
             case .enqueued:
                 admittedCount += 1
+                newlyAdmitted += 1
                 lastAdmitted = midpoint
             case .blocked:
-                enhancementDiagnostics.nativeWaits += 1
-                break phases
+                attempt.midpoint = .draining(
+                    remaining: Array(remaining[index...]),
+                    admittedCount: admittedCount,
+                    lastAdmitted: lastAdmitted
+                )
+                if newlyAdmitted > 0, let lastAdmitted {
+                    enhancementDiagnostics.midpointsEnqueued += newlyAdmitted
+                    postProcessor.noteMidpointAccepted(
+                        lastAdmitted,
+                        previous: request.reference,
+                        original: request.original,
+                        acceptedCount: admittedCount,
+                        plan: attempt.committedPlan
+                    )
+                }
+                return .blockedOnASBD
             case nil:
                 continue
             case .rendererFault:
-                return false
+                return .rendererFault
             }
         }
-        attempt.midpoint = .resolved(admittedCount: admittedCount)
-        enhancementDiagnostics.midpointsEnqueued += admittedCount
-        if let lastAdmitted {
+        attempt.midpoint = .resolved(admittedCount: admittedCount, lastAdmitted: lastAdmitted)
+        if newlyAdmitted > 0, let lastAdmitted {
+            enhancementDiagnostics.midpointsEnqueued += newlyAdmitted
             postProcessor.noteMidpointAccepted(
-                lastAdmitted, previous: request.reference, original: request.original, acceptedCount: admittedCount
+                lastAdmitted,
+                previous: request.reference,
+                original: request.original,
+                acceptedCount: admittedCount,
+                plan: attempt.committedPlan
             )
         }
-        return true
+        return .completed
     }
 
     private func isMidpointTimely(_ midpoint: MediaVideoFrame, request: EnhancementPresentation) -> Bool {
@@ -2117,6 +2218,19 @@ extension SampleBufferVideoRenderer {
         request: EnhancementPresentation,
         renderer: AVSampleBufferVideoRenderer
     ) throws -> DemandFramePresentationResult {
+        if attempt.committedPlan?.emitsOriginal == false,
+           attempt.admittedMidpointCount > 0,
+           let lastMidpoint = attempt.lastAdmittedMidpoint {
+            return completeMidpointOnlyEnhancement(
+                original: request.original,
+                lastMidpoint: lastMidpoint,
+                result: result,
+                midpointCount: attempt.admittedMidpointCount,
+                committedPlan: attempt.committedPlan,
+                playbackRate: request.playbackRate,
+                renderer: renderer
+            )
+        }
         var candidate = enhancedOriginal
         if case .ready = enhancedOriginal {
             if !request.canUpscale {
@@ -2126,8 +2240,13 @@ extension SampleBufferVideoRenderer {
             }
         }
         let outcome = try admitOriginal(
-            request.original, renderer: renderer, enhancedOriginal: candidate,
-            result: result, midpointCount: attempt.admittedMidpointCount
+            request.original,
+            renderer: renderer,
+            enhancedOriginal: candidate,
+            result: result,
+            midpointCount: attempt.admittedMidpointCount,
+            committedPlan: attempt.committedPlan,
+            playbackRate: request.playbackRate
         )
         if case .blockedOnASBD = outcome, case .ready = enhancedOriginal {
             switch candidate {
@@ -2140,6 +2259,67 @@ extension SampleBufferVideoRenderer {
             }
         }
         return outcome
+    }
+
+    private func completeMidpointOnlyEnhancement(
+        original: MediaVideoFrame,
+        lastMidpoint: MediaVideoFrame,
+        result: VideoFrameEnhancementResult,
+        midpointCount: Int,
+        committedPlan: VideoFrameInterpolationPlan?,
+        playbackRate: Double,
+        renderer: AVSampleBufferVideoRenderer
+    ) -> DemandFramePresentationResult {
+        let boundary = enhancementBoundary
+        consecutiveRendererFaultCount = 0
+        if let end = finitePresentationIntervalEnd(start: lastMidpoint.pts, duration: lastMidpoint.duration) {
+            maxEnqueuedPresentationEnd = max(maxEnqueuedPresentationEnd, end)
+        }
+        presentCount += 1
+        lastEnqueuedPTS = lastMidpoint.pts
+        presentationProgressSerial &+= 1
+        if presentationProgressSerial == 0 { presentationProgressSerial = 1 }
+        lastPresentationProgressUptime = ProcessInfo.processInfo.systemUptime
+        reduceAndPublishPresentationProof(
+            framePTS: lastMidpoint.pts,
+            frameDuration: lastMidpoint.duration,
+            surfaceReadiness: currentPresentationSurfaceReadiness(),
+            rendererHealthy: renderer.status != .failed
+                && !renderer.requiresFlushToResumeDecoding,
+            expectedHoldID: presentationImageHoldState?.id
+        )
+        if enhancementBoundary == boundary {
+            recordOriginalAdmission(
+                original,
+                result: result,
+                midpointCount: midpointCount,
+                upscaled: nil,
+                emittedOriginal: false,
+                committedPlan: committedPlan,
+                playbackRate: playbackRate
+            )
+        }
+        return .enqueued
+    }
+
+    private func recordSkippedOriginalAdmission(
+        _ original: MediaVideoFrame,
+        committedPlan: VideoFrameInterpolationPlan,
+        playbackRate: Double
+    ) {
+        clearEnhancementAttempt()
+        postProcessor.noteOriginalPresented(
+            original,
+            result: nil,
+            midpointCount: 0,
+            upscaled: nil,
+            emittedOriginal: false,
+            committedPlan: committedPlan,
+            playbackRate: playbackRate
+        )
+        guard tracksEnhancementAdmissions else { return }
+        enhancementReference = original
+        reportEnhancementDiagnosticsIfNeeded()
     }
 
     private func isUsableMidpoint(
@@ -2155,10 +2335,18 @@ extension SampleBufferVideoRenderer {
     }
 
     private func enqueueOptionalFrame(
-        _ frame: MediaVideoFrame, renderer: AVSampleBufferVideoRenderer, isMidpoint: Bool
+        _ frame: MediaVideoFrame,
+        renderer: AVSampleBufferVideoRenderer,
+        isMidpoint: Bool,
+        sampleDurationOverride: TimeInterval? = nil
     ) -> NativeFrameAdmission? {
         do {
-            return try enqueueSingleFrame(frame, renderer: renderer, isMidpoint: isMidpoint)
+            return try enqueueSingleFrame(
+                frame,
+                renderer: renderer,
+                isMidpoint: isMidpoint,
+                sampleDurationOverride: sampleDurationOverride
+            )
         } catch {
             postProcessor.noteBypass("Invalid enhancement output")
             return nil
@@ -2177,12 +2365,35 @@ extension SampleBufferVideoRenderer {
         renderer: AVSampleBufferVideoRenderer,
         enhancedOriginal: EnhancedOriginalAdmission = .unavailable,
         result: VideoFrameEnhancementResult? = nil,
-        midpointCount: Int = 0
+        midpointCount: Int = 0,
+        committedPlan: VideoFrameInterpolationPlan? = nil,
+        playbackRate: Double? = nil
     ) throws -> DemandFramePresentationResult {
         let boundary = enhancementBoundary
+        let effectiveRate = playbackRate ?? (displayRate > 0 ? Double(displayRate) : 1.0)
+        let sampleDurationOverride: TimeInterval?
+        if let committedPlan,
+           committedPlan.outputFrameDuration.isFinite,
+           committedPlan.outputFrameDuration > 0,
+           committedPlan.outputFrameDuration < original.duration {
+            sampleDurationOverride = committedPlan.outputFrameDuration
+        } else if tracksEnhancementAdmissions,
+                  let activeDuration = postProcessor.activeOutputFrameDuration(
+                      for: original, playbackRate: effectiveRate
+                  ),
+                  activeDuration < original.duration {
+            sampleDurationOverride = activeDuration
+        } else {
+            sampleDurationOverride = nil
+        }
         var admittedEnhancedOriginal: MediaVideoFrame?
         if case let .ready(candidate) = enhancedOriginal {
-            switch enqueueOptionalFrame(candidate, renderer: renderer, isMidpoint: false) {
+            switch enqueueOptionalFrame(
+                candidate,
+                renderer: renderer,
+                isMidpoint: false,
+                sampleDurationOverride: sampleDurationOverride
+            ) {
             case .enqueued: admittedEnhancedOriginal = candidate
             case .blocked: return noteNativeWait()
             case .rendererFault: return recordRendererFault(renderer, reason: "ASBD fault on enhanced frame")
@@ -2192,7 +2403,12 @@ extension SampleBufferVideoRenderer {
             }
         }
         if admittedEnhancedOriginal == nil {
-            switch try enqueueSingleFrame(original, renderer: renderer, isMidpoint: false) {
+            switch try enqueueSingleFrame(
+                original,
+                renderer: renderer,
+                isMidpoint: false,
+                sampleDurationOverride: sampleDurationOverride
+            ) {
             case .enqueued: break
             case .blocked: return noteNativeWait()
             case .rendererFault: return recordRendererFault(renderer, reason: "ASBD fault on original frame")
@@ -2204,7 +2420,13 @@ extension SampleBufferVideoRenderer {
                 postProcessor.notePerformanceMiss()
             }
             recordOriginalAdmission(
-                original, result: result, midpointCount: midpointCount, upscaled: admittedEnhancedOriginal
+                original,
+                result: result,
+                midpointCount: midpointCount,
+                upscaled: admittedEnhancedOriginal,
+                emittedOriginal: true,
+                committedPlan: committedPlan,
+                playbackRate: effectiveRate
             )
         }
         return .enqueued
@@ -2223,16 +2445,34 @@ extension SampleBufferVideoRenderer {
         _ original: MediaVideoFrame,
         result: VideoFrameEnhancementResult?,
         midpointCount: Int,
-        upscaled: MediaVideoFrame?
+        upscaled: MediaVideoFrame?,
+        emittedOriginal: Bool = true,
+        committedPlan: VideoFrameInterpolationPlan? = nil,
+        playbackRate: Double = 1.0
     ) {
         clearEnhancementAttempt()
-        postProcessor.noteOriginalPresented(original, result: result, midpointCount: midpointCount, upscaled: upscaled)
+        postProcessor.noteOriginalPresented(
+            original,
+            result: result,
+            midpointCount: midpointCount,
+            upscaled: upscaled,
+            emittedOriginal: emittedOriginal,
+            committedPlan: committedPlan,
+            playbackRate: playbackRate
+        )
         guard tracksEnhancementAdmissions else { return }
         enhancementReference = original
-        enhancementDiagnostics.originalsEnqueued += 1
+        if emittedOriginal {
+            enhancementDiagnostics.originalsEnqueued += 1
+        }
         if let upscaled {
             enhancementDiagnostics.superResolution.noteEnqueued(
                 input: original.pixelBuffer, output: upscaled.pixelBuffer
+            )
+        } else if !emittedOriginal, midpointCount > 0, result?.midpointsUpscaled == true,
+                  let midpointBuffer = result?.midpoints.first?.frame.pixelBuffer {
+            enhancementDiagnostics.superResolution.noteEnqueued(
+                input: original.pixelBuffer, output: midpointBuffer
             )
         }
         reportEnhancementDiagnosticsIfNeeded()

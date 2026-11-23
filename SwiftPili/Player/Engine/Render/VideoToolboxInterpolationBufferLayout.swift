@@ -143,8 +143,11 @@ struct VTInterpolationPool {
 
 enum VTNV12StagingCopy {
     static func copy(from source: CVPixelBuffer, to destination: CVPixelBuffer) throws {
+        let pixelFormat = CVPixelBufferGetPixelFormatType(source)
+        let isNV12 = pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            || pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         guard VideoFramePairFormat.hasSameStorageFormat(source, destination),
-              CVPixelBufferGetPixelFormatType(source) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+              isNV12,
               CVPixelBufferGetPlaneCount(source) == 2, CVPixelBufferGetPlaneCount(destination) == 2 else {
             throw VTInterpolationFailure(reason: "VT FI staging layout incompatible")
         }

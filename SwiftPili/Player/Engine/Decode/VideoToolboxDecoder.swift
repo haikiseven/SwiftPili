@@ -413,7 +413,8 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
         let pixelFormat = Self.preferredPixelFormatType(for: formatDescription)
         let attrs: [CFString: Any] = [
             kCVPixelBufferPixelFormatTypeKey: pixelFormat,
-            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+            kCVPixelBufferMetalCompatibilityKey: true
         ]
 
         var sessionOut: VTDecompressionSession?
@@ -983,9 +984,10 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
 
     private static func cmTime(_ value: TimeInterval?) -> CMTime {
         guard let value, value.isFinite else { return .invalid }
-        let maxRepresentableSeconds = Double(Int64.max - 1) / 600
+        let timescale: CMTimeScale = 60_000
+        let maxRepresentableSeconds = Double(Int64.max - 1) / Double(timescale)
         guard abs(value) <= maxRepresentableSeconds else { return .invalid }
-        let converted = CMTime(seconds: value, preferredTimescale: 600)
+        let converted = CMTime(seconds: value, preferredTimescale: timescale)
         guard CMTIME_IS_VALID(converted), CMTIME_IS_NUMERIC(converted),
               converted.isValid, converted.isNumeric else {
             return .invalid

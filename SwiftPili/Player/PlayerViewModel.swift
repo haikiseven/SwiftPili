@@ -211,6 +211,11 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         set { session.videoSuperResolutionScale = newValue }
     }
 
+    var videoSuperResolutionSharpness: VideoSuperResolutionSharpness {
+        get { session.videoSuperResolutionSharpness }
+        set { session.videoSuperResolutionSharpness = newValue }
+    }
+
     /// Defaults last applied to the per-player choices above; tuning-only changes don't reset them.
     @ObservationIgnored var appliedVideoEnhancementDefaults = VideoEnhancementDefaultsSnapshot.current
 

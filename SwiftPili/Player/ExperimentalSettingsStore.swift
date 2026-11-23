@@ -31,6 +31,7 @@ final class ExperimentalSettingsStore {
         videoEnhancementDefaultRate = VideoEnhancementPreferences.interpolationRate
         videoEnhancementDefaultScale = VideoEnhancementPreferences.superResolutionScale
         videoEnhancementDefaultTargetResolution = VideoEnhancementPreferences.superResolutionTargetResolution
+        videoEnhancementDefaultSharpness = VideoEnhancementPreferences.superResolutionSharpness
         videoEnhancementMaxInputResolution = VideoEnhancementPreferences.maxInputResolution
         videoEnhancementAdaptiveQuality = VideoEnhancementPreferences.adaptiveQualityEnabled
         videoEnhancementAdaptiveSensitivity = VideoEnhancementPreferences.adaptiveSensitivity
@@ -95,6 +96,7 @@ final class ExperimentalSettingsStore {
     private(set) var videoEnhancementDefaultScale = VideoEnhancementPreferences.superResolutionScale
     private(set) var videoEnhancementDefaultTargetResolution =
         VideoEnhancementPreferences.superResolutionTargetResolution
+    private(set) var videoEnhancementDefaultSharpness = VideoEnhancementPreferences.superResolutionSharpness
     private(set) var videoEnhancementMaxInputResolution = VideoEnhancementPreferences.maxInputResolution
     private(set) var videoEnhancementAdaptiveQuality = VideoEnhancementPreferences.adaptiveQualityEnabled
     private(set) var videoEnhancementAdaptiveSensitivity = VideoEnhancementPreferences.adaptiveSensitivity
@@ -198,6 +200,16 @@ final class ExperimentalSettingsStore {
         guard videoEnhancementDefaultTargetResolution != target else { return true }
         VideoEnhancementPreferences.superResolutionTargetResolution = target
         videoEnhancementDefaultTargetResolution = target
+        notifyObservers([.videoEnhancement])
+        return true
+    }
+
+    @discardableResult
+    func setVideoEnhancementDefaultSharpness(_ sharpness: VideoSuperResolutionSharpness) -> Bool {
+        guard isAllowed(.videoEnhancement), storageError == nil else { return false }
+        guard videoEnhancementDefaultSharpness != sharpness else { return true }
+        VideoEnhancementPreferences.superResolutionSharpness = sharpness
+        videoEnhancementDefaultSharpness = sharpness
         notifyObservers([.videoEnhancement])
         return true
     }

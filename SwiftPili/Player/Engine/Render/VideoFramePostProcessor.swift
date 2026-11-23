@@ -59,6 +59,8 @@ final class VideoFramePostProcessor {
     private var structuralHoldUntil = ContinuousClock.now
     private var automaticBudget: (bytes: Int, sampledAt: ContinuousClock.Instant)?
     private var lastInputSize: (width: Int, height: Int)?
+    private var cadenceEstimator = VideoFrameCadenceEstimator()
+    private var interpolationGridNextPTS: TimeInterval?
 
     /// User-requested configuration. The governor may degrade it at runtime; see `effectiveConfiguration`.
     var configuration = VideoEnhancementConfiguration.disabled {
@@ -67,6 +69,8 @@ final class VideoFramePostProcessor {
             pendingOutcomeMissed = nil
             governor.reset(requested: configuration)
             telemetryWindow.reset()
+            cadenceEstimator.reset()
+            interpolationGridNextPTS = nil
             warmedKey = nil
             resetBufferPlan()
             frameTelemetry = configuration.isRequested && configuration.isLiveStream
@@ -78,7 +82,7 @@ final class VideoFramePostProcessor {
     private var telemetryWindow = VideoEnhancementTelemetryWindow()
     private var lastProcessingMs: Double = 0
     /// What the in-flight submission was expected to deliver, to detect partial failures.
-    private var pendingExpectation: (frame: EnhancementFrameIdentity, interpolation: Bool, upscale: Bool)?
+    private var pendingExpectation: (frame: EnhancementFrameIdentity, expectedMidpointCount: Int, upscale: Bool)?
 
     /// Window-aggregated telemetry for the stats overlay / player menu.
     var telemetry: VideoEnhancementTelemetry {
@@ -188,11 +192,12 @@ final class VideoFramePostProcessor {
         return "Vision FI"
     }
 
-    func canProcess(_ frame: MediaVideoFrame) -> Bool {
+    func canProcess(_ frame: MediaVideoFrame, playbackRate: Double = 1.0) -> Bool {
         guard configuration.isRequested, ExperimentalSettingsPolicy.videoEnhancementEnabled else {
             frameTelemetry = VideoEnhancementTelemetry()
             return false
         }
+        cadenceEstimator.observe(pts: frame.pts)
         if let reason = VideoEnhancementGuardrails.commonBypassReason(
             configuration: configuration, pixelBuffer: frame.pixelBuffer
         ) {
@@ -216,11 +221,16 @@ final class VideoFramePostProcessor {
                 noteBypass(reason)
                 return false
             }
-            if frame.duration.isFinite, frame.duration > 0,
-               VideoFrameInterpolationPlan.bestMultiplier(
-                   forInterval: frame.duration, rate: effective.interpolationRate
-               ) == nil {
-                noteBypass("Target frame rate reached")
+            guard let estimatedInterval = cadenceEstimator.estimatedInterval(fallbackDuration: frame.duration) else {
+                noteBypass("Frame timing invalid")
+                return false
+            }
+            if let reason = VideoFrameInterpolationPlan.streamEligibilityBypassReason(
+                sourceInterval: estimatedInterval,
+                rate: effective.interpolationRate,
+                playbackRate: playbackRate
+            ) {
+                noteBypass(reason)
                 return false
             }
             return true
@@ -234,31 +244,128 @@ final class VideoFramePostProcessor {
         effectiveConfiguration.superResolutionMode != .off && superResolutionBypassReason(frame) == nil
     }
 
-    func interpolationPlan(previous: MediaVideoFrame, current: MediaVideoFrame) -> VideoFrameInterpolationPlan? {
-        let effective = effectiveConfiguration
-        guard effective.frameInterpolationEnabled,
+    /// Returns the non-overlapping media-time presentation duration for an original frame when
+    /// frame interpolation is active and eligible on this stream, or `nil` when the original
+    /// frame should retain its full source duration.
+    func activeOutputFrameDuration(for frame: MediaVideoFrame, playbackRate: Double = 1.0) -> TimeInterval? {
+        guard configuration.isRequested,
+              ExperimentalSettingsPolicy.videoEnhancementEnabled,
               VideoEnhancementGuardrails.commonBypassReason(
-                  configuration: configuration, pixelBuffer: previous.pixelBuffer
-              ) == nil,
-              interpolationInputBypassReason(previous) == nil,
-              interpolationInputBypassReason(current) == nil,
-              let timing = VideoFrameInterpolationTiming(
-                  previousPTS: previous.pts, previousDuration: previous.duration, current: current
-              ), VideoFramePairFormat.matches(previous.pixelBuffer, current.pixelBuffer) else { return nil }
-        if #unavailable(iOS 26.0), !VisionFrameInterpolationBackend.acceptsPairDelta(timing.delta) {
+                  configuration: configuration, pixelBuffer: frame.pixelBuffer
+              ) == nil else {
             return nil
         }
-        return VideoFrameInterpolationPlan(
-            previousPTS: previous.pts, currentPTS: current.pts, interval: timing.delta,
-            rate: effective.interpolationRate
+        let effective = effectiveConfiguration
+        guard effective.frameInterpolationEnabled,
+              interpolationInputBypassReason(frame) == nil,
+              frame.duration.isFinite, frame.duration > 0 else {
+            return nil
+        }
+        let estimatedInterval = cadenceEstimator.estimatedInterval(fallbackDuration: frame.duration) ?? frame.duration
+        guard VideoFrameInterpolationPlan.streamEligibilityBypassReason(
+            sourceInterval: estimatedInterval,
+            rate: effective.interpolationRate,
+            playbackRate: playbackRate
+        ) == nil else {
+            return nil
+        }
+        let speed = VideoFrameInterpolationPlan.normalizedPlaybackRate(playbackRate)
+        let outputDuration: TimeInterval
+        if let targetFPS = effective.interpolationRate.targetFPS {
+            let cap = Double(targetFPS)
+            let targetPeriod = 1.0 / cap
+            let wallCadence = estimatedInterval / speed
+            let allowedMultipliers = VideoFrameInterpolationPlan.defaultMultipliers
+            let ratio = cap * wallCadence
+            if interpolationGridNextPTS == nil, cadenceEstimator.isConstantRate,
+               let exactMultiplier = allowedMultipliers.first(where: { multiplier in
+                   let target = Double(multiplier)
+                   return abs(ratio - target) / target <= VideoFrameInterpolationPlan.exactIntegerTolerance
+               }) {
+                outputDuration = estimatedInterval / Double(exactMultiplier)
+            } else if VideoFrameInterpolationPlan.supportsArbitraryPhases {
+                outputDuration = targetPeriod * speed
+            } else if let multiplier = VideoFrameInterpolationPlan.bestMultiplier(
+                forInterval: wallCadence,
+                rate: effective.interpolationRate,
+                allowedMultipliers: VideoFrameInterpolationPlan.dyadicMultipliers
+            ) {
+                outputDuration = estimatedInterval / Double(multiplier)
+            } else {
+                return nil
+            }
+        } else {
+            outputDuration = estimatedInterval * 0.5
+        }
+        guard outputDuration.isFinite, outputDuration > 0, outputDuration < frame.duration else {
+            return nil
+        }
+        return outputDuration
+    }
+
+    /// Pure, idempotent planner for a `(previous, current)` source pair. Never mutates
+    /// `interpolationGridNextPTS`; grid advancement is committed only in `noteOriginalPresented`.
+    func interpolationPlanOutcome(
+        previous: MediaVideoFrame,
+        current: MediaVideoFrame,
+        playbackRate: Double = 1.0
+    ) -> VideoInterpolationPlanOutcome {
+        let effective = effectiveConfiguration
+        guard effective.frameInterpolationEnabled else { return .bypass("Off") }
+        if let reason = VideoEnhancementGuardrails.commonBypassReason(
+            configuration: configuration, pixelBuffer: previous.pixelBuffer
+        ) {
+            return .bypass(reason)
+        }
+        if let reason = interpolationInputBypassReason(previous) { return .bypass(reason) }
+        if let reason = interpolationInputBypassReason(current) { return .bypass(reason) }
+        let cadence = cadenceEstimator.medianInterval
+        guard let timing = VideoFrameInterpolationTiming(
+            previousPTS: previous.pts,
+            previousDuration: previous.duration,
+            current: current,
+            expectedInterval: cadence
+        ) else {
+            return .bypass("Frame timing gap")
+        }
+        guard VideoFramePairFormat.matches(previous.pixelBuffer, current.pixelBuffer) else {
+            return .bypass("Frame format changed")
+        }
+        if #unavailable(iOS 26.0), !VisionFrameInterpolationBackend.acceptsPairDelta(timing.delta) {
+            return .bypass("Vision FI > 30fps pair")
+        }
+        return VideoFrameInterpolationPlan.plan(
+            previousPTS: previous.pts,
+            currentPTS: current.pts,
+            interval: timing.delta,
+            cadenceInterval: cadence,
+            isCadenceStable: cadenceEstimator.isConstantRate,
+            gridNextPTS: interpolationGridNextPTS,
+            rate: effective.interpolationRate,
+            playbackRate: playbackRate
         )
+    }
+
+    func interpolationPlan(
+        previous: MediaVideoFrame,
+        current: MediaVideoFrame,
+        playbackRate: Double = 1.0
+    ) -> VideoFrameInterpolationPlan? {
+        if case let .plan(resolved) = interpolationPlanOutcome(
+            previous: previous, current: current, playbackRate: playbackRate
+        ) {
+            return resolved
+        }
+        return nil
     }
 
     private func interpolationInputBypassReason(_ frame: MediaVideoFrame) -> String? {
         if let reason = VideoFramePairFormat.interpolationBypassReason(frame.pixelBuffer) { return reason }
         if #available(iOS 26.0, *) { return nil }
         return VisionFrameInterpolationBackend.inputBypassReason(
-            frame, maxInputResolution: effectiveConfiguration.maxInputResolution
+            frame,
+            maxInputResolution: effectiveConfiguration.maxInputResolution,
+            cadenceInterval: cadenceEstimator.medianInterval
         )
     }
 
@@ -281,6 +388,8 @@ final class VideoFramePostProcessor {
         pendingOutcomeMissed = nil
         pendingExpectation = nil
         telemetryWindow.reset()
+        cadenceEstimator.reset()
+        interpolationGridNextPTS = nil
         warmedKey = nil
         governor.noteDiscontinuity()
     }
@@ -293,35 +402,50 @@ final class VideoFramePostProcessor {
     }
 
     func noteMidpointAccepted(
-        _ midpoint: MediaVideoFrame, previous: MediaVideoFrame, original: MediaVideoFrame, acceptedCount: Int = 1
+        _ midpoint: MediaVideoFrame,
+        previous: MediaVideoFrame,
+        original: MediaVideoFrame,
+        acceptedCount: Int = 1,
+        plan: VideoFrameInterpolationPlan? = nil
     ) {
-        let sourceFPS = 1 / (original.pts - previous.pts)
+        let delta = original.pts - previous.pts
+        let sourceFPS = delta > 0 ? 1 / delta : (plan?.sourceFPS ?? 0)
+        let outputFPS = plan?.targetOutputFPS ?? (sourceFPS * Double(acceptedCount + 1))
         frameTelemetry = VideoEnhancementTelemetry(
             activeModeLabel: interpolationLabel,
             inputWidth: CVPixelBufferGetWidth(original.pixelBuffer),
             inputHeight: CVPixelBufferGetHeight(original.pixelBuffer),
             outputWidth: CVPixelBufferGetWidth(midpoint.pixelBuffer),
             outputHeight: CVPixelBufferGetHeight(midpoint.pixelBuffer),
-            inputFPS: sourceFPS, outputFPS: sourceFPS * Double(acceptedCount + 1), isActive: true
+            inputFPS: sourceFPS, outputFPS: outputFPS, isActive: true
         )
     }
 
-    private func noteAccepted(_ result: VideoFrameEnhancementResult, midpointCount: Int, enhancedOriginal: Bool) {
+    private func noteAccepted(
+        _ result: VideoFrameEnhancementResult,
+        midpointCount: Int,
+        enhancedOriginal: Bool,
+        emittedOriginal: Bool,
+        committedPlan: VideoFrameInterpolationPlan?
+    ) {
         var displayed = result.telemetry
-        displayed.outputFPS = displayed.inputFPS * Double(midpointCount + 1)
-        if midpointCount == 0 {
-            if !result.midpoints.isEmpty {
-                displayed.activeModeLabel = enhancedOriginal
-                    ? effectiveConfiguration.superResolutionMode.telemetryLabel : "Bypass"
-            }
+        let srActive = enhancedOriginal || (!emittedOriginal && midpointCount > 0 && result.midpointsUpscaled)
+        if let plan = committedPlan {
+            displayed.outputFPS = midpointCount > 0 ? plan.targetOutputFPS : displayed.inputFPS
+        } else {
+            displayed.outputFPS = displayed.inputFPS * Double(midpointCount + (emittedOriginal ? 1 : 0))
         }
+        var labels: [String] = []
+        if srActive { labels.append(effectiveConfiguration.superResolutionMode.telemetryLabel) }
+        if midpointCount > 0 { labels.append(interpolationLabel) }
+        displayed.activeModeLabel = labels.isEmpty ? "Bypass" : labels.joined(separator: " + ")
         if !enhancedOriginal {
-            displayed.outputWidth = displayed.inputWidth
-            displayed.outputHeight = displayed.inputHeight
             if midpointCount > 0, let buffer = result.midpoints.first?.frame.pixelBuffer {
-                displayed.activeModeLabel = interpolationLabel
                 displayed.outputWidth = CVPixelBufferGetWidth(buffer)
                 displayed.outputHeight = CVPixelBufferGetHeight(buffer)
+            } else {
+                displayed.outputWidth = displayed.inputWidth
+                displayed.outputHeight = displayed.inputHeight
             }
         }
         displayed.isActive = midpointCount > 0 || enhancedOriginal
@@ -331,23 +455,58 @@ final class VideoFramePostProcessor {
         frameTelemetry = displayed
     }
 
-    /// Called once for every original frame the renderer presents while enhancement is requested.
+    /// Called once for every source frame the renderer settles while enhancement is requested
+    /// (including CFR steps where synthesized midpoints replace the original frame on screen).
     func noteOriginalPresented(
         _ original: MediaVideoFrame,
         result: VideoFrameEnhancementResult?,
         midpointCount: Int,
-        upscaled: MediaVideoFrame?
+        upscaled: MediaVideoFrame?,
+        emittedOriginal: Bool = true,
+        committedPlan: VideoFrameInterpolationPlan? = nil,
+        playbackRate: Double = 1.0
     ) {
+        cadenceEstimator.observe(pts: original.pts)
         if let result {
-            noteAccepted(result, midpointCount: midpointCount, enhancedOriginal: upscaled != nil)
+            noteAccepted(
+                result,
+                midpointCount: midpointCount,
+                enhancedOriginal: upscaled != nil,
+                emittedOriginal: emittedOriginal,
+                committedPlan: committedPlan
+            )
             if result.telemetry.smoothedProcessingMs > 0.01 { lastProcessingMs = result.telemetry.smoothedProcessingMs }
         }
         guard configuration.isRequested, !configuration.isLiveStream else { return }
 
+        let speed = VideoFrameInterpolationPlan.normalizedPlaybackRate(playbackRate)
+        if let plan = committedPlan, let nextGrid = plan.nextGridPTS {
+            if emittedOriginal == plan.emitsOriginal, midpointCount > 0 || plan.phases.isEmpty {
+                interpolationGridNextPTS = nextGrid
+            } else if emittedOriginal {
+                interpolationGridNextPTS = original.pts + plan.outputFrameDuration
+            }
+        } else if let plan = committedPlan, plan.nextGridPTS == nil {
+            interpolationGridNextPTS = nil
+        } else if emittedOriginal, interpolationGridNextPTS != nil,
+                  let targetFPS = effectiveConfiguration.interpolationRate.targetFPS {
+            interpolationGridNextPTS = original.pts + (1.0 / Double(targetFPS)) * speed
+        }
+
+        let validZeroMidpointCFRStep = committedPlan?.isCFRResampling == true
+            && committedPlan?.phases.isEmpty == true
+            && emittedOriginal == committedPlan?.emitsOriginal
+        let midpointsWereUpscaled = !emittedOriginal && midpointCount > 0 && (result?.midpointsUpscaled == true)
+        let stepUpscaled = (upscaled != nil) || midpointsWereUpscaled
+
+        var expectedMidpoints = committedPlan?.phases.count ?? 0
         var missReason: String?
         if let expectation = pendingExpectation, expectation.frame == EnhancementFrameIdentity(original) {
-            let interpolationMissed = expectation.interpolation && midpointCount == 0
-            let upscaleMissed = expectation.upscale && upscaled == nil
+            expectedMidpoints = max(expectedMidpoints, expectation.expectedMidpointCount)
+            let interpolationMissed = expectation.expectedMidpointCount > 0
+                && midpointCount < expectation.expectedMidpointCount
+                && !validZeroMidpointCFRStep
+            let upscaleMissed = expectation.upscale && !stepUpscaled
             if interpolationMissed {
                 missReason = result?.interpolationBypassReason ?? "Interpolation deadline"
             } else if upscaleMissed {
@@ -357,20 +516,42 @@ final class VideoFramePostProcessor {
             pendingOutcomeMissed = nil
             pendingExpectation = nil
             governor.record(missed: missed)
-        } else if upscaled == nil, midpointCount == 0 {
+        } else if !stepUpscaled, midpointCount == 0, !validZeroMidpointCFRStep {
             missReason = frameTelemetry.bypassReason
         }
         let input = original.pixelBuffer
-        let output = upscaled?.pixelBuffer ?? input
+        let output = upscaled?.pixelBuffer
+            ?? (midpointsWereUpscaled ? result?.midpoints.first?.frame.pixelBuffer : nil)
+            ?? input
         telemetryWindow.record(.init(
-            at: .now, upscaled: upscaled != nil, midpoints: midpointCount, missReason: missReason,
-            inputWidth: CVPixelBufferGetWidth(input), inputHeight: CVPixelBufferGetHeight(input),
-            outputWidth: CVPixelBufferGetWidth(output), outputHeight: CVPixelBufferGetHeight(output)
+            at: .now,
+            upscaled: stepUpscaled,
+            midpoints: midpointCount,
+            expectedMidpoints: expectedMidpoints,
+            missReason: missReason,
+            inputWidth: CVPixelBufferGetWidth(input),
+            inputHeight: CVPixelBufferGetHeight(input),
+            outputWidth: CVPixelBufferGetWidth(output),
+            outputHeight: CVPixelBufferGetHeight(output),
+            emittedOriginal: emittedOriginal,
+            interpolationStepActive: midpointCount > 0 || validZeroMidpointCFRStep
         ))
-        updateBufferPlan(original: original, upscaled: upscaled, midpointCount: midpointCount)
+        updateBufferPlan(
+            original: original,
+            upscaled: upscaled ?? (midpointsWereUpscaled ? result?.midpoints.first?.frame : nil),
+            midpointCount: midpointCount,
+            committedPlan: committedPlan,
+            playbackRate: speed
+        )
     }
 
-    private func updateBufferPlan(original: MediaVideoFrame, upscaled: MediaVideoFrame?, midpointCount: Int) {
+    private func updateBufferPlan(
+        original: MediaVideoFrame,
+        upscaled: MediaVideoFrame?,
+        midpointCount: Int,
+        committedPlan: VideoFrameInterpolationPlan?,
+        playbackRate: Double = 1.0
+    ) {
         let effective = effectiveConfiguration
         if effective.superResolutionMode == .off {
             lastUpscaledBytes = nil
@@ -379,22 +560,36 @@ final class VideoFramePostProcessor {
         }
         if !effective.frameInterpolationEnabled {
             lastMidpointsPerSource = 0
+        } else if let plan = committedPlan, plan.isCFRResampling {
+            let cadence = cadenceEstimator.estimatedInterval(fallbackDuration: original.duration) ?? plan.sourceInterval
+            let worstCasePhases = max(1, Int((cadence / plan.outputFrameDuration).rounded(.up)))
+            lastMidpointsPerSource = min(
+                VideoFrameInterpolationPlan.maximumPhasesPerPair, max(midpointCount, worstCasePhases)
+            )
         } else if midpointCount > 0 {
             lastMidpointsPerSource = midpointCount
         }
         let inputSize = (CVPixelBufferGetWidth(original.pixelBuffer), CVPixelBufferGetHeight(original.pixelBuffer))
         if lastInputSize.map({ $0 != inputSize }) ?? false { governor.resetStructuralFloor() }
         lastInputSize = inputSize
-        guard let fps = VideoFrameInterpolationTiming.sourceFPS(original),
+        let estimatedInterval = cadenceEstimator.estimatedInterval(fallbackDuration: original.duration)
+        let mediaFPS = estimatedInterval.map { 1.0 / $0 } ?? VideoFrameInterpolationTiming.sourceFPS(original)
+        let speed = VideoFrameInterpolationPlan.normalizedPlaybackRate(playbackRate)
+        let fps = mediaFPS.map { $0 * speed }
+        guard let fps, fps.isFinite, fps > 0,
               lastUpscaledBytes != nil || lastMidpointsPerSource > 0 else {
             if !effective.isRequested { resetBufferPlan() }
             return
         }
         let now = ContinuousClock.now
         let plan = VideoEnhancementBufferPlan.make(
-            sourceFPS: fps, midpointsPerSource: lastMidpointsPerSource,
-            upscaledBytes: lastUpscaledBytes, interpolatedBytes: original.pixelBuffer.enhancementByteSize,
-            budgetBytes: bufferBudgetBytes(now: now), maximumLead: configuration.maxLookahead.seconds
+            sourceFPS: fps,
+            midpointsPerSource: lastMidpointsPerSource,
+            upscaledBytes: lastUpscaledBytes,
+            interpolatedBytes: original.pixelBuffer.enhancementByteSize,
+            budgetBytes: bufferBudgetBytes(now: now),
+            maximumLead: configuration.maxLookahead.seconds,
+            outputFPSOverride: committedPlan?.targetOutputFPS
         )
         if plan.isMemoryBound, now >= structuralHoldUntil, governor.raiseStructuralFloor(now: now) {
             // Re-measure at the new level before judging again.
@@ -472,21 +667,23 @@ final class VideoFramePostProcessor {
             format: CVPixelBufferGetPixelFormatType(buffer)
         )
         guard key != warmedKey else { return }
-        warmedKey = key
 
         let srPlan = superResolutionPlan(for: frame)
         let upscale = srPlan.bypassReason == nil
         var plan: VideoFrameInterpolationPlan?
-        let interval = frame.duration
         if effective.frameInterpolationEnabled, interpolationInputBypassReason(frame) == nil,
-           interval.isFinite, interval > 0 {
-            plan = VideoFrameInterpolationPlan(
-                previousPTS: frame.pts - 2 * interval, currentPTS: frame.pts - interval, interval: interval,
+           let interval = cadenceEstimator.estimatedInterval(fallbackDuration: frame.duration) {
+            plan = VideoFrameInterpolationPlan.prewarmPlan(
+                before: frame.pts,
+                interval: interval,
+                cadenceInterval: cadenceEstimator.medianInterval,
+                isCadenceStable: cadenceEstimator.isConstantRate,
                 rate: effective.interpolationRate
             )
             if #unavailable(iOS 26.0), !VisionFrameInterpolationBackend.acceptsPairDelta(interval) { plan = nil }
         }
         guard upscale || plan != nil else { return }
+        warmedKey = key
 
         isWarming = true
         warmTaskCancelled = false
@@ -530,24 +727,31 @@ final class VideoFramePostProcessor {
         _ frame: MediaVideoFrame,
         previous: MediaVideoFrame,
         deadlines: VideoEnhancementDeadlines,
+        interpolationPlan: VideoFrameInterpolationPlan? = nil,
+        playbackRate: Double = 1.0,
         onUpdate: @escaping @MainActor (VideoFrameEnhancementUpdate) -> Void
     ) {
         precondition(activeTask == nil)
         finalizePendingOutcome()
         pendingOutcomeMissed = false
         let srPlan = superResolutionPlan(for: frame)
+        let resolvedPlan = deadlines.midpoint.flatMap { _ in
+            interpolationPlan ?? self.interpolationPlan(previous: previous, current: frame, playbackRate: playbackRate)
+        }.flatMap { $0.phases.isEmpty ? nil : $0 }
         let job = VideoFrameEnhancementJob(
             current: PostProcessFrameBox(frame: frame), previous: PostProcessFrameBox(frame: previous),
             configuration: effectiveConfiguration, interpolationLabel: interpolationLabel,
-            interpolationPlan: deadlines.midpoint.flatMap { _ in
-                interpolationPlan(previous: previous, current: frame)
-            },
+            interpolationPlan: resolvedPlan,
             deadlines: deadlines,
             upscalingBypassReason: srPlan.bypassReason,
             superResolutionCap: srPlan.scaleCapValue,
             superResolutionTargetDimensions: srPlan.targetDimensions
         )
-        pendingExpectation = (EnhancementFrameIdentity(frame), job.interpolationPlan != nil, job.isUpscaling)
+        pendingExpectation = (
+            EnhancementFrameIdentity(frame),
+            job.interpolationPlan?.phases.count ?? 0,
+            job.isUpscaling
+        )
         let worker = self.worker
         activeTask = Task.detached(priority: .userInitiated) { [weak self] in
             let result = await worker.process(job) { midpoints in
@@ -559,6 +763,7 @@ final class VideoFramePostProcessor {
 
     func flush() {
         finalizePendingOutcome()
+        interpolationGridNextPTS = nil
         if isWarming {
             // Warm-up is independent of stream position; let it finish and flush afterwards.
             needsFlush = true
@@ -575,6 +780,8 @@ final class VideoFramePostProcessor {
         pendingExpectation = nil
         governor.reset(requested: configuration)
         telemetryWindow.reset()
+        cadenceEstimator.reset()
+        interpolationGridNextPTS = nil
         lastProcessingMs = 0
         warmedKey = nil
         resetBufferPlan()
@@ -674,7 +881,7 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
                     || clock?.detail != capKey || frame.pts < (clock?.pts ?? 0) {
                     let warmPTS = max(0, frame.pts - 1)
                     _ = await vtSuperRes.upscale(
-                        pixelBuffer: frame.pixelBuffer, pts: CMTime(seconds: warmPTS, preferredTimescale: 600),
+                        pixelBuffer: frame.pixelBuffer, pts: CMTime(seconds: warmPTS, preferredTimescale: 60_000),
                         maxScale: cap, hasTimeRemaining: untilCancelled
                     )
                     vtSuperRes.flush()
@@ -688,7 +895,8 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
                     || metalFXWarmRaster?.detail != warmDetail {
                     _ = await metalFXSuperRes.upscale(
                         pixelBuffer: frame.pixelBuffer, maxScale: cap,
-                        targetDimensions: job.superResolutionTargetDimensions
+                        targetDimensions: job.superResolutionTargetDimensions,
+                        sharpness: job.configuration.superResolutionSharpness
                     )
                     metalFXWarmRaster = SessionClock(width: width, height: height, detail: warmDetail, pts: 0)
                     report.superResolution = true
@@ -696,10 +904,11 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
             }
         }
 
-        if let plan = job.interpolationPlan, !Task.isCancelled {
+        if let plan = job.interpolationPlan, !plan.phases.isEmpty, !Task.isCancelled {
             let clock = interpolationClock
+            let planDetail = Self.interpolationSessionDetail(for: plan)
             if clock == nil || clock?.width != width || clock?.height != height
-                || clock?.detail != plan.phases.count || frame.pts < (clock?.pts ?? 0) {
+                || clock?.detail != planDetail || frame.pts < (clock?.pts ?? 0) {
                 var first = frame
                 first.pts = plan.pts.first.map { $0 - plan.sourceInterval * Double(plan.phases[0]) } ?? frame.pts
                 first.duration = plan.sourceInterval
@@ -773,6 +982,11 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
         var midpoints: [MediaVideoFrame] = []
         var inputFPS: Double
         var bypassReason: String?
+        var midpointsUpscaled = false
+    }
+
+    private static func interpolationSessionDetail(for plan: VideoFrameInterpolationPlan) -> Int {
+        plan.allowsLowLatency ? plan.phases.count : -1
     }
 
     func process(
@@ -789,10 +1003,12 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
             resetInterpolation()
         }
         let interpolation = await processInterpolation(job, previousIdentity: previousIdentity)
-        if job.isUpscaling, !interpolation.midpoints.isEmpty, !Task.isCancelled {
+        let shouldUpscaleOriginal = job.isUpscaling
+            && ((job.interpolationPlan?.emitsOriginal ?? true) || interpolation.midpoints.isEmpty)
+        if shouldUpscaleOriginal, !interpolation.midpoints.isEmpty, !Task.isCancelled {
             await publishMidpoints(interpolation.midpoints.map(PostProcessFrameBox.init))
         }
-        let original = await processOriginal(job)
+        let original = shouldUpscaleOriginal ? await processOriginal(job) : nil
         previousInput = EnhancementFrameIdentity(frame)
         let elapsedMs = Double(start.duration(to: .now) / .microseconds(1)) / 1_000
         smoothedMs = smoothedMs > 0 ? smoothedMs * 0.8 + elapsedMs * 0.2 : elapsedMs
@@ -829,13 +1045,18 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
         case let .interpolated(frames):
             stage.inputFPS = plan.sourceFPS
             interpolationReference = EnhancementFrameIdentity(frame)
-            stage.midpoints = job.isUpscaling
-                ? await upscaleMidpoints(
+            if job.isUpscaling {
+                let upscaled = await upscaleMidpoints(
                     frames, configuration: job.configuration, maxScale: job.superResolutionCap,
                     targetDimensions: job.superResolutionTargetDimensions,
                     hasTimeRemaining: hasTimeRemaining
                 )
-                : frames
+                stage.midpoints = upscaled.frames
+                stage.midpointsUpscaled = upscaled.allUpscaled
+            } else {
+                stage.midpoints = frames
+                stage.midpointsUpscaled = false
+            }
         case .passthrough:
             interpolationReference = EnhancementFrameIdentity(frame)
         case let .bypassed(reason):
@@ -877,10 +1098,15 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
         } else if case let .bypassed(reason) = original {
             srBypass = reason
         }
+        let srActive = enhancedOriginal != nil || interpolation.midpointsUpscaled
         var labels: [String] = []
-        if enhancedOriginal != nil { labels.append(job.configuration.superResolutionMode.telemetryLabel) }
+        if srActive { labels.append(job.configuration.superResolutionMode.telemetryLabel) }
         if !interpolation.midpoints.isEmpty { labels.append(job.interpolationLabel) }
-        let output = enhancedOriginal?.pixelBuffer ?? frame.pixelBuffer
+        let output = enhancedOriginal?.pixelBuffer
+            ?? (interpolation.midpointsUpscaled ? interpolation.midpoints.first?.pixelBuffer : nil)
+            ?? frame.pixelBuffer
+        let outputFPS = job.interpolationPlan?.targetOutputFPS
+            ?? (interpolation.inputFPS * Double(interpolation.midpoints.count + 1))
         let telemetry = VideoEnhancementTelemetry(
             activeModeLabel: labels.isEmpty ? "Bypass" : labels.joined(separator: " + "),
             inputWidth: CVPixelBufferGetWidth(frame.pixelBuffer),
@@ -888,7 +1114,7 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
             outputWidth: CVPixelBufferGetWidth(output),
             outputHeight: CVPixelBufferGetHeight(output),
             inputFPS: interpolation.inputFPS,
-            outputFPS: interpolation.inputFPS * Double(interpolation.midpoints.count + 1),
+            outputFPS: outputFPS,
             smoothedProcessingMs: smoothedMs,
             bypassReason: labels.isEmpty ? (srBypass ?? interpolation.bypassReason) : nil,
             isActive: !labels.isEmpty
@@ -896,8 +1122,10 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
         return VideoFrameEnhancementResult(
             midpoints: interpolation.midpoints.map(PostProcessFrameBox.init),
             enhancedOriginal: enhancedOriginal.map(PostProcessFrameBox.init),
-            telemetry: telemetry, interpolationBypassReason: interpolation.bypassReason,
-            originalSuperResolutionBypassReason: srBypass
+            telemetry: telemetry,
+            interpolationBypassReason: interpolation.bypassReason,
+            originalSuperResolutionBypassReason: srBypass,
+            midpointsUpscaled: interpolation.midpointsUpscaled
         )
     }
 
@@ -915,7 +1143,8 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
     ) async -> VideoInterpolationBackendOutcome {
         interpolationClock = SessionClock(
             width: CVPixelBufferGetWidth(frame.pixelBuffer), height: CVPixelBufferGetHeight(frame.pixelBuffer),
-            detail: plan?.phases.count ?? interpolationClock?.detail ?? 0, pts: frame.pts
+            detail: plan.map(Self.interpolationSessionDetail(for:)) ?? interpolationClock?.detail ?? 0,
+            pts: frame.pts
         )
         if #available(iOS 26.0, *) {
             return await vtFrameInterp.process(frame, plan: plan, hasTimeRemaining: hasTimeRemaining)
@@ -931,21 +1160,25 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
         maxScale: Float,
         targetDimensions: VideoSuperResolutionDimensions?,
         hasTimeRemaining: @Sendable () -> Bool
-    ) async -> [MediaVideoFrame] {
+    ) async -> (frames: [MediaVideoFrame], allUpscaled: Bool) {
+        guard !frames.isEmpty else { return (frames, false) }
         var enhanced = frames
         for index in frames.indices {
-            guard hasTimeRemaining() else { break }
+            guard hasTimeRemaining() else { return (frames, false) }
             let outcome = await upscale(
                 frames[index], configuration: configuration, maxScale: maxScale,
                 targetDimensions: targetDimensions, hasTimeRemaining: hasTimeRemaining
             )
             if case let .processed(buffer) = outcome {
                 enhanced[index].pixelBuffer = buffer
-            } else if configuration.superResolutionMode == .videoToolboxML {
-                vtSuperRes.flush()
+            } else {
+                if configuration.superResolutionMode == .videoToolboxML {
+                    vtSuperRes.flush()
+                }
+                return (frames, false)
             }
         }
-        return enhanced
+        return (enhanced, true)
     }
 
     private func upscale(
@@ -959,7 +1192,7 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
         case .off:
             return .bypassed(reason: "Off")
         case .videoToolboxML:
-            let pts = CMTime(seconds: max(0, frame.pts), preferredTimescale: 600)
+            let pts = CMTime(seconds: max(0, frame.pts), preferredTimescale: 60_000)
             superResolutionClock = SessionClock(
                 width: CVPixelBufferGetWidth(frame.pixelBuffer), height: CVPixelBufferGetHeight(frame.pixelBuffer),
                 detail: Int((maxScale * 100).rounded()), pts: max(0, frame.pts)
@@ -975,7 +1208,9 @@ private final class VideoFramePostProcessorWorker: @unchecked Sendable {
                 detail: detail, pts: 0
             )
             return await metalFXSuperRes.upscale(
-                pixelBuffer: frame.pixelBuffer, maxScale: maxScale, targetDimensions: targetDimensions
+                pixelBuffer: frame.pixelBuffer, maxScale: maxScale,
+                targetDimensions: targetDimensions,
+                sharpness: configuration.superResolutionSharpness
             )
         }
     }
