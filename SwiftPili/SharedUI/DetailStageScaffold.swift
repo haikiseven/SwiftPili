@@ -13,7 +13,7 @@ enum DetailStagePreferences {
     }
 }
 
-struct DetailStageState: Equatable {
+struct DetailStageState: Equatable, Sendable {
     private(set) var presentation: DetailStagePresentation
     private var lastFlipAt: CFTimeInterval = 0
 
@@ -32,6 +32,66 @@ struct DetailStageState: Equatable {
     func target(forScrollOffset offset: CGFloat) -> DetailStagePresentation? {
         guard CACurrentMediaTime() - lastFlipAt > DetailStageSwitchPolicy.cooldown else { return nil }
         return DetailStageSwitchPolicy.next(current: presentation, offset: offset)
+    }
+}
+
+struct DetailStageController: Equatable, Sendable {
+    private(set) var state: DetailStageState
+    var heroBarHeight: CGFloat = 0
+
+    init(initialPresentation: DetailStagePresentation = DetailStagePreferences.initialPresentation) {
+        state = DetailStageState(initialPresentation: initialPresentation)
+    }
+
+    var presentation: DetailStagePresentation { state.presentation }
+
+    func showsHeroBar(isWideLayout: Bool) -> Bool {
+        isWideLayout && presentation == .hero
+    }
+
+    func geometry(
+        containerWidth: CGFloat,
+        containerHeight: CGFloat
+    ) -> DetailStageLayout.Geometry {
+        DetailStageLayout.geometry(
+            for: presentation,
+            containerSize: CGSize(width: containerWidth, height: containerHeight),
+            heroReserve: heroBarHeight > 0 ? heroBarHeight + DetailStageLayout.heroContentGap : 0
+        )
+    }
+
+    mutating func updateHeroBarHeight(_ height: CGFloat) {
+        if height.isFinite, height > 0, abs(height - heroBarHeight) >= 1 {
+            heroBarHeight = height
+        }
+    }
+
+    static var transitionSpring: Animation {
+        .spring(duration: 0.45, bounce: 0.12)
+    }
+
+    @MainActor
+    mutating func transition(
+        to next: DetailStagePresentation,
+        isWideLayout: Bool,
+        motion: AppMotionPreferences
+    ) {
+        guard isWideLayout, state.presentation != next else { return }
+        withAnimation(motion.animation(normal: Self.transitionSpring)) {
+            _ = state.set(next)
+        }
+    }
+
+    @MainActor
+    mutating func handleScroll(
+        offset: CGFloat,
+        isWideLayout: Bool,
+        motion: AppMotionPreferences,
+        logTag: String = "Stage"
+    ) {
+        guard isWideLayout, let next = state.target(forScrollOffset: offset) else { return }
+        PlayerLog.log("[\(logTag)] \(state.presentation) → \(next) offset=\(Int(offset))")
+        transition(to: next, isWideLayout: isWideLayout, motion: motion)
     }
 }
 

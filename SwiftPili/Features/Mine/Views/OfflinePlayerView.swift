@@ -18,8 +18,6 @@ struct OfflinePlayerView: View {
     @State private var pagingCoordinator = PlayerVerticalPagingCoordinator()
     @State private var assetValid = true
     @State private var inlineContainerSize: CGSize = .zero
-    @State private var pendingInlineContainerSize: CGSize?
-    @State private var pendingContainerSize: CGSize?
     @State private var owner: String
     @State private var containerWidth: CGFloat = WindowMetricsFallback.currentWidth
     private var player: PlayerViewModel { .shared }
@@ -161,11 +159,7 @@ struct OfflinePlayerView: View {
     }
 
     private var hostOwnsInlineSurface: Bool {
-        guard player.isFullscreenPresentationActive,
-              let ownerLease,
-              player.isCurrentOwner(ownerLease) else { return false }
-        return player.activeSurfaceLease?.ownerLease == ownerLease
-            && player.activeSurfaceLease?.role == .fullscreen
+        PlayerDetailSurfacePolicy.hostOwnsInlineSurface(player: player, lease: ownerLease)
     }
 
     private func beginPagingDrag() -> Bool {
@@ -311,22 +305,16 @@ extension OfflinePlayerView {
                                     cornerRadius: playerCornerRadius
                                 )
                             }
-                            if !player.isFullscreenPresentationActive, isActiveOfflineRoute {
-                                let showsNavigation = !hasInlineExitChrome || player.showControls
-                                if showsNavigation && (!isRouteActivated || !player.showControls) {
-                                    PlayerControlsScrim()
-                                        .frame(width: layout.playerSize.width, height: layout.playerSize.height)
-                                        .clipShape(RoundedRectangle(
-                                            cornerRadius: playerCornerRadius, style: .continuous
-                                        ))
-                                }
-                                PlayerPageNavigationButtons(actions: playerPageNavigation)
-                                    .padding(.horizontal, PlayerPageNavigationButtons.inlineHorizontalPadding)
-                                    .padding(.top, PlayerPageNavigationButtons.topPadding)
-                                    .opacity(showsNavigation ? 1 : 0)
-                                    .allowsHitTesting(showsNavigation)
-                                    .accessibilityHidden(!showsNavigation)
-                            }
+                            PlayerDetailInlineNavigationOverlay(
+                                player: player,
+                                isActiveRoute: isActiveOfflineRoute,
+                                isRouteActivated: isRouteActivated,
+                                hasInlineExitChrome: { hasInlineExitChrome },
+                                scrimWidth: layout.playerSize.width,
+                                scrimHeight: layout.playerSize.height,
+                                cornerRadius: playerCornerRadius,
+                                actions: playerPageNavigation
+                            )
                         }
                         .background {
                             PlayerInlineSlotProbe(cornerRadius: playerCornerRadius)
@@ -363,67 +351,34 @@ extension OfflinePlayerView {
                 .guardIPadTopSafeArea(when: true)
             }
         }
-        .allowsHitTesting(!player.isFullscreenPresentationActive)
-        .accessibilityHidden(player.isFullscreenPresentationActive)
-        .onChange(of: player.isFullscreenPresentationActive) { _, active in
-            guard !active else { return }
-            if let pendingInline = pendingInlineContainerSize {
-                pendingInlineContainerSize = nil
-                if inlineContainerSize != pendingInline { inlineContainerSize = pendingInline }
-            }
-            if let pendingSize = pendingContainerSize {
-                pendingContainerSize = nil
-                pagingReducer.updateContainerHeight(pendingSize.height)
-                if dragOffsetBox.y != pagingReducer.offset {
-                    dragOffsetBox.y = pagingReducer.offset
-                }
-                if containerWidth != pendingSize.width { containerWidth = pendingSize.width }
-                pagingReducer.noteCoverResolution(width: pendingSize.width, height: pendingSize.height)
-            }
+        .playerDetailInlineContainerSize(
+            isFullscreenPresentationActive: player.isFullscreenPresentationActive
+        ) { size in
+            if inlineContainerSize != size { inlineContainerSize = size }
         }
-        .appSurface(.cinematic)
-        .background {
-            GeometryReader { _ in
-                Color.clear
-                    .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
-                        if DeviceCapability.supportsOrientationLock,
-                           player.isFullscreenPresentationActive {
-                            pendingInlineContainerSize = size
-                            return
-                        }
-                        if inlineContainerSize != size { inlineContainerSize = size }
-                    }
-            }
-            .ignoresSafeArea(.all, edges: .vertical)
-        }
-        .onGeometryChange(for: CGSize.self) { $0.size } action: {
-            if DeviceCapability.supportsOrientationLock,
-               player.isFullscreenPresentationActive {
-                pendingContainerSize = $0
-                return
-            }
-            pagingReducer.updateContainerHeight($0.height)
+        .playerDetailDeferredSize(
+            isFullscreenPresentationActive: player.isFullscreenPresentationActive
+        ) { size in
+            pagingReducer.updateContainerHeight(size.height)
             if dragOffsetBox.y != pagingReducer.offset {
                 dragOffsetBox.y = pagingReducer.offset
             }
-            if containerWidth != $0.width { containerWidth = $0.width }
-            pagingReducer.noteCoverResolution(width: $0.width, height: $0.height)
+            if containerWidth != size.width { containerWidth = size.width }
+            pagingReducer.noteCoverResolution(width: size.width, height: size.height)
         }
         .modifier(PortraitDragOffset(box: dragOffsetBox))
         .background { pagingNeighbourPreviews }
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar(.hidden, for: .navigationBar)
-        .keepsInteractivePopGesture()
-        .routeAppearanceProbe { event in
-            _ = routeActivation.handle(event, owner: owner)
-        }
-        .toolbar(.hidden, for: .tabBar)
-        .statusBarHidden(player.isFullscreen)
-        .background(alignment: .topLeading) {
-            if let presentationContext {
-                PlayerFullscreenHost(context: presentationContext, navigation: coordinator)
+        .playerDetailChrome(
+            isFullscreenPresentationActive: player.isFullscreenPresentationActive,
+            isStatusBarHidden: player.isFullscreen,
+            guardsIPadTopSafeArea: nil,
+            presentationContext: presentationContext,
+            coordinator: coordinator,
+            watchdogScreen: "OfflinePlayer",
+            onRouteAppearance: { event in
+                _ = routeActivation.handle(event, owner: owner)
             }
-        }
+        )
         .onChange(of: isActiveOfflineRoute, initial: true) { _, active in
             let outcome = routeActivation.handle(.routeActivity(active), owner: owner)
             if outcome == .deactivated, routeActivation.defersActivation {

@@ -439,12 +439,12 @@ struct LiveRoomView: View {
     @State private var danmakuDraft = LiveDanmakuDraftModel()
     @FocusState private var isDanmakuFocused: Bool
     @Environment(AppCoordinator.self) private var coordinator
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.dismiss) private var dismiss
     @Environment(\.authManager) private var authManager
     @Environment(\.accentStore) private var accentStore
     @State private var scaleModeBeforeImmersivePortrait: VideoScaleMode?
     @State private var inlineContainerSize: CGSize = .zero
-    @State private var pendingInlineContainerSize: CGSize?
     @State private var standardChatAutoScroll = LiveChatAutoScrollPolicy<UUID>()
     @State private var immersiveChatAutoScroll = LiveChatAutoScrollPolicy<UUID>()
     @State private var portraitKeyboardFrame: CGRect?
@@ -498,7 +498,7 @@ struct LiveRoomView: View {
 
     private var usesWideCompanionLayout: Bool {
         DetailSplitPolicy.usesSplit(
-            isPad: DeviceCapability.supportsPadDetailSplit,
+            isRegularWidth: horizontalSizeClass == .regular,
             containerSize: inlineContainerSize
         )
     }
@@ -530,11 +530,7 @@ struct LiveRoomView: View {
     }
 
     private var hostOwnsInlineSurface: Bool {
-        guard player.isFullscreenPresentationActive,
-              let lease = viewModel.playerOwnerLease,
-              player.isCurrentOwner(lease) else { return false }
-        return player.activeSurfaceLease?.ownerLease == lease
-            && player.activeSurfaceLease?.role == .fullscreen
+        PlayerDetailSurfacePolicy.hostOwnsInlineSurface(player: player, lease: viewModel.playerOwnerLease)
     }
 
     private var playerPageNavigation: PlayerPageNavigationActions {
@@ -607,14 +603,6 @@ struct LiveRoomView: View {
                 wideDanmakuInput
             }
         }
-        .allowsHitTesting(!player.isFullscreenPresentationActive)
-        .accessibilityHidden(player.isFullscreenPresentationActive)
-        .onChange(of: player.isFullscreenPresentationActive) { _, active in
-            guard !active, let pending = pendingInlineContainerSize else { return }
-            pendingInlineContainerSize = nil
-            if inlineContainerSize != pending { inlineContainerSize = pending }
-        }
-        .guardIPadTopSafeArea(when: !usesImmersivePortraitLayout)
         .onPreferenceChange(LivePortraitInputBarHeightKey.self) { measuredHeight in
             guard measuredHeight > 0,
                   abs(measuredHeight - portraitInputBarHeight) > 0.5
@@ -623,21 +611,18 @@ struct LiveRoomView: View {
             }
             portraitInputBarHeight = measuredHeight
         }
-        .background {
-            GeometryReader { _ in
-                Color.clear
-                    .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
-                        if DeviceCapability.supportsOrientationLock,
-                           player.isFullscreenPresentationActive {
-                            pendingInlineContainerSize = size
-                            return
-                        }
-                        if inlineContainerSize != size { inlineContainerSize = size }
-                    }
+        .playerDetailChrome(
+            isFullscreenPresentationActive: player.isFullscreenPresentationActive,
+            isStatusBarHidden: player.isFullscreen || usesImmersivePortraitLayout,
+            guardsIPadTopSafeArea: !usesImmersivePortraitLayout,
+            presentationContext: presentationContext,
+            coordinator: coordinator,
+            liveRoom: viewModel,
+            watchdogScreen: "LiveRoom",
+            onRouteAppearance: { event in
+                _ = routeActivation.handle(event, owner: PlayerViewModel.liveOwner(roomID))
             }
-            .ignoresSafeArea(.all, edges: .vertical)
-        }
-        .background {
+        ) {
             if usesImmersivePortraitLayout {
                 Color.black.ignoresSafeArea()
             } else {
@@ -649,12 +634,10 @@ struct LiveRoomView: View {
                 )
             }
         }
-        .appSurface(.cinematic)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar(.hidden, for: .navigationBar)
-        .keepsInteractivePopGesture()
-        .routeAppearanceProbe { event in
-            _ = routeActivation.handle(event, owner: PlayerViewModel.liveOwner(roomID))
+        .playerDetailInlineContainerSize(
+            isFullscreenPresentationActive: player.isFullscreenPresentationActive
+        ) { size in
+            if inlineContainerSize != size { inlineContainerSize = size }
         }
         .onChange(of: isActiveLiveRoute, initial: true) { _, active in
             let outcome = routeActivation.handle(
@@ -665,13 +648,6 @@ struct LiveRoomView: View {
                 player.pauseForRouteDeparture(lease: viewModel.playerOwnerLease)
             }
         }
-        .toolbar(.hidden, for: .tabBar)
-        .toolbarBackground(.hidden, for: .navigationBar)
-        .background(alignment: .topLeading) {
-            if let presentationContext {
-                PlayerFullscreenHost(context: presentationContext, navigation: coordinator, liveRoom: viewModel)
-            }
-        }
         .task(id: isActiveLiveRoute) {
             guard isActiveLiveRoute else { return }
             await viewModel.prefetchMetadata(roomID: roomID, requestAdmission: { isActiveLiveRoute })
@@ -680,7 +656,6 @@ struct LiveRoomView: View {
             guard isRouteActivated else { return }
             await viewModel.load(roomID: roomID, requestAdmission: { isRouteActivated })
         }
-        .freezeWatchdogScreen("LiveRoom")
         .task(id: viewModel.roomInfo?.uid) {
             await viewModel.loadBroadcaster(uid: viewModel.roomInfo?.uid, authManager: authManager)
         }
@@ -729,7 +704,6 @@ struct LiveRoomView: View {
             isDanmakuFocused = false
             danmakuDraft.cancelSend()
         }
-        .statusBarHidden(player.isFullscreen || usesImmersivePortraitLayout)
     }
 
     private var bodyStageReader: some View {
@@ -1070,23 +1044,16 @@ struct LiveRoomView: View {
         }
     }
 
-    @ViewBuilder
     private func inlineNavigationOverlay(width: CGFloat, height: CGFloat) -> some View {
-        if isActiveLiveRoute {
-            let showsNavigation = !hasInlineExitChrome || player.showControls
-            ZStack(alignment: .topLeading) {
-                if showsNavigation && (!isRouteActivated || !player.showControls) {
-                    PlayerControlsScrim()
-                        .frame(width: width, height: height)
-                }
-                PlayerPageNavigationButtons(actions: playerPageNavigation)
-                    .padding(.horizontal, PlayerPageNavigationButtons.inlineHorizontalPadding)
-                    .padding(.top, PlayerPageNavigationButtons.topPadding)
-                    .opacity(showsNavigation ? 1 : 0)
-                    .allowsHitTesting(showsNavigation)
-                    .accessibilityHidden(!showsNavigation)
-            }
-        }
+        PlayerDetailInlineNavigationOverlay(
+            player: player,
+            isActiveRoute: isActiveLiveRoute,
+            isRouteActivated: isRouteActivated,
+            hasInlineExitChrome: { hasInlineExitChrome },
+            scrimWidth: width,
+            scrimHeight: height,
+            actions: playerPageNavigation
+        )
     }
 
     // MARK: - iPad landscape stage

@@ -26,43 +26,6 @@ private struct CommentSourceChange: ViewModifier {
     }
 }
 
-private struct VideoDetailInlineNavigation: View {
-    let player: PlayerViewModel
-    let screenLease: PlayerOwnerLease?
-    let isActiveVideoRoute: Bool
-    let isRouteActivated: Bool
-    let isPageAvailable: Bool
-    let cornerRadius: CGFloat
-    let actions: PlayerPageNavigationActions
-
-    var body: some View {
-        if !player.isFullscreenPresentationActive, isActiveVideoRoute {
-            let showsNavigation = !hasUsableInlinePlayerChrome || player.showControls
-            ZStack(alignment: .topLeading) {
-                if showsNavigation && (!isRouteActivated || !player.showControls) {
-                    PlayerControlsScrim()
-                        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-                }
-                PlayerPageNavigationButtons(actions: actions)
-                    .padding(.horizontal, PlayerPageNavigationButtons.inlineHorizontalPadding)
-                    .padding(.top, PlayerPageNavigationButtons.topPadding)
-                    .opacity(showsNavigation ? 1 : 0)
-                    .allowsHitTesting(showsNavigation)
-                    .accessibilityHidden(!showsNavigation)
-            }
-        }
-    }
-
-    private var hasUsableInlinePlayerChrome: Bool {
-        guard isRouteActivated, isPageAvailable,
-              player.error == nil, player.unavailability == nil,
-              player.videoPresentationFailureMessage == nil, player.currentURL != nil,
-              let lease = screenLease else { return false }
-        return player.isCurrentOwner(lease) && player.mode == .vod
-            && player.surfaceLease(matching: lease, role: .inline) != nil
-    }
-}
-
 struct VideoDetailView: View {
     @AppMotion private var motion
     let target: VideoRouteTarget
@@ -129,24 +92,9 @@ struct VideoDetailView: View {
     @State private var pageOffsetStore = PageOffsetStore()
     @State private var lastCondenseFlipAt: CFTimeInterval = 0
 
-    private static var fallbackContainerBounds: CGRect {
-        if let bounds = AppWindowMetrics.current?.bounds {
-            return bounds
-        }
-        if let scene = UIApplication.shared.connectedScenes
-            .compactMap({ $0 as? UIWindowScene })
-            .first {
-            if let windowBounds = scene.windows.first(where: { !$0.isHidden })?.bounds {
-                return windowBounds
-            }
-            return scene.coordinateSpace.bounds
-        }
-        return CGRect(x: 0, y: 0, width: 393, height: 852)
-    }
-
     private var playerVideoHeight: CGFloat {
         if isWideLayout { return wideVideoSize.height }
-        let fallbackBounds = Self.fallbackContainerBounds
+        let fallbackBounds = WindowMetricsFallback.currentBounds
         let base = containerWidth > 0 ? containerWidth : min(fallbackBounds.width, fallbackBounds.height)
         let shapeIsCurrent = playerShapeIsCurrent
         return DetailPlayerGeometry.videoHeight(
@@ -177,15 +125,14 @@ struct VideoDetailView: View {
             videoHeight: playerVideoHeight, isFullscreen: false
         )
     }
-    @State private var containerWidth: CGFloat
-    @State private var isWideLayout: Bool
-    @State private var usesCompactPhoneActions: Bool
-    @State private var wideContainerHeight: CGFloat
-    @State private var restingContainerHeight: CGFloat
-    @State private var pendingContainerSize: CGSize?
-    @State private var isKeyboardDocked = false
-    @State private var stage = DetailStageState()
-    private var stagePresentation: DetailStagePresentation { stage.presentation }
+    @State private var containerMetrics = PlayerDetailContainerMetrics()
+    @State private var stageController = DetailStageController()
+    private var containerWidth: CGFloat { containerMetrics.containerWidth }
+    private var isWideLayout: Bool { containerMetrics.isWideLayout(isRegularWidth: sizeClass == .regular) }
+    private var usesCompactPhoneActions: Bool { containerMetrics.usesCompactPhoneActions }
+    private var wideContainerHeight: CGFloat { containerMetrics.wideContainerHeight }
+    private var isKeyboardDocked: Bool { containerMetrics.isKeyboardDocked }
+    private var stagePresentation: DetailStagePresentation { stageController.presentation }
     @Environment(AppCoordinator.self) private var coordinator
     @Environment(\.horizontalSizeClass) private var sizeClass
     @Environment(\.scenePhase) private var scenePhase
@@ -197,56 +144,45 @@ struct VideoDetailView: View {
     @State private var routePosition: PlayerRoutePosition?
 
     init(target: VideoRouteTarget, routePosition: PlayerRoutePosition? = nil) {
-        let initialBounds = Self.fallbackContainerBounds
         self.target = target
         _routePosition = State(initialValue: routePosition)
         _screenOwner = State(initialValue: "vod-detail-\(UUID().uuidString)")
-        _containerWidth = State(initialValue: initialBounds.width)
-        _isWideLayout = State(initialValue: DetailSplitPolicy.usesSplit(
-            isPad: DeviceCapability.supportsPadDetailSplit,
-            containerSize: initialBounds.size
-        ))
-        _usesCompactPhoneActions = State(initialValue: DeviceCapability.usesCompactPortraitVideoFraming
-            && initialBounds.height >= initialBounds.width)
-        _wideContainerHeight = State(initialValue: initialBounds.height)
-        _restingContainerHeight = State(initialValue: initialBounds.height)
     }
 
     private var accent: Color { .biliAccent }
     private var stageGeometry: DetailStageLayout.Geometry {
-        DetailStageLayout.geometry(
-            for: stagePresentation,
-            containerSize: CGSize(width: pageWidth, height: wideContainerHeight),
-            heroReserve: heroBarHeight > 0 ? heroBarHeight + DetailStageLayout.heroContentGap : 0
-        )
+        stageController.geometry(containerWidth: pageWidth, containerHeight: wideContainerHeight)
     }
-    @State private var heroBarHeight: CGFloat = 0
-    private var showsHeroBar: Bool { isWideLayout && stagePresentation == .hero }
+    private var showsHeroBar: Bool { stageController.showsHeroBar(isWideLayout: isWideLayout) }
 
     private var wideVideoSize: CGSize { stageGeometry.playerSize }
 
     private var showsWideChrome: Bool { isWideLayout }
     private var hostOwnsInlineSurface: Bool {
-        guard player.isFullscreenPresentationActive,
-              let lease = viewModel.playerLease,
-              player.isCurrentOwner(lease) else { return false }
-        return player.activeSurfaceLease?.ownerLease == lease
-            && player.activeSurfaceLease?.role == .fullscreen
+        PlayerDetailSurfacePolicy.hostOwnsInlineSurface(player: player, lease: viewModel.playerLease)
+    }
+    private var hasUsableInlinePlayerChrome: Bool {
+        guard isRouteActivated, viewModel.error == nil, viewModel.unavailability == nil,
+              player.error == nil, player.unavailability == nil,
+              player.videoPresentationFailureMessage == nil, player.currentURL != nil,
+              let lease = viewModel.playerLease else { return false }
+        return player.isCurrentOwner(lease) && player.mode == .vod
+            && player.surfaceLease(matching: lease, role: .inline) != nil
     }
     private static var compactCapsuleMinimumWidth: CGFloat { 600 }
     private static var phoneShelfCardWidth: CGFloat { 220 }
 
     private func setStagePresentation(_ next: DetailStagePresentation) {
-        guard isWideLayout, stagePresentation != next else { return }
-        withAnimation(motion.animation(normal: .spring(duration: 0.45, bounce: 0.12))) {
-            _ = stage.set(next)
-        }
+        stageController.transition(to: next, isWideLayout: isWideLayout, motion: motion)
     }
 
     private func handleStageScroll(_ offset: CGFloat) {
-        guard showsWideChrome, let next = stage.target(forScrollOffset: offset) else { return }
-        PlayerLog.log("[Stage] \(stagePresentation) → \(next) offset=\(Int(offset))")
-        setStagePresentation(next)
+        stageController.handleScroll(
+            offset: offset,
+            isWideLayout: showsWideChrome,
+            motion: motion,
+            logTag: "Stage"
+        )
     }
 
     @State private var presentationScreenID = UUID()
@@ -302,7 +238,7 @@ struct VideoDetailView: View {
     }
 
     private var pageWidth: CGFloat {
-        containerWidth > 0 ? containerWidth : Self.fallbackContainerBounds.width
+        containerMetrics.pageWidth
     }
 
     private var pagerBottomInset: CGFloat {
@@ -313,7 +249,18 @@ struct VideoDetailView: View {
         let _ = UIHitchMonitor.countBody("detail")
         let inlineCornerRadius = showsWideChrome ? DetailStageLayout.playerCornerRadius : 0
         ZStack(alignment: .bottom) {
-            containerGeometryProbes
+            PlayerDetailGeometryProbes(
+                isWideLayout: isWideLayout,
+                restingHeight: containerMetrics.restingHeight,
+                isFullscreenPresentationActive: player.isFullscreenPresentationActive,
+                onSizeChange: { size in
+                    UIHitchMonitor.count("geom")
+                    containerMetrics.update(size: size, isRegularWidth: sizeClass == .regular)
+                },
+                onKeyboardDockedChange: { docked in
+                    containerMetrics.updateKeyboardDocked(docked)
+                }
+            )
 
             ZStack(alignment: .topLeading) {
                 if isWideLayout {
@@ -361,12 +308,11 @@ struct VideoDetailView: View {
                 }
                 .frame(width: showsWideChrome ? wideVideoSize.width : nil)
                 .overlay(alignment: .topLeading) {
-                    VideoDetailInlineNavigation(
+                    PlayerDetailInlineNavigationOverlay(
                         player: player,
-                        screenLease: viewModel.playerLease,
-                        isActiveVideoRoute: isActiveVideoRoute,
+                        isActiveRoute: isActiveVideoRoute,
                         isRouteActivated: isRouteActivated,
-                        isPageAvailable: viewModel.error == nil && viewModel.unavailability == nil,
+                        hasInlineExitChrome: { hasUsableInlinePlayerChrome },
                         cornerRadius: inlineCornerRadius,
                         actions: playerPageNavigation
                     )
@@ -398,34 +344,24 @@ struct VideoDetailView: View {
 
             rootCommentToast
         }
-        .allowsHitTesting(!player.isFullscreenPresentationActive)
-        .accessibilityHidden(player.isFullscreenPresentationActive)
-        .onChange(of: player.isFullscreenPresentationActive) { _, active in
-            guard !active, let pending = pendingContainerSize else { return }
-            pendingContainerSize = nil
-            updateContainerGeometry(pending)
-        }
-        .guardIPadTopSafeArea(when: true)
-        .background {
+        .playerDetailChrome(
+            isFullscreenPresentationActive: player.isFullscreenPresentationActive,
+            isStatusBarHidden: player.isFullscreen,
+            guardsIPadTopSafeArea: true,
+            preventsContentDismissal: isActiveVideoRoute,
+            presentationContext: presentationContext,
+            coordinator: coordinator,
+            watchdogScreen: "VideoDetail",
+            onRouteAppearance: { event in
+                activationCoordinator.handleAppearance(event, owner: screenOwner)
+            }
+        ) {
             CinematicBackdrop(
                 coverURL: placeholderCoverURL,
                 player: player,
                 ownerLease: viewModel.playerLease,
                 isRouteActive: isRouteActivated && isActiveVideoRoute
             )
-        }
-        .appSurface(.cinematic)
-        .background(alignment: .topLeading) {
-            if let presentationContext {
-                PlayerFullscreenHost(context: presentationContext, navigation: coordinator)
-            }
-        }
-        .toolbar(.hidden, for: .navigationBar)
-        .toolbar(.hidden, for: .tabBar)
-        .keepsInteractivePopGesture()
-        .preventsVideoDetailContentDismissal(isActive: isActiveVideoRoute)
-        .routeAppearanceProbe { event in
-            activationCoordinator.handleAppearance(event, owner: screenOwner)
         }
         .onChange(of: isActiveVideoRoute, initial: true) { _, active in
             if !active {
@@ -441,7 +377,6 @@ struct VideoDetailView: View {
         .onChange(of: coordinator.pendingCommentNavigation?.sequence) { _, _ in
             Task { await handlePendingCommentNavigationIfNeeded() }
         }
-        .freezeWatchdogScreen("VideoDetail")
         .onDisappear {
             cancelSharePreparation()
             downloadRequestSerial &+= 1
@@ -461,7 +396,6 @@ struct VideoDetailView: View {
             else { return }
             viewModel.showToast(message, style: .error)
         }
-        .statusBarHidden(player.isFullscreen)
         .imagePreview(item: $previewImages)
         .sheet(item: $activeSheet) { sheet in
             switch sheet {
@@ -499,57 +433,6 @@ struct VideoDetailView: View {
                 replyPresentation.anchors.sourceProvider = nil
             }
         })
-    }
-
-    @ViewBuilder
-    private var containerGeometryProbes: some View {
-        Color.clear
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
-            .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
-                updateContainerGeometry(size)
-            }
-            .ignoresSafeArea(.keyboard, edges: .bottom)
-
-        if isWideLayout {
-            let restingHeight = restingContainerHeight
-            Color.clear
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
-                .onGeometryChange(for: Bool.self) { proxy in
-                    let safeHeight = proxy.size.height
-                    guard restingHeight.isFinite, restingHeight > 0,
-                          safeHeight.isFinite, safeHeight > 0 else { return false }
-                    return (restingHeight - safeHeight) > 40
-                } action: { docked in
-                    if isKeyboardDocked != docked { isKeyboardDocked = docked }
-                }
-        }
-    }
-
-    private func updateContainerGeometry(_ size: CGSize) {
-        UIHitchMonitor.count("geom")
-        if DeviceCapability.supportsOrientationLock, player.isFullscreenPresentationActive {
-            pendingContainerSize = size
-            return
-        }
-        if size.width.isFinite, size.width > 0, containerWidth != size.width {
-            containerWidth = size.width
-        }
-        let wide = DetailSplitPolicy.usesSplit(
-            isPad: DeviceCapability.supportsPadDetailSplit,
-            containerSize: size
-        )
-        if isWideLayout != wide { isWideLayout = wide }
-        if !wide, isKeyboardDocked { isKeyboardDocked = false }
-        if size.height.isFinite, size.height > 0, restingContainerHeight != size.height {
-            restingContainerHeight = size.height
-        }
-        if wide, wideContainerHeight != size.height { wideContainerHeight = size.height }
-        if size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 {
-            let compactPhone = DeviceCapability.usesCompactPortraitVideoFraming && size.height >= size.width
-            if usesCompactPhoneActions != compactPhone { usesCompactPhoneActions = compactPhone }
-        }
     }
 
     private var rootCommentToast: some View {
@@ -1492,7 +1375,7 @@ struct VideoDetailView: View {
             }
         }
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
-            if height.isFinite, height > 0, abs(height - heroBarHeight) >= 1 { heroBarHeight = height }
+            stageController.updateHeroBarHeight(height)
         }
         .padding(.horizontal, horizontalInset)
     }

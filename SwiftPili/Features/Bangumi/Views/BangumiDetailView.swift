@@ -7,11 +7,8 @@ struct BangumiDetailView: View {
     @State private var routePosition: PlayerRoutePosition?
 
     init(seasonId: Int, routePosition: PlayerRoutePosition? = nil) {
-        let initialBounds = WindowMetricsFallback.currentBounds
         self.seasonId = seasonId
         _routePosition = State(initialValue: routePosition)
-        _containerWidth = State(initialValue: initialBounds.width)
-        _containerSize = State(initialValue: initialBounds.size)
     }
     @State private var viewModel = BangumiViewModel()
     @State private var routeActivation = RouteActivationState()
@@ -19,13 +16,9 @@ struct BangumiDetailView: View {
     @State private var showThread: CommentThreadTarget?
     @State private var commentPresentation = CommentZoomPresentation()
     @State private var replyPresentation = CommentZoomPresentation()
-    @State private var stage = DetailStageState()
-    @State private var heroBarHeight: CGFloat = 0
+    @State private var containerMetrics = PlayerDetailContainerMetrics()
+    @State private var stageController = DetailStageController()
     @State private var previewImages: ImagePreviewItem?
-    @State private var containerWidth: CGFloat
-    @State private var containerSize: CGSize
-    @State private var pendingContainerSize: CGSize?
-    @State private var isKeyboardDocked = false
     @State private var wideComposerExpanded = false
     @State private var compactComposerPresentation = CommentComposerPresentation()
     @State private var commentFocus = CommentComposerFocus()
@@ -51,28 +44,22 @@ struct BangumiDetailView: View {
             source: source
         )
     }
+    private var containerWidth: CGFloat { containerMetrics.containerWidth }
     private var isWideLayout: Bool {
-        DetailSplitPolicy.usesSplit(
-            isRegularWidth: sizeClass == .regular,
-            containerSize: containerSize
-        )
+        containerMetrics.isWideLayout(isRegularWidth: sizeClass == .regular)
     }
+    private var stagePresentation: DetailStagePresentation { stageController.presentation }
     private var stageGeometry: DetailStageLayout.Geometry {
-        DetailStageLayout.geometry(
-            for: stage.presentation,
-            containerSize: CGSize(width: pageWidth, height: containerSize.height),
-            heroReserve: heroBarHeight > 0 ? heroBarHeight + DetailStageLayout.heroContentGap : 0
+        stageController.geometry(
+            containerWidth: pageWidth,
+            containerHeight: containerMetrics.restingHeight
         )
     }
     private var wideVideoSize: CGSize { stageGeometry.playerSize }
     private var showsWideChrome: Bool { isWideLayout }
-    private var showsHeroBar: Bool { isWideLayout && stage.presentation == .hero }
+    private var showsHeroBar: Bool { stageController.showsHeroBar(isWideLayout: isWideLayout) }
     private var hostOwnsInlineSurface: Bool {
-        guard player.isFullscreenPresentationActive,
-              let lease = viewModel.playerLease,
-              player.isCurrentOwner(lease) else { return false }
-        return player.activeSurfaceLease?.ownerLease == lease
-            && player.activeSurfaceLease?.role == .fullscreen
+        PlayerDetailSurfacePolicy.hostOwnsInlineSurface(player: player, lease: viewModel.playerLease)
     }
 
     private var pgcOwner: String { PlayerViewModel.pgcOwner(seasonId) }
@@ -149,7 +136,7 @@ struct BangumiDetailView: View {
     }
 
     private var pageWidth: CGFloat {
-        containerWidth > 0 ? containerWidth : WindowMetricsFallback.currentWidth
+        containerMetrics.pageWidth
     }
     private var safeAreaBottom: CGFloat {
         AppWindowMetrics.safeAreaInsets.bottom
@@ -161,13 +148,23 @@ struct BangumiDetailView: View {
 
     private var showsCommentInput: Bool {
         showThread == nil && isInlineCommentInputEligible
-            && (isWideLayout ? stage.presentation == .stage : commentPresentation.isPresented)
+            && (isWideLayout ? stagePresentation == .stage : commentPresentation.isPresented)
     }
 
     var body: some View {
         let inlineCornerRadius = showsWideChrome ? DetailStageLayout.playerCornerRadius : 0
         ZStack(alignment: .bottom) {
-            containerGeometryProbes
+            PlayerDetailGeometryProbes(
+                isWideLayout: isWideLayout,
+                restingHeight: containerMetrics.restingHeight,
+                isFullscreenPresentationActive: player.isFullscreenPresentationActive,
+                onSizeChange: { size in
+                    containerMetrics.update(size: size, isRegularWidth: sizeClass == .regular)
+                },
+                onKeyboardDockedChange: { docked in
+                    containerMetrics.updateKeyboardDocked(docked)
+                }
+            )
 
             ZStack(alignment: .topLeading) {
                 if isWideLayout {
@@ -216,30 +213,18 @@ struct BangumiDetailView: View {
                 }
                 .frame(width: showsWideChrome ? wideVideoSize.width : nil)
                 .overlay(alignment: .topLeading) {
-                    if !player.isFullscreenPresentationActive, isActiveBangumiRoute {
-                        let showsNavigation = !hasInlineExitChrome || player.showControls
-                        ZStack(alignment: .topLeading) {
-                            if showsNavigation && (!isRouteActivated || !player.showControls) {
-                                PlayerControlsScrim()
-                                    .frame(height: playerVideoHeight)
-                                    .clipShape(
-                                        RoundedRectangle(
-                                            cornerRadius: inlineCornerRadius,
-                                            style: .continuous
-                                        )
-                                    )
-                            }
-                            PlayerPageNavigationButtons(actions: playerPageNavigation)
-                                .padding(.horizontal, PlayerPageNavigationButtons.inlineHorizontalPadding)
-                                .padding(.top, PlayerPageNavigationButtons.topPadding)
-                                .opacity(showsNavigation ? 1 : 0)
-                                .allowsHitTesting(showsNavigation)
-                                .accessibilityHidden(!showsNavigation)
-                        }
-                    }
+                    PlayerDetailInlineNavigationOverlay(
+                        player: player,
+                        isActiveRoute: isActiveBangumiRoute,
+                        isRouteActivated: isRouteActivated,
+                        hasInlineExitChrome: { hasInlineExitChrome },
+                        scrimHeight: playerVideoHeight,
+                        cornerRadius: inlineCornerRadius,
+                        actions: playerPageNavigation
+                    )
                 }
                 .detailStagePlayerPlacement(
-                    isActive: showsWideChrome, geometry: stageGeometry, presentation: stage.presentation
+                    isActive: showsWideChrome, geometry: stageGeometry, presentation: stagePresentation
                 )
                 .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
                 .padding(.bottom, DetailPlayerGeometry.headerBottomInset(isFullscreen: false))
@@ -263,7 +248,7 @@ struct BangumiDetailView: View {
                 compactCommentsOverlay
             }
 
-            if showsWideChrome, wideComposerExpanded, stage.presentation == .stage, showThread == nil {
+            if showsWideChrome, wideComposerExpanded, stagePresentation == .stage, showThread == nil {
                 Color.clear
                     .contentShape(Rectangle())
                     .ignoresSafeArea()
@@ -286,15 +271,18 @@ struct BangumiDetailView: View {
             }
             .animation(motion.feedbackAnimation(normal: .spring(duration: 0.3)), value: viewModel.toast)
         }
-        .allowsHitTesting(!player.isFullscreenPresentationActive)
-        .accessibilityHidden(player.isFullscreenPresentationActive)
-        .onChange(of: player.isFullscreenPresentationActive) { _, active in
-            guard !active, let pending = pendingContainerSize else { return }
-            pendingContainerSize = nil
-            updateContainerGeometry(pending)
-        }
-        .guardIPadTopSafeArea(when: true)
-        .background {
+        .playerDetailChrome(
+            isFullscreenPresentationActive: player.isFullscreenPresentationActive,
+            isStatusBarHidden: player.isFullscreen,
+            guardsIPadTopSafeArea: true,
+            preventsContentDismissal: isActiveBangumiRoute,
+            presentationContext: presentationContext,
+            coordinator: coordinator,
+            watchdogScreen: "BangumiDetail",
+            onRouteAppearance: { event in
+                _ = routeActivation.handle(event, owner: pgcOwner)
+            }
+        ) {
             CinematicBackdrop(
                 coverURL: placeholderCoverURL,
                 player: player,
@@ -302,27 +290,11 @@ struct BangumiDetailView: View {
                 isRouteActive: isRouteActivated && isActiveBangumiRoute
             )
         }
-        .appSurface(.cinematic)
-        .navigationBarTitleDisplayMode(.inline)
-        .statusBarHidden(player.isFullscreen)
-        .toolbar(.hidden, for: .tabBar)
-        .toolbar(.hidden, for: .navigationBar)
-        .toolbarBackground(.hidden, for: .navigationBar)
-        .keepsInteractivePopGesture()
-        .preventsVideoDetailContentDismissal(isActive: isActiveBangumiRoute)
-        .routeAppearanceProbe { event in
-            _ = routeActivation.handle(event, owner: pgcOwner)
-        }
         .onChange(of: isActiveBangumiRoute, initial: true) { _, active in
             let outcome = routeActivation.handle(.routeActivity(active), owner: pgcOwner)
             if outcome == .deactivated, routeActivation.defersActivation {
                 viewModel.revokeLoadForRouteDeparture()
                 player.pauseForRouteDeparture(lease: viewModel.playerLease)
-            }
-        }
-        .background(alignment: .topLeading) {
-            if let presentationContext {
-                PlayerFullscreenHost(context: presentationContext, navigation: coordinator)
             }
         }
         .task(id: isRouteActivated) { await activateIfNeeded() }
@@ -418,46 +390,9 @@ struct BangumiDetailView: View {
     private static var stageTextInset: CGFloat { 4 }
     private static var contentBottomPadding: CGFloat { 24 }
 
-    @ViewBuilder
-    private var containerGeometryProbes: some View {
-        Color.clear
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
-            .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
-                updateContainerGeometry(size)
-            }
-            .ignoresSafeArea(.keyboard, edges: .bottom)
-
-        if isWideLayout {
-            let restingHeight = containerSize.height
-            Color.clear
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
-                .onGeometryChange(for: Bool.self) { proxy in
-                    let safeHeight = proxy.size.height
-                    guard restingHeight.isFinite, restingHeight > 0,
-                          safeHeight.isFinite, safeHeight > 0 else { return false }
-                    return (restingHeight - safeHeight) > 40
-                } action: { docked in
-                    if isKeyboardDocked != docked { isKeyboardDocked = docked }
-                }
-        }
-    }
-
-    private func updateContainerGeometry(_ size: CGSize) {
-        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else { return }
-        if DeviceCapability.supportsOrientationLock, player.isFullscreenPresentationActive {
-            pendingContainerSize = size
-            return
-        }
-        if containerWidth != size.width { containerWidth = size.width }
-        if containerSize != size { containerSize = size }
-        if !isWideLayout, isKeyboardDocked { isKeyboardDocked = false }
-    }
-
     private var wideStage: some View {
         let geometry = stageGeometry
-        let presentation = stage.presentation
+        let presentation = stagePresentation
         let isStage = presentation == .stage
         let topInset = DetailStageLayout.contentTopInset(
             playerHeight: geometry.playerSize.height, presentation: presentation
@@ -466,7 +401,7 @@ struct BangumiDetailView: View {
             topInset: topInset,
             fadeGap: DetailStageLayout.contentGap(for: presentation),
             bottomSpacer: safeAreaBottom + Self.contentBottomPadding
-                + (isStage ? 0 : containerSize.height * 0.35),
+                + (isStage ? 0 : containerMetrics.restingHeight * 0.35),
             onOffset: handleStageScroll
         ) {
             bangumiColumn(
@@ -483,13 +418,13 @@ struct BangumiDetailView: View {
     private var wideStagePanel: some View {
         CinematicStagePanel(
             geometry: stageGeometry,
-            isStage: stage.presentation == .stage,
-            isKeyboardDocked: isKeyboardDocked
+            isStage: stagePresentation == .stage,
+            isKeyboardDocked: containerMetrics.isKeyboardDocked
         ) {
             ObservedModel(viewModel) { _ in
                 commentReplyRegion {
                     commentList(isWide: true)
-                        .transaction(value: stage.presentation) { $0.animation = nil }
+                        .transaction(value: stagePresentation) { $0.animation = nil }
                         .allowsHitTesting(showThread == nil)
                         .accessibilityHidden(showThread != nil)
                         .overlay(alignment: .bottom) {
@@ -677,16 +612,16 @@ struct BangumiDetailView: View {
     // MARK: - Stage and comment presentation
 
     private func setStagePresentation(_ next: DetailStagePresentation) {
-        guard isWideLayout, stage.presentation != next else { return }
-        withAnimation(motion.animation(normal: .spring(duration: 0.45, bounce: 0.12))) {
-            _ = stage.set(next)
-        }
+        stageController.transition(to: next, isWideLayout: isWideLayout, motion: motion)
     }
 
     private func handleStageScroll(_ offset: CGFloat) {
-        guard showsWideChrome, let next = stage.target(forScrollOffset: offset) else { return }
-        PlayerLog.log("[BangumiStage] \(stage.presentation) → \(next) offset=\(Int(offset))")
-        setStagePresentation(next)
+        stageController.handleScroll(
+            offset: offset,
+            isWideLayout: showsWideChrome,
+            motion: motion,
+            logTag: "BangumiStage"
+        )
     }
 
     private func openComments() {
@@ -833,7 +768,7 @@ struct BangumiDetailView: View {
             heroCommentsCapsule
         }
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
-            if height.isFinite, height > 0, abs(height - heroBarHeight) >= 1 { heroBarHeight = height }
+            stageController.updateHeroBarHeight(height)
         }
         .padding(.horizontal, horizontalInset)
     }
