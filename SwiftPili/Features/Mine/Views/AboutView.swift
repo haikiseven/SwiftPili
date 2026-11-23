@@ -52,7 +52,10 @@ struct AboutView: View {
 
     @ViewBuilder
     private var appIcon: some View {
-        if let image = info.iconNames.lazy.compactMap({ UIImage(named: $0) }).first {
+        let candidates = info.resolvedIconNames(
+            activeAlternateIconName: UIApplication.shared.alternateIconName
+        )
+        if let image = candidates.lazy.compactMap({ UIImage(named: $0) }).first {
             Image(uiImage: image)
                 .resizable()
                 .scaledToFit()

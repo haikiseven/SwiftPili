@@ -1,9 +1,11 @@
 import SwiftUI
+import UIKit
 
 struct ColorSettingsView: View {
     @AppMotion private var motion
     @State private var selected = AccentTheme.current
     @State private var scope = AccentScope.current
+    @State private var syncAppIcon = AppIconSync.isEnabled
 
     private var effectiveContentAccent: Color {
         guard scope.includesControls, let selected else { return .accentColor }
@@ -14,6 +16,7 @@ struct ColorSettingsView: View {
         selected = theme
         AccentTheme.current = theme
         AccentStore.shared.reload()
+        AppIconSync.syncIfEnabled(for: theme)
     }
 
     var body: some View {
@@ -43,6 +46,25 @@ struct ColorSettingsView: View {
                         Text("Apply Color To")
                     } icon: {
                         SettingsIcon(symbol: "paintpalette")
+                    }
+                }
+
+                if UIApplication.shared.supportsAlternateIcons {
+                    Toggle(isOn: Binding(
+                        get: { syncAppIcon },
+                        set: { newValue in
+                            syncAppIcon = newValue
+                            AppIconSync.isEnabled = newValue
+                            if newValue {
+                                AppIconSync.syncIfEnabled(for: selected)
+                            }
+                        }
+                    )) {
+                        Label {
+                            Text("Sync App Icon")
+                        } icon: {
+                            SettingsIcon(symbol: "app.badge")
+                        }
                     }
                 }
             }

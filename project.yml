@@ -28,7 +28,19 @@ targets:
     type: application
     platform: iOS
     sources:
-      - SwiftPili
+      - path: SwiftPili
+        excludes:
+          - Resources/AppIcons
+      - path: SwiftPili/Resources/AppIcons/AppIcon.icon
+        buildPhase: resources
+      - path: SwiftPili/Resources/AppIcons/AppIconPink.icon
+        buildPhase: resources
+      - path: SwiftPili/Resources/AppIcons/AppIconGreen.icon
+        buildPhase: resources
+      - path: SwiftPili/Resources/AppIcons/AppIconOrange.icon
+        buildPhase: resources
+      - path: SwiftPili/Resources/AppIcons/AppIconRed.icon
+        buildPhase: resources
     configFiles:
       Debug: Configuration/Signing.xcconfig
       Release: Configuration/Signing.xcconfig
@@ -36,6 +48,7 @@ targets:
       base:
         INFOPLIST_FILE: SwiftPili/Resources/Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS: "YES"
         VALIDATE_PRODUCT: "NO"
     dependencies:
       - package: Kingfisher

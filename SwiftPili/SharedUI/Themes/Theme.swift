@@ -22,6 +22,16 @@ enum AccentTheme: String, CaseIterable, Identifiable {
         }
     }
 
+    var alternateIconName: String? {
+        switch self {
+        case .bilibiliPink: nil
+        case .pink: "AppIconPink"
+        case .green: "AppIconGreen"
+        case .orange: "AppIconOrange"
+        case .red: "AppIconRed"
+        }
+    }
+
     static var current: AccentTheme? {
         get {
             guard let raw = UserDefaults.standard.string(forKey: storageKey),
@@ -36,6 +46,35 @@ enum AccentTheme: String, CaseIterable, Identifiable {
             } else {
                 UserDefaults.standard.removeObject(forKey: storageKey)
             }
+        }
+    }
+}
+
+@MainActor
+enum AppIconSync {
+    static let storageKey = "sync_app_icon_with_accent"
+
+    static var isEnabled: Bool {
+        get {
+            UserDefaults.standard.object(forKey: storageKey) as? Bool ?? true
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: storageKey)
+        }
+    }
+
+    static func targetIconName(for theme: AccentTheme?) -> String? {
+        (theme ?? .bilibiliPink).alternateIconName
+    }
+
+    static func syncIfEnabled(for theme: AccentTheme?) {
+        guard isEnabled else { return }
+        let application = UIApplication.shared
+        guard application.supportsAlternateIcons else { return }
+        let targetName = targetIconName(for: theme)
+        guard application.alternateIconName != targetName else { return }
+        Task { @MainActor in
+            try? await application.setAlternateIconName(targetName)
         }
     }
 }

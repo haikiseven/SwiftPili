@@ -1,7 +1,0 @@
-# Intermediates. The inputs are the design document and these scripts; the
-# outputs are the committed PNGs in AppIcon.appiconset.
-render-*.html
-out-*.png
-node_modules/
-package.json
-package-lock.json
