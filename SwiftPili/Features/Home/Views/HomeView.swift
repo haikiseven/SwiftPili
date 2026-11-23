@@ -34,9 +34,10 @@ struct HomeView: View {
     @State private var recentSections: [HomeSection] = [.recommend]
     @State private var viewModel = HomeViewModel()
     @Environment(AppCoordinator.self) private var coordinator
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     private static let maxVisitedSections = 3
-    private var isPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
+    private var usesRegularChrome: Bool { horizontalSizeClass == .regular }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -46,9 +47,9 @@ struct HomeView: View {
         .appAmbientBrowseBackground()
         .navigationTitle("Home")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar(isPad ? .visible : .hidden, for: .navigationBar)
+        .toolbar(usesRegularChrome ? .visible : .hidden, for: .navigationBar)
         .toolbar {
-            if isPad, AuthManager.shared.isLoggedIn {
+            if usesRegularChrome, AuthManager.shared.isLoggedIn {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         coordinator.navigate(to: .messages)
@@ -67,7 +68,7 @@ struct HomeView: View {
 
     @ViewBuilder
     private var homeHeaderBar: some View {
-        if isPad {
+        if usesRegularChrome {
             HomeSectionPillBar(
                 selection: selectedSection,
                 onSelect: selectSection

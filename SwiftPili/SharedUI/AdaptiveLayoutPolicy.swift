@@ -1,4 +1,68 @@
 import Foundation
+import UIKit
+
+@MainActor
+enum DeviceCapability {
+    /// Phones lock portrait outside fullscreen playback; iPads rotate freely.
+    static var supportsOrientationLock: Bool {
+        UIDevice.current.userInterfaceIdiom == .phone
+    }
+
+    /// iOS 26 tab bar minimization applies to phone-class devices only.
+    static var usesPhoneTabBarMinimization: Bool {
+        UIDevice.current.userInterfaceIdiom == .phone
+    }
+
+    /// Pad-class devices support side-by-side detail split layouts and the iPad stage setting.
+    static var supportsPadDetailSplit: Bool {
+        UIDevice.current.userInterfaceIdiom == .pad
+    }
+
+    /// Pad-class devices use form/page sheet presentation sizing in regular-width windows.
+    static var supportsPadFormSheetPresentation: Bool {
+        UIDevice.current.userInterfaceIdiom == .pad
+    }
+
+    /// Phones use 3:4 inline portrait-video framing; iPads keep 16:9 widescreen framing.
+    static var usesCompactPortraitVideoFraming: Bool {
+        UIDevice.current.userInterfaceIdiom != .pad
+    }
+
+    /// Pad-class windows can omit SwiftUI top safe area propagation in fullscreen-capable detail hosts.
+    static var requiresPadTopSafeAreaGuard: Bool {
+        UIDevice.current.userInterfaceIdiom == .pad
+    }
+
+    /// Pad-class devices support the floating keyboard composer dock in wide landscape windows.
+    static var supportsPadKeyboardDock: Bool {
+        UIDevice.current.userInterfaceIdiom == .pad
+    }
+}
+
+enum WindowMetricsFallback {
+    static let defaultSize = CGSize(width: 390, height: 844)
+    static let defaultBounds = CGRect(origin: .zero, size: defaultSize)
+    static var defaultWidth: CGFloat { defaultSize.width }
+
+    @MainActor
+    static var currentBounds: CGRect {
+        if let bounds = AppWindowMetrics.current?.bounds,
+           bounds.width > 0, bounds.height > 0 {
+            return bounds
+        }
+        return defaultBounds
+    }
+
+    @MainActor
+    static var currentSize: CGSize {
+        currentBounds.size
+    }
+
+    @MainActor
+    static var currentWidth: CGFloat {
+        currentBounds.width
+    }
+}
 
 enum FeedColumnPolicy {
     enum Surface {
@@ -142,6 +206,27 @@ enum DetailSplitPolicy {
         else { return false }
         return containerSize.width > containerSize.height
             && containerSize.width >= primaryMinimumWidth + companionMinimumWidth
+    }
+
+    static func usesSplit(
+        isRegularWidth: Bool,
+        supportsPadSplit: Bool,
+        containerSize: CGSize
+    ) -> Bool {
+        guard isRegularWidth, supportsPadSplit else { return false }
+        return usesSplit(isPad: true, containerSize: containerSize)
+    }
+
+    @MainActor
+    static func usesSplit(
+        isRegularWidth: Bool,
+        containerSize: CGSize
+    ) -> Bool {
+        usesSplit(
+            isRegularWidth: isRegularWidth,
+            supportsPadSplit: DeviceCapability.supportsPadDetailSplit,
+            containerSize: containerSize
+        )
     }
 
     static func companionColumnWidth(containerWidth: CGFloat) -> CGFloat {

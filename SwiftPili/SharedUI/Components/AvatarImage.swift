@@ -7,13 +7,14 @@ struct AvatarImage: View {
 
     @Environment(\.imageDiagnosticsScreen) private var diagnosticsScreen
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.displayScale) private var displayScale
 
     private var site: ImageSite {
         ImageSite(screen: diagnosticsScreen, component: "AvatarImage")
     }
 
     var body: some View {
-        let scale = UIScreen.main.scale
+        let scale = displayScale > 0 ? displayScale : 1
         RequestedAvatarImage(
             sourceURL: urlString ?? "",
             pointSize: size,

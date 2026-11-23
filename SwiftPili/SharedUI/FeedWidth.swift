@@ -67,8 +67,8 @@ enum FeedWidth {
 
     @MainActor
     private static var windowWidth: CGFloat {
-        if let frame = AppWindowMetrics.frameInScreen { return frame.width }
-        return UIScreen.main.bounds.width
+        if let frame = AppWindowMetrics.frameInScreen, frame.width > 0 { return frame.width }
+        return WindowMetricsFallback.currentWidth
     }
 }
 

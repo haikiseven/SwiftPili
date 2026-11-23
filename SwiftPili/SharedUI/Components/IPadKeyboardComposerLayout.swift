@@ -10,8 +10,12 @@ enum IPadKeyboardComposerLayout {
     static let sendButtonVisualDiameter: CGFloat = 32
     static let hitTargetSize: CGFloat = 44
 
-    @MainActor static func usesDock(windowSize: CGSize) -> Bool {
-        UIDevice.current.userInterfaceIdiom == .pad
+    @MainActor static func usesDock(
+        windowSize: CGSize,
+        isRegularWidth: Bool = true
+    ) -> Bool {
+        DeviceCapability.supportsPadKeyboardDock
+            && isRegularWidth
             && windowSize.width > windowSize.height
     }
 }
@@ -143,7 +147,10 @@ private struct IPadWindowGeometryProbe: UIViewRepresentable {
 
         func report() {
             guard let window else { return }
-            let value = IPadKeyboardComposerLayout.usesDock(windowSize: window.bounds.size)
+            let value = IPadKeyboardComposerLayout.usesDock(
+                windowSize: window.bounds.size,
+                isRegularWidth: window.traitCollection.horizontalSizeClass == .regular
+            )
             guard value != lastReported else { return }
             lastReported = value
             DispatchQueue.main.async { [weak self] in

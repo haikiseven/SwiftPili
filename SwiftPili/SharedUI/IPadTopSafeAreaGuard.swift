@@ -4,7 +4,7 @@ import UIKit
 extension View {
     @ViewBuilder
     func guardIPadTopSafeArea(when isEnabled: Bool = true) -> some View {
-        if UIDevice.current.userInterfaceIdiom == .pad {
+        if DeviceCapability.requiresPadTopSafeAreaGuard {
             modifier(IPadTopSafeAreaGuardModifier(isEnabled: isEnabled))
         } else {
             self

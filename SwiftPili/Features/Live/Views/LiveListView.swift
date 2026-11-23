@@ -9,8 +9,9 @@ struct LiveListView: View {
     @State private var areasGate = FeedLoadAdmissionGate()
     @State private var showAllTags = false
     @Environment(AppCoordinator.self) private var coordinator
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
-    private var isPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
+    private var usesRegularChrome: Bool { horizontalSizeClass == .regular }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -55,7 +56,7 @@ struct LiveListView: View {
         .appAmbientBrowseBackground()
         .navigationTitle("Live")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar(isPad ? .visible : .hidden, for: .navigationBar)
+        .toolbar(usesRegularChrome ? .visible : .hidden, for: .navigationBar)
         .sheet(isPresented: $showAllTags) {
             LiveAreaSheet(
                 areas: viewModel.areas,

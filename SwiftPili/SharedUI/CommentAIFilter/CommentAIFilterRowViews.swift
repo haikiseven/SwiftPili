@@ -1,5 +1,4 @@
 import SwiftUI
-import UIKit
 
 struct CommentAIFilterRowContainer<Content: View>: View {
     let comment: CommentResult.CommentItem
@@ -36,7 +35,7 @@ struct CommentAIFilterRowContainer<Content: View>: View {
         }
         .sheet(isPresented: $showDetailSheet) {
             if let assessment {
-                let isRegularPad = UIDevice.current.userInterfaceIdiom == .pad
+                let isRegularPad = DeviceCapability.supportsPadFormSheetPresentation
                     && horizontalSizeClass == .regular
                 CommentAIFilterDetailSheet(
                     comment: comment,

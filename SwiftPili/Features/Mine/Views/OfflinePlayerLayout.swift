@@ -6,11 +6,16 @@ struct OfflinePlayerLayout {
     let metadataWidth: CGFloat
 
     init(
-        containerSize: CGSize, layoutContainerSize: CGSize,
-        isPad: Bool, isPortraitContent: Bool, isCondensed: Bool
+        containerSize: CGSize,
+        layoutContainerSize: CGSize,
+        isRegularWidth: Bool,
+        supportsPadSplit: Bool,
+        isPortraitContent: Bool,
+        isCondensed: Bool
     ) {
         isSplit = DetailSplitPolicy.usesSplit(
-            isPad: isPad,
+            isRegularWidth: isRegularWidth,
+            supportsPadSplit: supportsPadSplit,
             containerSize: layoutContainerSize
         )
         let stageContentWidth = max(

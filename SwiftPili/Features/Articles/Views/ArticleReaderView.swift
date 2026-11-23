@@ -13,12 +13,13 @@ struct ArticleReaderView: View {
     @State private var showThread: CommentThreadTarget?
     @State private var commentFocus = CommentComposerFocus()
     @State private var commentLinkLifetime = ContentLinkLifetime()
-    @State private var containerSize = (AppWindowMetrics.current?.bounds ?? UIScreen.main.bounds).size
+    @State private var containerSize = WindowMetricsFallback.currentSize
     @Environment(AppCoordinator.self) private var coordinator
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     private var usesSplit: Bool {
         DetailSplitPolicy.usesSplit(
-            isPad: UIDevice.current.userInterfaceIdiom == .pad,
+            isRegularWidth: horizontalSizeClass == .regular,
             containerSize: containerSize
         )
     }

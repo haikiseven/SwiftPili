@@ -26,6 +26,7 @@ struct CoverImage: View {
 
     @Environment(\.imageDiagnosticsScreen) private var diagnosticsScreen
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.displayScale) private var displayScale
 
     private let componentFile: String
     private let componentLine: Int
@@ -187,7 +188,7 @@ struct CoverImage: View {
     private func image(box: CGSize, drawn: CGSize) -> some View {
         if box.width > 1, box.height > 1 {
             let serverCrops = cropsOnServer(drawnBox: drawn)
-            let scale = UIScreen.main.scale
+            let scale = displayScale > 0 ? displayScale : 1
             let chromeSide = min(drawn.width, drawn.height) > 1
                 ? min(drawn.width, drawn.height)
                 : min(box.width, box.height)

@@ -7,7 +7,7 @@ struct BangumiDetailView: View {
     @State private var routePosition: PlayerRoutePosition?
 
     init(seasonId: Int, routePosition: PlayerRoutePosition? = nil) {
-        let initialBounds = AppWindowMetrics.current?.bounds ?? UIScreen.main.bounds
+        let initialBounds = WindowMetricsFallback.currentBounds
         self.seasonId = seasonId
         _routePosition = State(initialValue: routePosition)
         _containerWidth = State(initialValue: initialBounds.width)
@@ -52,7 +52,7 @@ struct BangumiDetailView: View {
     }
     private var isWideLayout: Bool {
         DetailSplitPolicy.usesSplit(
-            isPad: UIDevice.current.userInterfaceIdiom == .pad,
+            isRegularWidth: sizeClass == .regular,
             containerSize: containerSize
         )
     }
@@ -102,7 +102,7 @@ struct BangumiDetailView: View {
 
     private var playerVideoHeight: CGFloat {
         if isWideLayout { return wideVideoSize.height }
-        let fallbackBounds = AppWindowMetrics.current?.bounds ?? UIScreen.main.bounds
+        let fallbackBounds = WindowMetricsFallback.currentBounds
         let base = containerWidth > 0
             ? containerWidth
             : min(fallbackBounds.width, fallbackBounds.height)
@@ -110,7 +110,7 @@ struct BangumiDetailView: View {
         return DetailPlayerGeometry.videoHeight(
             containerWidth: base,
             primaryColumnWidth: nil,
-            isPortraitContent: UIDevice.current.userInterfaceIdiom != .pad
+            isPortraitContent: DeviceCapability.usesCompactPortraitVideoFraming
                 && shapeIsCurrent && player.isPortraitContent,
             isCondensed: shapeIsCurrent && player.inlineCondensed
         )
@@ -141,7 +141,7 @@ struct BangumiDetailView: View {
     }
 
     private var pageWidth: CGFloat {
-        containerWidth > 0 ? containerWidth : (AppWindowMetrics.current?.bounds.width ?? UIScreen.main.bounds.width)
+        containerWidth > 0 ? containerWidth : WindowMetricsFallback.currentWidth
     }
     private var safeAreaBottom: CGFloat {
         AppWindowMetrics.safeAreaInsets.bottom

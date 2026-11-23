@@ -113,7 +113,7 @@ private extension SettingsView {
                 settingsLabel("Homepage Layout", symbol: "square.grid.2x2")
             }
 
-            if UIDevice.current.userInterfaceIdiom == .pad {
+            if DeviceCapability.supportsPadDetailSplit {
                 Picker(selection: $detailStartsInStage) {
                     Text("Hero First").tag(false)
                     Text("Direct Stage").tag(true)

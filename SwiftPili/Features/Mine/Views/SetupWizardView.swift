@@ -380,7 +380,7 @@ private struct SetupWizardPlaybackStep: View {
                 }
             }
 
-            if UIDevice.current.userInterfaceIdiom == .pad {
+            if DeviceCapability.supportsPadDetailSplit {
                 SetupWizardDetailLayoutCard()
             }
         }

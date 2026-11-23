@@ -17,9 +17,10 @@ struct DynamicsView: View {
     @State private var commentTarget: DynamicFeedResult.DynamicItem?
     @State private var repostTarget: DynamicFeedResult.DynamicItem?
     @Environment(AppCoordinator.self) private var coordinator
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     private static let maxVisitedSelections = 3
-    private var isPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
+    private var usesRegularChrome: Bool { horizontalSizeClass == .regular }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -27,7 +28,7 @@ struct DynamicsView: View {
                 selection: viewModel.selection,
                 selectionKey: DynamicsSelectionKey(viewModel.selection),
                 selectedAuthorMID: viewModel.selectedAuthorMID,
-                showsComposeButton: !isPad && AuthManager.shared.isLoggedIn,
+                showsComposeButton: !usesRegularChrome && AuthManager.shared.isLoggedIn,
                 onSelect: { target in
                     chooseSelection(target)
                 },
@@ -61,9 +62,9 @@ struct DynamicsView: View {
         .appAmbientBrowseBackground()
         .navigationTitle("Moments")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar(isPad ? .visible : .hidden, for: .navigationBar)
+        .toolbar(usesRegularChrome ? .visible : .hidden, for: .navigationBar)
         .toolbar {
-            if isPad, AuthManager.shared.isLoggedIn {
+            if usesRegularChrome, AuthManager.shared.isLoggedIn {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         beginComposeMoment()

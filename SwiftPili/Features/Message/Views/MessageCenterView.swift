@@ -61,13 +61,14 @@ enum MessageTab: String, CaseIterable {
 struct MessageCenterView: View {
     @State private var viewModel = MessageCenterViewModel()
     @Environment(AppCoordinator.self) private var coordinator
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     @State private var selection: MessageSelection?
 
     var body: some View {
         GeometryReader { proxy in
             let usesSplit = DetailSplitPolicy.usesSplit(
-                isPad: UIDevice.current.userInterfaceIdiom == .pad,
+                isRegularWidth: horizontalSizeClass == .regular,
                 containerSize: proxy.size
             )
             Group {

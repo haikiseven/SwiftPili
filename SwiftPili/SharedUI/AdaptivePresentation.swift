@@ -29,7 +29,7 @@ private struct AppAdaptiveSheetModifier: ViewModifier {
         AppWindowMetrics.current?.traitCollection.horizontalSizeClass ?? .unspecified
 
     private var usesRegularPadSizing: Bool {
-        guard UIDevice.current.userInterfaceIdiom == .pad else { return false }
+        guard DeviceCapability.supportsPadFormSheetPresentation else { return false }
         let effective = windowHorizontalSizeClass == .unspecified
             ? (AppWindowMetrics.current?.traitCollection.horizontalSizeClass ?? .unspecified)
             : windowHorizontalSizeClass
@@ -40,7 +40,7 @@ private struct AppAdaptiveSheetModifier: ViewModifier {
     func body(content: Content) -> some View {
         sizedContent(content)
             .background {
-                if UIDevice.current.userInterfaceIdiom == .pad {
+                if DeviceCapability.supportsPadFormSheetPresentation {
                     WindowHorizontalSizeClassProbe { sizeClass in
                         if windowHorizontalSizeClass != sizeClass {
                             windowHorizontalSizeClass = sizeClass

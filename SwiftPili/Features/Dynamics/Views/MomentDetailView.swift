@@ -28,12 +28,13 @@ struct MomentDetailView: View {
 
     @Environment(AppCoordinator.self) private var coordinator
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
-    @State private var containerSize = (AppWindowMetrics.current?.bounds ?? UIScreen.main.bounds).size
+    @State private var containerSize = WindowMetricsFallback.currentSize
 
     private var usesSplit: Bool {
         DetailSplitPolicy.usesSplit(
-            isPad: UIDevice.current.userInterfaceIdiom == .pad,
+            isRegularWidth: horizontalSizeClass == .regular,
             containerSize: containerSize
         )
     }

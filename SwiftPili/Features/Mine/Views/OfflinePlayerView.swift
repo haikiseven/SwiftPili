@@ -10,6 +10,7 @@ struct OfflinePlayerView: View {
     @State private var presentationScreenID = UUID()
     @State private var routePosition: PlayerRoutePosition?
     @Environment(AppCoordinator.self) private var coordinator
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.scenePhase) private var scenePhase
     @State private var pagingReducer: PortraitPagingReducer
     @State private var dragOffsetBox = PortraitDragOffsetBox()
@@ -18,7 +19,7 @@ struct OfflinePlayerView: View {
     @State private var assetValid = true
     @State private var inlineContainerSize: CGSize = .zero
     @State private var owner: String
-    @State private var containerWidth: CGFloat = AppWindowMetrics.current?.bounds.width ?? UIScreen.main.bounds.width
+    @State private var containerWidth: CGFloat = WindowMetricsFallback.currentWidth
     private var player: PlayerViewModel { .shared }
     private var isActiveOfflineRoute: Bool {
         coordinator.isActivePlayerRoute(.offline(pagingContext), position: routePosition)
@@ -61,10 +62,10 @@ struct OfflinePlayerView: View {
         return player.isCurrentPresentationSource(lease: ownerLease, source: .offline(asset))
     }
     private var pageIsPortraitContent: Bool {
-        UIDevice.current.userInterfaceIdiom != .pad && playerShapeIsCurrent && player.isPortraitContent
+        DeviceCapability.usesCompactPortraitVideoFraming && playerShapeIsCurrent && player.isPortraitContent
     }
     private var pageWidth: CGFloat {
-        containerWidth > 0 ? containerWidth : (AppWindowMetrics.current?.bounds.width ?? UIScreen.main.bounds.width)
+        containerWidth > 0 ? containerWidth : WindowMetricsFallback.currentWidth
     }
     init(pagingContext: OfflinePortraitPagingContext, routePosition: PlayerRoutePosition? = nil) {
         self.pagingContext = pagingContext
@@ -264,8 +265,11 @@ extension OfflinePlayerView {
             if let item, assetValid {
                 GeometryReader { geometry in
                     let shapeIsCurrent = playerShapeIsCurrent
-                    let layout = OfflinePlayerLayout(containerSize: geometry.size,
-                        layoutContainerSize: inlineContainerSize, isPad: UIDevice.current.userInterfaceIdiom == .pad,
+                    let layout = OfflinePlayerLayout(
+                        containerSize: geometry.size,
+                        layoutContainerSize: inlineContainerSize,
+                        isRegularWidth: horizontalSizeClass == .regular,
+                        supportsPadSplit: DeviceCapability.supportsPadDetailSplit,
                         isPortraitContent: pageIsPortraitContent,
                         isCondensed: shapeIsCurrent && player.inlineCondensed
                     )
