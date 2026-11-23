@@ -11,14 +11,14 @@ struct CinematicBackdrop: View {
     @Environment(\.colorSchemeContrast) private var contrast
 
     private static let crossFadeDuration = 1.05
-    private static let sourceBlur: CGFloat = 7.5
+    private static let sourceBlur: CGFloat = PlayerAmbientPolicy.blurRadius
     private static let horizontalOverscan: CGFloat = 1.38
 
     var body: some View {
         GeometryReader { outerProxy in
             let safeTop = max(outerProxy.safeAreaInsets.top, 48)
             ZStack(alignment: .top) {
-                Color(white: 0.035)
+                PlayerAmbientPolicy.groundColor
                 GeometryReader { proxy in
                     let envelope = ambientEnvelope(for: proxy.size, safeTop: safeTop)
                     ZStack(alignment: .top) {
@@ -29,7 +29,7 @@ struct CinematicBackdrop: View {
                                     crossFadeDuration: Self.crossFadeDuration
                                 )
                                     .blur(radius: Self.sourceBlur, opaque: true)
-                                    .saturation(1.14)
+                                    .saturation(PlayerAmbientPolicy.saturation)
                                     .scaleEffect(
                                         x: scale(
                                             proxy.size.width * Self.horizontalOverscan,
@@ -86,7 +86,7 @@ struct CinematicBackdrop: View {
                                         endRadius: max(proxy.size.width * 0.78, envelope.height * 0.65)
                                     )
                                 )
-                                .opacity(contrast == .increased ? 0.22 : 0.34)
+                                .opacity(PlayerAmbientPolicy.unifiedOpacity(isIncreasedContrast: contrast == .increased))
                                 .transition(.opacity)
                         }
                     }

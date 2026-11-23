@@ -1,3 +1,4 @@
+import Observation
 import QuartzCore
 import SwiftUI
 
@@ -35,7 +36,9 @@ struct DetailStageState: Equatable, Sendable {
     }
 }
 
-struct DetailStageController: Equatable, Sendable {
+@MainActor
+@Observable
+final class DetailStageController {
     private(set) var state: DetailStageState
     var heroBarHeight: CGFloat = 0
 
@@ -60,7 +63,7 @@ struct DetailStageController: Equatable, Sendable {
         )
     }
 
-    mutating func updateHeroBarHeight(_ height: CGFloat) {
+    func updateHeroBarHeight(_ height: CGFloat) {
         if height.isFinite, height > 0, abs(height - heroBarHeight) >= 1 {
             heroBarHeight = height
         }
@@ -70,8 +73,7 @@ struct DetailStageController: Equatable, Sendable {
         .spring(duration: 0.45, bounce: 0.12)
     }
 
-    @MainActor
-    mutating func transition(
+    func transition(
         to next: DetailStagePresentation,
         isWideLayout: Bool,
         motion: AppMotionPreferences
@@ -82,8 +84,7 @@ struct DetailStageController: Equatable, Sendable {
         }
     }
 
-    @MainActor
-    mutating func handleScroll(
+    func handleScroll(
         offset: CGFloat,
         isWideLayout: Bool,
         motion: AppMotionPreferences,

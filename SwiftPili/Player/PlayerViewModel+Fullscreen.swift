@@ -162,6 +162,23 @@ extension PlayerViewModel {
         isFullscreen || PlayerFullscreenTransitionState.shared.isHostActive
     }
 
+    func captureFullscreenTransitionCover() -> PlayerFullscreenTransitionCover? {
+        if let frame = backend.currentDisplayedFrameForTransition(),
+           frame.size.width > 1, frame.size.height > 1 {
+            return .image(frame, contentMode: scaleMode.contentMode)
+        }
+        if let frame = freezeFrame, frame.size.width > 1, frame.size.height > 1 {
+            return .image(frame, contentMode: scaleMode.contentMode)
+        }
+        if let sourceView = backend.renderViewController?.viewIfLoaded ?? (renderAttachment as? UIView),
+           sourceView.window != nil,
+           sourceView.bounds.width > 1, sourceView.bounds.height > 1,
+           let snapshot = sourceView.snapshotView(afterScreenUpdates: false) {
+            return .snapshotView(snapshot)
+        }
+        return nil
+    }
+
     func enterFullscreen() {
         guard !isFullscreen else { return }
         guard let presentation = fullscreenPresentation,
@@ -172,7 +189,8 @@ extension PlayerViewModel {
             return
         }
         refreshInlineVideoRect()
-        guard presentation.reserveHost(receipt: receipt) else {
+        let transitionCover = captureFullscreenTransitionCover()
+        guard presentation.reserveHost(receipt: receipt, transitionCover: transitionCover) else {
             settleFullscreenPresentation(actualState: false)
             return
         }

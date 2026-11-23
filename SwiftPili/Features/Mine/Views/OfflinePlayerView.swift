@@ -239,9 +239,19 @@ struct OfflinePlayerView: View {
                 }
             }
         }
-        .animation(nil, value: player.isFullscreen)
         .clipped()
         .allowsHitTesting(false)
+    }
+
+    private func originalVideoTarget(for item: DownloadedVideo) -> VideoRouteTarget? {
+        VideoRouteTarget.make(
+            bvid: item.bvid,
+            aid: item.aid,
+            title: item.title,
+            coverURL: item.coverURL,
+            ownerName: item.ownerName,
+            durationSeconds: item.durationSeconds
+        )
     }
 
     @ViewBuilder
@@ -286,7 +296,10 @@ extension OfflinePlayerView {
                                         .fill(Color.black)
                                         .frame(width: layout.playerSize.width, height: layout.playerSize.height)
                                 } else {
-                                    PlayerView(owner: owner, verticalPagingGestureSink: pagingSink,
+                                    PlayerView(
+                                        owner: owner,
+                                        surfaceRole: .inline,
+                                        verticalPagingGestureSink: pagingSink,
                                         pageNavigationActions: playerPageNavigation,
                                         inlineViewportSize: layout.playerSize,
                                         inlineCornerRadius: playerCornerRadius,
@@ -301,9 +314,11 @@ extension OfflinePlayerView {
                             } else {
                                 RouteActivationPlaceholderView(
                                     still: player.outgoingRouteStill(for: owner),
-                                    coverURL: item.coverURL, height: layout.playerSize.height,
+                                    coverURL: item.coverURL,
+                                    height: layout.playerSize.height,
                                     cornerRadius: playerCornerRadius
                                 )
+                                .frame(width: layout.playerSize.width, height: layout.playerSize.height)
                             }
                             PlayerDetailInlineNavigationOverlay(
                                 player: player,
@@ -316,15 +331,22 @@ extension OfflinePlayerView {
                                 actions: playerPageNavigation
                             )
                         }
+                        .frame(width: layout.playerSize.width, height: layout.playerSize.height, alignment: .topLeading)
                         .background {
                             PlayerInlineSlotProbe(cornerRadius: playerCornerRadius)
                                 .allowsHitTesting(false)
                                 .accessibilityHidden(true)
                         }
                     } metadata: {
-                        OfflinePlayerMetadataView(title: item.title, ownerName: item.ownerName,
-                            qualityLabel: item.qualityLabel, fileSizeBytes: item.fileSizeBytes,
-                            isSplit: layout.isSplit
+                        OfflinePlayerMetadataView(
+                            title: item.title,
+                            ownerName: item.ownerName,
+                            qualityLabel: item.qualityLabel,
+                            fileSizeBytes: item.fileSizeBytes,
+                            isSplit: layout.isSplit,
+                            onOpenOriginal: originalVideoTarget(for: item).map { target in
+                                { coordinator.navigate(to: .videoDetail(target)) }
+                            }
                         )
                     }
                 }
@@ -334,21 +356,39 @@ extension OfflinePlayerView {
                         coverURL: item.coverURL,
                         player: player,
                         ownerLease: ownerLease,
-                        isRouteActive: isRouteActivated
+                        isRouteActive: isRouteActivated && isActiveOfflineRoute
                     )
                 }
             } else {
-                ContentUnavailableView(item == nil ? "Not Available" : "Download unavailable",
-                    systemImage: "questionmark.folder",
-                    description: Text("Downloaded files are missing or corrupt.")
-                )
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .overlay(alignment: .topLeading) {
+                ZStack(alignment: .topLeading) {
+                    ContentUnavailableView {
+                        Label(
+                            item == nil
+                                ? LocalizedStringKey("Not Available")
+                                : LocalizedStringKey("Download unavailable"),
+                            systemImage: "questionmark.folder"
+                        )
+                    } description: {
+                        Text("Downloaded files are missing or corrupt.")
+                    } actions: {
+                        Button("Back") {
+                            coordinator.goBack()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(Color.biliAccent)
+                    }
+                    .padding(.top, PlayerPageNavigationButtons.topPadding + PlayerPageNavigationButtons.buttonSize)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+
                     PlayerPageNavigationButtons(actions: playerPageNavigation)
                         .padding(.horizontal, PlayerPageNavigationButtons.inlineHorizontalPadding)
                         .padding(.top, PlayerPageNavigationButtons.topPadding)
                 }
                 .guardIPadTopSafeArea(when: true)
+                .background {
+                    PlayerAmbientPolicy.groundColor
+                        .ignoresSafeArea()
+                }
             }
         }
         .playerDetailInlineContainerSize(
@@ -378,7 +418,10 @@ extension OfflinePlayerView {
             onRouteAppearance: { event in
                 _ = routeActivation.handle(event, owner: owner)
             }
-        )
+        ) {
+            PlayerAmbientPolicy.groundColor
+                .ignoresSafeArea()
+        }
         .onChange(of: isActiveOfflineRoute, initial: true) { _, active in
             let outcome = routeActivation.handle(.routeActivity(active), owner: owner)
             if outcome == .deactivated, routeActivation.defersActivation {

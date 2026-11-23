@@ -102,6 +102,8 @@ struct PlayerView: View {
     @Environment(\.appSceneID) private var appSceneID
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @AppMotion private var motion
     @AppStorage(DanmakuFeatureGate.defaultsKey) private var danmakuEnabled = false
     @State private var danmakuPanelPresented = false
     @State private var gestureDisplay: PlayerGestureDisplay
@@ -220,6 +222,18 @@ struct PlayerView: View {
         (vm.error ?? vm.videoPresentationFailureMessage) != nil
     }
 
+    private var showsUnifiedInlineAmbient: Bool {
+        guard surfaceRole == .inline, !isFullscreenPresentation,
+              isOwner, let screenLease,
+              !reduceTransparency,
+              vm.ambientModeEnabled,
+              ExperimentalSettingsPolicy.isAllowed(.ambient),
+              vm.isAmbientVideoLoaded(for: screenLease),
+              !isPlaybackUnavailable,
+              vm.unavailability == nil else { return false }
+        return true
+    }
+
     var body: some View {
         let _ = UIHitchMonitor.countBody("player")
         let isFullscreenTransitioning = surfaceRole == .fullscreen
@@ -233,9 +247,20 @@ struct PlayerView: View {
                 )
             )
         ZStack {
-            (surfaceRole == .inline || isFullscreenPresentation) ? Color.black : Color.clear
+            if isFullscreenPresentation {
+                Color.black
+            } else if surfaceRole == .inline {
+                Color.black
+                    .opacity(showsUnifiedInlineAmbient ? 0 : 1)
+                    .animation(
+                        motion.animation(normal: .easeInOut(duration: 0.45)),
+                        value: showsUnifiedInlineAmbient
+                    )
+            } else {
+                Color.clear
+            }
 
-            if isOwner {
+            if isOwner, isFullscreenPresentation {
                 PlayerFullscreenAmbientBackdrop(player: vm)
             }
 
@@ -340,29 +365,38 @@ struct PlayerView: View {
             }
 
             if let error = vm.error ?? vm.videoPresentationFailureMessage {
-                VStack(spacing: 12) {
-                    Image(systemName: vm.unavailability?.symbolName
-                        ?? "exclamationmark.triangle.fill")
-                        .font(.largeTitle)
-                        .foregroundStyle(vm.unavailability == nil ? .yellow : .white.opacity(0.8))
+                let title: LocalizedStringKey = vm.unavailability == nil
+                    ? "Playback Failed"
+                    : "Playback Unavailable"
+                ContentUnavailableView {
+                    Label {
+                        Text(title)
+                            .font(.headline)
+                            .foregroundStyle(.white)
+                    } icon: {
+                        Image(systemName: vm.unavailability?.symbolName
+                            ?? "exclamationmark.triangle.fill")
+                            .font(.title2)
+                            .foregroundStyle(vm.unavailability == nil ? .yellow : .white.opacity(0.8))
+                    }
+                } description: {
                     Text(error)
-                        .font(.caption)
-                        .foregroundStyle(.white)
+                        .font(.footnote)
+                        .foregroundStyle(.white.opacity(0.82))
                         .multilineTextAlignment(.center)
-                        .padding(.horizontal)
+                        .lineLimit(3)
+                } actions: {
                     if vm.unavailability?.isRetryable ?? true {
                         Button("Retry") {
                             vm.retryPlayback()
                         }
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 8)
-                        .background(.white.opacity(0.2))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                        .foregroundStyle(.white)
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
                     }
                 }
+                .environment(\.colorScheme, .dark)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 16)
                 .zIndex(3)
             }
 
@@ -450,10 +484,14 @@ struct PlayerView: View {
         .sheet(isPresented: $showSponsorBlock) {
             SponsorBlockPanel(vm: vm)
         }
-        .frame(maxWidth: .infinity)
-        .aspectRatio(containerAspect, contentMode: .fit)
-        .frame(width: allocatedInlineViewport?.width, height: allocatedInlineViewport?.height)
-        .frame(maxHeight: isFullscreenPresentation ? .infinity : nil)
+        .modifier(
+            PlayerViewportFrameModifier(
+                surfaceRole: surfaceRole,
+                containerAspect: containerAspect,
+                allocatedInlineViewport: allocatedInlineViewport,
+                isFullscreenPresentation: isFullscreenPresentation
+            )
+        )
         .background { if isFullscreenPresentation { Color.black } }
         .ignoresSafeArea(.keyboard, edges: .all)
         .ignoresSafeArea(.all, edges: isFullscreenPresentation ? .all : [])
@@ -865,5 +903,25 @@ struct PlayerView: View {
 
     private func scheduleHideControls() {
         if isOwner { vm.scheduleHideControls(isSeeking: gestureDisplay.isSeeking) }
+    }
+}
+
+private struct PlayerViewportFrameModifier: ViewModifier {
+    let surfaceRole: PlayerSurfaceRole
+    let containerAspect: CGFloat
+    let allocatedInlineViewport: CGSize?
+    let isFullscreenPresentation: Bool
+
+    func body(content: Content) -> some View {
+        if surfaceRole == .fullscreen {
+            content
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            content
+                .frame(maxWidth: .infinity)
+                .aspectRatio(containerAspect, contentMode: .fit)
+                .frame(width: allocatedInlineViewport?.width, height: allocatedInlineViewport?.height)
+                .frame(maxHeight: isFullscreenPresentation ? .infinity : nil)
+        }
     }
 }

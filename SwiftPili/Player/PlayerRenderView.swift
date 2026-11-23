@@ -1,3 +1,4 @@
+import QuartzCore
 import SwiftUI
 import UIKit
 
@@ -273,14 +274,51 @@ final class PlayerContainerView: UIView, PlayerRenderAttachment {
     func syncHostedSurfaceLayoutIfNeeded() {
         guard window != nil, bounds.width > 1, bounds.height > 1 else { return }
         embedIfNeeded()
-        if let hostedView = hostedVC?.view, hostedView.superview === self, hostedView.bounds.size != bounds.size {
-            hostedView.frame = bounds
-            layoutIfNeeded()
+        if let hostedView = hostedVC?.view, hostedView.superview === self {
+            if hostedView.bounds.size != bounds.size {
+                if UIView.inheritedAnimationDuration == 0 {
+                    UIView.performWithoutAnimation {
+                        CATransaction.begin()
+                        CATransaction.setDisableActions(true)
+                        hostedView.frame = bounds
+                        layoutIfNeeded()
+                        hostedView.layoutIfNeeded()
+                        CATransaction.commit()
+                    }
+                } else {
+                    hostedView.frame = bounds
+                    layoutIfNeeded()
+                    hostedView.layoutIfNeeded()
+                }
+            } else {
+                hostedView.layoutIfNeeded()
+            }
         }
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        if window != nil, bounds.width > 1, bounds.height > 1 {
+            embedIfNeeded()
+            if let hostedView = hostedVC?.view, hostedView.superview === self {
+                if hostedView.bounds.size != bounds.size {
+                    if UIView.inheritedAnimationDuration == 0 {
+                        UIView.performWithoutAnimation {
+                            CATransaction.begin()
+                            CATransaction.setDisableActions(true)
+                            hostedView.frame = bounds
+                            hostedView.layoutIfNeeded()
+                            CATransaction.commit()
+                        }
+                    } else {
+                        hostedView.frame = bounds
+                        hostedView.layoutIfNeeded()
+                    }
+                } else {
+                    hostedView.layoutIfNeeded()
+                }
+            }
+        }
         UIHitchMonitor.count("surface")
         PlayerViewModel.shared.noteInlineVideoRect(from: self)
         PlayerViewModel.shared.renderAttachmentDidChange(self)
@@ -324,6 +362,15 @@ final class PlayerContainerView: UIView, PlayerRenderAttachment {
         } else {
             addSubview(vc.view)
             pinEdges(vc.view)
+        }
+        if bounds.width > 1, bounds.height > 1 {
+            UIView.performWithoutAnimation {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                vc.view.frame = bounds
+                vc.view.layoutIfNeeded()
+                CATransaction.commit()
+            }
         }
         if let recoveryCoverView { bringSubviewToFront(recoveryCoverView) }
     }

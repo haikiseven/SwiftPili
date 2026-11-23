@@ -366,6 +366,19 @@ extension PlayerViewModel {
         }
     }
 
+    func hasUsableRenderAttachment(
+        forRole role: PlayerSurfaceRole,
+        ownerLease: PlayerOwnerLease
+    ) -> Bool {
+        guard let attachment = renderAttachment,
+              let lease = renderAttachmentSurfaceLease,
+              lease == activeSurfaceLease,
+              lease.ownerLease == ownerLease,
+              lease.role == role else { return false }
+        let snapshot = attachment.presentationSnapshot
+        return snapshot.isAttached && snapshot.isVisible && snapshot.boundsUsable
+    }
+
     func renderAttachmentDidChange(_ attachment: any PlayerRenderAttachment) {
         guard renderAttachment === attachment else { return }
         if let recoveryCover, let image = freezeFrame, ownsRecoveryCoverAuthority(recoveryCover) {
@@ -378,6 +391,7 @@ extension PlayerViewModel {
             isVisible: snapshot.isVisible,
             boundsUsable: snapshot.boundsUsable
         )
+        fullscreenPresentation?.surfaceAttachmentDidChange()
         guard usesDemandPresentationContinuity,
               snapshotGeneration == playerGeneration,
               let pendingFence = lifecycleRecovery.presentationPhase.fence,

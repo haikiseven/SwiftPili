@@ -3,8 +3,14 @@ import UIKit
 
 enum PlayerAmbientPolicy {
     static let analysisBox = CGSize(width: 64, height: 36)
-    static let blurRadius: CGFloat = 5.5
+    static let blurRadius: CGFloat = 7.5
+    static let saturation: Double = 1.14
+    static let groundColor = Color(white: 0.035)
     static let crossFadeDuration: Double = 0.65
+
+    static func unifiedOpacity(isIncreasedContrast: Bool) -> Double {
+        isIncreasedContrast ? 0.22 : 0.34
+    }
 
     static func isEligible(
         mode: PlayerMode,
@@ -51,24 +57,20 @@ enum PlayerAmbientPolicy {
 
 struct PlayerAmbientBackdrop: View {
     let source: PlayerAmbientSource
-    @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var contrast
+    @State private var isAppForeground = UIApplication.shared.applicationState != .background
 
     var body: some View {
         GeometryReader { proxy in
             let size = proxy.size
-            let backdropAlpha = PlayerAmbientPolicy.backdropOpacity(
-                isDarkAppearance: colorScheme == .dark
-            )
             ZStack {
-                Color.black
-                if scenePhase == .active, !reduceTransparency {
+                PlayerAmbientPolicy.groundColor
+                if isAppForeground, !reduceTransparency {
                     ZStack {
                         PlayerAmbientArtworkView(source: source)
                             .blur(radius: PlayerAmbientPolicy.blurRadius, opaque: true)
-                            .saturation(1.14)
+                            .saturation(PlayerAmbientPolicy.saturation)
                             .scaleEffect(
                                 PlayerAmbientPolicy.scale(
                                     from: PlayerAmbientPolicy.analysisBox,
@@ -80,11 +82,20 @@ struct PlayerAmbientBackdrop: View {
                         AmbientLiveLayerView()
                             .frame(width: size.width, height: size.height)
                     }
-                    .opacity(backdropAlpha)
-                    Color.black.opacity(PlayerAmbientPolicy.scrimOpacity(
-                        isDarkAppearance: colorScheme == .dark,
-                        isIncreasedContrast: contrast == .increased
-                    ))
+                    .mask(
+                        RadialGradient(
+                            stops: [
+                                .init(color: .white, location: 0.0),
+                                .init(color: .white.opacity(0.92), location: 0.68),
+                                .init(color: .white.opacity(0.58), location: 0.92),
+                                .init(color: .white.opacity(0.32), location: 1.0)
+                            ],
+                            center: .center,
+                            startRadius: 16,
+                            endRadius: max(size.width, size.height) * 0.66
+                        )
+                    )
+                    .opacity(PlayerAmbientPolicy.unifiedOpacity(isIncreasedContrast: contrast == .increased))
                 }
             }
             .frame(width: size.width, height: size.height)
@@ -92,6 +103,15 @@ struct PlayerAmbientBackdrop: View {
         .clipped()
         .allowsHitTesting(false)
         .accessibilityHidden(true)
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            isAppForeground = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            isAppForeground = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+            isAppForeground = false
+        }
     }
 }
 

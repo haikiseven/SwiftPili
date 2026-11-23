@@ -13,15 +13,45 @@ enum PlayerFullscreenViewportPolicy {
 }
 
 @MainActor
+enum PlayerFullscreenTransitionCover {
+    case image(UIImage, contentMode: UIView.ContentMode)
+    case snapshotView(UIView)
+
+    func makeView(frame: CGRect) -> UIView {
+        switch self {
+        case .image(let image, let contentMode):
+            let imageView = UIImageView(image: image)
+            imageView.frame = frame
+            imageView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            imageView.contentMode = contentMode
+            imageView.backgroundColor = .black
+            imageView.clipsToBounds = true
+            imageView.isUserInteractionEnabled = false
+            return imageView
+        case .snapshotView(let snapshot):
+            snapshot.frame = frame
+            snapshot.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            snapshot.clipsToBounds = true
+            snapshot.isUserInteractionEnabled = false
+            return snapshot
+        }
+    }
+}
+
+@MainActor
 protocol PlayerFullscreenPresentation: AnyObject {
     var routeIsActive: Bool { get }
     var coverage: PlayerPresentationCoverage { get }
     var hasPresentedHost: Bool { get }
     func isCurrentHost(_ identity: UUID) -> Bool
-    func reserveHost(receipt: PlayerPresentationReceipt) -> Bool
+    func reserveHost(
+        receipt: PlayerPresentationReceipt,
+        transitionCover: PlayerFullscreenTransitionCover?
+    ) -> Bool
     func cancelReservedHost(receipt: PlayerPresentationReceipt)
     func reconcile()
     func applyOrientation(mask: UIInterfaceOrientationMask, label: String)
+    func surfaceAttachmentDidChange()
     func relinquishForOwnerReplacement()
 }
 
@@ -101,9 +131,11 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
     private let content: UIHostingController<PlayerFullscreenHostContent>
     private let geometry: PlayerFullscreenHostGeometry
     private let initialInlineSnapshot: PlayerFullscreenStageGeometry.InlineSnapshot?
+    private var initialTransitionCover: PlayerFullscreenTransitionCover?
 
     private let backdropView = UIView()
     private let stageContainerView = UIView()
+    private var transitionCoverView: UIView?
     private var currentAnimator: UIViewPropertyAnimator?
     private var transitionGeneration: UInt64 = 0
     private var stageIsPinnedToFullBounds = false
@@ -113,17 +145,27 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
         UIAccessibility.isReduceMotionEnabled || UIAccessibility.prefersCrossFadeTransitions
     }
 
+    var hasTransitionCover: Bool {
+        transitionCoverView != nil || initialTransitionCover != nil
+    }
+
+    var isStageVisuallyVisible: Bool {
+        isViewLoaded && view.window != nil && !stageContainerView.isHidden && stageContainerView.alpha > 0.01
+    }
+
     init(
         receipt: PlayerPresentationReceipt,
         presenter: PlayerFullscreenHostCoordinator,
         liveRoom: LiveRoomViewModel?,
-        initialInlineSnapshot: PlayerFullscreenStageGeometry.InlineSnapshot?
+        initialInlineSnapshot: PlayerFullscreenStageGeometry.InlineSnapshot?,
+        initialTransitionCover: PlayerFullscreenTransitionCover? = nil
     ) {
         self.receipt = receipt
         let identity = UUID()
         self.identity = identity
         self.presenter = presenter
         self.initialInlineSnapshot = initialInlineSnapshot
+        self.initialTransitionCover = initialTransitionCover
         let geometry = PlayerFullscreenHostGeometry()
         self.geometry = geometry
         content = UIHostingController(
@@ -157,6 +199,7 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
                 stageContainerView.layer.cornerRadius = 0
             }
         }
+        syncTransitionCoverFrame()
         geometry.update(from: view, stageSize: stageContainerView.bounds.size)
     }
 
@@ -175,6 +218,8 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        overrideUserInterfaceStyle = .dark
+        content.overrideUserInterfaceStyle = .dark
         view.backgroundColor = .clear
 
         backdropView.backgroundColor = .black
@@ -188,6 +233,8 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
         stageContainerView.layer.cornerCurve = .continuous
         view.addSubview(stageContainerView)
 
+        applyInitialStageGeometry()
+
         addChild(content)
         content.view.backgroundColor = .clear
         content.view.frame = stageContainerView.bounds
@@ -196,10 +243,59 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
         stageContainerView.addSubview(content.view)
         content.didMove(toParent: self)
 
-        applyInitialStageGeometry()
+        if let cover = initialTransitionCover {
+            initialTransitionCover = nil
+            installTransitionCover(cover)
+        }
+
         geometry.update(from: view, stageSize: stageContainerView.bounds.size)
+        synchronizeContentLayout()
+    }
+
+    func installTransitionCover(_ cover: PlayerFullscreenTransitionCover) {
+        initialTransitionCover = nil
+        transitionCoverView?.removeFromSuperview()
+        guard isViewLoaded else {
+            initialTransitionCover = cover
+            return
+        }
+        let coverView = cover.makeView(frame: stageContainerView.bounds)
+        stageContainerView.addSubview(coverView)
+        stageContainerView.bringSubviewToFront(coverView)
+        transitionCoverView = coverView
+    }
+
+    func clearTransitionCover() {
+        initialTransitionCover = nil
+        transitionCoverView?.removeFromSuperview()
+        transitionCoverView = nil
+    }
+
+    func prepareContentForWindowPresentation() {
+        guard isViewLoaded else { return }
+        if !stageIsPinnedToFullBounds, currentAnimator == nil, !isTransitioningSize {
+            applyInitialStageGeometry()
+        }
+        geometry.update(from: view, stageSize: stageContainerView.bounds.size)
+        synchronizeContentLayout()
+    }
+
+    func synchronizeContentLayout() {
+        guard isViewLoaded else { return }
+        view.layoutIfNeeded()
         stageContainerView.layoutIfNeeded()
         content.view.layoutIfNeeded()
+        syncTransitionCoverFrame()
+    }
+
+    private func syncTransitionCoverFrame() {
+        guard let transitionCoverView, transitionCoverView.superview === stageContainerView else { return }
+        if transitionCoverView.frame != stageContainerView.bounds {
+            transitionCoverView.frame = stageContainerView.bounds
+        }
+        if stageContainerView.subviews.last !== transitionCoverView {
+            stageContainerView.bringSubviewToFront(transitionCoverView)
+        }
     }
 
     private func applyInitialStageGeometry() {
@@ -216,6 +312,7 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
             stageContainerView.layer.cornerRadius = 0
             stageContainerView.alpha = 0
         }
+        syncTransitionCoverFrame()
     }
 
     private func resolvedInlineTarget(
@@ -235,6 +332,7 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
     private func pinStageToFullBounds(size: CGSize? = nil) {
         let bounds = size.map { CGRect(origin: .zero, size: $0) } ?? view.bounds
         stageIsPinnedToFullBounds = true
+        clearTransitionCover()
         stageContainerView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         stageContainerView.frame = bounds
         stageContainerView.layer.cornerRadius = 0
@@ -257,6 +355,7 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
         let gen = transitionGeneration
         stageIsPinnedToFullBounds = false
         view.layoutIfNeeded()
+        geometry.prepareForTransition(to: view.bounds.size)
 
         let reduceMotion = prefersReducedMotion
         if reduceMotion {
@@ -309,6 +408,9 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
         view.layoutIfNeeded()
 
         let target = resolvedInlineTarget(snapshot: snapshot, in: view.bounds.size)
+        if let target {
+            geometry.prepareForTransition(to: target.rect.size)
+        }
         let reduceMotion = prefersReducedMotion || target == nil
         let animator = reduceMotion
             ? UIViewPropertyAnimator(duration: prefersReducedMotion ? 0.15 : 0.20, curve: .easeInOut)
@@ -342,7 +444,6 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
     ) {
         super.viewWillTransition(to: size, with: coordinator)
         isTransitioningSize = true
-        geometry.prepareForTransition(to: size)
         let plan = presenter?.hostRotationWillBegin(self, to: size)
             ?? RotationPlan(generation: 0, mode: .steadyFullscreen)
         let rotationGen = plan.generation
@@ -353,6 +454,7 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
             cancelActiveTransition()
             let gen = transitionGeneration
             stageIsPinnedToFullBounds = false
+            geometry.prepareForTransition(to: size)
             let reduceMotion = prefersReducedMotion
             stageContainerView.autoresizingMask = reduceMotion ? [.flexibleWidth, .flexibleHeight] : []
             if reduceMotion {
@@ -393,6 +495,7 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
             let gen = transitionGeneration
             stageIsPinnedToFullBounds = false
             let target = resolvedInlineTarget(snapshot: snapshot, in: size)
+            geometry.prepareForTransition(to: target?.rect.size ?? size)
             let reduceMotion = prefersReducedMotion || target == nil
             coordinator.animate(alongsideTransition: { [weak self] _ in
                 guard let self else { return }
@@ -423,6 +526,7 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
             })
 
         case .steadyFullscreen:
+            geometry.prepareForTransition(to: size)
             coordinator.animate(alongsideTransition: { [weak self] _ in
                 guard let self else { return }
                 if self.stageIsPinnedToFullBounds {

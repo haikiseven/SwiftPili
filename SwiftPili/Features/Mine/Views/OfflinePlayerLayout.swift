@@ -3,6 +3,7 @@ import SwiftUI
 struct OfflinePlayerLayout {
     let isSplit: Bool
     let playerSize: CGSize
+    let primaryColumnWidth: CGFloat
     let metadataWidth: CGFloat
 
     init(
@@ -13,28 +14,41 @@ struct OfflinePlayerLayout {
         isPortraitContent: Bool,
         isCondensed: Bool
     ) {
-        isSplit = DetailSplitPolicy.usesSplit(
+        let safeWidth = containerSize.width.isFinite ? max(0, containerSize.width) : 0
+        let safeHeight = containerSize.height.isFinite ? max(0, containerSize.height) : 0
+        let splitReferenceSize = (layoutContainerSize.width > 0 && layoutContainerSize.height > 0)
+            ? layoutContainerSize
+            : CGSize(width: safeWidth, height: safeHeight)
+        let split = DetailSplitPolicy.usesSplit(
             isRegularWidth: isRegularWidth,
             supportsPadSplit: supportsPadSplit,
-            containerSize: layoutContainerSize
+            containerSize: splitReferenceSize
         )
-        let stageContentWidth = max(
-            0, containerSize.width - 2 * DetailStageLayout.outerMargin - DetailStageLayout.columnGap
-        )
-        let panelWidth = DetailStageLayout.panelWidth(containerWidth: containerSize.width)
-        let width = isSplit
-            ? floor(max(0, stageContentWidth - panelWidth))
-            : max(0, containerSize.width)
-        let height = DetailPlayerGeometry.videoHeight(
-            containerWidth: containerSize.width,
-            primaryColumnWidth: isSplit ? width : nil,
-            isPortraitContent: isPortraitContent,
-            isCondensed: isCondensed
-        )
-        playerSize = CGSize(width: width, height: height)
-        metadataWidth = isSplit
-            ? floor(panelWidth)
-            : max(0, containerSize.width)
+        isSplit = split
+        if split {
+            let panelWidth = floor(DetailStageLayout.panelWidth(containerWidth: safeWidth))
+            let columnWidth = floor(max(
+                0,
+                safeWidth - 2 * DetailStageLayout.outerMargin - DetailStageLayout.columnGap - panelWidth
+            ))
+            let columnHeight = max(0, safeHeight - 2 * DetailStageLayout.outerMargin)
+            primaryColumnWidth = columnWidth
+            playerSize = DetailStageLayout.videoBox(
+                availableWidth: columnWidth,
+                heightCap: columnHeight
+            )
+            metadataWidth = panelWidth
+        } else {
+            let height = DetailPlayerGeometry.videoHeight(
+                containerWidth: safeWidth,
+                primaryColumnWidth: nil,
+                isPortraitContent: isPortraitContent,
+                isCondensed: isCondensed
+            )
+            primaryColumnWidth = safeWidth
+            playerSize = CGSize(width: safeWidth, height: height)
+            metadataWidth = safeWidth
+        }
     }
 }
 
@@ -44,80 +58,101 @@ struct OfflinePlayerMetadataView: View {
     let qualityLabel: String
     let fileSizeBytes: Int64
     var isSplit = false
+    var onOpenOriginal: (() -> Void)? = nil
 
     private var formattedSize: String {
         ByteCountFormatter.string(fromByteCount: fileSizeBytes, countStyle: .file)
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: isSplit ? AppSpacing.m : 10) {
-            if isSplit {
-                Label("Offline", systemImage: "arrow.down.circle.fill")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.biliAccent)
-            }
+        VStack(alignment: .leading, spacing: isSplit ? AppSpacing.m : 12) {
+            VStack(alignment: .leading, spacing: AppSpacing.s) {
+                Text(title)
+                    .appFont(.screenTitle)
+                    .fontWeight(.bold)
+                    .foregroundStyle(.primary)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
 
-            Text(title)
-                .appFont(isSplit ? .screenTitle : .rowTitle)
-                .fontWeight(.semibold)
-                .foregroundStyle(.primary)
-                .fixedSize(horizontal: false, vertical: true)
+                if !ownerName.isEmpty {
+                    HStack(spacing: 6) {
+                        Image(systemName: "person.circle.fill")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .accessibilityHidden(true)
+                        Text(ownerName)
+                            .appFont(.screenOwner)
+                            .fontWeight(.medium)
+                            .foregroundStyle(.primary.opacity(0.88))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+            }
 
             if isSplit {
                 Divider()
-                    .opacity(0.28)
-                splitMetaSection
-            } else {
-                compactMetaRow
+                    .opacity(0.24)
+            }
+
+            metadataBadges
+
+            if let onOpenOriginal {
+                Button(action: onOpenOriginal) {
+                    Label("View Original Video", systemImage: "arrow.up.forward.app")
+                        .font(.footnote.weight(.medium))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(Color.primary)
+                .padding(.top, AppSpacing.xs)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, isSplit ? 20 : AppSpacing.l)
-        .padding(.vertical, isSplit ? 20 : 14)
-        .fixedSize(horizontal: false, vertical: true)
+        .padding(.vertical, isSplit ? 20 : AppSpacing.l)
     }
 
-    private var splitMetaSection: some View {
-        VStack(alignment: .leading, spacing: AppSpacing.s) {
-            if !ownerName.isEmpty {
-                Label(ownerName, systemImage: "person.circle")
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.primary)
+    private var metadataBadges: some View {
+        FlowLayout(spacing: AppSpacing.s) {
+            Label("Offline", systemImage: "arrow.down.circle.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Color.biliAccent)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(Color.biliAccent.opacity(0.16), in: Capsule())
+                .overlay(
+                    Capsule()
+                        .strokeBorder(Color.biliAccent.opacity(0.28), lineWidth: 0.5)
+                )
+
+            if !qualityLabel.isEmpty {
+                Text(qualityLabel)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.primary.opacity(0.9))
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .background(Color.white.opacity(0.10), in: Capsule())
+                    .overlay(
+                        Capsule()
+                            .strokeBorder(Color.white.opacity(0.12), lineWidth: 0.5)
+                    )
             }
-            HStack(spacing: AppSpacing.s) {
-                if !qualityLabel.isEmpty {
-                    Text(qualityLabel)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.primary.opacity(0.88))
-                        .padding(.horizontal, AppSpacing.s)
-                        .padding(.vertical, 3)
-                        .background(AppFill.inset, in: Capsule())
-                }
-                Text(formattedSize)
-                    .font(.caption)
+
+            if fileSizeBytes > 0 {
+                Label(formattedSize, systemImage: "internaldrive")
+                    .font(.caption.weight(.medium))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .background(Color.white.opacity(0.07), in: Capsule())
+                    .overlay(
+                        Capsule()
+                            .strokeBorder(Color.white.opacity(0.09), lineWidth: 0.5)
+                    )
             }
         }
-    }
-
-    private var compactMetaRow: some View {
-        HStack(spacing: AppSpacing.s) {
-            if !ownerName.isEmpty {
-                Text(ownerName)
-            }
-            if !qualityLabel.isEmpty {
-                Text("·")
-                    .foregroundStyle(.tertiary)
-                Text(qualityLabel)
-            }
-            Text("·")
-                .foregroundStyle(.tertiary)
-            Text(formattedSize)
-                .monospacedDigit()
-        }
-        .font(.caption)
-        .foregroundStyle(.secondary)
     }
 }
 
@@ -126,10 +161,10 @@ struct OfflinePlayerPage<Player: View, Metadata: View>: View {
     let viewportHeight: CGFloat
     private let player: () -> Player
     private let metadata: () -> Metadata
-    @State private var metadataHeight: CGFloat?
 
     init(
-        layout: OfflinePlayerLayout, viewportHeight: CGFloat,
+        layout: OfflinePlayerLayout,
+        viewportHeight: CGFloat,
         @ViewBuilder player: @escaping () -> Player,
         @ViewBuilder metadata: @escaping () -> Metadata
     ) {
@@ -142,8 +177,6 @@ struct OfflinePlayerPage<Player: View, Metadata: View>: View {
     var body: some View {
         let stageInset = layout.isSplit ? DetailStageLayout.outerMargin : 0
         let columnHeight = max(0, viewportHeight - 2 * stageInset)
-        let needsOuterScroll = !layout.isSplit
-            && layout.playerSize.height + (metadataHeight ?? 0) > viewportHeight
         let columns = layout.isSplit
             ? AnyLayout(HStackLayout(alignment: .top, spacing: DetailStageLayout.columnGap))
             : AnyLayout(VStackLayout(alignment: .leading, spacing: 0))
@@ -151,45 +184,43 @@ struct OfflinePlayerPage<Player: View, Metadata: View>: View {
             cornerRadius: layout.isSplit ? DetailStageLayout.panelCornerRadius : 0,
             style: .continuous
         )
-        ScrollView(needsOuterScroll ? .vertical : []) {
-            columns {
-                ScrollView(layout.isSplit && layout.playerSize.height > columnHeight ? .vertical : []) {
-                    player()
-                }
-                .scrollClipDisabled()
+
+        columns {
+            player()
                 .frame(
                     width: layout.playerSize.width,
-                    height: layout.isSplit ? columnHeight : layout.playerSize.height,
+                    height: layout.playerSize.height,
                     alignment: .topLeading
+                )
+                .frame(
+                    width: layout.primaryColumnWidth,
+                    height: layout.isSplit ? columnHeight : layout.playerSize.height,
+                    alignment: .top
                 )
 
-                ScrollView(layout.isSplit && (metadataHeight ?? 0) > columnHeight ? .vertical : []) {
-                    metadata()
-                        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
-                            if metadataHeight == nil || abs((metadataHeight ?? 0) - height) > 0.5 {
-                                metadataHeight = height
-                            }
-                        }
-                }
-                .frame(
-                    width: layout.metadataWidth,
-                    height: layout.isSplit ? columnHeight : metadataHeight,
-                    alignment: .topLeading
-                )
-                .clipShape(panelShape)
-                .background {
-                    if layout.isSplit {
-                        Color.clear
-                            .appCardSurface(in: panelShape)
-                            .allowsHitTesting(false)
-                            .accessibilityHidden(true)
-                    }
+            ScrollView(.vertical) {
+                metadata()
+                    .frame(width: layout.metadataWidth, alignment: .topLeading)
+            }
+            .scrollIndicators(.hidden)
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(
+                width: layout.metadataWidth,
+                height: layout.isSplit ? columnHeight : nil,
+                alignment: .topLeading
+            )
+            .frame(maxHeight: layout.isSplit ? nil : .infinity, alignment: .topLeading)
+            .clipShape(panelShape)
+            .background {
+                if layout.isSplit {
+                    Color.clear
+                        .appCardSurface(in: panelShape)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
                 }
             }
-            .padding(stageInset)
-            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
-        .scrollIndicators(.hidden)
+        .padding(stageInset)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }

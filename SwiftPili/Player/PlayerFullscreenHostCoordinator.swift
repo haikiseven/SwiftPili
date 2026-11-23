@@ -19,6 +19,17 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
     private var rotationInFlight = false
     private var rotationGeneration: UInt64 = 0
     private var rotationFallbackTask: Task<Void, Never>?
+    private var awaitingEnterAttachment = false
+    private var enterAttachmentCommitScheduled = false
+    private var enterAttachmentWaitTask: Task<Void, Never>?
+    private var awaitingInlineReattach = false
+    private var inlineReattachCommitScheduled = false
+    private var inlineReattachWaitTask: Task<Void, Never>?
+    private var pendingInlineDismissSource: String?
+    private var handoffWaitGeneration: UInt64 = 0
+
+    private static let enterAttachmentTimeout: Duration = .milliseconds(100)
+    private static let inlineReattachTimeout: Duration = .milliseconds(120)
 
     init(
         context: PlayerScreenPresentationContext,
@@ -106,11 +117,29 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
         isCurrent && host?.identity == identity
     }
 
-    func reserveHost(receipt: PlayerPresentationReceipt) -> Bool {
+    private func cancelHandoffWaits() {
+        handoffWaitGeneration &+= 1
+        awaitingEnterAttachment = false
+        enterAttachmentCommitScheduled = false
+        enterAttachmentWaitTask?.cancel()
+        enterAttachmentWaitTask = nil
+        awaitingInlineReattach = false
+        inlineReattachCommitScheduled = false
+        inlineReattachWaitTask?.cancel()
+        inlineReattachWaitTask = nil
+        pendingInlineDismissSource = nil
+    }
+
+    func reserveHost(
+        receipt: PlayerPresentationReceipt,
+        transitionCover: PlayerFullscreenTransitionCover?
+    ) -> Bool {
         guard self.receipt == receipt, isCurrent, !dismissalInFlight else { return false }
         if let existingHost = host,
            phase == .leaving,
            existingHost.presentingViewController != nil {
+            let wasAwaitingInlineReattach = awaitingInlineReattach
+            cancelHandoffWaits()
             rotationGeneration &+= 1
             rotationFallbackTask?.cancel()
             rotationFallbackTask = nil
@@ -118,6 +147,17 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
             phase = .entering
             activeAnimationPhase = nil
             PlayerFullscreenTransitionState.shared.update(hostID: existingHost.identity, phase: .entering)
+            if wasAwaitingInlineReattach || !PlayerViewModel.shared.hasUsableRenderAttachment(
+                forRole: .fullscreen,
+                ownerLease: receipt.context.ownerLease
+            ) {
+                if let transitionCover, !existingHost.hasTransitionCover {
+                    existingHost.installTransitionCover(transitionCover)
+                }
+                armEnterSurfaceReadinessWait(for: existingHost)
+            } else {
+                existingHost.clearTransitionCover()
+            }
             return true
         }
         guard host == nil,
@@ -131,7 +171,8 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
             receipt: receipt,
             presenter: self,
             liveRoom: liveRoom,
-            initialInlineSnapshot: PlayerViewModel.shared.inlineStageSnapshot
+            initialInlineSnapshot: PlayerViewModel.shared.inlineStageSnapshot,
+            initialTransitionCover: transitionCover
         )
         controller.transitioningDelegate = self
         reservedHost = controller
@@ -144,8 +185,12 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
 
     func cancelReservedHost(receipt: PlayerPresentationReceipt) {
         guard self.receipt == receipt, isCurrent, phase == .entering,
-              let controller = host,
-              controller.presentingViewController == nil else { return }
+              let controller = host else { return }
+        cancelHandoffWaits()
+        guard controller.presentingViewController == nil else {
+            reconcile()
+            return
+        }
         rotationFallbackTask?.cancel()
         rotationFallbackTask = nil
         host = nil
@@ -166,6 +211,7 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
             } else if let controller = host,
                       phase == .entering,
                       !presentInFlight,
+                      !awaitingEnterAttachment,
                       !rotationInFlight,
                       pendingMask == nil,
                       activeAnimationPhase != .entering {
@@ -173,6 +219,7 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
             }
         } else if let controller = host {
             if phase != .leaving, phase != .retired {
+                cancelHandoffWaits()
                 rotationGeneration &+= 1
                 phase = .leaving
                 activeAnimationPhase = nil
@@ -181,6 +228,7 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
             }
             if phase == .leaving,
                !presentInFlight,
+               !awaitingInlineReattach,
                !rotationInFlight,
                pendingMask == nil,
                activeAnimationPhase != .leaving,
@@ -201,21 +249,76 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
         pendingMask = mask
         pendingMaskLabel = label
         if !PlayerViewModel.shared.isFullscreen, let controller = host, phase != .leaving, phase != .retired {
+            cancelHandoffWaits()
             rotationGeneration &+= 1
             phase = .leaving
             activeAnimationPhase = nil
             controller.cancelActiveTransition()
             PlayerFullscreenTransitionState.shared.update(hostID: controller.identity, phase: .leaving)
         }
-        if !presentInFlight, (phase == .fullscreen || phase == .leaving || (phase == .entering && reservedHost == nil)) {
+        if !presentInFlight,
+           !awaitingEnterAttachment,
+           (phase == .fullscreen || phase == .leaving || (phase == .entering && reservedHost == nil)) {
             commitPendingOrientation(reason: "hostPresented")
         } else if !PlayerViewModel.shared.isFullscreen {
             commitPendingOrientation(reason: "entryCancelled")
         }
     }
 
+    func surfaceAttachmentDidChange() {
+        guard isCurrent, let controller = host, let receipt else { return }
+        let ownerLease = receipt.context.ownerLease
+
+        if awaitingEnterAttachment {
+            if PlayerViewModel.shared.hasUsableRenderAttachment(
+                forRole: .fullscreen,
+                ownerLease: ownerLease
+            ) {
+                scheduleEnterSurfaceReadyCommit(
+                    for: controller,
+                    generation: handoffWaitGeneration,
+                    reason: "surfaceAttached"
+                )
+            }
+            return
+        }
+
+        if awaitingInlineReattach {
+            if PlayerViewModel.shared.hasUsableRenderAttachment(
+                forRole: .inline,
+                ownerLease: ownerLease
+            ) {
+                scheduleInlineReattachDismissal(
+                    for: controller,
+                    generation: handoffWaitGeneration,
+                    source: pendingInlineDismissSource ?? "inlineSurfaceAttached"
+                )
+            }
+            return
+        }
+
+        if (phase == .entering || phase == .fullscreen),
+           controller.hasTransitionCover,
+           PlayerViewModel.shared.hasUsableRenderAttachment(
+               forRole: .fullscreen,
+               ownerLease: ownerLease
+           ) {
+            let generation = handoffWaitGeneration
+            DispatchQueue.main.async { [weak self, weak controller] in
+                MainActor.assumeIsolated {
+                    guard let self, let controller,
+                          self.accepts(controller),
+                          self.handoffWaitGeneration == generation,
+                          (self.phase == .entering || self.phase == .fullscreen) else { return }
+                    controller.clearTransitionCover()
+                }
+            }
+        }
+    }
+
     func relinquishForOwnerReplacement() {
         let outgoingHost = host
+        cancelHandoffWaits()
         rotationGeneration &+= 1
         phase = .retired
         presentInFlight = false
@@ -227,6 +330,7 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
         rotationFallbackTask = nil
         reservedHost = nil
         outgoingHost?.cancelActiveTransition()
+        outgoingHost?.clearTransitionCover()
         if DeviceCapability.supportsOrientationLock, AppOrientation.shared.mask != .portrait {
             AppOrientation.shared.set(.portrait)
             let window = outgoingHost?.viewIfLoaded?.window ?? AppWindowMetrics.current
@@ -278,19 +382,105 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
                 self.completeLeaveAndDismiss(controller, source: "presentationRefused")
                 return
             }
+            controller.prepareContentForWindowPresentation()
             if !PlayerViewModel.shared.isFullscreen {
+                self.cancelHandoffWaits()
                 self.phase = .leaving
                 PlayerFullscreenTransitionState.shared.update(hostID: controller.identity, phase: .leaving)
+                self.logEvent("hostPresented")
+                self.commitPendingOrientation(reason: "presented")
+                self.reconcile()
+                return
             }
             self.logEvent("hostPresented")
-            self.commitPendingOrientation(reason: "presented")
-            self.reconcile()
+            self.armEnterSurfaceReadinessWait(for: controller)
         }
         if controller.presentingViewController == nil, accepts(controller) {
             presentInFlight = false
             PlayerViewModel.shared.exitFullscreen(presentation: self, receipt: receipt)
             completeLeaveAndDismiss(controller, source: "presentationRefused")
         }
+    }
+
+    private func armEnterSurfaceReadinessWait(for controller: PlayerFullscreenHostController) {
+        guard accepts(controller), phase == .entering, let receipt else { return }
+        cancelHandoffWaits()
+        let waitGen = handoffWaitGeneration
+        awaitingEnterAttachment = true
+
+        if PlayerViewModel.shared.hasUsableRenderAttachment(
+            forRole: .fullscreen,
+            ownerLease: receipt.context.ownerLease
+        ) {
+            if controller.hasTransitionCover {
+                scheduleEnterSurfaceReadyCommit(
+                    for: controller,
+                    generation: waitGen,
+                    reason: "alreadyUsable"
+                )
+            } else {
+                finishEnterSurfaceReadiness(
+                    for: controller,
+                    generation: waitGen,
+                    reason: "alreadyUsable"
+                )
+            }
+            return
+        }
+
+        enterAttachmentWaitTask = Task { @MainActor [weak self, weak controller] in
+            try? await Task.sleep(for: Self.enterAttachmentTimeout)
+            guard !Task.isCancelled, let self, let controller,
+                  self.accepts(controller),
+                  self.awaitingEnterAttachment,
+                  self.handoffWaitGeneration == waitGen else { return }
+            PlayerLog.log("[Fullscreen] enter surface wait timeout — continuing transition")
+            self.finishEnterSurfaceReadiness(
+                for: controller,
+                generation: waitGen,
+                reason: "timeout"
+            )
+        }
+    }
+
+    private func scheduleEnterSurfaceReadyCommit(
+        for controller: PlayerFullscreenHostController,
+        generation: UInt64,
+        reason: String
+    ) {
+        guard awaitingEnterAttachment,
+              !enterAttachmentCommitScheduled,
+              handoffWaitGeneration == generation else { return }
+        enterAttachmentCommitScheduled = true
+        DispatchQueue.main.async { [weak self, weak controller] in
+            MainActor.assumeIsolated {
+                guard let self, let controller else { return }
+                self.finishEnterSurfaceReadiness(
+                    for: controller,
+                    generation: generation,
+                    reason: reason
+                )
+            }
+        }
+    }
+
+    private func finishEnterSurfaceReadiness(
+        for controller: PlayerFullscreenHostController,
+        generation: UInt64,
+        reason: String
+    ) {
+        guard accepts(controller),
+              awaitingEnterAttachment,
+              handoffWaitGeneration == generation else { return }
+        cancelHandoffWaits()
+        controller.clearTransitionCover()
+        guard phase == .entering, PlayerViewModel.shared.isFullscreen else {
+            reconcile()
+            return
+        }
+        logEvent("enterSurfaceReady", detail: reason)
+        commitPendingOrientation(reason: "enterSurfaceReady")
+        reconcile()
     }
 
     private func beginEnterAnimationIfNeeded(_ controller: PlayerFullscreenHostController) {
@@ -333,11 +523,115 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
     }
 
     private func completeLeaveAndDismiss(_ controller: PlayerFullscreenHostController, source: String) {
-        guard host === controller, !dismissalInFlight else { return }
+        guard host === controller, !dismissalInFlight, !awaitingInlineReattach else { return }
+        if controller.presentingViewController == nil {
+            cancelHandoffWaits()
+            if let receipt,
+               PlayerViewModel.shared.isCurrentOwner(receipt.context.ownerLease),
+               PlayerViewModel.shared.activeSurfaceLease?.role == .fullscreen {
+                _ = PlayerViewModel.shared.handoffSurfaceSlot(ownerLease: receipt.context.ownerLease, to: .inline)
+            }
+            hostDidDismiss(controller, source: source)
+            return
+        }
+
+        if accepts(controller),
+           let receipt,
+           controller.isStageVisuallyVisible,
+           PlayerViewModel.shared.isCurrentOwner(receipt.context.ownerLease),
+           PlayerViewModel.shared.activeSurfaceLease?.role == .fullscreen {
+            if !controller.hasTransitionCover,
+               let cover = PlayerViewModel.shared.captureFullscreenTransitionCover() {
+                controller.installTransitionCover(cover)
+            }
+            _ = PlayerViewModel.shared.handoffSurfaceSlot(ownerLease: receipt.context.ownerLease, to: .inline)
+            beginInlineReattachWait(
+                for: controller,
+                ownerLease: receipt.context.ownerLease,
+                source: source
+            )
+            return
+        }
+
+        cancelHandoffWaits()
         if let receipt,
            PlayerViewModel.shared.isCurrentOwner(receipt.context.ownerLease),
            PlayerViewModel.shared.activeSurfaceLease?.role == .fullscreen {
             _ = PlayerViewModel.shared.handoffSurfaceSlot(ownerLease: receipt.context.ownerLease, to: .inline)
+        }
+        requestHostDismissal(controller, animated: false)
+    }
+
+    private func beginInlineReattachWait(
+        for controller: PlayerFullscreenHostController,
+        ownerLease: PlayerOwnerLease,
+        source: String
+    ) {
+        cancelHandoffWaits()
+        let waitGen = handoffWaitGeneration
+        awaitingInlineReattach = true
+        pendingInlineDismissSource = source
+
+        if PlayerViewModel.shared.hasUsableRenderAttachment(
+            forRole: .inline,
+            ownerLease: ownerLease
+        ) {
+            scheduleInlineReattachDismissal(
+                for: controller,
+                generation: waitGen,
+                source: source
+            )
+            return
+        }
+
+        inlineReattachWaitTask = Task { @MainActor [weak self, weak controller] in
+            try? await Task.sleep(for: Self.inlineReattachTimeout)
+            guard !Task.isCancelled, let self, let controller,
+                  self.host === controller,
+                  self.awaitingInlineReattach,
+                  self.handoffWaitGeneration == waitGen else { return }
+            PlayerLog.log("[Fullscreen] inline reattach wait timeout — dismissing host")
+            self.finishInlineReattachAndDismiss(
+                for: controller,
+                generation: waitGen,
+                source: "\(source)-timeout"
+            )
+        }
+    }
+
+    private func scheduleInlineReattachDismissal(
+        for controller: PlayerFullscreenHostController,
+        generation: UInt64,
+        source: String
+    ) {
+        guard awaitingInlineReattach,
+              !inlineReattachCommitScheduled,
+              handoffWaitGeneration == generation else { return }
+        inlineReattachCommitScheduled = true
+        DispatchQueue.main.async { [weak self, weak controller] in
+            MainActor.assumeIsolated {
+                guard let self, let controller else { return }
+                self.finishInlineReattachAndDismiss(
+                    for: controller,
+                    generation: generation,
+                    source: source
+                )
+            }
+        }
+    }
+
+    private func finishInlineReattachAndDismiss(
+        for controller: PlayerFullscreenHostController,
+        generation: UInt64,
+        source: String
+    ) {
+        guard host === controller,
+              awaitingInlineReattach,
+              handoffWaitGeneration == generation else { return }
+        cancelHandoffWaits()
+        guard phase == .leaving, !PlayerViewModel.shared.isFullscreen else {
+            reconcile()
+            return
         }
         if controller.presentingViewController == nil {
             hostDidDismiss(controller, source: source)
@@ -356,6 +650,8 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
 
     func hostDidDismiss(_ controller: PlayerFullscreenHostController, source: String) {
         guard host === controller else { return }
+        cancelHandoffWaits()
+        controller.clearTransitionCover()
         rotationFallbackTask?.cancel()
         rotationFallbackTask = nil
         let current = accepts(controller)
@@ -401,8 +697,14 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
         let isLandscapeSize = size.width > size.height
 
         if !PlayerViewModel.shared.isFullscreen {
+            if awaitingInlineReattach {
+                return .init(generation: 0, mode: .steadyFullscreen)
+            }
             if isPhone, isLandscapeSize {
                 return .init(generation: 0, mode: .steadyFullscreen)
+            }
+            if awaitingEnterAttachment {
+                cancelHandoffWaits()
             }
             rotationFallbackTask?.cancel()
             rotationFallbackTask = nil
@@ -417,6 +719,16 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
         if phase == .entering {
             if isPhone, !PlayerViewModel.shared.isPortraitContent, !isLandscapeSize {
                 return .init(generation: 0, mode: .steadyFullscreen)
+            }
+            if awaitingEnterAttachment {
+                cancelHandoffWaits()
+                if let receipt,
+                   PlayerViewModel.shared.hasUsableRenderAttachment(
+                       forRole: .fullscreen,
+                       ownerLease: receipt.context.ownerLease
+                   ) {
+                    controller.clearTransitionCover()
+                }
             }
             rotationFallbackTask?.cancel()
             rotationFallbackTask = nil

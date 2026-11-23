@@ -79,9 +79,9 @@ struct PlayerFullscreenHostContent: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let resolvedSize = geometry.containerSize.width > 1 && geometry.containerSize.height > 1
-                ? geometry.containerSize
-                : proxy.size
+            let resolvedSize = proxy.size.width > 1 && proxy.size.height > 1
+                ? proxy.size
+                : geometry.containerSize
             let viewportAspect = PlayerFullscreenViewportPolicy.aspect(for: resolvedSize)
             let playerSafeArea = EdgeInsets(
                 top: geometry.safeAreaInsets.top,
