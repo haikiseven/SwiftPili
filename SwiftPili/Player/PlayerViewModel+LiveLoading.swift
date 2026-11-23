@@ -12,7 +12,8 @@ extension PlayerViewModel {
         preservePlayState: Bool = false,
         owner: String? = nil,
         ownerLease: PlayerOwnerLease? = nil,
-        mediaResetID: UUID? = nil
+        mediaResetID: UUID? = nil,
+        preservingLiveReconnect: Bool = false
     ) async -> Int? {
         let loadTask = Task {
             await performLoadLive(
@@ -22,7 +23,8 @@ extension PlayerViewModel {
                 preservePlayState: preservePlayState,
                 owner: owner,
                 ownerLease: ownerLease,
-                mediaResetID: mediaResetID
+                mediaResetID: mediaResetID,
+                preservingLiveReconnect: preservingLiveReconnect
             )
         }
         return await withTaskCancellationHandler {
@@ -38,6 +40,8 @@ extension PlayerViewModel {
         hardwareCapabilities: VideoHardwareCapabilities.Snapshot
     ) -> Int {
         currentLiveQuality = resolved.actualQn
+        liveBackupURLs = resolved.backupURLs
+        liveActiveSourceKind = activeBackendKind == .demandPaced ? resolved.liveSourceKind : nil
         publishLiveQualityStats(resolved.actualQn, from: playInfo)
         stats.decoderType = decoderLabel(
             codecs: resolved.codecFourCC,
@@ -46,6 +50,12 @@ extension PlayerViewModel {
         stats.codec = resolved.codecFourCC
         isDASHMode = false
         currentVideoIsAV1 = resolved.metadata.codecName == "av1"
+        if !resolved.backupURLs.isEmpty {
+            PlayerLog.log(
+                "[LiveRecovery] retained \(resolved.backupURLs.count) same-format backup CDN URL(s) " +
+                "for \(resolved.metadata.tupleFamily) qn=\(resolved.actualQn)"
+            )
+        }
         playURL(resolved.url, liveSource: resolved.demandSource(for: currentOwnerLease))
         return resolved.actualQn
     }
@@ -102,7 +112,8 @@ extension PlayerViewModel {
         preservePlayState: Bool,
         owner: String?,
         ownerLease: PlayerOwnerLease?,
-        mediaResetID: UUID?
+        mediaResetID: UUID?,
+        preservingLiveReconnect: Bool
     ) async -> Int? {
         if let mediaResetID,
            !mediaResetRecovery.accepts(mediaResetID, owner: currentOwnerLease) { return nil }
@@ -135,7 +146,11 @@ extension PlayerViewModel {
         if !sameContent {
             nowPlayingMeta = nil
         }
-        stop(reason: teardownReason, mediaResetID: mediaResetID)
+        stop(
+            reason: teardownReason,
+            mediaResetID: mediaResetID,
+            preservingLiveReconnect: preservingLiveReconnect
+        )
         presentationResetPendingForOwnerChange = false
         resetMultiConnectionDisplay()
         loadGeneration += 1
@@ -155,6 +170,7 @@ extension PlayerViewModel {
         terminalOpenFailure = false
         error = nil
         unavailability = nil
+        isBuffering = true
         availableQualities = []
         availableCodecs = []
         availableAudioTiers = []
@@ -209,13 +225,25 @@ extension PlayerViewModel {
                 )
             }
 
-            guard let url = resolveLiveURL(playInfo) else {
+            guard let resolved = resolveLiveURLs(playInfo) else {
+                if playInfo.liveStatus == 1,
+                   let activeLease = currentOwnerLease,
+                   scheduleLiveRefreshReconnect(
+                       roomID: roomID,
+                       quality: quality,
+                       ownerLease: activeLease,
+                       reason: "no-live-stream-url"
+                   ) {
+                    return nil
+                }
                 guard settleResetPreOpenFailure(loadCompletion, retryable: true) else { return nil }
                 settleTerminalFailure(TerminalFailurePayload(
                     message: String(localized: "No live stream URL found")
                 ))
                 return nil
             }
+            liveBackupURLs = resolved.backupURLs
+            liveActiveSourceKind = nil
             publishLiveQualityStats(quality, from: playInfo)
             stats.decoderType = decoderLabel(
                 codecs: "avc1", hardwareSupported: hardwareCapabilities.supports(codecs: "avc1")
@@ -223,7 +251,12 @@ extension PlayerViewModel {
             stats.codec = "live"
             isDASHMode = false
             currentVideoIsAV1 = false
-            playURL(url)
+            if !resolved.backupURLs.isEmpty {
+                PlayerLog.log(
+                    "[LiveRecovery] retained \(resolved.backupURLs.count) same-format backup CDN URL(s) for vlc qn=\(quality)"
+                )
+            }
+            playURL(resolved.url)
             return quality
         } catch {
             guard mediaResetRecovery.allowsLoadCompletion(
@@ -241,11 +274,22 @@ extension PlayerViewModel {
                 loadCompletion, retryable: error.isCancellation || (refusal?.isRetryable ?? true)
             ) else { return nil }
             if error.isCancellation {
+                isBuffering = false
                 PlayerLog.log("[Player] loadLive cancelled (benign) — no error surfaced")
                 return nil
             }
             if let reason = refusal {
                 markUnavailable(reason, detail: "loadLive")
+                return nil
+            }
+            if let activeLease = currentOwnerLease,
+               StreamTransportFailure.preserving(error, stage: .resolver)?.isEligible == true,
+               scheduleLiveRefreshReconnect(
+                   roomID: roomID,
+                   quality: quality,
+                   ownerLease: activeLease,
+                   reason: "getPlayInfo: \(error.localizedDescription)"
+               ) {
                 return nil
             }
             settleTerminalFailure(TerminalFailurePayload(
@@ -295,6 +339,18 @@ extension PlayerViewModel {
 
         switch route {
         case .refused(let failure):
+            if failure.isRetryable,
+               playInfo.liveStatus == 1,
+               let roomID = currentRoomID,
+               let activeLease = currentOwnerLease,
+               scheduleLiveRefreshReconnect(
+                   roomID: roomID,
+                   quality: quality,
+                   ownerLease: activeLease,
+                   reason: "no-compatible-candidate"
+               ) {
+                return nil
+            }
             guard settleResetPreOpenFailure(
                 loadCompletion, retryable: failure.isRetryable
             ) else { return nil }
@@ -375,9 +431,34 @@ extension PlayerViewModel {
         }
     }
 
-    private func resolveLiveURL(_ info: LivePlayInfo) -> URL? {
+    private func resolveLiveURLs(_ info: LivePlayInfo) -> (url: URL, backupURLs: [URL])? {
         guard let streams = info.playurlInfo?.playurl?.stream, !streams.isEmpty else {
             PlayerLog.log("[Player] live: no streams in playInfo")
+            return nil
+        }
+
+        func orderedEndpoints(
+            for codec: LivePlayInfo.PlayurlInfo.Playurl.StreamInfo.FormatInfo.CodecInfo
+        ) -> (url: URL, backupURLs: [URL])? {
+            if let urlInfos = codec.urlInfo, !urlInfos.isEmpty {
+                let urls = urlInfos.compactMap { URL(string: $0.host + codec.baseUrl + $0.extra) }
+                guard let primary = urls.first else { return nil }
+                let primaryHost = primary.host?.lowercased()
+                var seen: Set<URL> = [primary]
+                var distinctHost: [URL] = []
+                var sameHost: [URL] = []
+                for candidate in urls.dropFirst() where seen.insert(candidate).inserted {
+                    if let primaryHost, candidate.host?.lowercased() != primaryHost {
+                        distinctHost.append(candidate)
+                    } else {
+                        sameHost.append(candidate)
+                    }
+                }
+                return (primary, distinctHost + sameHost)
+            }
+            if let url = URL(string: codec.baseUrl) {
+                return (url, [])
+            }
             return nil
         }
 
@@ -405,18 +486,12 @@ extension PlayerViewModel {
                 }
 
                 for codec in sortedCodecs {
-                    for urlInfo in codec.urlInfo ?? [] {
-                        let rawURL = urlInfo.host + codec.baseUrl + urlInfo.extra
-                        guard let url = URL(string: rawURL) else { continue }
+                    if let resolved = orderedEndpoints(for: codec) {
                         PlayerLog.log(
                             "[Player] live: \(stream.protocolName)/\(format.formatName)/" +
                                 "\(codec.codecName) qn=\(codec.currentQn ?? 0)"
                         )
-                        return url
-                    }
-                    if codec.urlInfo == nil || codec.urlInfo?.isEmpty == true,
-                       let url = URL(string: codec.baseUrl) {
-                        return url
+                        return resolved
                     }
                 }
             }
@@ -424,17 +499,12 @@ extension PlayerViewModel {
 
         if let stream = streams.first,
            let format = stream.format.first,
-           let codec = format.codec.first {
+           let codec = format.codec.first,
+           let resolved = orderedEndpoints(for: codec) {
             PlayerLog.log(
                 "[Player] live fallback: \(stream.protocolName)/\(format.formatName)/\(codec.codecName)"
             )
-            if let urlInfo = codec.urlInfo?.first,
-               let url = URL(string: urlInfo.host + codec.baseUrl + urlInfo.extra) {
-                return url
-            }
-            if let url = URL(string: codec.baseUrl) {
-                return url
-            }
+            return resolved
         }
 
         PlayerLog.log("[Player] live: no usable stream found")

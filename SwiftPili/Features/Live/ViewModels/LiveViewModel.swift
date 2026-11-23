@@ -410,7 +410,7 @@ final class LiveRoomViewModel {
             let playInfo = try await LiveAPI.getPlayInfo(roomID: roomID, quality: currentQuality)
             try requireCurrentLoad(requestSerial, requestAdmission: requestAdmission)
             if let isPortrait = playInfo.isPortrait { isPortraitHint = isPortrait }
-            updateQualities(from: playInfo)
+            let preloadedCurrentQn = updateQualities(from: playInfo)
             let decision = LiveRoomStatusPolicy.decide(
                 liveStatus: playInfo.liveStatus,
                 hasStream: playInfo.hasPlayableStream
@@ -427,16 +427,21 @@ final class LiveRoomViewModel {
                 return
             }
             streamUnavailable = nil
+            error = nil
             PlayerLog.log("[LiveRoomVM] qualities: \(availableQualities.map { "\($0.qn):\($0.label)" }) current=\(currentQuality)")
             let lease = PlayerViewModel.shared.claimOwnerLease(
                 owner: PlayerViewModel.liveOwner(roomID)
             )
             playerOwnerLease = lease
             committedRoomID = roomID
+            let preloadedPlayInfo: LivePlayInfo? =
+                (preloadedCurrentQn == nil || preloadedCurrentQn == currentQuality)
+                ? playInfo
+                : nil
             let selectedQuality = await PlayerViewModel.shared.loadLive(
                 roomID: roomID,
                 quality: currentQuality,
-                playInfo: playInfo,
+                playInfo: preloadedPlayInfo,
                 owner: lease.owner,
                 ownerLease: lease
             )
@@ -454,8 +459,9 @@ final class LiveRoomViewModel {
                 )
             }
         } catch {
-            guard admitsLoad(requestSerial, requestAdmission: requestAdmission) else { return }
-            self.error = "\(error)"
+            guard admitsLoad(requestSerial, requestAdmission: requestAdmission),
+                  !BiliAPIRetryPolicy.isCancellation(error) else { return }
+            self.error = error.localizedDescription
             PlayerLog.log("[LiveRoomVM] play info failed: \(error)")
         }
 
@@ -655,25 +661,73 @@ final class LiveRoomViewModel {
 private extension LiveRoomViewModel {
     // MARK: - Quality
 
-    func updateQualities(from playInfo: LivePlayInfo) {
-        var acceptQn: [Int] = []
-        var apiCurrentQn: Int?
+    @discardableResult
+    func updateQualities(from playInfo: LivePlayInfo) -> Int? {
+        let protocolOrder = ["http_hls", "http_stream"]
+        let formatOrder = ["fmp4", "ts", "flv"]
+        let codecOrder = ["avc", "hevc", "av1"]
+
+        func normalizedCodecName(_ raw: String) -> String {
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if value.hasPrefix("avc") || value.hasPrefix("h264") { return "avc" }
+            if value.hasPrefix("hev") || value.hasPrefix("hvc") || value.hasPrefix("dvh") { return "hevc" }
+            if value.hasPrefix("av01") || value.hasPrefix("av1") { return "av1" }
+            return value
+        }
+
+        var orderedCodecs: [LivePlayInfo.PlayurlInfo.Playurl.StreamInfo.FormatInfo.CodecInfo] = []
         if let streams = playInfo.playurlInfo?.playurl?.stream {
-            for stream in streams {
-                for format in stream.format {
-                    for codec in format.codec {
-                        if let aq = codec.acceptQn, !aq.isEmpty {
-                            acceptQn = aq
-                        }
-                        if let qn = codec.currentQn {
-                            apiCurrentQn = qn
-                        }
+            let sortedStreams = streams.enumerated().sorted { lhs, rhs in
+                let left = protocolOrder.firstIndex(of: lhs.element.protocolName.lowercased()) ?? protocolOrder.count
+                let right = protocolOrder.firstIndex(of: rhs.element.protocolName.lowercased()) ?? protocolOrder.count
+                return left == right ? lhs.offset < rhs.offset : left < right
+            }
+            for (_, stream) in sortedStreams {
+                let sortedFormats = stream.format.enumerated().sorted { lhs, rhs in
+                    let left = formatOrder.firstIndex(of: lhs.element.formatName.lowercased()) ?? formatOrder.count
+                    let right = formatOrder.firstIndex(of: rhs.element.formatName.lowercased()) ?? formatOrder.count
+                    return left == right ? lhs.offset < rhs.offset : left < right
+                }
+                for (_, format) in sortedFormats {
+                    let sortedCodecs = format.codec.enumerated().sorted { lhs, rhs in
+                        let left = codecOrder.firstIndex(of: normalizedCodecName(lhs.element.codecName)) ?? codecOrder.count
+                        let right = codecOrder.firstIndex(of: normalizedCodecName(rhs.element.codecName)) ?? codecOrder.count
+                        return left == right ? lhs.offset < rhs.offset : left < right
                     }
+                    orderedCodecs.append(contentsOf: sortedCodecs.map(\.element))
                 }
             }
         }
 
-        if let apiCurrentQn, !acceptQn.contains(currentQuality) {
+        let primaryCodec = orderedCodecs.first { codec in
+            !(codec.urlInfo ?? []).isEmpty || !codec.baseUrl.isEmpty
+        } ?? orderedCodecs.first
+
+        let acceptQn: [Int] = {
+            if let primaryAccept = primaryCodec?.acceptQn?.filter({ $0 > 0 }), !primaryAccept.isEmpty {
+                return primaryAccept
+            }
+            for codec in orderedCodecs {
+                if let values = codec.acceptQn?.filter({ $0 > 0 }), !values.isEmpty {
+                    return values
+                }
+            }
+            return []
+        }()
+
+        let apiCurrentQn: Int? = {
+            if let qn = primaryCodec?.currentQn, qn > 0 {
+                return qn
+            }
+            for codec in orderedCodecs {
+                if let qn = codec.currentQn, qn > 0 {
+                    return qn
+                }
+            }
+            return nil
+        }()
+
+        if let apiCurrentQn {
             currentQuality = apiCurrentQn
         }
 
@@ -687,6 +741,7 @@ private extension LiveRoomViewModel {
         } else {
             availableQualities = Self.fallbackQualities
         }
+        return apiCurrentQn
     }
 }
 
@@ -799,8 +854,11 @@ private extension LiveRoomViewModel {
             publication.roomInfo = room
             publishRoomInfo(room, publicationLease: publication.lease)
         } catch {
-            guard admitsLoad(requestSerial, requestAdmission: requestAdmission) else { return }
-            if roomInfo == nil, streamUnavailable == nil { self.error = "\(error)" }
+            guard admitsLoad(requestSerial, requestAdmission: requestAdmission),
+                  !BiliAPIRetryPolicy.isCancellation(error) else { return }
+            if roomInfo == nil, streamUnavailable == nil, publication.lease == nil, playerOwnerLease == nil {
+                self.error = error.localizedDescription
+            }
             PlayerLog.log("[LiveRoomVM] room info failed: \(error)")
         }
     }

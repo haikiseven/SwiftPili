@@ -78,6 +78,9 @@ extension PlayerViewModel {
                 PlayerLog.log("[Player] state → readyToPlay (t=\(String(format: "%.1f", self.mediaTime)))")
                 self.isBuffering = false
                 self.updateIsPlaying(transportRunning: true)
+                if self.mode == .live {
+                    self.armLiveStabilityResetIfNeeded()
+                }
 
                 if let track = self.backend.videoTracks().first {
                     let w = Int(track.naturalSize.width)
@@ -150,6 +153,7 @@ extension PlayerViewModel {
                     self.beginBackgroundPlaybackRestoration(reason: "buffering")
                 }
                 self.budget.interruptStreamStability()
+                self.cancelLiveStabilityReset()
                 if !self.isBuffering { self.isBuffering = true }
                 self.updateIsPlaying(transportRunning: false)
                 self.syncDanmakuTransport()
@@ -165,11 +169,15 @@ extension PlayerViewModel {
                     self.backend.play()
                 }
                 self.updateIsPlaying(transportRunning: self.backend.isPlaying)
+                if self.mode == .live {
+                    self.armLiveStabilityResetIfNeeded()
+                }
                 self.resumeDeferredDemandVideoSuspensionIfNeeded()
                 self.handleNativeAudioOutputChange()
                 self.syncDanmakuTransport()
 
             case .paused:
+                self.cancelLiveStabilityReset()
                 self.updateIsPlaying(transportRunning: false)
                 self.publishBufferedTime(
                     self.backend.playableTime, display: { self.backend.bufferDisplaySample },
@@ -198,11 +206,11 @@ extension PlayerViewModel {
                     self.suspendStreamRecovery()
                     return
                 }
-                self.backgroundExecution.end(reason: "backend-error")
-                self.retireStreamRecovery(reason: "nontransient-backend")
-                if self.cdnFrameCover?.ownsLoad(self.backend) == true { self.clearFreezeFrame() }
                 if self.mediaResetRecovery.request?.opening == true,
                    self.mediaResetRecovery.request?.loadGeneration == self.loadGeneration {
+                    self.backgroundExecution.end(reason: "backend-error")
+                    self.retireStreamRecovery(reason: "nontransient-backend")
+                    if self.cdnFrameCover?.ownsLoad(self.backend) == true { self.clearFreezeFrame() }
                     self.mediaResetRecovery.settle(loadGeneration: self.loadGeneration, succeeded: false)
                     self.playbackIntent = .pausedByUser
                     self.audioSessionPolicy.requireUserPlay()
@@ -212,6 +220,9 @@ extension PlayerViewModel {
                     return
                 }
                 if error is CancellationError || (error as NSError).code == NSURLErrorCancelled {
+                    self.backgroundExecution.end(reason: "backend-error")
+                    self.retireStreamRecovery(reason: "nontransient-backend")
+                    if self.cdnFrameCover?.ownsLoad(self.backend) == true { self.clearFreezeFrame() }
                     if let cover = self.recoveryCover {
                         self.clearRecoveryCover(matching: cover.identity)
                     }
@@ -220,6 +231,13 @@ extension PlayerViewModel {
                     return
                 }
                 let hostIndependent = (error as? MediaEngineError)?.isHostIndependent ?? false
+                if self.mode == .live, !hostIndependent,
+                   self.attemptLiveErrorRecovery(error) {
+                    return
+                }
+                self.backgroundExecution.end(reason: "backend-error")
+                self.retireStreamRecovery(reason: "nontransient-backend")
+                if self.cdnFrameCover?.ownsLoad(self.backend) == true { self.clearFreezeFrame() }
                 guard self.mode.usesOnlineVODServices, !hostIndependent else {
                     let prefix = hostIndependent
                         ? "[Player] engine error is host-independent — no CDN switch"
@@ -289,6 +307,9 @@ extension PlayerViewModel {
                     }
                     if !self.isPlaying {
                         self.updateIsPlaying(transportRunning: true)
+                    }
+                    if self.mode == .live {
+                        self.armLiveStabilityResetIfNeeded()
                     }
                 }
 

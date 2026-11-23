@@ -47,6 +47,7 @@ extension PlayerViewModel {
             }
         }
         resetStreamDisplayForOpen(videoURL: url, audioURL: audioURL, isSeekReopen: isSeekReopen)
+        liveNeedsReconnectOnResume = false
         terminalOpenFailure = false
         admitDanmakuSession(openingAt: startAt)
         lastStreamStartAt = CACurrentMediaTime()

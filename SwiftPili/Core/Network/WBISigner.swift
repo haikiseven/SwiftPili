@@ -33,6 +33,7 @@ struct WBISignerInFlightPolicy: Sendable {
 actor WBISigner {
     static let shared = WBISigner()
 
+    private var generation: UInt64 = 0
     private var mixinKey: String?
     private var lastFetchDate: Date?
     private var inflightFetch: (
@@ -47,6 +48,17 @@ actor WBISigner {
         37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
         22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
     ]
+
+    func invalidate() {
+        generation &+= 1
+        mixinKey = nil
+        lastFetchDate = nil
+        if let inflight = inflightFetch {
+            inflightPolicy.finish(inflight.token)
+            inflightFetch = nil
+        }
+        PlayerLog.log("[WBI] mixin key invalidated")
+    }
 
     func sign(params: [String: String]) async throws -> [String: String] {
         let key = try await getMixinKey()
@@ -81,17 +93,18 @@ actor WBISigner {
         case .waiterCancelled:
             throw CancellationError()
         case .join(let token):
-            guard let inflightFetch, inflightFetch.token == token else {
+            guard let inflight = inflightFetch, inflight.token == token else {
                 inflightPolicy.finish(token)
                 return try await getMixinKey()
             }
-            let key = try await inflightFetch.task.value
+            let key = try await inflight.task.value
             try Task.checkCancellation()
             return key
         case .start(let token):
             producerToken = token
         }
 
+        let fetchGeneration = generation
         PlayerLog.log("[WBI] mixin key cold — fetching nav (blocking this signed request)")
         let fetch = Task.detached(priority: nil) { () throws -> String in
             let data = try await BiliAPIClient.shared.requestRaw(
@@ -105,13 +118,19 @@ actor WBISigner {
             key = try await fetch.value
         } catch {
             inflightPolicy.finish(producerToken)
-            inflightFetch = nil
+            if inflightFetch?.token == producerToken {
+                inflightFetch = nil
+            }
             throw error
         }
-        mixinKey = key
-        lastFetchDate = Date()
+        if generation == fetchGeneration {
+            mixinKey = key
+            lastFetchDate = Date()
+        }
         inflightPolicy.finish(producerToken)
-        inflightFetch = nil
+        if inflightFetch?.token == producerToken {
+            inflightFetch = nil
+        }
         try Task.checkCancellation()
         return key
     }
@@ -125,6 +144,12 @@ actor WBISigner {
         let imgKey = extractKey(from: nav.wbiImg.imgUrl)
         let subKey = extractKey(from: nav.wbiImg.subUrl)
         let raw = imgKey + subKey
+        let requiredLength = (mixinKeyEncTab.prefix(32).max() ?? 0) + 1
+        guard raw.count >= requiredLength else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: [], debugDescription: "Invalid WBI key material")
+            )
+        }
         return String(
             mixinKeyEncTab.prefix(32).map { raw[raw.index(raw.startIndex, offsetBy: $0)] }
         )

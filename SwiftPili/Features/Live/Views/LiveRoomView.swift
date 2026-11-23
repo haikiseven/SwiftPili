@@ -489,7 +489,7 @@ struct LiveRoomView: View {
 
     private var isImmersiveChromeActive: Bool {
         player.showControls || isDanmakuFocused || !player.isPlaying
-            || viewModel.streamUnavailable != nil || isRoomOffline
+            || viewModel.streamUnavailable != nil || viewModel.error != nil || isRoomOffline
     }
 
     private var immersiveChromeAnimation: Animation? {
@@ -731,6 +731,7 @@ struct LiveRoomView: View {
             )
             let hasInput = AuthManager.shared.isLoggedIn
             let hasImmersiveTransport = viewModel.streamUnavailable == nil
+                && viewModel.error == nil
                 && !isCurrentRoomPlaybackUnavailable
             let minimumTransportHeight: CGFloat = if hasImmersiveTransport {
                 LivePortraitOverlayMetrics.minimumInputHeight
@@ -1020,6 +1021,13 @@ struct LiveRoomView: View {
                             unavailablePlayerOverlay(refusal)
                         } else if isRoomOffline {
                             offlinePlayerOverlay
+                        } else if let loadError = viewModel.error, player.error == nil {
+                            errorPlayerOverlay(loadError)
+                        } else if viewModel.isLoading, !isPlayerOwner {
+                            ProgressView()
+                                .tint(.white)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .background(.black.opacity(0.6))
                         }
                     }
                     .background {
@@ -1305,7 +1313,9 @@ struct LiveRoomView: View {
                             .animation(immersiveChromeAnimation, value: isImmersiveChromeActive)
                     }
 
-                    if viewModel.streamUnavailable == nil, !isCurrentRoomPlaybackUnavailable {
+                    if viewModel.streamUnavailable == nil,
+                       viewModel.error == nil,
+                       !isCurrentRoomPlaybackUnavailable {
                         immersiveTransportRow
                             .padding(.horizontal, 12)
                             .padding(.bottom, hasInput ? LivePortraitOverlayMetrics.transportRowSpacing : 0)
@@ -1395,42 +1405,65 @@ struct LiveRoomView: View {
     private func unavailablePlayerOverlay(
         _ refusal: LiveRoomStatusPolicy.Refusal
     ) -> some View {
-        VStack(spacing: 10) {
-            Image(systemName: refusal == .roundPlayWithoutStream
-                ? "arrow.trianglehead.2.clockwise.rotate.90"
-                : "antenna.radiowaves.left.and.right.slash")
-                .font(.largeTitle)
-                .foregroundStyle(.secondary)
-            Text(refusal == .roundPlayWithoutStream
-                ? String(localized: "Round play — no stream available")
-                : String(localized: "OFFLINE"))
-                .font(.headline)
-                .fontWeight(.semibold)
-                .multilineTextAlignment(.center)
+        ContentUnavailableView {
+            Label(
+                refusal == .roundPlayWithoutStream
+                    ? String(localized: "Round play — no stream available")
+                    : String(localized: "OFFLINE"),
+                systemImage: refusal == .roundPlayWithoutStream
+                    ? "arrow.trianglehead.2.clockwise.rotate.90"
+                    : "antenna.radiowaves.left.and.right.slash"
+            )
+        } description: {
             if refusal == .roundPlayWithoutStream {
                 Text("The streamer is away and this room's carousel is not available to play.")
-                    .font(.footnote)
-                    .foregroundStyle(.white.opacity(0.72))
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 28)
             }
         }
-        .foregroundStyle(.white)
+        .environment(\.colorScheme, .dark)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.black.opacity(0.86))
         .contentShape(Rectangle())
     }
 
     private var offlinePlayerOverlay: some View {
-        VStack(spacing: 10) {
-            Image(systemName: "antenna.radiowaves.left.and.right.slash")
-                .font(.largeTitle)
-                .foregroundStyle(.secondary)
-            Text("OFFLINE")
-                .font(.headline)
-                .fontWeight(.semibold)
+        ContentUnavailableView(
+            "OFFLINE",
+            systemImage: "antenna.radiowaves.left.and.right.slash"
+        )
+        .environment(\.colorScheme, .dark)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.black.opacity(0.86))
+        .contentShape(Rectangle())
+    }
+
+    private func errorPlayerOverlay(_ message: String) -> some View {
+        ContentUnavailableView {
+            Label {
+                Text("Playback Failed")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+            } icon: {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.yellow)
+            }
+        } description: {
+            Text(message)
+                .font(.footnote)
+                .foregroundStyle(.white.opacity(0.82))
+                .multilineTextAlignment(.center)
+                .lineLimit(3)
+        } actions: {
+            Button("Retry") {
+                Task {
+                    await viewModel.load(roomID: roomID, requestAdmission: { isRouteActivated })
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .disabled(viewModel.isLoading)
         }
-        .foregroundStyle(.white)
+        .environment(\.colorScheme, .dark)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.black.opacity(0.86))
         .contentShape(Rectangle())

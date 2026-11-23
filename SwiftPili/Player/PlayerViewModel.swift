@@ -324,7 +324,12 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         get { session.mode }
         set {
             let oldValue = session.mode
-            if newValue != oldValue { revokeEqualizerMaintenancePermission() }
+            if newValue != oldValue {
+                revokeEqualizerMaintenancePermission()
+                if oldValue == .live {
+                    cancelLiveRecoveryTasks(resetAttempts: true, clearBackups: true)
+                }
+            }
             session.mode = newValue
             retireRecoveryCoverIfAuthorityChanged()
             guard newValue != oldValue, newValue != .vod else { return }
@@ -338,6 +343,7 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
             if newValue != nil {
                 backgroundExecution.end(reason: "playback-error")
                 revokeEqualizerMaintenancePermission()
+                cancelLiveRecoveryTasks(resetAttempts: false)
             }
             session.error = newValue
             if session.error != nil { retireCDNFrameCover() }
@@ -426,6 +432,7 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
             if newValue != routeOwnership.ownerKey {
                 backgroundExecution.end(reason: "owner-change")
                 revokeEqualizerMaintenancePermission()
+                cancelLiveRecoveryTasks(resetAttempts: true, clearBackups: true)
             }
             routeOwnership.ownerKey = newValue
         }
@@ -436,6 +443,7 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         set {
             backgroundExecution.end(reason: "owner-lease-change")
             revokeEqualizerMaintenancePermission()
+            cancelLiveRecoveryTasks(resetAttempts: true, clearBackups: true)
             routeOwnership.ownerLeaseGeneration = newValue
         }
     }
@@ -535,7 +543,10 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     var currentRoomID: Int? {
         get { session.currentRoomID }
         set {
-            if newValue != session.currentRoomID { revokeEqualizerMaintenancePermission() }
+            if newValue != session.currentRoomID {
+                revokeEqualizerMaintenancePermission()
+                cancelLiveRecoveryTasks(resetAttempts: true, clearBackups: true)
+            }
             session.currentRoomID = newValue
         }
     }
@@ -560,6 +571,17 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     var budget = RecoveryBudget()
     @ObservationIgnored var streamRecovery: StreamRecoveryCycle?
     @ObservationIgnored var streamSourceRequestAdmission: (@MainActor @Sendable () -> Bool)?
+
+    static let maxLiveRefreshReconnects = 4
+    static let liveRefreshBackoffSeconds: [TimeInterval] = [2, 4, 8, 12]
+    static let liveStabilityResetSeconds: TimeInterval = 10
+    @ObservationIgnored var liveBackupURLs: [URL] = []
+    @ObservationIgnored var liveActiveSourceKind: DemandLiveSourceKind?
+    @ObservationIgnored var liveReconnectAttempts = 0
+    @ObservationIgnored var liveRecoveryGeneration: UInt64 = 0
+    @ObservationIgnored var liveReconnectTask: Task<Void, Never>?
+    @ObservationIgnored var liveStabilityResetTask: Task<Void, Never>?
+    @ObservationIgnored var liveNeedsReconnectOnResume = false
 
     @ObservationIgnored let backgroundExecution = PlayerBackgroundExecution()
     struct NativeAudioRepairAttempt: Equatable {
@@ -615,6 +637,14 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
                 backgroundExecution.end(reason: "intent-paused")
                 revokeEqualizerMaintenancePermission()
                 suspendStreamRecovery()
+                if newValue == .pausedByUser {
+                    let hadPendingLiveReconnect = liveReconnectTask != nil
+                    cancelLiveRecoveryTasks(resetAttempts: false)
+                    if hadPendingLiveReconnect {
+                        liveNeedsReconnectOnResume = true
+                        isBuffering = false
+                    }
+                }
             }
             session.playbackIntent = newValue
         }
@@ -645,6 +675,7 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
             if newValue.isTerminal {
                 backgroundExecution.end(reason: "terminal")
                 revokeEqualizerMaintenancePermission()
+                cancelLiveRecoveryTasks(resetAttempts: false)
             }
             session.playbackTerminalState = newValue
         }
@@ -1500,6 +1531,34 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
             playbackIntent = .playing
             if resumeStreamRecoveryIfNeeded() { return }
         }
+        if mode == .live, liveReconnectTask != nil {
+            playbackIntent = .playing
+            isBuffering = true
+            return
+        }
+        if mode == .live, liveNeedsReconnectOnResume,
+           let roomID = currentRoomID, let ownerLease = currentOwnerLease {
+            liveNeedsReconnectOnResume = false
+            playbackIntent = .playing
+            playbackTerminalState = .active
+            terminalOpenFailure = false
+            error = nil
+            isBuffering = true
+            let quality = currentLiveQuality
+            PlayerLog.log("[LiveRecovery] resuming paused live reconnect room=\(roomID) qn=\(quality)")
+            Task { @MainActor [weak self] in
+                guard let self, self.isCurrentOwner(ownerLease) else { return }
+                _ = await self.loadLive(
+                    roomID: roomID,
+                    quality: quality,
+                    playInfo: nil,
+                    preservePlayState: false,
+                    owner: ownerLease.owner,
+                    ownerLease: ownerLease
+                )
+            }
+            return
+        }
         guard PlayerTransportControlPolicy.allowsPlay(
             afterTerminalOpenFailure: terminalOpenFailure
         ) else {
@@ -1657,9 +1716,11 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         mediaResetID: UUID? = nil,
         recoveryCoverIdentity: UInt64? = nil,
         cdnSwitchID: UUID? = nil,
-        streamRetryID: UUID? = nil
+        streamRetryID: UUID? = nil,
+        preservingLiveReconnect: Bool = false
     ) {
         prepareBackgroundExecutionForStop(reason)
+        cancelLiveRecoveryTasks(resetAttempts: !preservingLiveReconnect, clearBackups: true)
         let preservesStreamRecovery = preservesStreamRetryForReload(id: streamRetryID, reason: reason)
         revokeEqualizerMaintenancePermission()
         let preservesRecoveryCover = reason == .internalReload

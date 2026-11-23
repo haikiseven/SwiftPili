@@ -29,65 +29,75 @@ actor BiliAPIClient {
         self.decoder = JSONDecoder()
     }
 
+    fileprivate struct RequestResult {
+        let data: Data
+        let response: HTTPURLResponse
+        let didRefreshWBI: Bool
+    }
+
+    fileprivate enum TransientStatusAction {
+        case proceed
+        case retry
+        case retryWithWBIRefresh
+    }
+
     func request<T: Decodable>(
         _ endpoint: BiliEndpoint,
         type: T.Type = T.self
     ) async throws(BiliError) -> T {
-        let urlRequest: URLRequest
-        do {
-            urlRequest = try await endpoint.buildRequest()
-        } catch {
-            throw .network(error)
-        }
+        var didRefreshWBI = false
 
-        PlayerLog.log("[API] \(endpoint.method.rawValue) \(endpoint.path)")
-
-        let (data, response) = try await requestData(
-            urlRequest,
-            endpoint: endpoint
-        )
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw .network(URLError(.badServerResponse))
-        }
-
-        guard (200...299).contains(httpResponse.statusCode) else {
-            PlayerLog.log("[API] HTTP \(httpResponse.statusCode) for \(endpoint.path)")
-            throw .httpError(
-                statusCode: httpResponse.statusCode,
-                retryAfter: [429, 503].contains(httpResponse.statusCode)
-                    ? HTTPRetryAfter.delay(httpResponse.value(forHTTPHeaderField: "Retry-After")) : nil
+        while true {
+            PlayerLog.log("[API] \(endpoint.method.rawValue) \(endpoint.path)")
+            let result = try await performRequest(
+                endpoint,
+                allowHTTP412WBIRefresh: !didRefreshWBI
             )
-        }
+            didRefreshWBI = didRefreshWBI || result.didRefreshWBI
 
-        let wrapper: BiliResponse<T>
-        do {
-            wrapper = try decoder.decode(BiliResponse<T>.self, from: data)
-        } catch {
-            let preview = String(data: data.prefix(500), encoding: .utf8) ?? "<binary>"
-            PlayerLog.log("[API] Decode error for \(endpoint.path): \(error)\nResponse: \(preview)")
-            throw .decodingFailed(error)
-        }
-
-        guard wrapper.code == 0 else {
-            let preview = String(data: data.prefix(300), encoding: .utf8) ?? "<binary>"
-            PlayerLog.log("[API] \(endpoint.path) code=\(wrapper.code): \(preview)")
-            throw .apiError(code: wrapper.code, message: wrapper.message)
-        }
-
-        guard let result = wrapper.data else {
-            if let empty = try? decoder.decode(T.self, from: Data("{}".utf8)) {
-                if T.self != EmptyResult.self {
-                    PlayerLog.log("[API] ⚠️ \(endpoint.path) returned no data/result payload — synthesized empty \(T.self)")
+            let httpResponse = result.response
+            guard (200...299).contains(httpResponse.statusCode) else {
+                if httpResponse.statusCode == 412,
+                   canRefreshWBI(for: endpoint, didRefreshWBI: didRefreshWBI) {
+                    if Task.isCancelled { throw .network(URLError(.cancelled)) }
+                    didRefreshWBI = true
+                    PlayerLog.log(
+                        "[API] HTTP 412 for WBI GET \(endpoint.path) — refreshing WBI key and retrying once"
+                    )
+                    await WBISigner.shared.invalidate()
+                    continue
                 }
-                return empty
+                PlayerLog.log("[API] HTTP \(httpResponse.statusCode) for \(endpoint.path)")
+                throw httpError(from: httpResponse)
             }
-            let preview = String(data: data.prefix(500), encoding: .utf8) ?? "<binary>"
-            PlayerLog.log("[API] Data is nil for \(endpoint.path) (code=0). Response: \(preview)")
-            throw .apiError(code: wrapper.code, message: String(localized: "Data decode failed"))
-        }
 
-        return result
+            let wrapper: BiliResponse<T>
+            do {
+                wrapper = try decoder.decode(BiliResponse<T>.self, from: result.data)
+            } catch {
+                let preview = String(data: result.data.prefix(500), encoding: .utf8) ?? "<binary>"
+                PlayerLog.log("[API] Decode error for \(endpoint.path): \(error)\nResponse: \(preview)")
+                throw .decodingFailed(error)
+            }
+
+            guard wrapper.code == 0 else {
+                if canRefreshWBI(for: endpoint, didRefreshWBI: didRefreshWBI),
+                   BiliAPIRetryPolicy.isRetryableWBIErrorCode(wrapper.code) {
+                    if Task.isCancelled { throw .network(URLError(.cancelled)) }
+                    didRefreshWBI = true
+                    PlayerLog.log(
+                        "[API] \(endpoint.path) WBI code=\(wrapper.code) — refreshing WBI key and retrying once"
+                    )
+                    await WBISigner.shared.invalidate()
+                    continue
+                }
+                let preview = String(data: result.data.prefix(300), encoding: .utf8) ?? "<binary>"
+                PlayerLog.log("[API] \(endpoint.path) code=\(wrapper.code): \(preview)")
+                throw .apiError(code: wrapper.code, message: wrapper.message)
+            }
+
+            return try unwrapResponseData(wrapper, rawData: result.data, endpoint: endpoint)
+        }
     }
 
     func requestRaw(_ endpoint: BiliEndpoint) async throws(BiliError) -> Data {
@@ -95,11 +105,7 @@ actor BiliAPIClient {
 
         guard (200...299).contains(httpResponse.statusCode) else {
             PlayerLog.log("[API] HTTP \(httpResponse.statusCode) for \(endpoint.path)")
-            throw .httpError(
-                statusCode: httpResponse.statusCode,
-                retryAfter: [429, 503].contains(httpResponse.statusCode)
-                    ? HTTPRetryAfter.delay(httpResponse.value(forHTTPHeaderField: "Retry-After")) : nil
-            )
+            throw httpError(from: httpResponse)
         }
 
         return data
@@ -108,54 +114,221 @@ actor BiliAPIClient {
     func requestRawResponse(
         _ endpoint: BiliEndpoint
     ) async throws(BiliError) -> (Data, HTTPURLResponse) {
-        let urlRequest: URLRequest
-        do {
-            urlRequest = try await endpoint.buildRequest()
-        } catch {
-            throw .network(error)
-        }
-
-        let (data, response) = try await requestData(
-            urlRequest,
-            endpoint: endpoint
-        )
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw .network(URLError(.badServerResponse))
-        }
-        return (data, httpResponse)
+        let result = try await performRequest(endpoint, allowHTTP412WBIRefresh: true)
+        return (result.data, result.response)
     }
 
-    private func requestData(
-        _ request: URLRequest,
-        endpoint: BiliEndpoint
-    ) async throws(BiliError) -> (Data, URLResponse) {
+    private func performRequest(
+        _ endpoint: BiliEndpoint,
+        allowHTTP412WBIRefresh: Bool
+    ) async throws(BiliError) -> RequestResult {
         let maxAttempts = BiliAPIRetryPolicy.maxAttempts(for: endpoint.method)
+        var cachedRequest: URLRequest?
+        var didRefreshWBI = false
+
         for attempt in 1 ... maxAttempts {
-            do {
-                return try await session.data(for: request)
-            } catch {
-                guard BiliAPIRetryPolicy.shouldRetry(
-                    method: endpoint.method,
+            if Task.isCancelled { throw .network(URLError(.cancelled)) }
+
+            let urlRequest: URLRequest
+            if let existing = cachedRequest {
+                urlRequest = existing
+            } else {
+                guard let built = try await buildRequestOrRetry(
+                    endpoint,
                     attempt: attempt,
-                    error: error
+                    maxAttempts: maxAttempts
                 ) else {
-                    if !BiliAPIRetryPolicy.isCancellation(error) {
-                        PlayerLog.log("[API] Network error: \(error)")
-                    }
-                    throw .network(error)
+                    continue
                 }
-                PlayerLog.log(
-                    "[API] transient \(error) for \(endpoint.path) "
-                        + "(attempt \(attempt)/\(maxAttempts)) — retrying"
-                )
-                do {
-                    try await Task.sleep(for: .milliseconds(500 * attempt))
-                } catch {
-                    throw .network(URLError(.cancelled))
+                cachedRequest = built
+                urlRequest = built
+            }
+
+            guard let (data, httpResponse) = try await executeAttemptOrRetry(
+                urlRequest,
+                endpoint: endpoint,
+                attempt: attempt,
+                maxAttempts: maxAttempts
+            ) else {
+                continue
+            }
+
+            switch try await handleTransientHTTPStatus(
+                httpResponse,
+                endpoint: endpoint,
+                attempt: attempt,
+                maxAttempts: maxAttempts
+            ) {
+            case .proceed:
+                return RequestResult(data: data, response: httpResponse, didRefreshWBI: didRefreshWBI)
+            case .retry:
+                continue
+            case .retryWithWBIRefresh:
+                if allowHTTP412WBIRefresh,
+                   canRefreshWBI(for: endpoint, didRefreshWBI: didRefreshWBI) {
+                    didRefreshWBI = true
+                    cachedRequest = nil
+                    PlayerLog.log(
+                        "[API] HTTP 412 for WBI GET \(endpoint.path) — refreshing WBI key before retry"
+                    )
+                    await WBISigner.shared.invalidate()
                 }
+                continue
             }
         }
         throw .network(URLError(.unknown))
+    }
+}
+
+private extension BiliAPIClient {
+    func handleTransientHTTPStatus(
+        _ httpResponse: HTTPURLResponse,
+        endpoint: BiliEndpoint,
+        attempt: Int,
+        maxAttempts: Int
+    ) async throws(BiliError) -> TransientStatusAction {
+        let statusCode = httpResponse.statusCode
+        guard !(200...299).contains(statusCode),
+              BiliAPIRetryPolicy.shouldRetryHTTPStatus(
+                  method: endpoint.method,
+                  attempt: attempt,
+                  statusCode: statusCode
+              ) else {
+            return .proceed
+        }
+
+        let retryAfter = HTTPRetryAfter.delay(
+            httpResponse.value(forHTTPHeaderField: "Retry-After")
+        )
+        let delay = BiliAPIRetryPolicy.retryDelay(attempt: attempt, retryAfter: retryAfter)
+        PlayerLog.log(
+            "[API] transient HTTP \(statusCode) for \(endpoint.path) "
+                + "(attempt \(attempt)/\(maxAttempts)) — retrying in "
+                + String(format: "%.2fs", delay)
+        )
+        try await sleepForRetry(delay)
+        return statusCode == 412 ? .retryWithWBIRefresh : .retry
+    }
+
+    func buildRequestOrRetry(
+        _ endpoint: BiliEndpoint,
+        attempt: Int,
+        maxAttempts: Int
+    ) async throws(BiliError) -> URLRequest? {
+        do {
+            return try await endpoint.buildRequest()
+        } catch {
+            guard BiliAPIRetryPolicy.shouldRetry(
+                method: endpoint.method,
+                attempt: attempt,
+                error: error
+            ) else {
+                if !BiliAPIRetryPolicy.isCancellation(error) {
+                    PlayerLog.log("[API] Request build error for \(endpoint.path): \(error)")
+                }
+                throw mapBuildError(error)
+            }
+            let delay = BiliAPIRetryPolicy.retryDelay(
+                attempt: attempt,
+                retryAfter: extractRetryAfter(from: error)
+            )
+            PlayerLog.log(
+                "[API] transient build error \(error) for \(endpoint.path) "
+                    + "(attempt \(attempt)/\(maxAttempts)) — retrying in "
+                    + String(format: "%.2fs", delay)
+            )
+            try await sleepForRetry(delay)
+            return nil
+        }
+    }
+
+    func executeAttemptOrRetry(
+        _ request: URLRequest,
+        endpoint: BiliEndpoint,
+        attempt: Int,
+        maxAttempts: Int
+    ) async throws(BiliError) -> (Data, HTTPURLResponse)? {
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw URLError(.badServerResponse)
+            }
+            return (data, httpResponse)
+        } catch {
+            guard BiliAPIRetryPolicy.shouldRetry(
+                method: endpoint.method,
+                attempt: attempt,
+                error: error
+            ) else {
+                if !BiliAPIRetryPolicy.isCancellation(error) {
+                    PlayerLog.log("[API] Network error: \(error)")
+                }
+                throw .network(error)
+            }
+            let delay = BiliAPIRetryPolicy.retryDelay(attempt: attempt)
+            PlayerLog.log(
+                "[API] transient \(error) for \(endpoint.path) "
+                    + "(attempt \(attempt)/\(maxAttempts)) — retrying in "
+                    + String(format: "%.2fs", delay)
+            )
+            try await sleepForRetry(delay)
+            return nil
+        }
+    }
+
+    func unwrapResponseData<T: Decodable>(
+        _ wrapper: BiliResponse<T>,
+        rawData: Data,
+        endpoint: BiliEndpoint
+    ) throws(BiliError) -> T {
+        guard let result = wrapper.data else {
+            if let empty = try? decoder.decode(T.self, from: Data("{}".utf8)) {
+                if T.self != EmptyResult.self {
+                    PlayerLog.log(
+                        "[API] ⚠️ \(endpoint.path) returned no data/result payload — synthesized empty \(T.self)"
+                    )
+                }
+                return empty
+            }
+            let preview = String(data: rawData.prefix(500), encoding: .utf8) ?? "<binary>"
+            PlayerLog.log("[API] Data is nil for \(endpoint.path) (code=0). Response: \(preview)")
+            throw .apiError(code: wrapper.code, message: String(localized: "Data decode failed"))
+        }
+        return result
+    }
+
+    func canRefreshWBI(for endpoint: BiliEndpoint, didRefreshWBI: Bool) -> Bool {
+        !didRefreshWBI && endpoint.method == .get && endpoint.signType == .wbi
+    }
+
+    func httpError(from response: HTTPURLResponse) -> BiliError {
+        .httpError(
+            statusCode: response.statusCode,
+            retryAfter: [429, 503].contains(response.statusCode)
+                ? HTTPRetryAfter.delay(response.value(forHTTPHeaderField: "Retry-After")) : nil
+        )
+    }
+
+    func mapBuildError(_ error: any Error) -> BiliError {
+        if let biliError = error as? BiliError {
+            return biliError
+        }
+        return .network(error)
+    }
+
+    func extractRetryAfter(from error: any Error) -> TimeInterval? {
+        guard let biliError = error as? BiliError,
+              case .httpError(_, let retryAfter) = biliError else {
+            return nil
+        }
+        return retryAfter
+    }
+
+    func sleepForRetry(_ delay: TimeInterval) async throws(BiliError) {
+        do {
+            try await Task.sleep(for: .seconds(delay))
+        } catch {
+            throw .network(URLError(.cancelled))
+        }
     }
 }

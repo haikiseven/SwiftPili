@@ -460,6 +460,18 @@ struct DecoderRecoveryAdmission: Equatable {
     struct Ticket: Equatable {
         let token: UInt64
         let request: Request
+        let originBackendGeneration: UInt64
+
+        init(
+            token: UInt64,
+            request: Request,
+            originBackendGeneration: UInt64? = nil
+        ) {
+            self.token = token
+            self.request = request
+            self.originBackendGeneration = originBackendGeneration
+                ?? request.context.backendGeneration
+        }
     }
 
     enum Rejection: Equatable {
@@ -513,7 +525,8 @@ struct DecoderRecoveryAdmission: Equatable {
                     trigger: ticket.request.trigger,
                     position: ticket.request.position,
                     fault: ticket.request.fault
-                )
+                ),
+                originBackendGeneration: ticket.originBackendGeneration
             )
             return
         }
@@ -586,12 +599,17 @@ struct DecoderRecoveryAdmission: Equatable {
             guard ticket.request.context == request.context else {
                 return .rejected(.staleContext)
             }
-            if let epoch = request.trigger.lifecycleEpoch {
-                if !markLifecycleEpoch(epoch), lastLifecycleEpoch != epoch {
-                    return .rejected(.lifecycleEpochAlreadySpent)
+            if request.trigger.isRuntimeFault,
+               request.context.backendGeneration != ticket.originBackendGeneration {
+                inFlight = nil
+            } else {
+                if let epoch = request.trigger.lifecycleEpoch {
+                    if !markLifecycleEpoch(epoch), lastLifecycleEpoch != epoch {
+                        return .rejected(.lifecycleEpochAlreadySpent)
+                    }
                 }
+                return .coalesced(ticket.token)
             }
-            return .coalesced(ticket.token)
         }
 
         switch request.trigger {
@@ -608,7 +626,9 @@ struct DecoderRecoveryAdmission: Equatable {
                     return .rejected(.budgetExhausted)
                 }
             }
-        case .manualRetry, .streamTransport:
+        case .manualRetry:
+            runtimeBackoffUntil = 0
+        case .streamTransport:
             break
         }
 

@@ -477,6 +477,12 @@ extension MessageCenterViewModel {
 
     private func recordPageFailure(_ error: BiliError, for request: PageRequest) {
         guard isCurrentPage(request), !error.isCancellation else { return }
+        if request.kind == .system, !request.isRefresh, request.cursor.id > 0, !systemItems.isEmpty,
+           case .apiError(let code, _) = error, code == -6 {
+            endedPages.insert(.system)
+            PlayerLog.log("[MsgVM] system cursor \(request.cursor.id) rejected (-6); marking ended")
+            return
+        }
         let failure = PageFailure(message: error.localizedDescription)
         pageFailures[request.kind] = failure
         failedPageRequests[request.kind] = request

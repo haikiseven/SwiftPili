@@ -3,18 +3,28 @@ import CryptoKit
 
 enum BuvidManager {
     private static let buvidKey = "buvid3"
+    private static let buvid4Key = "buvid4"
+    private static let cookieLifetime: TimeInterval = 365 * 24 * 60 * 60
 
     static func ensureBuvid() {
-        if getBuvid() == nil {
-            let buvid3 = generateBuvid3()
+        let buvid3: String
+        if let existing = getBuvid(), !existing.isEmpty {
+            buvid3 = existing
+        } else {
+            buvid3 = generateBuvid3()
             UserDefaults.standard.set(buvid3, forKey: buvidKey)
-            setCookie(name: "buvid3", value: buvid3)
         }
-        if UserDefaults.standard.string(forKey: "buvid4") == nil {
-            let buvid4 = "\(generateBuvid3())\(Int(Date().timeIntervalSince1970))"
-            UserDefaults.standard.set(buvid4, forKey: "buvid4")
-            setCookie(name: "buvid4", value: buvid4)
+        setCookie(name: "buvid3", value: buvid3)
+
+        let buvid4: String
+        if let existing = UserDefaults.standard.string(forKey: buvid4Key), !existing.isEmpty {
+            buvid4 = existing
+        } else {
+            buvid4 = "\(generateBuvid3())\(Int(Date().timeIntervalSince1970))"
+            UserDefaults.standard.set(buvid4, forKey: buvid4Key)
         }
+        setCookie(name: "buvid4", value: buvid4)
+
         setCookie(name: "b_nut", value: "100")
     }
 
@@ -42,7 +52,7 @@ enum BuvidManager {
 
         do {
             let data = try await BiliAPIClient.shared.requestRaw(
-                BiliEndpoint(path: "/x/frontend/finger/spi")
+                BiliEndpoint(path: "/x/frontend/finger/spi", signType: .none)
             )
             let wrapper = try JSONDecoder().decode(Wrapper.self, from: data)
             guard wrapper.code == 0, let b3 = wrapper.data?.b3, !b3.isEmpty else {
@@ -52,7 +62,7 @@ enum BuvidManager {
             UserDefaults.standard.set(b3, forKey: buvidKey)
             setCookie(name: "buvid3", value: b3)
             if let b4 = wrapper.data?.b4, !b4.isEmpty {
-                UserDefaults.standard.set(b4, forKey: "buvid4")
+                UserDefaults.standard.set(b4, forKey: buvid4Key)
                 setCookie(name: "buvid4", value: b4)
             }
             UserDefaults.standard.set(true, forKey: "buvid_server_issued")
@@ -73,6 +83,7 @@ enum BuvidManager {
             .value: value,
             .domain: ".bilibili.com",
             .path: "/",
+            .expires: Date().addingTimeInterval(cookieLifetime),
         ]
         if let cookie = HTTPCookie(properties: properties) {
             HTTPCookieStorage.shared.setCookie(cookie)

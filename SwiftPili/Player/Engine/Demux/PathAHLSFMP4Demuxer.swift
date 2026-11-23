@@ -6,10 +6,15 @@ actor PathAHLSFMP4Demuxer: MediaDemuxing {
     func updateMultiConnectionPlayback(position: TimeInterval, rate: Float) async {}
     func cancelMultiConnectionPrefetching() async {}
 
+    private static let requestTimeoutSeconds: TimeInterval = 20
+    private static let maxTransientAttempts = 3
+    private static let transientRetryBackoffs: [TimeInterval] = [0.5, 1.2]
+
     private let session: URLSession
     private let ownsSession: Bool
     private var generation: UInt64 = 0
     private var inFlightRequest: PathAHLSInFlightRequest?
+    private var sleepWaiter: (id: UUID, task: Task<Void, Never>)?
     private var playlistURL: URL?
     private var headers: [String: String] = [:]
     private var networkBytes: MediaNetworkByteCounter?
@@ -32,7 +37,7 @@ actor PathAHLSFMP4Demuxer: MediaDemuxing {
             self.ownsSession = false
         } else {
             let configuration = URLSessionConfiguration.ephemeral
-            configuration.timeoutIntervalForRequest = 15
+            configuration.timeoutIntervalForRequest = Self.requestTimeoutSeconds
             configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
             self.session = URLSession(configuration: configuration)
             self.ownsSession = true
@@ -146,13 +151,16 @@ actor PathAHLSFMP4Demuxer: MediaDemuxing {
         }
         let pumpGeneration = generation
         if segmentWindow.pending.isEmpty, !endListSeen {
-            guard ProcessInfo.processInfo.systemUptime >= nextRefreshUptime else { return [] }
+            let waitSeconds = nextRefreshUptime - ProcessInfo.processInfo.systemUptime
+            if waitSeconds > 0 {
+                try await sleep(waitSeconds, generation: pumpGeneration)
+            }
             let playlist = try await fetchPlaylist(generation: pumpGeneration)
             guard isCurrent(pumpGeneration) else {
                 throw MediaEngineError.stopped
             }
             guard playlist.mapURL == activeMapURL else {
-                throw MediaEngineError.demuxFailed("HLS map changed; live reload required")
+                throw MediaEngineError.demuxFailed(MediaEngineError.liveMapChangedReloadRequiredDiagnostic)
             }
             let enqueued = apply(playlist)
             PlayerLog.log(
@@ -354,8 +362,45 @@ actor PathAHLSFMP4Demuxer: MediaDemuxing {
         stage: String,
         generation: UInt64
     ) async throws -> Data {
+        for attempt in 1...Self.maxTransientAttempts {
+            guard isCurrent(generation), !Task.isCancelled else {
+                throw MediaEngineError.stopped
+            }
+            do {
+                return try await loadOnce(url, stage: stage, generation: generation)
+            } catch {
+                if Self.isCancellation(error) || !isCurrent(generation) {
+                    throw MediaEngineError.stopped
+                }
+                guard attempt < Self.maxTransientAttempts,
+                      let mediaError = error as? MediaEngineError,
+                      case .transportFailed(let failure) = mediaError,
+                      Self.isTransientFailure(failure) else {
+                    throw error
+                }
+                let baseBackoff = Self.transientRetryBackoffs[
+                    min(attempt - 1, Self.transientRetryBackoffs.count - 1)
+                ]
+                let delay = min(max(baseBackoff, failure.retryAfter ?? 0), 5.0)
+                PlayerLog.log(
+                    "[PathA:HLS] transient \(stage) failure=\(failure.diagnostic) " +
+                    "attempt=\(attempt)/\(Self.maxTransientAttempts) " +
+                    "retryIn=\(String(format: "%.2f", delay))s"
+                )
+                try await sleep(delay, generation: generation)
+            }
+        }
+        throw MediaEngineError.stopped
+    }
+
+    private func loadOnce(
+        _ url: URL,
+        stage: String,
+        generation: UInt64
+    ) async throws -> Data {
         guard isCurrent(generation) else { throw MediaEngineError.stopped }
         var request = URLRequest(url: url)
+        request.timeoutInterval = Self.requestTimeoutSeconds
         for (key, value) in headers {
             request.setValue(value, forHTTPHeaderField: key)
         }
@@ -391,10 +436,16 @@ actor PathAHLSFMP4Demuxer: MediaDemuxing {
             })
             guard isCurrent(generation) else { throw MediaEngineError.stopped }
             guard let http = result.response as? HTTPURLResponse else {
-                throw MediaEngineError.demuxFailed("HLS \(stage): non-HTTP response")
+                throw MediaEngineError.transportFailed(StreamTransportFailure(
+                    stage: .mediaRead,
+                    reason: .url(URLError.badServerResponse.rawValue),
+                    retryAfter: nil
+                ))
             }
             guard (200..<300).contains(http.statusCode) else {
-                throw MediaEngineError.demuxFailed("HLS \(stage): HTTP \(http.statusCode)")
+                throw MediaEngineError.transportFailed(
+                    StreamTransportFailure.http(http, stage: .mediaRead)
+                )
             }
             guard result.data.count <= responseLimit else {
                 throw MediaEngineError.demuxFailed(
@@ -409,9 +460,55 @@ actor PathAHLSFMP4Demuxer: MediaDemuxing {
             if let mediaError = error as? MediaEngineError {
                 throw mediaError
             }
+            if let bodyError = error as? MediaNetworkDataTask.BodyError, case .exceedsBound = bodyError {
+                throw MediaEngineError.demuxFailed(
+                    "HLS \(stage): response exceeds bound"
+                )
+            }
+            if let failure = StreamTransportFailure.preserving(error, stage: .mediaRead) {
+                throw MediaEngineError.transportFailed(failure)
+            }
             throw MediaEngineError.demuxFailed(
                 "HLS \(stage): \(error.localizedDescription)"
             )
+        }
+    }
+
+    private func sleep(_ seconds: TimeInterval, generation: UInt64) async throws {
+        guard isCurrent(generation), !Task.isCancelled else {
+            throw MediaEngineError.stopped
+        }
+        guard seconds > 0 else { return }
+        let waiterID = UUID()
+        let sleepTask = Task<Void, Never> {
+            try? await Task.sleep(for: .seconds(seconds))
+        }
+        sleepWaiter?.task.cancel()
+        sleepWaiter = (id: waiterID, task: sleepTask)
+        defer {
+            if sleepWaiter?.id == waiterID {
+                sleepWaiter = nil
+            }
+        }
+        await withTaskCancellationHandler {
+            await sleepTask.value
+        } onCancel: {
+            sleepTask.cancel()
+        }
+        guard isCurrent(generation), !Task.isCancelled else {
+            throw MediaEngineError.stopped
+        }
+    }
+
+    private static func isTransientFailure(_ failure: StreamTransportFailure) -> Bool {
+        if failure.isEligible { return true }
+        switch failure.reason {
+        case .http(404):
+            return true
+        case .url(let code):
+            return URLError.Code(rawValue: code) == .badServerResponse
+        default:
+            return false
         }
     }
 
@@ -464,6 +561,9 @@ actor PathAHLSFMP4Demuxer: MediaDemuxing {
     ) {
         generation &+= 1
         closed = true
+        let activeSleep = sleepWaiter?.task
+        sleepWaiter = nil
+        activeSleep?.cancel()
         let request = inFlightRequest
         inFlightRequest = nil
         reset()

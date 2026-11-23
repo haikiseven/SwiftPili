@@ -69,7 +69,7 @@ extension PlayerViewModel {
             await loadLive(
                 roomID: roomID,
                 quality: quality,
-                preservePlayState: true,
+                preservePlayState: request.trigger != .manualRetry,
                 owner: authority.owner,
                 ownerLease: PlayerOwnerLease(
                     owner: authority.owner,

@@ -102,6 +102,23 @@ struct LiveDemandResolvedTuple: Sendable, Equatable {
     let actualQn: Int
     let liveSourceKind: DemandLiveSourceKind?
     let hlsTSBackupPlaylistURL: URL?
+    let backupURLs: [URL]
+
+    init(
+        url: URL,
+        metadata: LiveDemandCandidateMetadata,
+        actualQn: Int,
+        liveSourceKind: DemandLiveSourceKind?,
+        hlsTSBackupPlaylistURL: URL?,
+        backupURLs: [URL] = []
+    ) {
+        self.url = url
+        self.metadata = metadata
+        self.actualQn = actualQn
+        self.liveSourceKind = liveSourceKind
+        self.hlsTSBackupPlaylistURL = hlsTSBackupPlaylistURL
+        self.backupURLs = backupURLs
+    }
 
     func demandSource(for ownerLease: PlayerOwnerLease?) -> DemandLiveSource? {
         liveSourceKind.map {
@@ -432,7 +449,8 @@ enum LiveDemandCandidateResolver {
             metadata: selected.metadata,
             actualQn: selected.actualQn!,
             liveSourceKind: selected.liveSourceKind,
-            hlsTSBackupPlaylistURL: backupPlaylistURL(for: selected, among: admitted)
+            hlsTSBackupPlaylistURL: backupPlaylistURL(for: selected, among: admitted),
+            backupURLs: backupURLs(for: selected, among: admitted)
         )
         return LiveDemandSelection(
             requestedQn: requestedQn,
@@ -441,6 +459,32 @@ enum LiveDemandCandidateResolver {
             selected: selectedTuple,
             failure: nil
         )
+    }
+
+    private static func backupURLs(for selected: Candidate, among admitted: [Candidate]) -> [URL] {
+        guard let selectedURL = selected.url else { return [] }
+        let selectedHost = playlistHost(selectedURL)
+        let siblings = admitted
+            .filter { candidate in
+                candidate.codecRowStartOrder == selected.codecRowStartOrder
+                    && candidate.actualQn == selected.actualQn
+                    && candidate.sourceOrder != selected.sourceOrder
+            }
+            .sorted { $0.sourceOrder < $1.sourceOrder }
+        var seenURLs: Set<URL> = [selectedURL]
+        var distinctHostURLs: [URL] = []
+        var sameHostURLs: [URL] = []
+        for candidate in siblings {
+            guard let url = candidate.url,
+                  DemandLiveHTTPTransport.isHTTPURL(url),
+                  seenURLs.insert(url).inserted else { continue }
+            if let selectedHost, let candidateHost = playlistHost(url), candidateHost != selectedHost {
+                distinctHostURLs.append(url)
+            } else {
+                sameHostURLs.append(url)
+            }
+        }
+        return distinctHostURLs + sameHostURLs
     }
 
     private static func backupPlaylistURL(for selected: Candidate, among admitted: [Candidate]) -> URL? {
@@ -868,6 +912,12 @@ enum LiveDemandCandidateResolver {
 
         if let lower = accepted.filter({ $0 < requested }).max() {
             return QualityMatch(actualQn: lower, isExact: false)
+        }
+        if let higher = accepted.filter({ $0 > requested }).min() {
+            return QualityMatch(actualQn: higher, isExact: false)
+        }
+        if let current, current > requested, accepted.isEmpty {
+            return QualityMatch(actualQn: current, isExact: false)
         }
         if current == nil, accepted.isEmpty, requested > 0 {
             return QualityMatch(actualQn: requested, isExact: true)

@@ -39,6 +39,41 @@ extension PlayerViewModel {
         )
     }
 
+    private func preOpenManualRetryContext() -> DecoderRecoveryAdmission.Context? {
+        guard let ownerLease = currentOwnerLease,
+              let source = decoderRecoverySource() else { return nil }
+        return DecoderRecoveryAdmission.Context(
+            owner: ownerLease.owner,
+            ownerLeaseGeneration: ownerLease.generation,
+            backendGeneration: max(backend.runtimeGeneration, 1),
+            source: source
+        )
+    }
+
+    private func clearSupersededRecoveryState(for priorToken: UInt64) {
+        if let pending = nonLifecycleRecoveryTicket, pending.token == priorToken {
+            nonLifecycleRecoveryTicket = nil
+            PlayerLog.log(
+                "[Recovery] boundary=1 ticket=\(pending.token) closed " +
+                    "outcome=\(DecoderRecoveryCompletion.backendError) " +
+                    "trigger=\(String(describing: pending.request.trigger)) \(budget.summary)"
+            )
+        }
+        if nonLifecycleRecoveryTask?.token == priorToken {
+            nonLifecycleRecoveryTask?.task.cancel()
+            nonLifecycleRecoveryTask = nil
+        }
+        if pendingLifecycleAdmission?.token == priorToken
+            || lifecycleReadinessFence?.admissionToken == priorToken {
+            if let epoch = pendingLifecycleAdmission?.epoch
+                ?? lifecycleReadinessFence?.lifecycleEpoch {
+                lifecycleRecovery.abandon(epoch: epoch)
+            }
+            invalidateLifecycleReadiness()
+        }
+        clearCoalescedWatchdogTracking(for: priorToken)
+    }
+
     private func surfaceDemandRuntimeFault(_ fault: MediaRuntimeFault) {
         settleTerminalFailure(TerminalFailurePayload(
             message: MediaRuntimeFaultPresentation.message(for: fault),
@@ -55,11 +90,23 @@ extension PlayerViewModel {
         position: TimeInterval,
         fault: MediaRuntimeFault? = nil
     ) -> DecoderRecoveryAdmission.Decision {
-        guard let context = decoderRecoveryContext() else {
+        let resolvedContext = decoderRecoveryContext()
+            ?? (trigger == .manualRetry ? preOpenManualRetryContext() : nil)
+        guard let context = resolvedContext else {
             PlayerLog.log(
                 "[Recovery] \(String(describing: trigger)) rejected — no retained authority"
             )
             return .rejected(.noAuthority)
+        }
+        if trigger == .manualRetry,
+           decoderRecoveryAdmission.inFlight == nil,
+           decoderRecoveryAdmission.context != context {
+            PlayerLog.log(
+                "[Recovery] installing manual retry authority owner=\(context.owner) " +
+                    "backendGen=\(context.backendGeneration) " +
+                    "hadContext=\(decoderRecoveryAdmission.context != nil ? 1 : 0)"
+            )
+            decoderRecoveryAdmission.install(context)
         }
         let request = DecoderRecoveryAdmission.Request(
             context: context,
@@ -73,6 +120,10 @@ extension PlayerViewModel {
             now: CACurrentMediaTime(),
             budget: &budget
         )
+        if let priorToken = ticketBeforeAdmit,
+           decoderRecoveryAdmission.inFlight?.token != priorToken {
+            clearSupersededRecoveryState(for: priorToken)
+        }
         PlayerLog.log(
             "[Recovery] boundary=1 \(String(describing: trigger)) → \(String(describing: decision)) " +
                 "at=\(String(format: "%.1f", position)) " +
@@ -82,16 +133,6 @@ extension PlayerViewModel {
         switch decision {
         case .admitted(let token), .coalesced(let token):
             rememberNonLifecycleRecoveryTicket(token: token, authority: context)
-        case .rejected(.nonRecoverableFault):
-            if let pending = nonLifecycleRecoveryTicket, pending.token == ticketBeforeAdmit {
-                nonLifecycleRecoveryTicket = nil
-                PlayerLog.log(
-                    "[Recovery] boundary=1 ticket=\(pending.token) closed " +
-                        "outcome=\(DecoderRecoveryCompletion.backendError) " +
-                        "trigger=\(String(describing: pending.request.trigger)) \(budget.summary)"
-                )
-            }
-            return decision
         case .rejected:
             return decision
         }
@@ -179,6 +220,8 @@ extension PlayerViewModel {
             )
         case .rejected(let rejection) where rejection.endsAutomaticRecovery:
             surfaceDemandRuntimeFault(fault)
+        case .rejected(.backoff) where mode == .live:
+            surfaceDemandRuntimeFault(fault)
         case .rejected(let rejection):
             PlayerLog.log(
                 "[PathA] runtime fault not admitted (\(rejection)) class=\(fault.classification.rawValue) " +
@@ -200,6 +243,7 @@ extension PlayerViewModel {
         if let unavailability {
             PlayerLog.log("[Player] retry accepted — \(unavailability.rawValue) is transient")
         }
+        cancelLiveRecoveryTasks(resetAttempts: true, clearBackups: true)
         self.unavailability = nil
         playbackTerminalState = .active
         terminalOpenFailure = false

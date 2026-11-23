@@ -373,4 +373,207 @@ extension PlayerViewModel {
     func migrateStreamRetryLoad(preserving: Bool) {
         if preserving { streamRecovery?.loadGeneration = loadGeneration }
     }
+
+    // MARK: - Live Failover & Auto-Reconnect
+
+    func cancelLiveStabilityReset() {
+        liveStabilityResetTask?.cancel()
+        liveStabilityResetTask = nil
+    }
+
+    func cancelLiveRecoveryTasks(
+        resetAttempts: Bool,
+        clearBackups: Bool = false
+    ) {
+        liveRecoveryGeneration &+= 1
+        liveReconnectTask?.cancel()
+        liveReconnectTask = nil
+        cancelLiveStabilityReset()
+        if resetAttempts {
+            liveReconnectAttempts = 0
+            liveNeedsReconnectOnResume = false
+        }
+        if clearBackups {
+            liveBackupURLs = []
+            liveActiveSourceKind = nil
+        }
+    }
+
+    func armLiveStabilityResetIfNeeded() {
+        guard mode == .live,
+              liveReconnectAttempts > 0,
+              isPlaying,
+              !isBuffering,
+              error == nil,
+              liveStabilityResetTask == nil,
+              let roomID = currentRoomID,
+              let ownerLease = currentOwnerLease else { return }
+        let token = liveRecoveryGeneration
+        let backendGen = backend.runtimeGeneration
+        liveStabilityResetTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(Self.liveStabilityResetSeconds))
+            } catch {
+                return
+            }
+            guard let self,
+                  !Task.isCancelled,
+                  self.liveRecoveryGeneration == token,
+                  self.mode == .live,
+                  self.currentRoomID == roomID,
+                  self.isCurrentOwner(ownerLease),
+                  self.backend.runtimeGeneration == backendGen,
+                  self.isPlaying,
+                  !self.isBuffering,
+                  self.error == nil else { return }
+            self.liveStabilityResetTask = nil
+            if self.liveReconnectAttempts > 0 {
+                self.liveReconnectAttempts = 0
+                PlayerLog.log(
+                    "[LiveRecovery] live playback stable for \(Int(Self.liveStabilityResetSeconds))s " +
+                    "— reconnect attempt counter reset"
+                )
+            }
+        }
+    }
+
+    @discardableResult
+    func attemptLiveErrorRecovery(_ error: any Error) -> Bool {
+        guard mode == .live,
+              let roomID = currentRoomID,
+              let ownerLease = currentOwnerLease,
+              canAutoRevive else { return false }
+        if let engine = error as? MediaEngineError, case .stopped = engine {
+            return false
+        }
+        if !liveBackupURLs.isEmpty {
+            let nextURL = liveBackupURLs.removeFirst()
+            let remainingCount = liveBackupURLs.count
+            let liveSource: DemandLiveSource?
+            if activeBackendKind == .demandPaced, let kind = liveActiveSourceKind {
+                let nextHost = nextURL.host?.lowercased()
+                let hlsTSBackup = kind == .hlsMPEGTS
+                    ? liveBackupURLs.first { $0.host?.lowercased() != nextHost }
+                    : nil
+                liveSource = DemandLiveSource(
+                    kind: kind,
+                    ownerLease: ownerLease,
+                    hlsTSBackupPlaylistURL: hlsTSBackup
+                )
+            } else {
+                liveSource = nil
+            }
+            PlayerLog.log(
+                "[LiveRecovery] backup CDN failover room=\(roomID) qn=\(currentLiveQuality) " +
+                "engine=\(activeBackendKind.shortLabel) " +
+                "nextHost=\(nextURL.host() ?? "?") remainingBackups=\(remainingCount) " +
+                "error=\(error.localizedDescription)"
+            )
+            relinquishLifecycleAuthority(
+                takenOverBy: "live-backup-failover",
+                reason: error.localizedDescription
+            )
+            cancelLiveStabilityReset()
+            if playbackIntent == .playing, !audioSessionInterrupted {
+                beginBackgroundPlaybackRestoration(reason: "live-backup-failover")
+            }
+            self.error = nil
+            unavailability = nil
+            terminalOpenFailure = false
+            playbackTerminalState = .active
+            isBuffering = true
+            playURL(nextURL, liveSource: liveSource)
+            return true
+        }
+        return scheduleLiveRefreshReconnect(
+            roomID: roomID,
+            quality: currentLiveQuality,
+            ownerLease: ownerLease,
+            reason: error.localizedDescription
+        )
+    }
+
+    @discardableResult
+    func scheduleLiveRefreshReconnect(
+        roomID: Int,
+        quality: Int,
+        ownerLease: PlayerOwnerLease,
+        reason: String
+    ) -> Bool {
+        guard mode == .live,
+              currentRoomID == roomID,
+              isCurrentOwner(ownerLease),
+              canAutoRevive,
+              liveReconnectAttempts < Self.maxLiveRefreshReconnects else {
+            return false
+        }
+        let attemptIndex = liveReconnectAttempts
+        liveReconnectAttempts += 1
+        let attemptNumber = liveReconnectAttempts
+        let delay = Self.liveRefreshBackoffSeconds[
+            min(attemptIndex, Self.liveRefreshBackoffSeconds.count - 1)
+        ]
+        relinquishLifecycleAuthority(
+            takenOverBy: "live-refresh-reconnect",
+            reason: reason
+        )
+        cancelLiveRecoveryTasks(resetAttempts: false, clearBackups: true)
+        let token = liveRecoveryGeneration
+        if playbackIntent == .playing, !audioSessionInterrupted {
+            beginBackgroundPlaybackRestoration(reason: "live-reconnect")
+        }
+        backend.stop()
+        updateIsPlaying(transportRunning: false)
+        error = nil
+        unavailability = nil
+        terminalOpenFailure = false
+        playbackTerminalState = .active
+        isBuffering = true
+
+        PlayerLog.log(
+            "[LiveRecovery] scheduling getPlayInfo refresh reconnect " +
+            "room=\(roomID) qn=\(quality) attempt=\(attemptNumber)/\(Self.maxLiveRefreshReconnects) " +
+            "delay=\(String(format: "%.1f", delay))s reason=\(reason)"
+        )
+
+        liveReconnectTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(delay))
+            } catch {
+                return
+            }
+            guard let self,
+                  !Task.isCancelled,
+                  self.liveRecoveryGeneration == token,
+                  self.mode == .live,
+                  self.currentRoomID == roomID,
+                  self.currentLiveQuality == quality,
+                  self.isCurrentOwner(ownerLease) else {
+                return
+            }
+            self.liveReconnectTask = nil
+            guard self.canAutoRevive else {
+                if !self.currentPlaybackTerminalState.isTerminal,
+                   self.mediaResetRecovery.request == nil {
+                    self.liveNeedsReconnectOnResume = true
+                    self.isBuffering = false
+                }
+                return
+            }
+            PlayerLog.log(
+                "[LiveRecovery] executing getPlayInfo refresh reconnect " +
+                "room=\(roomID) qn=\(quality) attempt=\(attemptNumber)/\(Self.maxLiveRefreshReconnects)"
+            )
+            _ = await self.loadLive(
+                roomID: roomID,
+                quality: quality,
+                playInfo: nil,
+                preservePlayState: true,
+                owner: ownerLease.owner,
+                ownerLease: ownerLease,
+                preservingLiveReconnect: true
+            )
+        }
+        return true
+    }
 }

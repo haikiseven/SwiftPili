@@ -1,9 +1,14 @@
 import Foundation
 
 enum MessageAPI {
+    private static let messageHeaders: [String: String] = [
+        "Referer": "https://message.bilibili.com/",
+        "Origin": "https://message.bilibili.com",
+    ]
+
     static func getUnreadCount() async throws(BiliError) -> MessageUnreadCount {
         try await BiliAPIClient.shared.request(
-            BiliEndpoint(path: "/x/msgfeed/unread"),
+            BiliEndpoint(path: "/x/msgfeed/unread", headers: messageHeaders),
             type: MessageUnreadCount.self
         )
     }
@@ -16,7 +21,7 @@ enum MessageAPI {
         if id > 0 { params["id"] = String(id) }
         if replyTime > 0 { params["reply_time"] = String(replyTime) }
         return try await BiliAPIClient.shared.request(
-            BiliEndpoint(path: "/x/msgfeed/reply", params: params),
+            BiliEndpoint(path: "/x/msgfeed/reply", params: params, headers: messageHeaders),
             type: ReplyMessageResult.self
         )
     }
@@ -29,7 +34,7 @@ enum MessageAPI {
         if id > 0 { params["id"] = String(id) }
         if atTime > 0 { params["at_time"] = String(atTime) }
         return try await BiliAPIClient.shared.request(
-            BiliEndpoint(path: "/x/msgfeed/at", params: params),
+            BiliEndpoint(path: "/x/msgfeed/at", params: params, headers: messageHeaders),
             type: AtMessageResult.self
         )
     }
@@ -42,18 +47,18 @@ enum MessageAPI {
         if id > 0 { params["id"] = String(id) }
         if likeTime > 0 { params["like_time"] = String(likeTime) }
         return try await BiliAPIClient.shared.request(
-            BiliEndpoint(path: "/x/msgfeed/like", params: params),
+            BiliEndpoint(path: "/x/msgfeed/like", params: params, headers: messageHeaders),
             type: LikeMessageResult.self
         )
     }
 
     static func getSystemNotifications(
         cursor: Int = 0,
-        pageSize: Int = 25
+        pageSize: Int = 20
     ) async throws(BiliError) -> SystemNotifyResult {
+        let clampedPageSize = min(max(pageSize, 1), 20)
         var params: [String: String] = [
-            "data_type": "1",
-            "page_size": String(pageSize),
+            "page_size": String(clampedPageSize),
             "build": "0",
             "mobi_app": "web",
         ]
@@ -68,7 +73,8 @@ enum MessageAPI {
                 path: "/x/sys-msg/query_user_notify",
                 params: params,
                 signType: .none,
-                baseURL: "https://message.bilibili.com"
+                baseURL: "https://message.bilibili.com",
+                headers: messageHeaders
             ),
             type: SystemNotifyResult.self
         )
@@ -90,7 +96,8 @@ enum MessageAPI {
             BiliEndpoint(
                 path: "/session_svr/v1/session_svr/get_sessions",
                 params: params,
-                baseURL: "https://api.vc.bilibili.com"
+                baseURL: "https://api.vc.bilibili.com",
+                headers: messageHeaders
             ),
             type: SessionListResult.self
         )
@@ -106,7 +113,8 @@ enum MessageAPI {
                     "build": "0",
                     "mobi_app": "web",
                 ],
-                baseURL: "https://api.vc.bilibili.com"
+                baseURL: "https://api.vc.bilibili.com",
+                headers: messageHeaders
             ),
             type: [IMUserInfo].self
         )
@@ -132,7 +140,8 @@ enum MessageAPI {
             BiliEndpoint(
                 path: "/svr_sync/v1/svr_sync/fetch_session_msgs",
                 params: params,
-                baseURL: "https://api.vc.bilibili.com"
+                baseURL: "https://api.vc.bilibili.com",
+                headers: messageHeaders
             ),
             type: SessionMsgsResult.self
         )
@@ -152,7 +161,8 @@ enum MessageAPI {
                     "csrf_token": csrf,
                     "csrf": csrf,
                 ],
-                baseURL: "https://api.vc.bilibili.com"
+                baseURL: "https://api.vc.bilibili.com",
+                headers: messageHeaders
             ),
             type: EmptyResult.self
         )
@@ -189,7 +199,8 @@ enum MessageAPI {
                     "csrf_token": csrf,
                     "csrf": csrf,
                 ],
-                baseURL: "https://api.vc.bilibili.com"
+                baseURL: "https://api.vc.bilibili.com",
+                headers: messageHeaders
             ),
             type: SendMsgResult.self
         )
