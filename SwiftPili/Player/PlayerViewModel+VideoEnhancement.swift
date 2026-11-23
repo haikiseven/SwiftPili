@@ -8,6 +8,8 @@ struct VideoEnhancementDefaultsSnapshot: Equatable {
     let frameInterpolation: Bool
     let interpolationRate: VideoInterpolationRate
     let superResolutionScale: VideoSuperResolutionScale
+    let superResolutionTargetResolution: VideoSuperResolutionTargetResolution
+    let maxInputResolution: VideoEnhancementMaxInputResolution
 
     @MainActor static var current: Self {
         let store = ExperimentalSettingsStore.shared
@@ -16,7 +18,9 @@ struct VideoEnhancementDefaultsSnapshot: Equatable {
             superResolutionMode: store.videoEnhancementDefaultSRMode,
             frameInterpolation: store.videoEnhancementDefaultFrameInterpolation,
             interpolationRate: store.videoEnhancementDefaultRate,
-            superResolutionScale: store.videoEnhancementDefaultScale
+            superResolutionScale: store.videoEnhancementDefaultScale,
+            superResolutionTargetResolution: store.videoEnhancementDefaultTargetResolution,
+            maxInputResolution: store.videoEnhancementMaxInputResolution
         )
     }
 }
@@ -32,6 +36,16 @@ struct VideoEnhancementControlStatus: Equatable {
 }
 
 extension PlayerViewModel {
+    var videoSuperResolutionTargetResolution: VideoSuperResolutionTargetResolution {
+        get { session.videoSuperResolutionTargetResolution }
+        set { session.videoSuperResolutionTargetResolution = newValue }
+    }
+
+    var videoEnhancementMaxInputResolution: VideoEnhancementMaxInputResolution {
+        get { session.videoEnhancementMaxInputResolution }
+        set { session.videoEnhancementMaxInputResolution = newValue }
+    }
+
     var videoEnhancementUnavailableReason: String? {
         if mode == .live {
             return "Live unsupported"
@@ -59,6 +73,8 @@ extension PlayerViewModel {
             frameInterpolationEnabled: videoFrameInterpolationEnabled,
             interpolationRate: videoInterpolationRate,
             superResolutionScale: videoSuperResolutionScale,
+            superResolutionTargetResolution: videoSuperResolutionTargetResolution,
+            maxInputResolution: videoEnhancementMaxInputResolution,
             isLiveStream: mode == .live,
             adaptiveQualityEnabled: ExperimentalSettingsStore.shared.videoEnhancementAdaptiveQuality,
             adaptiveSensitivity: ExperimentalSettingsStore.shared.videoEnhancementAdaptiveSensitivity,
@@ -98,6 +114,22 @@ extension PlayerViewModel {
         syncVideoEnhancementToBackend()
     }
 
+    func setVideoSuperResolutionTargetResolution(_ target: VideoSuperResolutionTargetResolution) {
+        guard ExperimentalSettingsStore.shared.isAllowed(.videoEnhancement),
+              isVideoEnhancementEligibleForStream, videoSuperResolutionMode == .metalFXSpatial,
+              videoSuperResolutionTargetResolution != target else { return }
+        videoSuperResolutionTargetResolution = target
+        syncVideoEnhancementToBackend()
+    }
+
+    func setVideoEnhancementMaxInputResolution(_ limit: VideoEnhancementMaxInputResolution) {
+        guard ExperimentalSettingsStore.shared.isAllowed(.videoEnhancement),
+              isVideoEnhancementEligibleForStream,
+              videoEnhancementMaxInputResolution != limit else { return }
+        videoEnhancementMaxInputResolution = limit
+        syncVideoEnhancementToBackend()
+    }
+
     func syncVideoEnhancementToBackend(_ targetBackend: (any PlayerBackend)? = nil) {
         let target = targetBackend ?? backend
         target.videoEnhancementConfiguration = effectiveVideoEnhancementConfiguration
@@ -126,21 +158,42 @@ extension PlayerViewModel {
 
     func handleVideoEnhancementPolicyChange() {
         let defaults = VideoEnhancementDefaultsSnapshot.current
-        guard defaults != appliedVideoEnhancementDefaults else {
+        let previous = appliedVideoEnhancementDefaults
+        guard defaults != previous else {
             syncVideoEnhancementToBackend()
             return
         }
         appliedVideoEnhancementDefaults = defaults
-        let experiments = ExperimentalSettingsStore.shared
-        if experiments.isAllowed(.videoEnhancement) {
-            videoSuperResolutionMode = experiments.videoEnhancementDefaultSRMode
-            videoFrameInterpolationEnabled = experiments.videoEnhancementDefaultFrameInterpolation
-        } else {
+        if !defaults.allowed {
             videoSuperResolutionMode = .off
             videoFrameInterpolationEnabled = false
+        } else if !previous.allowed {
+            videoSuperResolutionMode = defaults.superResolutionMode
+            videoFrameInterpolationEnabled = defaults.frameInterpolation
+            videoInterpolationRate = defaults.interpolationRate
+            videoSuperResolutionScale = defaults.superResolutionScale
+            videoSuperResolutionTargetResolution = defaults.superResolutionTargetResolution
+            videoEnhancementMaxInputResolution = defaults.maxInputResolution
+        } else {
+            if defaults.superResolutionMode != previous.superResolutionMode {
+                videoSuperResolutionMode = defaults.superResolutionMode
+            }
+            if defaults.frameInterpolation != previous.frameInterpolation {
+                videoFrameInterpolationEnabled = defaults.frameInterpolation
+            }
+            if defaults.interpolationRate != previous.interpolationRate {
+                videoInterpolationRate = defaults.interpolationRate
+            }
+            if defaults.superResolutionScale != previous.superResolutionScale {
+                videoSuperResolutionScale = defaults.superResolutionScale
+            }
+            if defaults.superResolutionTargetResolution != previous.superResolutionTargetResolution {
+                videoSuperResolutionTargetResolution = defaults.superResolutionTargetResolution
+            }
+            if defaults.maxInputResolution != previous.maxInputResolution {
+                videoEnhancementMaxInputResolution = defaults.maxInputResolution
+            }
         }
-        videoInterpolationRate = experiments.videoEnhancementDefaultRate
-        videoSuperResolutionScale = experiments.videoEnhancementDefaultScale
         syncVideoEnhancementToBackend()
     }
 }

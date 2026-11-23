@@ -5,11 +5,16 @@ enum VideoEnhancementGuardrails {
     static let maxInputLongEdge = 1920
     static let maxInputShortEdge = 1080
 
+    static func isWithin(
+        width: Int,
+        height: Int,
+        limit: VideoEnhancementMaxInputResolution
+    ) -> Bool {
+        limit.contains(width: width, height: height)
+    }
+
     static func isWithin1080p(width: Int, height: Int) -> Bool {
-        guard width > 0, height > 0 else { return false }
-        let longEdge = max(width, height)
-        let shortEdge = min(width, height)
-        return longEdge <= maxInputLongEdge && shortEdge <= maxInputShortEdge
+        isWithin(width: width, height: height, limit: .p1080)
     }
 
     static func isThermalThrottled(
@@ -57,9 +62,15 @@ enum VideoEnhancementGuardrails {
         return nil
     }
 
-    static func superResolutionBypassReason(_ pixelBuffer: CVPixelBuffer) -> String? {
-        isWithin1080p(width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
-            ? nil : "Resolution > 1080p"
+    static func superResolutionBypassReason(
+        _ pixelBuffer: CVPixelBuffer,
+        maxInputResolution: VideoEnhancementMaxInputResolution = .p1080
+    ) -> String? {
+        isWithin(
+            width: CVPixelBufferGetWidth(pixelBuffer),
+            height: CVPixelBufferGetHeight(pixelBuffer),
+            limit: maxInputResolution
+        ) ? nil : maxInputResolution.bypassReason
     }
 }
 

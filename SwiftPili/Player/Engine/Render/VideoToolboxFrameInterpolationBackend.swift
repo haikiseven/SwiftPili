@@ -158,7 +158,7 @@ private extension VideoToolboxFrameInterpolationBackend {
         hasSubmittedPair = false
         let raster = key.raster
         var rejected: [String] = []
-        for kind in VTInterpolationKind.candidates(for: raster) {
+        for kind in VTInterpolationKind.candidates(for: key) {
             guard hasTimeRemaining() else { throw VTInterpolationFailure.deadline }
             if let cached = rejectedConfigurations.first(where: { $0.key == key && $0.kind == kind }) {
                 rejected.append(cached.detail)
@@ -248,16 +248,29 @@ private struct VTInterpolationSessionKey: Equatable {
     let raster: VTInterpolationRaster
     let phaseCount: Int
 
-    var lowLatencyLevel: Int { phaseCount == 3 ? 2 : 1 }
+    /// `VTLowLatencyFrameInterpolationConfiguration` exposes `2^x - 1` dyadic points
+    /// (`1` → `[0.5]`, `2` → `[0.25, 0.5, 0.75]`). Non-dyadic uniform counts (`2` for 3× `[1/3, 2/3]`
+    /// and `4` for 5× `[0.2, 0.4, 0.6, 0.8]`) return `nil` and use `VTFrameRateConversionConfiguration`,
+    /// which natively supports arbitrary float phases in `(0, 1)`.
+    var lowLatencyLevel: Int? {
+        switch phaseCount {
+        case 1: 1
+        case 3: 2
+        default: nil
+        }
+    }
 }
 
 private enum VTInterpolationKind: String {
     case lowLatency = "LLFI"
     case frameRateConversion = "FRC"
 
-    static func candidates(for raster: VTInterpolationRaster) -> [Self] {
-        raster.format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-            ? [.lowLatency, .frameRateConversion] : [.frameRateConversion]
+    static func candidates(for key: VTInterpolationSessionKey) -> [Self] {
+        if key.lowLatencyLevel != nil,
+           key.raster.format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
+            return [.lowLatency, .frameRateConversion]
+        }
+        return [.frameRateConversion]
     }
 
     @available(iOS 26.0, *)
@@ -268,8 +281,9 @@ private enum VTInterpolationKind: String {
         switch self {
         case .lowLatency:
             guard VTLowLatencyFrameInterpolationConfiguration.isSupported else { return unavailable("device") }
+            guard let level = key.lowLatencyLevel else { return unavailable("phases") }
             guard let config = VTLowLatencyFrameInterpolationConfiguration(
-                frameWidth: raster.width, frameHeight: raster.height, numberOfInterpolatedFrames: key.lowLatencyLevel
+                frameWidth: raster.width, frameHeight: raster.height, numberOfInterpolatedFrames: level
             ) else { return unavailable("dimensions") }
             return VTInterpolationSession.Configuration.resolve(
                 config, kind: self, formats: config.supportedPixelFormats, raster: raster
@@ -379,12 +393,16 @@ private final class VTInterpolationSession {
         self.key == key && (lastLLFISourcePTS.map { previousPTS >= $0 } ?? true)
     }
 
+    private var canStageNV12: Bool {
+        key.raster.format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+    }
+
     func layoutDetail(previous: CVPixelBuffer, current: CVPixelBuffer) -> String {
         "\(kind.rawValue) sourcePadding=\(source.padding) destinationPadding=\(destination.requirements.padding) " +
             "previousPadding=\(VTInterpolationPadding(previous)) currentPadding=\(VTInterpolationPadding(current)) " +
             "previousIOSurface=\(CVPixelBufferGetIOSurface(previous) != nil) " +
             "currentIOSurface=\(CVPixelBufferGetIOSurface(current) != nil) " +
-            "stagingAllowed=\(kind == .lowLatency)"
+            "stagingAllowed=\(canStageNV12)"
     }
 
     func directInput(_ input: CVPixelBuffer) -> CVPixelBuffer? {
@@ -392,7 +410,7 @@ private final class VTInterpolationSession {
     }
 
     func stage(_ input: CVPixelBuffer) throws -> CVPixelBuffer {
-        guard kind == .lowLatency else {
+        guard canStageNV12 else {
             throw VTInterpolationFailure(reason: "VT FI decoded buffers do not meet source requirements")
         }
         let pool = try stagingPool ?? VTInterpolationPool(requirements: source, role: "source staging", limit: 2)

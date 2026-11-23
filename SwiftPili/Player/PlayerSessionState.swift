@@ -30,6 +30,9 @@ final class PlayerSessionState {
         : false
     var videoInterpolationRate = ExperimentalSettingsStore.shared.videoEnhancementDefaultRate
     var videoSuperResolutionScale = ExperimentalSettingsStore.shared.videoEnhancementDefaultScale
+    var videoSuperResolutionTargetResolution =
+        ExperimentalSettingsStore.shared.videoEnhancementDefaultTargetResolution
+    var videoEnhancementMaxInputResolution = ExperimentalSettingsStore.shared.videoEnhancementMaxInputResolution
     var equalizerConfiguration = PlayerEqualizerPreferences.equalizerConfiguration
 
     var playbackOrder = PlayerPlaybackPreferences.playbackOrder

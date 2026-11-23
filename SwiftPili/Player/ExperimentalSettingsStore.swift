@@ -30,6 +30,8 @@ final class ExperimentalSettingsStore {
         videoEnhancementDefaultFrameInterpolation = VideoEnhancementPreferences.defaultFrameInterpolationEnabled
         videoEnhancementDefaultRate = VideoEnhancementPreferences.interpolationRate
         videoEnhancementDefaultScale = VideoEnhancementPreferences.superResolutionScale
+        videoEnhancementDefaultTargetResolution = VideoEnhancementPreferences.superResolutionTargetResolution
+        videoEnhancementMaxInputResolution = VideoEnhancementPreferences.maxInputResolution
         videoEnhancementAdaptiveQuality = VideoEnhancementPreferences.adaptiveQualityEnabled
         videoEnhancementAdaptiveSensitivity = VideoEnhancementPreferences.adaptiveSensitivity
         videoEnhancementBufferBudget = VideoEnhancementPreferences.bufferBudget
@@ -91,6 +93,9 @@ final class ExperimentalSettingsStore {
 
     private(set) var videoEnhancementDefaultRate = VideoEnhancementPreferences.interpolationRate
     private(set) var videoEnhancementDefaultScale = VideoEnhancementPreferences.superResolutionScale
+    private(set) var videoEnhancementDefaultTargetResolution =
+        VideoEnhancementPreferences.superResolutionTargetResolution
+    private(set) var videoEnhancementMaxInputResolution = VideoEnhancementPreferences.maxInputResolution
     private(set) var videoEnhancementAdaptiveQuality = VideoEnhancementPreferences.adaptiveQualityEnabled
     private(set) var videoEnhancementAdaptiveSensitivity = VideoEnhancementPreferences.adaptiveSensitivity
     private(set) var videoEnhancementBufferBudget = VideoEnhancementPreferences.bufferBudget
@@ -183,6 +188,26 @@ final class ExperimentalSettingsStore {
         guard videoEnhancementDefaultScale != scale else { return true }
         VideoEnhancementPreferences.superResolutionScale = scale
         videoEnhancementDefaultScale = scale
+        notifyObservers([.videoEnhancement])
+        return true
+    }
+
+    @discardableResult
+    func setVideoEnhancementDefaultTargetResolution(_ target: VideoSuperResolutionTargetResolution) -> Bool {
+        guard isAllowed(.videoEnhancement), storageError == nil else { return false }
+        guard videoEnhancementDefaultTargetResolution != target else { return true }
+        VideoEnhancementPreferences.superResolutionTargetResolution = target
+        videoEnhancementDefaultTargetResolution = target
+        notifyObservers([.videoEnhancement])
+        return true
+    }
+
+    @discardableResult
+    func setVideoEnhancementMaxInputResolution(_ limit: VideoEnhancementMaxInputResolution) -> Bool {
+        guard isAllowed(.videoEnhancement), storageError == nil else { return false }
+        guard videoEnhancementMaxInputResolution != limit else { return true }
+        VideoEnhancementPreferences.maxInputResolution = limit
+        videoEnhancementMaxInputResolution = limit
         notifyObservers([.videoEnhancement])
         return true
     }

@@ -9,11 +9,18 @@ final class VisionFrameInterpolationBackend {
 
     private static let minimumSourceInterval: TimeInterval = 1 / 30.5
 
-    static func inputBypassReason(_ frame: MediaVideoFrame) -> String? {
-        if !VideoEnhancementGuardrails.isWithin1080p(
-            width: CVPixelBufferGetWidth(frame.pixelBuffer), height: CVPixelBufferGetHeight(frame.pixelBuffer)
+    /// Vision optical flow + Metal synthesis supports arbitrary phases in `(0, 1)` (2×–5×),
+    /// constrained to progressive SDR sources ≤ 30 fps within the configured input resolution cap.
+    static func inputBypassReason(
+        _ frame: MediaVideoFrame,
+        maxInputResolution: VideoEnhancementMaxInputResolution = .p1080
+    ) -> String? {
+        if !VideoEnhancementGuardrails.isWithin(
+            width: CVPixelBufferGetWidth(frame.pixelBuffer),
+            height: CVPixelBufferGetHeight(frame.pixelBuffer),
+            limit: maxInputResolution
         ) {
-            return "Vision FI resolution > 1080p"
+            return "Vision FI \(maxInputResolution.bypassReason.lowercased())"
         }
         guard VideoFrameInterpolationTiming.sourceFPS(frame) != nil,
               frame.duration + VideoFrameInterpolationTiming.tolerance >= minimumSourceInterval else {
@@ -39,12 +46,13 @@ final class VisionFrameInterpolationBackend {
     func process(
         _ frame: MediaVideoFrame,
         plan: VideoFrameInterpolationPlan?,
+        maxInputResolution: VideoEnhancementMaxInputResolution = .p1080,
         hasTimeRemaining: @Sendable () -> Bool
     ) async -> VideoInterpolationBackendOutcome {
         #if targetEnvironment(simulator)
         return .bypassed(reason: "Vision FI device required")
         #else
-        if let reason = Self.inputBypassReason(frame) {
+        if let reason = Self.inputBypassReason(frame, maxInputResolution: maxInputResolution) {
             flush()
             return .bypassed(reason: reason)
         }

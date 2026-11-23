@@ -237,11 +237,24 @@ private struct PlayerVideoEnhancementMenuItems: View {
             return title + Text(verbatim: " · ") + Text("Paused")
         }
         var parts: [String] = []
-        if player.videoSuperResolutionMode != .off {
+        switch player.videoSuperResolutionMode {
+        case .off:
+            break
+        case .videoToolboxML:
             parts.append(player.videoSuperResolutionMode.menuLabel)
+        case .metalFXSpatial:
+            if let shortEdge = player.videoSuperResolutionTargetResolution.shortEdge {
+                parts.append("\(player.videoSuperResolutionMode.menuLabel) \(shortEdge)p")
+            } else {
+                parts.append(player.videoSuperResolutionMode.menuLabel)
+            }
         }
         if player.videoFrameInterpolationEnabled {
-            parts.append(String(localized: "FRC"))
+            if let fps = player.videoInterpolationRate.targetFPS {
+                parts.append("\(String(localized: "FRC")) \(fps)fps")
+            } else {
+                parts.append(String(localized: "FRC"))
+            }
         }
         return title + Text(verbatim: " · \(parts.joined(separator: " + "))")
     }

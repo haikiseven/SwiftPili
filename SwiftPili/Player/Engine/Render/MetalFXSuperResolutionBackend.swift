@@ -106,25 +106,47 @@ final class MetalFXSuperResolutionBackend {
         configuredOutput = nil
     }
 
-    /// - Parameter maxScale: may be fractional; the caller caps it to the on-screen magnification so
-    ///   output never exceeds the display's pixel size (upscaling past it is wasted GPU and memory).
-    func upscale(pixelBuffer: CVPixelBuffer, maxScale: Float = 2) async -> VideoEnhancementBackendOutcome {
+    /// - Parameters:
+    ///   - maxScale: may be fractional in Auto mode; the caller caps it to the on-screen
+    ///     magnification so output never exceeds the display's pixel size.
+    ///   - targetDimensions: explicit output dimensions (even, within raster budget) when the user
+    ///     configured a manual MetalFX target resolution; bypasses the Auto magnification floor.
+    func upscale(
+        pixelBuffer: CVPixelBuffer,
+        maxScale: Float = 2,
+        targetDimensions: VideoSuperResolutionDimensions? = nil
+    ) async -> VideoEnhancementBackendOutcome {
         #if !canImport(MetalFX)
         return .bypassed(reason: "MetalFX unavailable")
         #else
-        guard maxScale.isFinite, maxScale >= VideoEnhancementDisplaySurface.minimumUsefulMagnification else {
-            return .bypassed(reason: "Display resolution reached")
-        }
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
-        let scale = min(maxScale, 4)
-        let candidates = [Self.evenSize(width, height, scale)]
-            + [4, 3, 2].filter { Float($0) < scale }.map { (width * $0, height * $0) }
-        guard VideoSuperResolutionRasterBudget.contains(width: width, height: height),
-              let output = candidates.first(where: {
-                  VideoSuperResolutionRasterBudget.contains(width: $0.0, height: $0.1)
-              }) else {
-            return .bypassed(reason: "MetalFX output exceeds raster budget")
+        let output: (Int, Int)
+        if let targetDimensions {
+            guard targetDimensions.width > width, targetDimensions.height > height else {
+                return .bypassed(reason: "Target resolution reached")
+            }
+            guard VideoSuperResolutionRasterBudget.contains(width: width, height: height),
+                  VideoSuperResolutionRasterBudget.contains(
+                    width: targetDimensions.width, height: targetDimensions.height
+                  ) else {
+                return .bypassed(reason: "MetalFX output exceeds raster budget")
+            }
+            output = (targetDimensions.width, targetDimensions.height)
+        } else {
+            guard maxScale.isFinite, maxScale >= VideoEnhancementDisplaySurface.minimumUsefulMagnification else {
+                return .bypassed(reason: "Display resolution reached")
+            }
+            let scale = min(maxScale, 4)
+            let candidates = [Self.evenSize(width, height, scale)]
+                + [4, 3, 2].filter { Float($0) < scale }.map { (width * $0, height * $0) }
+            guard VideoSuperResolutionRasterBudget.contains(width: width, height: height),
+                  let resolved = candidates.first(where: {
+                      VideoSuperResolutionRasterBudget.contains(width: $0.0, height: $0.1)
+                  }) else {
+                return .bypassed(reason: "MetalFX output exceeds raster budget")
+            }
+            output = resolved
         }
         if let setupReason = ensureMetalInfrastructure() {
             return .bypassed(reason: setupReason)
@@ -225,8 +247,13 @@ final class MetalFXSuperResolutionBackend {
         // Fallback if a fractional ratio is rejected: largest integer scale that fits.
         let ratio = Float(output.0) / Float(max(1, width))
         for scale in [4, 3, 2] where Float(scale) <= max(2, ratio.rounded(.down)) {
-            descriptor.outputWidth = width * scale
-            descriptor.outputHeight = height * scale
+            let candidateWidth = width * scale
+            let candidateHeight = height * scale
+            guard VideoSuperResolutionRasterBudget.contains(
+                width: candidateWidth, height: candidateHeight
+            ) else { continue }
+            descriptor.outputWidth = candidateWidth
+            descriptor.outputHeight = candidateHeight
             if let scaler = descriptor.makeSpatialScaler(device: device) { return scaler }
         }
         return nil
@@ -406,8 +433,8 @@ enum VideoEnhancementBackendOutcome {
 }
 
 enum VideoSuperResolutionRasterBudget {
-    private static let longestEdge = 3840
-    private static let pixelCount = 3840 * 2160
+    static let longestEdge = 3840
+    static let pixelCount = 3840 * 2160
 
     static func contains(width: Int, height: Int) -> Bool {
         width > 0 && height > 0 && max(width, height) <= longestEdge && width * height <= pixelCount

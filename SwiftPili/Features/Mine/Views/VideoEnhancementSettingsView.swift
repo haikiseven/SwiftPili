@@ -58,28 +58,63 @@ struct VideoEnhancementSettingsView: View {
             .pickerStyle(.inline)
             .labelsHidden()
 
+            switch experiments.videoEnhancementDefaultSRMode {
+            case .off:
+                EmptyView()
+            case .videoToolboxML:
+                Picker(
+                    "Maximum Scale",
+                    selection: binding(\.videoEnhancementDefaultScale, experiments.setVideoEnhancementDefaultScale)
+                ) {
+                    ForEach(VideoSuperResolutionScale.allCases) { scale in
+                        Text(scale.label).tag(scale)
+                    }
+                }
+                .pickerStyle(.menu)
+                .menuOrder(.fixed)
+            case .metalFXSpatial:
+                VideoEnhancementTargetResolutionControls(
+                    targetResolution: experiments.videoEnhancementDefaultTargetResolution,
+                    isDisabled: false
+                ) { target in
+                    guard canMutate else { return }
+                    _ = experiments.setVideoEnhancementDefaultTargetResolution(target)
+                }
+            }
+
             Picker(
-                "Maximum Scale",
-                selection: binding(\.videoEnhancementDefaultScale, experiments.setVideoEnhancementDefaultScale)
+                "Max Input Resolution",
+                selection: binding(
+                    \.videoEnhancementMaxInputResolution, experiments.setVideoEnhancementMaxInputResolution
+                )
             ) {
-                ForEach(VideoSuperResolutionScale.allCases) { scale in
-                    Text(scale.label).tag(scale)
+                ForEach(VideoEnhancementMaxInputResolution.allCases) { limit in
+                    Text(limit.label).tag(limit)
                 }
             }
             .pickerStyle(.menu)
             .menuOrder(.fixed)
 
-            Toggle(isOn: binding(\.videoEnhancementLimitToScreen, experiments.setVideoEnhancementLimitToScreen)) {
-                Label {
-                    Text("Limit to Screen Resolution")
-                } icon: {
-                    SettingsIcon(symbol: "display")
+            if experiments.videoEnhancementDefaultSRMode != .metalFXSpatial
+                || !experiments.videoEnhancementDefaultTargetResolution.isManual {
+                Toggle(isOn: binding(\.videoEnhancementLimitToScreen, experiments.setVideoEnhancementLimitToScreen)) {
+                    Label {
+                        Text("Limit to Screen Resolution")
+                    } icon: {
+                        SettingsIcon(symbol: "display")
+                    }
                 }
             }
         } header: {
             Text("Super Resolution")
         } footer: {
-            Text("VideoEnhancementSRFooter", tableName: nil, comment: "Super resolution section footer")
+            Text(
+                """
+                Applies to SDR Demand VOD streams within the max input resolution. \
+                VideoToolbox ML uses native scale factors; MetalFX Spatial supports manual target resolution, \
+                which overrides Limit to Screen Resolution. High temperatures pause enhancement.
+                """
+            )
         }
         .disabled(!canMutate)
     }
@@ -98,16 +133,13 @@ struct VideoEnhancementSettingsView: View {
                 }
             }
 
-            Picker(
-                "Interpolation Rate",
-                selection: binding(\.videoEnhancementDefaultRate, experiments.setVideoEnhancementDefaultRate)
-            ) {
-                ForEach(VideoInterpolationRate.allCases) { rate in
-                    Text(rate.label).tag(rate)
-                }
+            VideoEnhancementTargetFPSControls(
+                rate: experiments.videoEnhancementDefaultRate,
+                isDisabled: false
+            ) { rate in
+                guard canMutate else { return }
+                _ = experiments.setVideoEnhancementDefaultRate(rate)
             }
-            .pickerStyle(.menu)
-            .menuOrder(.fixed)
         } header: {
             Text("Frame Interpolation")
         } footer: {

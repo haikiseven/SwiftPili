@@ -26,14 +26,27 @@ enum VideoEnhancementDegradationLevel: Int, Comparable, CaseIterable, Sendable {
         metalFXAvailable: Bool = VideoEnhancementGovernor.metalFXAvailable
     ) -> VideoEnhancementConfiguration {
         var config = requested
-        if self >= .reducedInterpolation, config.interpolationRate == .fps90 || config.interpolationRate == .fps120 {
-            config.interpolationRate = .fps60
+        if self >= .reducedInterpolation, config.frameInterpolationEnabled {
+            config.interpolationRate = config.interpolationRate.degradedForPerformance
         }
         if self >= .reducedScale {
-            config.superResolutionScale = .two
+            switch config.superResolutionMode {
+            case .off:
+                break
+            case .videoToolboxML:
+                config.superResolutionScale = .two
+            case .metalFXSpatial:
+                if config.superResolutionTargetResolution.isManual {
+                    config.superResolutionTargetResolution =
+                        config.superResolutionTargetResolution.degradedForPerformance
+                } else {
+                    config.superResolutionScale = .two
+                }
+            }
         }
         if self >= .lightweightUpscaler, config.superResolutionMode == .videoToolboxML, metalFXAvailable {
             config.superResolutionMode = .metalFXSpatial
+            config.superResolutionTargetResolution = .auto
         }
         if self >= .interpolationSuspended {
             config.frameInterpolationEnabled = false

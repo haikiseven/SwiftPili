@@ -58,6 +58,9 @@ struct VideoEnhancementBufferPlan: Equatable, Sendable {
         let midpoints = max(0, midpointsPerSource)
         let outputFPS = sourceFPS * Double(1 + midpoints)
         let maximumLead = max(minimumLead, maximumLead)
+        // High-multiplier interpolation (e.g. 5× = 4 midpoints + 1 original) keeps up to
+        // `midpoints + 1` buffers in flight inside the worker before enqueueing to the display layer.
+        let headroom = max(workerHeadroom, midpoints + 2)
         var plan = Self.default
         plan.budgetBytes = budgetBytes
 
@@ -65,16 +68,22 @@ struct VideoEnhancementBufferPlan: Equatable, Sendable {
             // SR output covers originals and (upscaled) midpoints; FI buffers are transient.
             let affordable = budgetBytes / upscaledBytes
             plan.superResolutionFrames = max(defaultSuperResolutionFrames, affordable)
-            plan.lead = leadFitting(frames: plan.superResolutionFrames, fps: outputFPS, maximumLead: maximumLead)
-            plan.isMemoryBound = framesNeeded(fps: outputFPS) > plan.superResolutionFrames
-            plan.estimatedBytes = framesNeeded(fps: outputFPS, lead: plan.lead) * upscaledBytes
+            plan.lead = leadFitting(
+                frames: plan.superResolutionFrames, fps: outputFPS, maximumLead: maximumLead, headroom: headroom
+            )
+            plan.isMemoryBound = framesNeeded(fps: outputFPS, headroom: headroom) > plan.superResolutionFrames
+            plan.estimatedBytes = framesNeeded(fps: outputFPS, lead: plan.lead, headroom: headroom) * upscaledBytes
         } else if midpoints > 0, interpolatedBytes > 0 {
             // FI only: midpoints sit in the display queue straight from the FI pool.
             let affordable = budgetBytes / interpolatedBytes
             let midpointFPS = sourceFPS * Double(midpoints)
-            plan.lead = leadFitting(frames: affordable, fps: midpointFPS, maximumLead: maximumLead)
-            plan.isMemoryBound = framesNeeded(fps: midpointFPS) > affordable
-            plan.estimatedBytes = framesNeeded(fps: midpointFPS, lead: plan.lead) * interpolatedBytes
+            plan.lead = leadFitting(
+                frames: affordable, fps: midpointFPS, maximumLead: maximumLead, headroom: headroom
+            )
+            plan.isMemoryBound = framesNeeded(fps: midpointFPS, headroom: headroom) > affordable
+            plan.estimatedBytes = framesNeeded(
+                fps: midpointFPS, lead: plan.lead, headroom: headroom
+            ) * interpolatedBytes
         } else {
             return .default
         }
@@ -87,12 +96,16 @@ struct VideoEnhancementBufferPlan: Equatable, Sendable {
     }
 
     /// Buffers alive at the minimum lookahead.
-    private static func framesNeeded(fps: Double, lead: TimeInterval = minimumLead) -> Int {
-        Int(((lead + displaySlack) * fps).rounded(.up)) + workerHeadroom
+    private static func framesNeeded(
+        fps: Double, lead: TimeInterval = minimumLead, headroom: Int = workerHeadroom
+    ) -> Int {
+        Int(((lead + displaySlack) * fps).rounded(.up)) + headroom
     }
 
-    private static func leadFitting(frames: Int, fps: Double, maximumLead: TimeInterval) -> TimeInterval {
-        let lead = Double(frames - workerHeadroom) / fps - displaySlack
+    private static func leadFitting(
+        frames: Int, fps: Double, maximumLead: TimeInterval, headroom: Int = workerHeadroom
+    ) -> TimeInterval {
+        let lead = Double(frames - headroom) / fps - displaySlack
         return min(maximumLead, max(minimumLead, lead))
     }
 }
