@@ -132,11 +132,8 @@ struct FollowingListView: View {
             }
             .appAdaptiveSheet(padSizing: .form)
         }
-        .task(id: accountManager.identityRevision) {
+        .task {
             viewModel.bind(authManager: authManager, accountManager: accountManager)
-            if viewModel.resetForAccountRevisionIfNeeded(accountManager.identityRevision) {
-                groupTarget = nil
-            }
             await viewModel.loadInitialIfNeeded()
         }
     }

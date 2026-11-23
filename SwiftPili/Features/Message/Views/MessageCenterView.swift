@@ -83,7 +83,7 @@ struct MessageCenterView: View {
         .appAmbientBrowseBackground()
         .navigationTitle("Messages")
         .navigationBarTitleDisplayMode(.inline)
-        .task(id: AccountManager.shared.identityRevision) { await viewModel.loadInitial() }
+        .task { await viewModel.loadInitial() }
     }
 
     private func sidebarList(usesSplit: Bool) -> some View {
@@ -540,7 +540,7 @@ private struct ReplyListView: View {
                 replyRow(item).onTapGesture { navigateToSource(item) }
             }
         )
-        .task(id: AccountManager.shared.identityRevision) { await viewModel.loadReplies() }
+        .task { await viewModel.loadReplies() }
     }
 
     private func replyRow(_ item: ReplyMessageResult.ReplyMsgItem) -> some View {
@@ -623,7 +623,7 @@ private struct AtListView: View {
                 atRow(item).onTapGesture { navigateToSource(item) }
             }
         )
-        .task(id: AccountManager.shared.identityRevision) { await viewModel.loadAt() }
+        .task { await viewModel.loadAt() }
     }
 
     private func atRow(_ item: AtMessageResult.AtMsgItem) -> some View {
@@ -705,7 +705,7 @@ private struct LikeListView: View {
                 likeRow(item).onTapGesture { navigateToSource(item) }
             }
         )
-        .task(id: AccountManager.shared.identityRevision) { await viewModel.loadLikes() }
+        .task { await viewModel.loadLikes() }
     }
 
     private func likeRow(_ item: LikeMessageResult.LikeMsgItem) -> some View {
@@ -797,7 +797,7 @@ private struct SystemListView: View {
                     }
             }
         )
-        .task(id: AccountManager.shared.identityRevision) { await viewModel.loadSystem() }
+        .task { await viewModel.loadSystem() }
     }
 
     private func systemRow(_ item: SystemNotifyResult.SystemNotifyItem) -> some View {

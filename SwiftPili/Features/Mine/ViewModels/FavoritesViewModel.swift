@@ -15,7 +15,6 @@ final class FavoritesViewModel {
     var errorText: String?
 
     @ObservationIgnored private var previewTasks: [Int: Task<Void, Never>] = [:]
-    @ObservationIgnored private var accountRevision: UInt64
     @ObservationIgnored private var authManager: AuthManager
     @ObservationIgnored private var accountManager: AccountManager
 
@@ -25,7 +24,6 @@ final class FavoritesViewModel {
     ) {
         self.authManager = authManager
         self.accountManager = accountManager
-        self.accountRevision = accountManager.identityRevision
     }
 
     func bind(authManager: AuthManager, accountManager: AccountManager) {
@@ -50,17 +48,6 @@ final class FavoritesViewModel {
                 needsPreview: !isFresh && !hasFailed
             )
         }
-    }
-
-    @discardableResult
-    func resetForAccountRevisionIfNeeded(_ revision: UInt64) -> Bool {
-        guard accountRevision != revision else { return false }
-        accountRevision = revision
-        folders = []
-        resetPreviewState(clearCache: true)
-        errorText = nil
-        isLoading = true
-        return true
     }
 
     func loadInitial() async {

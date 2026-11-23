@@ -62,12 +62,15 @@ final class ChatViewModel {
 
     init(
         talkerId: Int,
-        source: ChatAccountSource,
+        source: ChatAccountSource? = nil,
         authManager: AuthManager = .shared,
         accountManager: AccountManager = .shared
     ) {
         self.talkerId = talkerId
-        self.source = source
+        self.source = source ?? ChatAccountSource.current(
+            authManager: authManager,
+            accountManager: accountManager
+        )
         self.authManager = authManager
         self.accountManager = accountManager
     }

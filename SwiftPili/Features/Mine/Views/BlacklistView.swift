@@ -2,13 +2,6 @@ import Observation
 import SwiftUI
 
 struct BlacklistView: View {
-    var body: some View {
-        BlockedUsersContentView()
-            .id(AccountManager.shared.identityRevision)
-    }
-}
-
-private struct BlockedUsersContentView: View {
     @State private var model = BlockedUsersListModel()
     @Environment(AppCoordinator.self) private var coordinator
 

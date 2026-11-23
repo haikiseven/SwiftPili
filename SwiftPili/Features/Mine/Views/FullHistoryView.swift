@@ -2,13 +2,6 @@ import Observation
 import SwiftUI
 
 struct FullHistoryView: View {
-    var body: some View {
-        FullHistoryContentView()
-            .id(AccountManager.shared.identityRevision)
-    }
-}
-
-private struct FullHistoryContentView: View {
     @State private var model = FullHistoryListModel()
     @Environment(AppCoordinator.self) private var coordinator
 

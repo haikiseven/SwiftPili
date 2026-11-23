@@ -2,13 +2,6 @@ import Observation
 import SwiftUI
 
 struct WatchLaterListView: View {
-    var body: some View {
-        WatchLaterListContentView()
-            .id(AccountManager.shared.identityRevision)
-    }
-}
-
-private struct WatchLaterListContentView: View {
     @State private var model = WatchLaterListModel()
     @State private var pendingRemoval: WatchLaterResult.WatchLaterItem?
     @State private var showRemoveWatchedConfirm = false

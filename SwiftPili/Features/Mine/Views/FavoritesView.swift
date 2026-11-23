@@ -129,11 +129,8 @@ struct FavoritesView: View {
                 ContentUnavailableView("No Favorites", systemImage: "star.slash")
             }
         }
-        .task(id: accountManager.identityRevision) {
+        .task {
             viewModel.bind(authManager: authManager, accountManager: accountManager)
-            if viewModel.resetForAccountRevisionIfNeeded(accountManager.identityRevision) {
-                pendingDelete = nil
-            }
             await viewModel.loadInitial()
         }
     }

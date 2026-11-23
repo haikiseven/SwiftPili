@@ -702,7 +702,6 @@ private struct PGCListView: View {
     }
 
     private var canLoadFollowed: Bool {
-        _ = AccountManager.shared.activeMid
         guard let midString = AuthManager.shared.dedeUserID else { return false }
         return Int(midString) != nil
     }

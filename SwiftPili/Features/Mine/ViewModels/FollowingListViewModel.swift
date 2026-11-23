@@ -57,7 +57,6 @@ final class FollowingListViewModel {
     @ObservationIgnored private var loadAdmission = FeedLoadAdmissionGate()
     @ObservationIgnored private var loadingRequest: PageRequest?
     @ObservationIgnored private var pageWork: Task<Void, Never>?
-    @ObservationIgnored private var accountRevision: UInt64
     @ObservationIgnored private var authManager: AuthManager
     @ObservationIgnored private var accountManager: AccountManager
 
@@ -71,7 +70,6 @@ final class FollowingListViewModel {
         self.mid = mid
         self.authManager = authManager
         self.accountManager = accountManager
-        self.accountRevision = accountManager.identityRevision
     }
 
     func bind(authManager: AuthManager, accountManager: AccountManager) {
@@ -137,25 +135,6 @@ final class FollowingListViewModel {
             revision: accountManager.identityRevision, session: authManager.sessionGeneration,
             ownFollowing: mode == .following && isOwnList
         )
-    }
-
-    @discardableResult
-    func resetForAccountRevisionIfNeeded(_ revision: UInt64) -> Bool {
-        guard accountRevision != revision else { return false }
-        accountRevision = revision
-        pageWork?.cancel()
-        pageWork = nil
-        loadAdmission.supersede()
-        paginationGeneration = loadAdmission.generation
-        loadingRequest = nil
-        isLoading = false
-        items = []
-        page = 1
-        loadFailure = nil
-        tags = []
-        selectedTag = nil
-        followOperations = [:]
-        return true
     }
 
     func loadInitialIfNeeded() async {

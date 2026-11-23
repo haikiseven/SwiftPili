@@ -16,14 +16,9 @@ struct FavoriteDetailView: View {
     let mediaId: Int
     let title: String
 
-    private struct ContentIdentity: Hashable {
-        let mediaID: Int
-        let accountRevision: UInt64
-    }
-
     var body: some View {
         FavoriteDetailContent(mediaId: mediaId, title: title)
-            .id(ContentIdentity(mediaID: mediaId, accountRevision: AccountManager.shared.identityRevision))
+            .id(mediaId)
     }
 }
 

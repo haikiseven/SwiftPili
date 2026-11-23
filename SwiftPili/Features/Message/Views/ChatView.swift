@@ -15,20 +15,14 @@ struct ChatView: View {
     }
 
     var body: some View {
-        let source = ChatAccountSource.current(
-            authManager: authManager,
-            accountManager: accountManager
-        )
         ChatConversationView(
             talkerId: talkerId,
             name: name,
             face: face,
-            source: source,
             authManager: authManager,
             accountManager: accountManager
         )
         .id(talkerId)
-        .id(source)
     }
 }
 
@@ -45,7 +39,6 @@ private struct ChatConversationView: View {
         talkerId: Int,
         name: String,
         face: String?,
-        source: ChatAccountSource,
         authManager: AuthManager,
         accountManager: AccountManager
     ) {
@@ -54,7 +47,6 @@ private struct ChatConversationView: View {
         _viewModel = State(
             initialValue: ChatViewModel(
                 talkerId: talkerId,
-                source: source,
                 authManager: authManager,
                 accountManager: accountManager
             )
