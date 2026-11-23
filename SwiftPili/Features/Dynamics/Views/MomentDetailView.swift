@@ -26,6 +26,7 @@ struct MomentDetailView: View {
         let context: CommentComposerUploadOwner.Context
     }
 
+    @AppMotion private var motion
     @Environment(AppCoordinator.self) private var coordinator
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
@@ -40,6 +41,8 @@ struct MomentDetailView: View {
     }
 
     var body: some View {
+        let model = viewModel
+        let requestedID = dynamicId
         let composer = commentComposerCapture
         let source = viewModel.readyCommentSource
         let showsComposer = AuthManager.shared.isLoggedIn && viewModel.oid != nil && !viewModel.commentsClosed
@@ -66,7 +69,7 @@ struct MomentDetailView: View {
             if containerSize != size { containerSize = size }
         }
         .contentLinks(presentsFeedback: false, isCurrent: {
-            source != nil && viewModel.readyCommentSource == source
+            viewModel === model && dynamicId == requestedID
         })
         .appAmbientBrowseBackground()
         .navigationTitle("Moment")
@@ -320,12 +323,17 @@ struct MomentDetailView: View {
             HStack { Spacer(); ProgressView(); Spacer() }
                 .padding(.top, 60)
         } else if let error = viewModel.error {
-            ContentUnavailableView(
-                "Couldn't Load Moment",
-                systemImage: "exclamationmark.triangle",
-                description: Text(error)
-            )
-            .padding(.top, 40)
+            ContentUnavailableView {
+                Label("Couldn't Load Moment", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(error)
+            } actions: {
+                Button("Retry") {
+                    Task { await viewModel.load(dynamicId: dynamicId) }
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .padding(.top, 24)
         }
     }
 
@@ -410,7 +418,9 @@ struct MomentDetailView: View {
             focus: commentFocus,
             onCancelReply: {
                 guard composerIsCurrent(composer) else { return }
-                setCommentReplyTarget(nil, for: composer)
+                withAnimation(motion.animation(normal: CollapsibleComposer.composerCollapseAnimation)) {
+                    setCommentReplyTarget(nil, for: composer)
+                }
                 commentFocus.dismiss()
             },
             onSend: { sendComment(from: composer) },
@@ -717,14 +727,17 @@ private extension MomentDetailView {
     }
 
     func interactionFailure(_ message: LocalizedStringKey, retry: @escaping () -> Void) -> some View {
-        VStack(spacing: 10) {
-            Label(message, systemImage: "exclamationmark.bubble")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
+        ContentUnavailableView {
+            Label("Couldn't Load", systemImage: "exclamationmark.bubble")
+        } description: {
+            Text(message)
+        } actions: {
             Button("Retry", action: retry)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 16)
+        .padding(.vertical, 8)
     }
 }
 

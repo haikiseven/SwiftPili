@@ -42,12 +42,15 @@ struct CommentFeedEnvironmentSnapshot: Equatable {
     var imageDiagnosticsScreen: String = "-"
     var contentLinkDefersToParent: Bool = false
     var navigationZoomNamespace: Namespace.ID?
+    var contentLinkStateKey: ContentLinkStateKey?
 }
 
 @MainActor
 struct CommentFeedEnvironment {
     var snapshot = CommentFeedEnvironmentSnapshot()
+    var rawEnvironment = EnvironmentValues()
     var coordinator: AppCoordinator?
+    var noticeCenter: AppNoticeCenter?
     var openURL: OpenURLAction?
     var contentLinkContext: ContentLinkContext?
 }
@@ -56,6 +59,7 @@ struct CommentFeedEnvironment {
 struct UIKitCommentFeedCollectionView: View {
     private var config: UIKitCommentFeedConfiguration
 
+    @Environment(\.self) private var rawEnvironment
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
@@ -70,6 +74,7 @@ struct UIKitCommentFeedCollectionView: View {
     @Environment(\.contentLinkDefersToParent) private var contentLinkDefersToParent
     @Environment(\.navigationZoomNamespace) private var navigationZoomNamespace
     @Environment(AppCoordinator.self) private var coordinator: AppCoordinator?
+    @Environment(\.appNoticeCenter) private var noticeCenter
     @Environment(\.openURL) private var openURL
     @Environment(\.contentLinkContext) private var contentLinkContext
     @State private var bottomSafeAreaInset: CGFloat = 0
@@ -229,9 +234,12 @@ struct UIKitCommentFeedCollectionView: View {
                 accessibilityReduceTransparency: accessibilityReduceTransparency,
                 imageDiagnosticsScreen: imageDiagnosticsScreen,
                 contentLinkDefersToParent: contentLinkDefersToParent,
-                navigationZoomNamespace: navigationZoomNamespace
+                navigationZoomNamespace: navigationZoomNamespace,
+                contentLinkStateKey: contentLinkContext?.stateKey
             ),
+            rawEnvironment: rawEnvironment,
             coordinator: coordinator,
+            noticeCenter: noticeCenter,
             openURL: openURL,
             contentLinkContext: contentLinkContext
         )

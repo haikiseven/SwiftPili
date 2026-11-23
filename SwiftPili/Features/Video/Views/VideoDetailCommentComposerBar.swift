@@ -47,16 +47,19 @@ struct VideoDetailCommentComposerOverlay: View {
         VideoDetailCommentPresentationReader(presentation: commentPresentation) { commentsPresented in
             let showsToast = isCompactOverlay
                 || (showsWideChrome && stagePresentation == .stage && !hasActiveThread)
+            let visibleToast = showsToast
+                ? model.toast.flatMap { $0.style == .error ? nil : $0 }
+                : nil
             let showsInput = (isCompactOverlay || showsWideChrome)
                 && showsCommentInput(for: commentsPresented)
             let usesFeedWidth = !showsWideChrome && DeviceCapability.supportsPadDetailSplit
             VStack(spacing: 10) {
                 Group {
-                    if showsToast, let toast = model.toast {
+                    if let toast = visibleToast {
                         ToastView(message: toast)
                     }
                 }
-                .animation(motion.feedbackAnimation(normal: .spring(duration: 0.3)), value: model.toast)
+                .animation(motion.feedbackAnimation(normal: .spring(duration: 0.3)), value: visibleToast)
 
                 if showsInput {
                     VideoDetailCommentComposerBar(
@@ -97,19 +100,49 @@ struct VideoDetailCommentComposerBar: View {
     ) -> Void
 
     var body: some View {
-        let captured = composer.capture(model: model, requestedID: requestedVideoID)
+        let sourceIdentity = model.commentComposerContext.sourceIdentity
         CommentComposerMorphContainer(
             isExpanded: composer.isExpanded,
             hasDraft: composer.hasDraft,
-            sourceIdentity: AnyHashable(captured.context.sourceIdentity),
+            sourceIdentity: AnyHashable(sourceIdentity),
             onExpand: { composer.open(motion: motion) },
-            expandedComposer: { expandedComposer(captured: captured) }
+            expandedComposer: {
+                VideoDetailExpandedComposerView(
+                    composer: composer,
+                    model: model,
+                    commentPresentation: commentPresentation,
+                    requestedVideoID: requestedVideoID,
+                    showsCommentInput: showsCommentInput,
+                    isModelCurrent: isModelCurrent,
+                    onRevealPostedComment: onRevealPostedComment
+                )
+            }
         )
         .frame(maxWidth: usesFeedWidth ? ReadableWidth.feed : .infinity)
         .frame(maxWidth: .infinity)
     }
+}
 
-    private func expandedComposer(captured: VideoCommentComposerState.Capture) -> some View {
+/// Dedicated observing view so both inline `warmComposerLayer` and iPad `IPadKeyboardDockPresenter`
+/// (`UIHostingController`) stay live-subscribed to `composer` (`text`, `replyTarget`, `pictures`, `isSending`)
+/// without re-evaluating `VideoDetailView.body`.
+private struct VideoDetailExpandedComposerView: View {
+    @AppMotion private var motion
+    let composer: VideoCommentComposerState
+    let model: VideoDetailViewModel
+    let commentPresentation: CommentZoomPresentation
+    let requestedVideoID: VideoID
+    let showsCommentInput: @MainActor (Bool) -> Bool
+    let isModelCurrent: @MainActor () -> Bool
+    let onRevealPostedComment: @MainActor (
+        _ postedRpid: Int,
+        _ target: CommentResult.CommentItem?,
+        _ model: VideoDetailViewModel,
+        _ sourceIsCurrent: @escaping @MainActor () -> Bool
+    ) -> Void
+
+    var body: some View {
+        let captured = composer.capture(model: model, requestedID: requestedVideoID)
         CommentComposerBar(
             text: composer.textBinding(for: captured, isCurrentModelAndVideo: isModelCurrent),
             pictures: composer.picturesBinding(for: captured, isCurrentModelAndVideo: isModelCurrent),

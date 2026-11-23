@@ -18,7 +18,13 @@ struct BangumiDetailView: View {
     @State private var replyPresentation = CommentZoomPresentation()
     @State private var containerMetrics = PlayerDetailContainerMetrics()
     @State private var stageController = DetailStageController()
+    private struct BangumiErrorAlert {
+        let title: LocalizedStringKey
+        let message: String
+    }
+
     @State private var previewImages: ImagePreviewItem?
+    @State private var errorAlert: BangumiErrorAlert?
     @State private var wideComposerExpanded = false
     @State private var compactComposerPresentation = CommentComposerPresentation()
     @State private var commentFocus = CommentComposerFocus()
@@ -254,9 +260,7 @@ struct BangumiDetailView: View {
                     .ignoresSafeArea()
                     .onTapGesture {
                         commentFocus.dismiss()
-                        withAnimation(motion.animation(normal: CollapsibleComposer.composerCollapseAnimation)) {
-                            wideComposerExpanded = false
-                        }
+                        wideComposerExpanded = false
                     }
             }
 
@@ -264,12 +268,13 @@ struct BangumiDetailView: View {
                 wideStagePanel
             }
 
+            let visibleToast = viewModel.toast.flatMap { $0.style == .error ? nil : $0 }
             Group {
-                if let toast = viewModel.toast {
+                if let toast = visibleToast {
                     ToastView(message: toast)
                 }
             }
-            .animation(motion.feedbackAnimation(normal: .spring(duration: 0.3)), value: viewModel.toast)
+            .animation(motion.feedbackAnimation(normal: .spring(duration: 0.3)), value: visibleToast)
         }
         .playerDetailChrome(
             isFullscreenPresentationActive: player.isFullscreenPresentationActive,
@@ -310,6 +315,29 @@ struct BangumiDetailView: View {
                   let message = player.takeFullscreenDanmakuFailure(ownerLease: viewModel.playerLease)
             else { return }
             viewModel.showToast(message, style: .error)
+        }
+        .onChange(of: viewModel.toast) { _, toast in
+            guard let toast, toast.style == .error else { return }
+            errorAlert = BangumiErrorAlert(title: "Operation Failed", message: toast.text)
+            viewModel.toast = nil
+        }
+        .onChange(of: viewModel.error) { _, error in
+            guard let error, let season = viewModel.season,
+                  let episodes = season.episodes, !episodes.isEmpty else { return }
+            errorAlert = BangumiErrorAlert(title: "Unavailable", message: error)
+            viewModel.error = nil
+        }
+        .alert(
+            errorAlert?.title ?? "Operation Failed",
+            isPresented: Binding(
+                get: { errorAlert != nil },
+                set: { if !$0 { errorAlert = nil } }
+            ),
+            presenting: errorAlert
+        ) { _ in
+            Button("OK", role: .cancel) { errorAlert = nil }
+        } message: { alert in
+            Text(alert.message)
         }
         .onChange(of: viewModel.commentSourceRevision) { _, _ in
             commentFocus.dismiss()
@@ -373,12 +401,18 @@ struct BangumiDetailView: View {
     @ViewBuilder
     private var seasonLoadFeedback: some View {
         if let error = viewModel.error, !viewModel.isLoading {
-            ContentUnavailableView(
-                "Couldn't Load",
-                systemImage: "exclamationmark.triangle",
-                description: Text(error)
-            )
-            .padding(.top, 40)
+            ContentUnavailableView {
+                Label("Couldn't Load", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(error)
+            } actions: {
+                Button("Retry") {
+                    Task { await viewModel.load(seasonId: seasonId) }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.biliAccent)
+            }
+            .padding(.top, 24)
         } else {
             ProgressView()
                 .padding(.top, 60)
@@ -464,7 +498,7 @@ struct BangumiDetailView: View {
             allowsInteractiveDismissal: showThread == nil,
             onDismissed: resetCommentThreadAfterModalDismissal
         )
-        .padding(.top, playerAreaHeight)
+        .padding(.top, playerVideoHeight)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .clipped()
         .ignoresSafeArea(.container, edges: .bottom)
@@ -477,7 +511,6 @@ struct BangumiDetailView: View {
                 ZStack(alignment: .top) {
                     VStack(spacing: 0) {
                         commentSurfaceHeader(isOverlay: true)
-                            .clipShape(UnevenRoundedRectangle(topLeadingRadius: 24, topTrailingRadius: 24))
                         commentList(isWide: false)
                             .ignoresSafeArea(.container, edges: .bottom)
                     }
@@ -488,9 +521,7 @@ struct BangumiDetailView: View {
                             .contentShape(Rectangle())
                             .onTapGesture {
                                 commentFocus.dismiss()
-                                withAnimation(motion.animation(normal: CollapsibleComposer.composerCollapseAnimation)) {
-                                    compactComposerPresentation.isExpanded = false
-                                }
+                                compactComposerPresentation.isExpanded = false
                             }
                     }
                 }
@@ -506,7 +537,6 @@ struct BangumiDetailView: View {
         }
         .background {
             CommentZoomContentSurface()
-                .clipShape(UnevenRoundedRectangle(topLeadingRadius: 24, topTrailingRadius: 24))
                 .ignoresSafeArea(.container, edges: .bottom)
                 .ignoresSafeArea(.keyboard, edges: .bottom)
         }
@@ -599,7 +629,9 @@ struct BangumiDetailView: View {
             focus: commentFocus,
             onCancelReply: {
                 guard composerIsCurrent(context) else { return }
-                setCommentReplyTarget(nil, context: context)
+                withAnimation(motion.animation(normal: CollapsibleComposer.composerCollapseAnimation)) {
+                    setCommentReplyTarget(nil, context: context)
+                }
                 commentFocus.dismiss()
             },
             onSend: { sendComment(context: context) },
@@ -719,15 +751,15 @@ struct BangumiDetailView: View {
                         .padding(.horizontal, inset)
                 }
 
-                if let error = viewModel.error {
-                    Label(error, systemImage: "exclamationmark.triangle")
-                        .font(.footnote)
-                        .foregroundStyle(.orange)
-                        .padding(.horizontal, inset)
-                }
-
                 if let episodes = season.episodes, !episodes.isEmpty {
                     episodePanel(episodes, horizontalInset: inset)
+                } else if let error = viewModel.error {
+                    ContentUnavailableView(
+                        "Unavailable",
+                        systemImage: "exclamationmark.triangle",
+                        description: Text(error)
+                    )
+                    .padding(.horizontal, inset)
                 }
 
                 if let evaluate = season.evaluate, !evaluate.isEmpty {

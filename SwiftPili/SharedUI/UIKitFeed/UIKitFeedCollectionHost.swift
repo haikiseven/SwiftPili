@@ -14,7 +14,12 @@ struct UIKitHostEnvironment {
 @MainActor
 protocol UIKitCollectionControllable: UIViewController {
     func applyHostEnvironment(_ environment: UIKitHostEnvironment)
+    func didFinishHostUpdate()
     func tearDown()
+}
+
+extension UIKitCollectionControllable {
+    func didFinishHostUpdate() {}
 }
 
 @MainActor
@@ -91,6 +96,7 @@ private struct UIKitCollectionRepresentable<Controller: UIKitCollectionControlla
         guard environment.isActive || !context.coordinator.hasAppliedInitialUpdate else { return }
         context.coordinator.hasAppliedInitialUpdate = true
         updateController(uiViewController)
+        uiViewController.didFinishHostUpdate()
     }
 
     static func dismantleUIViewController(_ uiViewController: Controller, coordinator: Coordinator) {
@@ -126,6 +132,9 @@ class UIKitBaseCollectionViewController: UIViewController,
     private var onRefreshHandler: (@MainActor () async -> Bool)?
     private var activeRefreshToken: UUID?
     private var refreshTask: Task<Void, Never>?
+    private var pendingScrollToTopAfterRefresh = false
+    private var refreshScrollGeneration: UInt64 = 0
+    private var refreshScrollTask: Task<Void, Never>?
     private var lastPaginationKey: AnyHashable?
 
     var layoutHorizontalInset: CGFloat { UIKitFeedLayoutMetrics.horizontalInset }
@@ -205,12 +214,25 @@ class UIKitBaseCollectionViewController: UIViewController,
         activeRefreshToken = nil
         refreshTask?.cancel()
         refreshTask = nil
+        cancelPendingRefreshScrollToTop()
         prefetchCoordinator.cancelAll()
     }
 
+    /// Resting top content offset excluding any temporary `UIRefreshControl` inset expansion.
+    var restingTopContentOffsetY: CGFloat {
+        -(collectionView.safeAreaInsets.top + collectionView.contentInset.top)
+    }
+
     @objc dynamic func scrollToTop(animated: Bool) {
-        let topOffset = CGPoint(x: 0, y: -collectionView.adjustedContentInset.top)
+        cancelPendingRefreshScrollToTop()
+        let topOffset = CGPoint(x: 0, y: restingTopContentOffsetY)
         collectionView.setContentOffset(topOffset, animated: animated)
+    }
+
+    func didFinishHostUpdate() {
+        guard pendingScrollToTopAfterRefresh else { return }
+        pendingScrollToTopAfterRefresh = false
+        scheduleSettledRefreshScrollToTop(afterSnapshot: true)
     }
 
     func resetPaginationGate() {
@@ -298,6 +320,7 @@ class UIKitBaseCollectionViewController: UIViewController,
     }
 
     func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        cancelPendingRefreshScrollToTop()
         if ImageDiagnostics.isEnabled { ImageDiagnostics.isScrolling = true }
     }
 
@@ -335,6 +358,7 @@ class UIKitBaseCollectionViewController: UIViewController,
             return
         }
         refreshTask?.cancel()
+        cancelPendingRefreshScrollToTop()
         let token = UUID()
         activeRefreshToken = token
         refreshTask = Task { @MainActor [weak self] in
@@ -342,11 +366,55 @@ class UIKitBaseCollectionViewController: UIViewController,
             let didPublishNewTop = await onRefreshHandler()
             guard !Task.isCancelled, activeRefreshToken == token else { return }
             activeRefreshToken = nil
-            refreshControl.endRefreshing()
             if didPublishNewTop {
-                scrollToTop(animated: !UIAccessibility.isReduceMotionEnabled)
+                pendingScrollToTopAfterRefresh = true
+                refreshControl.endRefreshing()
+                // Fallback if SwiftUI already flushed the new snapshot synchronously before returning.
+                scheduleSettledRefreshScrollToTop(afterSnapshot: false)
+            } else {
+                refreshControl.endRefreshing()
             }
         }
+    }
+
+    private func cancelPendingRefreshScrollToTop() {
+        pendingScrollToTopAfterRefresh = false
+        refreshScrollGeneration &+= 1
+        refreshScrollTask?.cancel()
+        refreshScrollTask = nil
+    }
+
+    private func scheduleSettledRefreshScrollToTop(afterSnapshot: Bool) {
+        refreshScrollGeneration &+= 1
+        let generation = refreshScrollGeneration
+        refreshScrollTask?.cancel()
+        refreshScrollTask = Task { @MainActor [weak self] in
+            // Wait for SwiftUI to commit the refreshed diffable snapshot (if not yet applied)
+            // and for UIRefreshControl.endRefreshing() to collapse its top inset.
+            let initialDelayMs = afterSnapshot ? 60 : 120
+            try? await Task.sleep(for: .milliseconds(initialDelayMs))
+            guard let self, !Task.isCancelled, self.refreshScrollGeneration == generation else { return }
+            self.pendingScrollToTopAfterRefresh = false
+            self.scrollToRestingTopIfIdle()
+
+            // Follow-up check after UIRefreshControl's ~0.3s collapse animation settles
+            // in case UIKit's collapse offset clashed with the newly prepended top section.
+            try? await Task.sleep(for: .milliseconds(260))
+            guard !Task.isCancelled, self.refreshScrollGeneration == generation else { return }
+            self.scrollToRestingTopIfIdle()
+        }
+    }
+
+    private func scrollToRestingTopIfIdle() {
+        guard isViewLoaded,
+              view.window != nil,
+              !collectionView.isTracking,
+              !collectionView.isDragging else { return }
+        collectionView.layoutIfNeeded()
+        let targetY = restingTopContentOffsetY
+        guard abs(collectionView.contentOffset.y - targetY) > 0.5 else { return }
+        let animated = !UIAccessibility.isReduceMotionEnabled
+        collectionView.setContentOffset(CGPoint(x: 0, y: targetY), animated: animated)
     }
 
     private func syncBottomSafeAreaIfNeeded() {

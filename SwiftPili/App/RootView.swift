@@ -19,6 +19,9 @@ struct RootView: View {
     private var semanticAccent: Color { AccentStore.shared.semanticAccent }
     @ViewBuilder
     private func bottomChrome(showsSurface: Bool) -> some View {
+        let chromeTransition = showsSurface
+            ? motion.transition(normal: .move(edge: .bottom).combined(with: .opacity))
+            : motion.transition(normal: .opacity)
         ZStack {
             if let suggestion = coordinator.clipboardSuggestion {
                 ClipboardLinkBanner(
@@ -28,13 +31,14 @@ struct RootView: View {
                     open: { coordinator.acceptClipboardSuggestion() },
                     dismiss: { coordinator.dismissClipboardSuggestion() }
                 )
-                .transition(motion.transition(normal: .move(edge: .bottom).combined(with: .opacity)))
-            } else {
+                .transition(chromeTransition)
+            } else if DownloadManager.shared.hasInFlightDownloads {
                 DownloadProgressCapsuleHost(
                     accent: semanticAccent,
                     open: { coordinator.navigate(to: .downloads) },
                     showsSurface: showsSurface
                 )
+                .transition(chromeTransition)
             }
         }
         .animation(motion.animation(normal: .snappy(duration: 0.22)), value: coordinator.clipboardSuggestion)
@@ -63,7 +67,13 @@ struct RootView: View {
             .fullScreenCover(
                 isPresented: detailCoverPresented,
                 onDismiss: { retainedCoverRoot = nil },
-                content: { detailCover }
+                content: {
+                    detailCover.modifier(
+                        DetailCoverLinkModifier(coordinator: coordinator) { url, context in
+                            handleOpenURL(url, context: context)
+                        }
+                    )
+                }
             )
     }
 
@@ -133,7 +143,10 @@ struct RootView: View {
             .tabViewStyle(.sidebarAdaptable)
             .tabViewCustomization($tabCustomization)
             .glassTabBarBehaviour()
-            .appBottomChrome(isPresented: hasBottomChrome) { showsSurface in
+            .appBottomChrome(
+                isPresented: hasBottomChrome,
+                bottomOverlayPadding: showsSidebar ? 16 : 58
+            ) { showsSurface in
                 bottomChrome(showsSurface: showsSurface)
             }
             .allowsHitTesting(!detailPresentation.projectionHeld)
@@ -199,6 +212,23 @@ struct RootView: View {
         }
     }
 
+    private func handleOpenURL(_ url: URL, context: ContentLinkContext) -> OpenURLAction.Result {
+        coordinator.contentLinks.cancel()
+        if url.scheme == "swiftpili", url.host() == "seek" {
+            let player = PlayerViewModel.shared
+            if let seconds = Double(url.lastPathComponent),
+               player.mode == .vod, player.currentURL != nil,
+               player.duration > 0, seconds < player.duration {
+                PlayerLog.log("[Player] comment timestamp tapped → seek \(Int(seconds))s")
+                player.seek(to: seconds)
+            } else {
+                PlayerLog.log("[Player] comment timestamp ignored (no VOD playing or out of range)")
+            }
+            return .handled
+        }
+        return coordinator.openContentURL(url, context: context)
+    }
+
     var body: some View {
         navigationContent
         .environment(\.navigationZoomNamespace, navigationZoomNamespace)
@@ -243,28 +273,20 @@ struct RootView: View {
         }
         .tint(navigationTint)
         .onOpenURL { url in
-            coordinator.handle(url: url, context: contentLinkLifetime.capture())
+            coordinator.handle(
+                url: url,
+                context: coordinator.activeCoverLinkContext ?? contentLinkLifetime.capture()
+            )
         }
         .environment(\.contentLinkContext, contentLinkLifetime.capture())
         .environment(\.openURL, OpenURLAction { url in
-            coordinator.contentLinks.cancel()
-            if url.scheme == "swiftpili", url.host() == "seek" {
-                let player = PlayerViewModel.shared
-                if let seconds = Double(url.lastPathComponent),
-                   player.mode == .vod, player.currentURL != nil,
-                   player.duration > 0, seconds < player.duration {
-                    PlayerLog.log("[Player] comment timestamp tapped → seek \(Int(seconds))s")
-                    player.seek(to: seconds)
-                } else {
-                    PlayerLog.log("[Player] comment timestamp ignored (no VOD playing or out of range)")
-                }
-                return .handled
-            }
-            return coordinator.openContentURL(url, context: contentLinkLifetime.capture())
+            handleOpenURL(url, context: contentLinkLifetime.capture())
         })
-        .overlay(alignment: .top) {
-            ContentLinkFeedback(controller: coordinator.contentLinks, scopeID: contentLinkLifetime.id)
-        }
+        .contentLinkFeedback(
+            controller: coordinator.contentLinks,
+            scopeID: contentLinkLifetime.id,
+            bottomPadding: showsSidebar ? 8 : 54
+        )
         .onAppear {
             contentLinkLifetime.activate()
             coordinator.rootLinkContext = contentLinkLifetime.capture()
@@ -319,6 +341,7 @@ private extension View {
     @ViewBuilder
     func appBottomChrome(
         isPresented: Bool,
+        bottomOverlayPadding: CGFloat = 58,
         @ViewBuilder content: @escaping (_ showsSurface: Bool) -> some View
     ) -> some View {
         if #available(iOS 26.1, *) {
@@ -332,10 +355,40 @@ private extension View {
                 if isPresented {
                     content(true)
                         .padding(.horizontal, 16)
-                        .padding(.bottom, 58)
+                        .padding(.bottom, bottomOverlayPadding)
                 }
             }
         }
+    }
+}
+
+private struct DetailCoverLinkModifier: ViewModifier {
+    let coordinator: AppCoordinator
+    let handleOpenURL: @MainActor (URL, ContentLinkContext) -> OpenURLAction.Result
+    @State private var lifetime = ContentLinkLifetime()
+
+    func body(content: Content) -> some View {
+        let context = lifetime.capture()
+        content
+            .environment(\.contentLinkContext, context)
+            .environment(\.openURL, OpenURLAction { url in
+                handleOpenURL(url, lifetime.capture())
+            })
+            .contentLinkFeedback(
+                controller: coordinator.contentLinks,
+                scopeID: lifetime.id
+            )
+            .onAppear {
+                lifetime.activate()
+                coordinator.activeCoverLinkContext = lifetime.capture()
+            }
+            .onDisappear {
+                lifetime.deactivate()
+                if coordinator.activeCoverLinkContext?.presentationID == lifetime.id {
+                    coordinator.activeCoverLinkContext = nil
+                }
+                coordinator.contentLinks.cancel(lifetimeID: lifetime.id)
+            }
     }
 }
 

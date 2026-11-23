@@ -1,31 +1,71 @@
 import Foundation
 import Observation
 
+struct ContentLinkStateKey: Equatable, Hashable, Sendable {
+    let presentationID: UUID
+    let lifetimeIDs: Set<UUID>
+    let revisions: [UUID: UInt64]
+}
+
 struct ContentLinkContext: Sendable {
     let presentationID: UUID
     let lifetimeIDs: Set<UUID>
+    let revisions: [UUID: UInt64]
     let isCurrent: @MainActor @Sendable () -> Bool
     var beforeNavigate: @MainActor @Sendable () -> Void = {}
 
+    var stateKey: ContentLinkStateKey {
+        ContentLinkStateKey(
+            presentationID: presentationID,
+            lifetimeIDs: lifetimeIDs,
+            revisions: revisions
+        )
+    }
+
     func preparingNavigation(_ action: @escaping @MainActor @Sendable () -> Void) -> ContentLinkContext {
-        ContentLinkContext(presentationID: presentationID, lifetimeIDs: lifetimeIDs,
-                           isCurrent: isCurrent, beforeNavigate: action)
+        ContentLinkContext(
+            presentationID: presentationID,
+            lifetimeIDs: lifetimeIDs,
+            revisions: revisions,
+            isCurrent: isCurrent,
+            beforeNavigate: action
+        )
     }
 
     func guarded(by predicate: @escaping @MainActor @Sendable () -> Bool) -> ContentLinkContext {
-        ContentLinkContext(presentationID: presentationID, lifetimeIDs: lifetimeIDs, isCurrent: {
-            isCurrent() && predicate()
-        }, beforeNavigate: beforeNavigate)
+        ContentLinkContext(
+            presentationID: presentationID,
+            lifetimeIDs: lifetimeIDs,
+            revisions: revisions,
+            isCurrent: { isCurrent() && predicate() },
+            beforeNavigate: beforeNavigate
+        )
+    }
+
+    func forwarded(
+        isCurrent: @escaping @MainActor @Sendable () -> Bool,
+        beforeNavigate: @escaping @MainActor @Sendable () -> Void
+    ) -> ContentLinkContext {
+        ContentLinkContext(
+            presentationID: presentationID,
+            lifetimeIDs: lifetimeIDs,
+            revisions: revisions,
+            isCurrent: isCurrent,
+            beforeNavigate: beforeNavigate
+        )
     }
 
     func joining(_ child: ContentLinkContext, presentsFeedback: Bool) -> ContentLinkContext {
         ContentLinkContext(
             presentationID: presentsFeedback ? child.presentationID : presentationID,
             lifetimeIDs: lifetimeIDs.union(child.lifetimeIDs),
-            isCurrent: { isCurrent() && child.isCurrent() }, beforeNavigate: {
-            beforeNavigate()
-            child.beforeNavigate()
-        })
+            revisions: revisions.merging(child.revisions) { _, newer in newer },
+            isCurrent: { isCurrent() && child.isCurrent() },
+            beforeNavigate: {
+                beforeNavigate()
+                child.beforeNavigate()
+            }
+        )
     }
 }
 
@@ -42,22 +82,27 @@ final class ContentLinkLifetime {
 
     func capture() -> ContentLinkContext {
         let captured = revision
-        return ContentLinkContext(presentationID: id, lifetimeIDs: [id], isCurrent: { [weak self] in
-            self?.active == true && self?.revision == captured
-        })
+        return ContentLinkContext(
+            presentationID: id,
+            lifetimeIDs: [id],
+            revisions: [id: captured],
+            isCurrent: { [weak self] in
+                self?.active == true && self?.revision == captured
+            }
+        )
     }
 }
 
 @MainActor
 @Observable
 final class ContentLinkController {
-    enum Status {
+    enum Status: Equatable {
         case loading
         case failed(String)
         case unsupported
     }
 
-    struct Presentation: Identifiable {
+    struct Presentation: Identifiable, Equatable {
         let id: UUID
         let scopeID: UUID
         var status: Status

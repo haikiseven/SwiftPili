@@ -7,6 +7,8 @@ enum BiliLinkTarget: Equatable, Sendable {
     case moment(String)
     case article(Int)
     case music(MusicDestination)
+    case bangumi(Int)
+    case search(SearchType, keyword: String)
 }
 
 enum BiliLinkResolution: Equatable, Sendable {
@@ -17,7 +19,14 @@ enum BiliLinkResolution: Equatable, Sendable {
 
 enum BiliLinkHostPolicy {
     static let bilibiliDomains: Set<String> = ["bilibili.com"]
-    static let shortenerDomains: Set<String> = ["b23.tv"]
+    static let shortenerDomains: Set<String> = [
+        "b23.tv",
+        "bili2233.cn",
+        "acg.tv",
+        "bili22.cn",
+        "bili23.cn",
+        "bili33.cn",
+    ]
 
     static func matches(host: String?, anyOf domains: Set<String>) -> Bool {
         guard let host = host?.lowercased(), !host.isEmpty else { return false }
@@ -104,7 +113,7 @@ enum BiliLinkScanner {
         let matches = regex.matches(in: text, range: NSRange(location: 0, length: ns.length))
         for match in matches {
             var raw = ns.substring(with: match.range)
-            while let last = raw.last, ".,;:!?)】」".contains(last) {
+            while let last = raw.last, ".,;:!?)]}。，！？；：】」》）".contains(last) {
                 raw.removeLast()
             }
             guard let url = URL(string: raw),
@@ -119,14 +128,16 @@ enum BiliLinkScanner {
     }
 
     private static func firstBVID(in text: String) -> String? {
-        let pattern = #"(?<![A-Za-z0-9])(BV[A-HJ-NP-Za-km-z1-9]{10})(?![A-Za-z0-9])"#
-        return firstCapture(pattern, in: text)
+        let pattern = #"(?<![A-Za-z0-9])([Bb][Vv][A-HJ-NP-Za-km-z1-9]{10})(?![A-Za-z0-9])"#
+        guard let raw = firstCapture(pattern, in: text) else { return nil }
+        return BiliLinkResolver.normalizedBVID(raw)
     }
 
     private static func firstAID(in text: String) -> Int? {
         let pattern = #"(?<![A-Za-z0-9])[Aa][Vv](\d{1,12})(?![A-Za-z0-9])"#
-        guard let digits = firstCapture(pattern, in: text) else { return nil }
-        return Int(digits)
+        guard let digits = firstCapture(pattern, in: text),
+              let aid = Int(digits), aid > 0 else { return nil }
+        return aid
     }
 
     private static func firstCapture(_ pattern: String, in text: String) -> String? {
@@ -157,9 +168,14 @@ enum BiliLinkResolver {
         let host = url.host
 
         if BiliLinkHostPolicy.isShortener(host) {
-            let first = url.pathComponents.dropFirst().first ?? ""
-            if let target = videoTarget(fromPathComponent: first) {
-                return .resolved(target, sanitized: BiliLinkSanitizer.sanitize(url))
+            let parts = url.path.split(separator: "/").map(String.init)
+            if parts.count == 1, let first = parts.first {
+                if let target = videoTarget(fromPathComponent: first, allowBareNumeric: false) {
+                    return .resolved(target, sanitized: BiliLinkSanitizer.sanitize(url))
+                }
+                if let seasonID = parsedPrefixedID(first, prefix: "ss") {
+                    return .resolved(.bangumi(seasonID), sanitized: BiliLinkSanitizer.sanitize(url))
+                }
             }
             return .needsRedirect(url)
         }
@@ -175,6 +191,48 @@ enum BiliLinkResolver {
               let target = musicTarget(for: finalURL) ?? target(forBilibiliURL: finalURL)
         else { return .none }
         return .resolved(target, sanitized: BiliLinkSanitizer.sanitize(finalURL))
+    }
+
+    // MARK: - Strict ID validation
+
+    private static let base58Charset = Set("ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz123456789")
+
+    static func normalizedBVID(_ raw: String) -> String? {
+        guard raw.count == 12,
+              raw.prefix(2).lowercased() == "bv" else { return nil }
+        let body = raw.dropFirst(2)
+        guard body.allSatisfy({ $0.isASCII && base58Charset.contains($0) }) else { return nil }
+        return "BV" + body
+    }
+
+    static func parsedAID(_ raw: String, allowBareNumeric: Bool) -> Int? {
+        guard !raw.isEmpty else { return nil }
+        if raw.prefix(2).lowercased() == "av" {
+            let digits = raw.dropFirst(2)
+            guard !digits.isEmpty, digits.allSatisfy({ $0.isASCII && $0.isNumber }),
+                  let aid = Int(digits), aid > 0 else { return nil }
+            return aid
+        }
+        if allowBareNumeric,
+           raw.allSatisfy({ $0.isASCII && $0.isNumber }),
+           let aid = Int(raw), aid > 0 {
+            return aid
+        }
+        return nil
+    }
+
+    static func parsedPrefixedID(_ raw: String, prefix: String) -> Int? {
+        let count = prefix.count
+        guard raw.count > count,
+              raw.prefix(count).lowercased() == prefix.lowercased() else { return nil }
+        let digits = raw.dropFirst(count)
+        guard digits.allSatisfy({ $0.isASCII && $0.isNumber }),
+              let value = Int(digits), value > 0 else { return nil }
+        return value
+    }
+
+    static func isPositiveNumericID(_ raw: String) -> Bool {
+        !raw.isEmpty && raw.allSatisfy({ $0.isASCII && $0.isNumber }) && raw.contains(where: { $0 != "0" })
     }
 
     // MARK: - Identity extraction
@@ -195,55 +253,157 @@ enum BiliLinkResolver {
     private static func target(forBilibiliURL url: URL) -> BiliLinkTarget? {
         let host = url.host?.lowercased() ?? ""
         let parts = url.path.split(separator: "/").map(String.init)
+        let queryItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
 
+        func queryValue(_ names: [String]) -> String? {
+            for name in names {
+                if let value = queryItems.first(where: { $0.name.lowercased() == name })?.value,
+                   !value.isEmpty {
+                    return value
+                }
+            }
+            return nil
+        }
+
+        if host.hasPrefix("search.") {
+            return searchTarget(pathHead: parts.first, queryValue: queryValue)
+        }
         if host.hasPrefix("space.") {
-            if let mid = parts.first.flatMap(Int.init) { return .userSpace(mid) }
+            if let first = parts.first, let mid = Int(first), mid > 0 { return .userSpace(mid) }
             return nil
         }
         if host.hasPrefix("live.") {
-            if let room = parts.first.flatMap(Int.init) { return .liveRoom(room) }
+            if let first = parts.first {
+                if let room = Int(first), room > 0 { return .liveRoom(room) }
+                let lower = first.lowercased()
+                if (lower == "h5" || lower == "blanc"), parts.count >= 2,
+                   let room = Int(parts[1]), room > 0 {
+                    return .liveRoom(room)
+                }
+            }
             return nil
         }
         if host.hasPrefix("t.") {
-            if let last = parts.last, Int(last) != nil { return .moment(last) }
+            if parts.count == 1, isPositiveNumericID(parts[0]) {
+                return .moment(parts[0])
+            }
+            if parts.count >= 4,
+               parts[0].lowercased() == "h5",
+               parts[1].lowercased() == "dynamic",
+               parts[2].lowercased() == "detail",
+               isPositiveNumericID(parts[3]) {
+                return .moment(parts[3])
+            }
+            if parts.count >= 2,
+               ["dynamic", "opus", "detail"].contains(parts[0].lowercased()),
+               isPositiveNumericID(parts[1]) {
+                return .moment(parts[1])
+            }
             return nil
         }
 
-        guard let first = parts.first else { return nil }
+        guard let first = parts.first?.lowercased() else { return nil }
         switch first {
         case "video":
             guard parts.count >= 2 else { return nil }
-            return videoTarget(fromPathComponent: parts[1])
+            return videoTarget(fromPathComponent: parts[1], allowBareNumeric: true)
+        case "s":
+            guard parts.count >= 3, parts[1].lowercased() == "video" else { return nil }
+            return videoTarget(fromPathComponent: parts[2], allowBareNumeric: true)
+        case "bangumi":
+            guard parts.count >= 3, parts[1].lowercased() == "play" else { return nil }
+            if let seasonID = parsedPrefixedID(parts[2], prefix: "ss") {
+                return .bangumi(seasonID)
+            }
+            return nil
+        case "search":
+            return searchTarget(pathHead: parts.dropFirst().first, queryValue: queryValue)
+        case "dynamic":
+            guard parts.count >= 2, isPositiveNumericID(parts[1]) else { return nil }
+            return .moment(parts[1])
+        case "opus":
+            guard parts.count >= 2, isPositiveNumericID(parts[1]) else { return nil }
+            return .moment(parts[1])
+        case "h5":
+            if parts.count >= 4,
+               parts[1].lowercased() == "dynamic",
+               parts[2].lowercased() == "detail",
+               isPositiveNumericID(parts[3]) {
+                return .moment(parts[3])
+            }
+            return nil
         case "read":
             guard parts.count >= 2 else { return nil }
-            let raw = parts[1]
-            if raw.hasPrefix("cv"), let cv = Int(raw.dropFirst(2)) { return .article(cv) }
-            if raw == "mobile", parts.count >= 3, let cv = Int(parts[2]) { return .article(cv) }
+            let second = parts[1]
+            if let cv = parsedPrefixedID(second, prefix: "cv") { return .article(cv) }
+            if second.lowercased() == "mobile" {
+                if parts.count >= 3, let cv = parsedPrefixedID(parts[2], prefix: "cv") ?? positiveInt(parts[2]) {
+                    return .article(cv)
+                }
+                if let rawID = queryValue(["id"]),
+                   let cv = parsedPrefixedID(rawID, prefix: "cv") ?? positiveInt(rawID) {
+                    return .article(cv)
+                }
+            }
             return nil
-        case "opus":
-            guard parts.count >= 2, Int(parts[1]) != nil else { return nil }
-            return .moment(parts[1])
         case "space":
-            guard parts.count >= 2, let mid = Int(parts[1]) else { return nil }
+            guard parts.count >= 2, let mid = Int(parts[1]), mid > 0 else { return nil }
             return .userSpace(mid)
         case "live":
-            guard parts.count >= 2, let room = Int(parts[1]) else { return nil }
+            guard parts.count >= 2, let room = Int(parts[1]), room > 0 else { return nil }
             return .liveRoom(room)
+        case "festival", "list", "medialist":
+            if let bvid = queryValue(["bvid"]).flatMap(normalizedBVID) {
+                return .video(.bvid(bvid))
+            }
+            if let aid = queryValue(["aid", "avid"]).flatMap({ parsedAID($0, allowBareNumeric: true) }) {
+                return .video(.aid(aid))
+            }
+            if first != "festival" {
+                for segment in parts.dropFirst().reversed() {
+                    if let target = videoTarget(fromPathComponent: segment, allowBareNumeric: false) {
+                        return target
+                    }
+                }
+            }
+            return nil
         default:
             return nil
         }
     }
 
-    private static func videoTarget(fromPathComponent raw: String) -> BiliLinkTarget? {
-        guard !raw.isEmpty else { return nil }
-        if raw.hasPrefix("BV") || raw.hasPrefix("bv") {
-            return .video(.bvid("BV" + raw.dropFirst(2)))
+    private static func searchTarget(
+        pathHead: String?,
+        queryValue: ([String]) -> String?
+    ) -> BiliLinkTarget? {
+        guard let keyword = queryValue(["keyword", "word", "q"])?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !keyword.isEmpty else { return nil }
+        let rawType = (pathHead ?? queryValue(["type"]) ?? "all").lowercased()
+        let searchType: SearchType = switch rawType {
+        case "video": .video
+        case "bangumi", "pgc", "media_bangumi": .bangumi
+        case "live", "live_room": .liveRoom
+        case "upuser", "user", "bili_user": .user
+        case "article", "read": .article
+        default: .all
         }
-        let lower = raw.lowercased()
-        if lower.hasPrefix("av"), let aid = Int(lower.dropFirst(2)) {
+        return .search(searchType, keyword: keyword)
+    }
+
+    private static func positiveInt(_ raw: String) -> Int? {
+        guard raw.allSatisfy({ $0.isASCII && $0.isNumber }), let value = Int(raw), value > 0 else { return nil }
+        return value
+    }
+
+    static func videoTarget(fromPathComponent raw: String, allowBareNumeric: Bool = true) -> BiliLinkTarget? {
+        guard !raw.isEmpty else { return nil }
+        if let bvid = normalizedBVID(raw) {
+            return .video(.bvid(bvid))
+        }
+        if let aid = parsedAID(raw, allowBareNumeric: allowBareNumeric) {
             return .video(.aid(aid))
         }
-        if let aid = Int(raw) { return .video(.aid(aid)) }
         return nil
     }
 }
@@ -259,6 +419,8 @@ extension BiliLinkTarget {
         case .moment(let id): .momentDetail(id)
         case .article(let cv): .articleReader(cv)
         case .music(let destination): .musicInfo(destination)
+        case .bangumi(let seasonID): .bangumiDetail(seasonID)
+        case .search(let type, let keyword): .search(type, keyword: keyword)
         }
     }
 }

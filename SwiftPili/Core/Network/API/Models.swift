@@ -59,6 +59,18 @@ struct VideoInfo: Decodable, Sendable {
     private static let descLinkDetector: NSRegularExpression? = try? NSDataDetector(
         types: NSTextCheckingResult.CheckingType.link.rawValue
     )
+    private static let descAVRegex = try? NSRegularExpression(
+        pattern: #"(?<![A-Za-z0-9])([Aa][Vv]\d{1,12})(?![A-Za-z0-9])"#
+    )
+    private static let descCVRegex = try? NSRegularExpression(
+        pattern: #"(?<![A-Za-z0-9])([Cc][Vv]\d{1,12})(?![A-Za-z0-9])"#
+    )
+    private static let descSSRegex = try? NSRegularExpression(
+        pattern: #"(?<![A-Za-z0-9])([Ss][Ss]\d{1,12})(?![A-Za-z0-9])"#
+    )
+    private static let descEPRegex = try? NSRegularExpression(
+        pattern: #"(?<![A-Za-z0-9])([Ee][Pp]\d{1,12})(?![A-Za-z0-9])"#
+    )
 
     private static func prepareDescLinks(desc: String, descV2: [DescV2Node]?) -> [String: URL] {
         var out: [String: URL] = [:]
@@ -67,17 +79,64 @@ struct VideoInfo: Decodable, Sendable {
                 out["@\(node.rawText)"] = URL(string: "https://space.bilibili.com/\(mid)")
             }
         }
-        for key in desc.bvIDs where out[key] == nil {
-            out[key] = URL(string: "https://www.bilibili.com/video/\(key)")
-        }
+        let ns = desc as NSString
+        let fullRange = NSRange(location: 0, length: ns.length)
         if let detector = Self.descLinkDetector {
-            let ns = desc as NSString
-            for match in detector.matches(
-                in: desc, range: NSRange(location: 0, length: ns.length)
-            ) {
-                guard let url = match.url else { continue }
-                let literal = ns.substring(with: match.range)
+            for match in detector.matches(in: desc, range: fullRange) {
+                guard var url = match.url else { continue }
+                var literal = ns.substring(with: match.range)
+                while let last = literal.last, "。，！？；：】」》）".contains(last) {
+                    literal.removeLast()
+                }
+                guard !literal.isEmpty else { continue }
+                if url.scheme?.lowercased() == "http",
+                   BiliLinkHostPolicy.isBilibiliHost(url.host) || BiliLinkHostPolicy.isShortener(url.host),
+                   var comps = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+                    comps.scheme = "https"
+                    if let upgraded = comps.url { url = upgraded }
+                }
                 if out[literal] == nil { out[literal] = url }
+            }
+        }
+        for key in desc.bvIDs where out[key] == nil {
+            if let bvid = BiliLinkResolver.normalizedBVID(key) {
+                out[key] = URL(string: "https://www.bilibili.com/video/\(bvid)")
+            }
+        }
+        if let descAVRegex {
+            for match in descAVRegex.matches(in: desc, range: fullRange) {
+                let token = ns.substring(with: match.range(at: 1))
+                if out[token] == nil,
+                   let aid = BiliLinkResolver.parsedAID(token, allowBareNumeric: false) {
+                    out[token] = URL(string: "https://www.bilibili.com/video/av\(aid)")
+                }
+            }
+        }
+        if let descCVRegex {
+            for match in descCVRegex.matches(in: desc, range: fullRange) {
+                let token = ns.substring(with: match.range(at: 1))
+                if out[token] == nil,
+                   let cvid = BiliLinkResolver.parsedPrefixedID(token, prefix: "cv") {
+                    out[token] = URL(string: "https://www.bilibili.com/read/cv\(cvid)")
+                }
+            }
+        }
+        if let descSSRegex {
+            for match in descSSRegex.matches(in: desc, range: fullRange) {
+                let token = ns.substring(with: match.range(at: 1))
+                if out[token] == nil,
+                   let sid = BiliLinkResolver.parsedPrefixedID(token, prefix: "ss") {
+                    out[token] = URL(string: "https://www.bilibili.com/bangumi/play/ss\(sid)")
+                }
+            }
+        }
+        if let descEPRegex {
+            for match in descEPRegex.matches(in: desc, range: fullRange) {
+                let token = ns.substring(with: match.range(at: 1))
+                if out[token] == nil,
+                   let epid = BiliLinkResolver.parsedPrefixedID(token, prefix: "ep") {
+                    out[token] = URL(string: "https://www.bilibili.com/bangumi/play/ep\(epid)")
+                }
             }
         }
         return out
@@ -2723,11 +2782,34 @@ struct CommentResult: Decodable, Sendable {
             struct JumpTarget: Decodable, Sendable {
                 let title: String?
                 let pcUrl: String?
+                let appUrlSchema: String?
 
                 enum CodingKeys: String, CodingKey {
                     case title
                     case pcUrl = "pc_url"
+                    case appUrlSchema = "app_url_schema"
                 }
+            }
+
+            private static let commentURLRegex = try? NSRegularExpression(
+                pattern: #"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+"#
+            )
+            private static let commentAVRegex = try? NSRegularExpression(
+                pattern: #"(?<![A-Za-z0-9])([Aa][Vv]\d{1,12})(?![A-Za-z0-9])"#
+            )
+
+            private static func normalizedJumpURL(_ raw: String?) -> URL? {
+                guard let raw else { return nil }
+                var trimmed = HTMLEntityDecoder.decode(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return nil }
+                if trimmed.hasPrefix("//") {
+                    trimmed = "https:" + trimmed
+                }
+                let lower = trimmed.lowercased()
+                guard lower.hasPrefix("http://") || lower.hasPrefix("https://") || lower.hasPrefix("bilibili://") else {
+                    return nil
+                }
+                return URL(string: trimmed) ?? URL(string: trimmed, encodingInvalidCharacters: true)
             }
 
             private static func prepareLinks(
@@ -2737,12 +2819,20 @@ struct CommentResult: Decodable, Sendable {
                 members: [AtMember]?
             ) -> [String: URL] {
                 var out: [String: URL] = [:]
-                for (key, target) in jumpUrl ?? [:] {
-                    if key.hasPrefix("http"), let url = URL(string: key) {
+                for (rawKey, target) in jumpUrl ?? [:] {
+                    let key = HTMLEntityDecoder.decode(rawKey)
+                    guard !key.isEmpty else { continue }
+                    if let url = normalizedJumpURL(key) {
                         out[key] = url
-                    } else if let pc = target.pcUrl, pc.hasPrefix("http"), let url = URL(string: pc) {
+                    } else if let url = normalizedJumpURL(target.pcUrl) {
                         out[key] = url
-                    } else if key.hasPrefix("BV"), let url = URL(string: "https://www.bilibili.com/video/\(key)") {
+                    } else if let url = normalizedJumpURL(target.appUrlSchema) {
+                        out[key] = url
+                    } else if let bvid = BiliLinkResolver.normalizedBVID(key),
+                              let url = URL(string: "https://www.bilibili.com/video/\(bvid)") {
+                        out[key] = url
+                    } else if let aid = BiliLinkResolver.parsedAID(key, allowBareNumeric: false),
+                              let url = URL(string: "https://www.bilibili.com/video/av\(aid)") {
                         out[key] = url
                     }
                 }
@@ -2757,8 +2847,32 @@ struct CommentResult: Decodable, Sendable {
                         out["@\(name)"] = URL(string: "https://space.bilibili.com/\(mid)")
                     }
                 }
+                let nsMessage = message as NSString
+                let fullRange = NSRange(location: 0, length: nsMessage.length)
+                if let commentURLRegex {
+                    for match in commentURLRegex.matches(in: message, range: fullRange) {
+                        var raw = nsMessage.substring(with: match.range)
+                        while let last = raw.last, ".,;:!?)]}。，！？；：】」》）".contains(last) {
+                            raw.removeLast()
+                        }
+                        if out[raw] == nil, let url = URL(string: raw) {
+                            out[raw] = url
+                        }
+                    }
+                }
                 for key in message.bvIDs where out[key] == nil {
-                    out[key] = URL(string: "https://www.bilibili.com/video/\(key)")
+                    if let bvid = BiliLinkResolver.normalizedBVID(key) {
+                        out[key] = URL(string: "https://www.bilibili.com/video/\(bvid)")
+                    }
+                }
+                if let commentAVRegex {
+                    for match in commentAVRegex.matches(in: message, range: fullRange) {
+                        let token = nsMessage.substring(with: match.range(at: 1))
+                        if out[token] == nil,
+                           let aid = BiliLinkResolver.parsedAID(token, allowBareNumeric: false) {
+                            out[token] = URL(string: "https://www.bilibili.com/video/av\(aid)")
+                        }
+                    }
                 }
                 return out
             }
@@ -3249,7 +3363,9 @@ extension String {
         return self
     }
 
-    private static let bvIDRegex = try? NSRegularExpression(pattern: "BV[0-9A-Za-z]{10}")
+    private static let bvIDRegex = try? NSRegularExpression(
+        pattern: #"(?<![A-Za-z0-9])([Bb][Vv][A-HJ-NP-Za-km-z1-9]{10})(?![A-Za-z0-9])"#
+    )
 
     var bvIDs: [String] {
         guard let regex = Self.bvIDRegex else { return [] }

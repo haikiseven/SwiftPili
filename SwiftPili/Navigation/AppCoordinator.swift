@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct VideoNavigationAdmission: Equatable, Sendable {
     private(set) var pendingTarget: VideoID?
@@ -41,6 +42,7 @@ enum BangumiRouteSurfacePolicy {
 final class AppCoordinator {
     let contentLinks = ContentLinkController()
     @ObservationIgnored var rootLinkContext: ContentLinkContext?
+    @ObservationIgnored var activeCoverLinkContext: ContentLinkContext?
     var contentLinkNavigationRevision: UInt64 = 0
 
     @ObservationIgnored
@@ -489,7 +491,15 @@ final class AppCoordinator {
     }
 
     func handle(url: URL, context: ContentLinkContext? = nil) {
-        _ = openContentURL(url, context: context)
+        if BiliURLParser.handlesContent(url) {
+            _ = openContentURL(url, context: context)
+            return
+        }
+        contentLinks.cancel()
+        guard (context ?? activeCoverLinkContext ?? rootLinkContext)?.isCurrent() != false else { return }
+        if BiliLinkHostPolicy.isSupportedScheme(url.scheme) {
+            UIApplication.shared.open(url)
+        }
     }
 
     // MARK: - Clipboard suggestion
@@ -511,14 +521,19 @@ final class AppCoordinator {
             return
         }
         clipboardSuggestion = suggestion
-        PlayerLog.log("[BiliLink] clipboard suggestion: \(suggestion.target)")
+        PlayerLog.log("[BiliLink] clipboard suggestion: \(suggestion.action)")
     }
 
     func acceptClipboardSuggestion() {
         guard let suggestion = clipboardSuggestion else { return }
         clipboardGate.noteHandled(content: suggestion.sourceContent)
         clipboardSuggestion = nil
-        navigate(to: suggestion.target.route)
+        switch suggestion.action {
+        case .target(let target):
+            navigate(to: target.route)
+        case .shortLink(let url):
+            _ = openContentURL(url)
+        }
     }
 
     func dismissClipboardSuggestion() {

@@ -15,7 +15,7 @@ extension AppCoordinator {
     }
 
     func contentLinkOrigin(_ context: ContentLinkContext? = nil) -> ContentLinkContext? {
-        guard let origin = context ?? rootLinkContext else { return nil }
+        guard let origin = context ?? activeCoverLinkContext ?? rootLinkContext else { return nil }
         let navigation = contentLinkNavigationRevision
         let account = AccountManager.shared.identityRevision
         return origin.guarded { [weak self] in

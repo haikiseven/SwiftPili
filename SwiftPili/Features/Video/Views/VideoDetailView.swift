@@ -72,6 +72,7 @@ struct VideoDetailView: View {
     @State private var composer = VideoCommentComposerState()
     @State private var activeSheet: DetailSheet?
     @State private var activeDialog: DetailDialog?
+    @State private var errorAlert: ToastMessage?
     @State private var shareState = VideoShareState()
     @State private var showThread: CommentThreadTarget?
     @State private var commentTargetRpid: Int?
@@ -396,6 +397,23 @@ struct VideoDetailView: View {
             else { return }
             viewModel.showToast(message, style: .error)
         }
+        .onChange(of: viewModel.toast) { _, toast in
+            guard let toast, toast.style == .error else { return }
+            errorAlert = toast
+            viewModel.toast = nil
+        }
+        .alert(
+            "Operation Failed",
+            isPresented: Binding(
+                get: { errorAlert != nil },
+                set: { if !$0 { errorAlert = nil } }
+            ),
+            presenting: errorAlert
+        ) { _ in
+            Button("OK", role: .cancel) { errorAlert = nil }
+        } message: { alert in
+            Text(alert.text)
+        }
         .imagePreview(item: $previewImages)
         .sheet(item: $activeSheet) { sheet in
             switch sheet {
@@ -439,13 +457,16 @@ struct VideoDetailView: View {
         VideoDetailCommentPresentationReader(presentation: commentPresentation) { commentsPresented in
             let handledByWidePanel = showsWideChrome && stagePresentation == .stage && showThread == nil
             let handledByCompactOverlay = !isWideLayout && commentsPresented
+            let visibleToast = (!handledByWidePanel && !handledByCompactOverlay
+                && (isWideLayout || !commentsPresented))
+                ? viewModel.toast.flatMap { $0.style == .error ? nil : $0 }
+                : nil
             Group {
-                if !handledByWidePanel, !handledByCompactOverlay,
-                   isWideLayout || !commentsPresented, let toast = viewModel.toast {
+                if let toast = visibleToast {
                     ToastView(message: toast)
                 }
             }
-            .animation(motion.feedbackAnimation(normal: .spring(duration: 0.3)), value: viewModel.toast)
+            .animation(motion.feedbackAnimation(normal: .spring(duration: 0.3)), value: visibleToast)
             .frame(maxWidth: showsWideChrome ? stageGeometry.panelWidth : .infinity)
             .padding(.trailing, showsWideChrome ? DetailStageLayout.outerMargin : 0)
             .padding(.bottom, showsWideChrome ? DetailStageLayout.outerMargin : 0)
@@ -491,7 +512,7 @@ struct VideoDetailView: View {
     }
 
     private var isInlineCommentInputEligible: Bool {
-        AuthManager.shared.isLoggedIn && !viewModel.commentsClosed
+        !player.isFullscreen && AuthManager.shared.isLoggedIn && !viewModel.commentsClosed
     }
 
     private func statsLine(_ info: VideoInfo) -> some View {
@@ -523,14 +544,13 @@ struct VideoDetailView: View {
                     .appFont(.screenSummary)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                    .contentShape(Rectangle())
-                    .onTapGesture {
+                    .linkAwareLongPress(minimumDuration: 0.4) {
+                        activeDialog = .descriptionActions
+                    }
+                    .linkAwareTap {
                         withAnimation(motion.animation(normal: .snappy(duration: 0.22, extraBounce: 0))) {
                             isDescExpanded.toggle()
                         }
-                    }
-                    .onLongPressGesture(minimumDuration: 0.4) {
-                        activeDialog = .descriptionActions
                     }
                     .confirmationDialog(
                         "", isPresented: dialogBinding(.descriptionActions), titleVisibility: .hidden
@@ -874,7 +894,7 @@ struct VideoDetailView: View {
             allowsInteractiveDismissal: showThread == nil,
             onDismissed: resetCommentThreadAfterModalDismissal
         )
-        .padding(.top, playerAreaHeight)
+        .padding(.top, playerVideoHeight)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .clipped()
         .ignoresSafeArea(.container, edges: .bottom)
@@ -1079,35 +1099,29 @@ struct VideoDetailView: View {
 
     @ViewBuilder
     private func unavailableState(_ message: String) -> some View {
-        VStack(spacing: 14) {
-            Image(systemName: viewModel.unavailability?.symbolName
-                ?? "exclamationmark.triangle")
-                .font(.largeTitle)
-                .foregroundStyle(.secondary)
+        ContentUnavailableView {
+            Label(
+                viewModel.unavailability != nil
+                    ? String(localized: "Unavailable")
+                    : String(localized: "Couldn't Load"),
+                systemImage: viewModel.unavailability?.symbolName ?? "exclamationmark.triangle"
+            )
+        } description: {
             Text(message)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
+        } actions: {
             if viewModel.unavailability?.isRetryable ?? true {
-                Button {
+                Button("Retry") {
                     Task {
                         await activationCoordinator.activate(
                             owner: screenOwner, route: activationRouteRead, ports: activationPorts
                         )
                     }
-                } label: {
-                    Text("Retry")
-                        .font(.subheadline.weight(.medium))
-                        .padding(.horizontal, 22)
-                        .padding(.vertical, 9)
-                        .background(accent.opacity(0.16), in: Capsule())
                 }
-                .buttonStyle(.appControl)
-                .foregroundStyle(accent)
+                .buttonStyle(.borderedProminent)
+                .tint(accent)
             }
         }
-        .padding(.horizontal, 32)
-        .padding(.top, 48)
+        .padding(.top, 24)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
@@ -1636,7 +1650,6 @@ struct VideoDetailView: View {
                 ZStack(alignment: .top) {
                     VStack(spacing: 0) {
                         commentPageHeader(model: model)
-                            .clipShape(UnevenRoundedRectangle(topLeadingRadius: 24, topTrailingRadius: 24))
                         commentsPageList(bottomInset: bottomInset, model: model)
                             .ignoresSafeArea(.container, edges: .bottom)
                     }
@@ -1653,7 +1666,6 @@ struct VideoDetailView: View {
             }
             .background {
                 CommentZoomContentSurface()
-                    .clipShape(UnevenRoundedRectangle(topLeadingRadius: 24, topTrailingRadius: 24))
                     .ignoresSafeArea(.container, edges: .bottom)
                     .ignoresSafeArea(.keyboard, edges: .bottom)
             }

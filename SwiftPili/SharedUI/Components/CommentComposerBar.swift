@@ -46,6 +46,7 @@ struct CommentComposerBar: View {
     @State private var photoSelection: [PhotosPickerItem] = []
     @State private var legacyIsUploading = false
     @State private var legacyUploadError: String?
+    @State private var errorAlertMessage: String?
     @State private var photoPickerOrigin: CommentComposerUploadOwner.Context?
     @State private var editingPickerOrigin: CommentComposerUploadOwner.Context?
     @State private var emotePickerAccount: CommentEditingPickerReceipt?
@@ -82,6 +83,34 @@ struct CommentComposerBar: View {
             .onChange(of: showEmotePicker) { if showEmotePicker { PerfLog.firstTime("emote picker open") } }
             .onChange(of: photoSelection) { handlePhotoSelectionChange() }
             .onChange(of: uploadScope?.context) { _, _ in handleUploadContextChange() }
+            .onChange(of: sendError) { _, message in
+                guard let message, isInteractionCurrent() else { return }
+                errorAlertMessage = message
+            }
+            .onChange(of: uploadError) { _, message in
+                guard let message, isInteractionCurrent() else { return }
+                errorAlertMessage = message
+            }
+            .alert(
+                "Operation Failed",
+                isPresented: Binding(
+                    get: { errorAlertMessage != nil },
+                    set: { isPresented in
+                        if !isPresented {
+                            errorAlertMessage = nil
+                            legacyUploadError = nil
+                        }
+                    }
+                ),
+                presenting: errorAlertMessage
+            ) { _ in
+                Button("OK", role: .cancel) {
+                    errorAlertMessage = nil
+                    legacyUploadError = nil
+                }
+            } message: { message in
+                Text(message)
+            }
     }
 
     @ViewBuilder
@@ -100,8 +129,6 @@ struct CommentComposerBar: View {
         VStack(alignment: .leading, spacing: 0) {
             if let replyBanner { replyHeader(replyBanner) }
             if !pictures.isEmpty || isUploading { attachmentsRow }
-            if let uploadError { composerErrorRow(uploadError) }
-            if let sendError { composerErrorRow(sendError) }
             editorField
             toolsRow
         }
@@ -410,20 +437,6 @@ private extension CommentComposerBar {
         }
     }
 
-    func composerErrorRow(_ message: String) -> some View {
-        HStack(spacing: AppSpacing.xs) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.caption2)
-                .accessibilityHidden(true)
-            Text(message)
-                .font(.caption)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .foregroundStyle(.red)
-        .padding(.horizontal, AppSpacing.l)
-        .padding(.top, AppSpacing.s)
-    }
-
     var editorField: some View {
         TextField(placeholder, text: interactionText, axis: .vertical)
             .font(.body)
@@ -625,6 +638,7 @@ private extension CommentComposerBar {
         showPhotoPicker = false
         photoSelection = []
         legacyUploadError = nil
+        errorAlertMessage = nil
         photoPickerOrigin = nil
         editingPickerOrigin = nil
         emotePickerAccount = nil

@@ -6,7 +6,7 @@ enum UIKitDynamicRichTextBuilder {
         pattern: #"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+"#
     )
     private static let bvRegex = try? NSRegularExpression(
-        pattern: #"(?<![A-Za-z0-9])(BV[A-HJ-NP-Za-km-z1-9]{10})(?![A-Za-z0-9])"#
+        pattern: #"(?<![A-Za-z0-9])([Bb][Vv][A-HJ-NP-Za-km-z1-9]{10})(?![A-Za-z0-9])"#
     )
     private static let avRegex = try? NSRegularExpression(
         pattern: #"(?<![A-Za-z0-9])([Aa][Vv]\d{1,12})(?![A-Za-z0-9])"#
@@ -146,13 +146,21 @@ enum UIKitDynamicRichTextBuilder {
             }
         case "RICH_TEXT_NODE_TYPE_BV", "RICH_TEXT_NODE_TYPE_AV":
             if let rid = node.rid, !rid.isEmpty {
+                if let bvid = BiliLinkResolver.normalizedBVID(rid) {
+                    return URL(string: "https://www.bilibili.com/video/\(bvid)")
+                }
+                if let aid = BiliLinkResolver.parsedAID(rid, allowBareNumeric: true) {
+                    return URL(string: "https://www.bilibili.com/video/av\(aid)")
+                }
                 return URL(string: "https://www.bilibili.com/video/\(rid)")
             }
         default:
             break
         }
-        guard let jump = node.jumpUrl, !jump.isEmpty else { return nil }
-        return URL(string: jump.hasPrefix("//") ? "https:" + jump : jump)
+        guard let rawJump = node.jumpUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawJump.isEmpty else { return nil }
+        let normalized = rawJump.hasPrefix("//") ? "https:" + rawJump : rawJump
+        return URL(string: normalized) ?? URL(string: normalized, encodingInvalidCharacters: true)
     }
 
     static func inlineLinks(in text: String) -> [String: URL] {
@@ -163,14 +171,15 @@ enum UIKitDynamicRichTextBuilder {
         if let urlRegex {
             for match in urlRegex.matches(in: text, range: fullRange) {
                 var raw = nsText.substring(with: match.range)
-                while let last = raw.last, ".,;:!?)】」".contains(last) { raw.removeLast() }
+                while let last = raw.last, ".,;:!?)]}。，！？；：】」》）".contains(last) { raw.removeLast() }
                 if let url = URL(string: raw) { found[raw] = url }
             }
         }
         if let bvRegex {
             for match in bvRegex.matches(in: text, range: fullRange) {
                 let token = nsText.substring(with: match.range(at: 1))
-                if let url = URL(string: "https://www.bilibili.com/video/\(token)") {
+                if let bvid = BiliLinkResolver.normalizedBVID(token),
+                   let url = URL(string: "https://www.bilibili.com/video/\(bvid)") {
                     found[token] = url
                 }
             }
@@ -178,7 +187,8 @@ enum UIKitDynamicRichTextBuilder {
         if let avRegex {
             for match in avRegex.matches(in: text, range: fullRange) {
                 let token = nsText.substring(with: match.range(at: 1))
-                if let url = URL(string: "https://www.bilibili.com/video/\(token)") {
+                if let aid = BiliLinkResolver.parsedAID(token, allowBareNumeric: false),
+                   let url = URL(string: "https://www.bilibili.com/video/av\(aid)") {
                     found[token] = url
                 }
             }

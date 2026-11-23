@@ -389,8 +389,140 @@ private enum EmoteTextOverflowVerdicts {
     }
 }
 
+@MainActor
+final class LinkAwareTapScope {
+    weak var parent: LinkAwareTapScope?
+    private var descendantClaimedAt: CFTimeInterval = -.greatestFiniteMagnitude
+    private var subtreeSuppressedAt: CFTimeInterval = -.greatestFiniteMagnitude
+    private var pendingToken: UInt64 = 0
+
+    func attach(parent: LinkAwareTapScope?) {
+        guard parent !== self else { return }
+        self.parent = parent
+    }
+
+    func claimFromDescendant() {
+        descendantClaimedAt = CACurrentMediaTime()
+        pendingToken &+= 1
+        parent?.claimFromDescendant()
+    }
+
+    func suppressAroundGesture() {
+        let now = CACurrentMediaTime()
+        descendantClaimedAt = now
+        subtreeSuppressedAt = now
+        pendingToken &+= 1
+        parent?.claimFromDescendant()
+    }
+
+    private func isSuppressedByAncestor(at now: CFTimeInterval) -> Bool {
+        if now - subtreeSuppressedAt < 0.12 { return true }
+        return parent?.isSuppressedByAncestor(at: now) ?? false
+    }
+
+    private func isBlocked(at now: CFTimeInterval) -> Bool {
+        if now - descendantClaimedAt < 0.08 { return true }
+        return isSuppressedByAncestor(at: now)
+    }
+
+    func scheduleFallbackTap(_ action: @escaping @MainActor () -> Void) {
+        let now = CACurrentMediaTime()
+        guard !isBlocked(at: now) else { return }
+        parent?.claimFromDescendant()
+        pendingToken &+= 1
+        let token = pendingToken
+        scheduleMainRunloopTurn { [weak self] in
+            guard let self,
+                  self.pendingToken == token,
+                  !self.isBlocked(at: CACurrentMediaTime()) else { return }
+            action()
+        }
+    }
+}
+
+private struct LinkAwareTapScopeKey: EnvironmentKey {
+    static let defaultValue: LinkAwareTapScope? = nil
+}
+
+extension EnvironmentValues {
+    var linkAwareTapScope: LinkAwareTapScope? {
+        get { self[LinkAwareTapScopeKey.self] }
+        set { self[LinkAwareTapScopeKey.self] = newValue }
+    }
+}
+
+private struct LinkAwareTapModifier: ViewModifier {
+    let isEnabled: Bool
+    let action: @MainActor () -> Void
+    @Environment(\.openURL) private var openURL
+    @Environment(\.linkAwareTapScope) private var parentScope
+    @State private var scope = LinkAwareTapScope()
+
+    func body(content: Content) -> some View {
+        let _ = scope.attach(parent: parentScope)
+        content
+            .environment(\.linkAwareTapScope, scope)
+            .environment(\.openURL, OpenURLAction { url in
+                scope.claimFromDescendant()
+                openURL(url)
+                return .handled
+            })
+            .contentShape(Rectangle())
+            .simultaneousGesture(
+                TapGesture().onEnded {
+                    guard isEnabled else { return }
+                    scope.scheduleFallbackTap(action)
+                },
+                including: isEnabled ? .all : .subviews
+            )
+    }
+}
+
+private struct LinkAwareLongPressModifier: ViewModifier {
+    let minimumDuration: Double
+    let action: @MainActor () -> Void
+    @Environment(\.linkAwareTapScope) private var parentScope
+    @State private var scope = LinkAwareTapScope()
+    @State private var longPressFired = false
+
+    func body(content: Content) -> some View {
+        let _ = scope.attach(parent: parentScope)
+        content
+            .environment(\.linkAwareTapScope, scope)
+            .onLongPressGesture(minimumDuration: minimumDuration) {
+                longPressFired = true
+                scope.suppressAroundGesture()
+                action()
+            } onPressingChanged: { pressing in
+                if pressing {
+                    longPressFired = false
+                } else if longPressFired {
+                    scope.suppressAroundGesture()
+                    longPressFired = false
+                }
+            }
+    }
+}
+
+extension View {
+    func linkAwareTap(
+        isEnabled: Bool = true,
+        perform action: @escaping @MainActor () -> Void
+    ) -> some View {
+        modifier(LinkAwareTapModifier(isEnabled: isEnabled, action: action))
+    }
+
+    func linkAwareLongPress(
+        minimumDuration: Double = 0.4,
+        perform action: @escaping @MainActor () -> Void
+    ) -> some View {
+        modifier(LinkAwareLongPressModifier(minimumDuration: minimumDuration, action: action))
+    }
+}
+
 private struct EmoteTextCollapsibleContent: View {
     @AppMotion private var motion
+    @Environment(\.linkAwareTapScope) private var parentTapScope
     let text: Text
     let limit: Int
     @Binding var isExpanded: Bool
@@ -443,14 +575,13 @@ private struct EmoteTextCollapsibleContent: View {
                         .accessibilityHidden(true)
                     }
                 }
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    guard isTruncated || isExpanded else { return }
+                .linkAwareTap(isEnabled: isTruncated || isExpanded) {
                     withAnimation(motion.animation(normal: .easeInOut(duration: 0.2))) { isExpanded.toggle() }
                 }
 
             if isTruncated || isExpanded {
                 Button {
+                    parentTapScope?.claimFromDescendant()
                     withAnimation(motion.animation(normal: .easeInOut(duration: 0.2))) { isExpanded.toggle() }
                 } label: {
                     (isExpanded ? Text("Show Less") : Text("Show More"))

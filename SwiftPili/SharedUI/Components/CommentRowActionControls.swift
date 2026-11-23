@@ -255,7 +255,7 @@ private struct CommentContextActions: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .onLongPressGesture(minimumDuration: 0.4) {
+            .linkAwareLongPress(minimumDuration: 0.4) {
                 state.present(.actions)
             }
             .background {
@@ -346,12 +346,8 @@ struct TapToReply: ViewModifier {
     let action: (() -> Void)?
 
     func body(content: Content) -> some View {
-        if let action {
-            content
-                .contentShape(Rectangle())
-                .onTapGesture(perform: action)
-        } else {
-            content
+        content.linkAwareTap(isEnabled: action != nil) {
+            action?()
         }
     }
 }

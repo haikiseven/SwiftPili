@@ -129,18 +129,53 @@ final class SearchViewModel {
     }
 
     func prepareSearch(modelContext: ModelContext?) -> PreparedRequest? {
-        var term = keyword.trimmingCharacters(in: .whitespaces)
+        var term = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
         if term.isEmpty {
             guard !hasSearched,
-                  let fallback = defaultSearchTerm?.name?.trimmingCharacters(in: .whitespaces),
+                  let fallback = defaultSearchTerm?.name?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !fallback.isEmpty else { return nil }
             keyword = fallback
             term = fallback
+        } else {
+            let normalized = Self.normalizedSearchTerm(from: term)
+            if normalized != term {
+                term = normalized
+                keyword = normalized
+            }
         }
         clearSuggestions()
         let request = prepareInitial(query: makeQuery(term: term, type: selectedType))
         if let modelContext { saveToHistory(keyword: term, modelContext: modelContext) }
         return request
+    }
+
+    private static func normalizedSearchTerm(from raw: String) -> String {
+        guard raw.contains("://") else { return raw }
+        if let directURL = URL(string: raw),
+           directURL.scheme?.lowercased() == "bilibili",
+           let route = BiliURLParser.parse(directURL) {
+            return searchTerm(for: route) ?? raw
+        }
+        if case .resolved(let target, _) = BiliLinkResolver.resolve(text: raw) {
+            return searchTerm(for: target.route) ?? raw
+        }
+        return raw
+    }
+
+    private static func searchTerm(for route: Route) -> String? {
+        switch route {
+        case .videoDetail(let target):
+            switch target.videoID {
+            case .bvid(let bvid): return bvid
+            case .aid(let aid): return "av\(aid)"
+            }
+        case .articleReader(let cvid):
+            return "cv\(cvid)"
+        case .search(_, let keyword):
+            return keyword
+        default:
+            return nil
+        }
     }
 
     func prepareTypeChange(to type: SearchType) -> PreparedRequest? {

@@ -121,7 +121,13 @@ final class VideoCommentComposerState {
         aid: Int,
         motion: AppMotionPreferences
     ) {
-        setReplyTarget(target)
+        if presentation.isExpanded {
+            withAnimation(motion.animation(normal: CollapsibleComposer.composerExpandAnimation)) {
+                setReplyTarget(target)
+            }
+        } else {
+            setReplyTarget(target)
+        }
         PlayerLog.log(
             "[Composer] reply target set rpid=\(target.rpid) "
             + "aid=\(aid)"
@@ -139,9 +145,16 @@ final class VideoCommentComposerState {
             "[Composer] reply target cleared (explicit ✕) "
             + "was rpid=\(replyTarget?.rpid ?? 0)"
         )
-        setReplyTarget(nil)
-        focus.dismiss()
-        if !hasDraft { collapse(motion: motion) }
+        let shouldCollapse = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && pictures.isEmpty
+        if shouldCollapse {
+            setReplyTarget(nil)
+            collapse(motion: motion)
+        } else {
+            withAnimation(motion.animation(normal: CollapsibleComposer.composerCollapseAnimation)) {
+                setReplyTarget(nil)
+            }
+            focus.dismiss()
+        }
     }
 
     func open(motion: AppMotionPreferences) {
@@ -150,9 +163,9 @@ final class VideoCommentComposerState {
             return
         }
         PlayerLog.log("[Composer] expanding from launcher")
-        withAnimation(motion.animation(normal: CollapsibleComposer.composerExpandAnimation)) {
-            presentation.isExpanded = true
-        }
+        // `CommentComposerMorphContainer` owns the expand spring transition on `presentedExpanded`.
+        // Setting `isExpanded` directly avoids double-nesting two staggered animations.
+        presentation.isExpanded = true
         focus.request()
     }
 
@@ -162,9 +175,8 @@ final class VideoCommentComposerState {
         PlayerLog.log(
             "[Composer] collapsing to launcher draft=\(hasDraft ? 1 : 0)"
         )
-        withAnimation(motion.animation(normal: CollapsibleComposer.composerCollapseAnimation)) {
-            presentation.isExpanded = false
-        }
+        // `CommentComposerMorphContainer` owns the collapse spring transition on `presentedExpanded`.
+        presentation.isExpanded = false
     }
 
     func collapseImmediatelyIfSourceCleared(_ source: VideoDetailViewModel.CommentSource?) {

@@ -48,18 +48,17 @@ struct RepostSheet: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(AppFill.inset, in: RoundedRectangle(cornerRadius: AppRadius.control))
 
-                if failed {
-                    Label("Repost failed — try again", systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                }
-
                 Spacer()
             }
             .padding(16)
             .appAmbientBrowseBackground()
             .navigationTitle("Repost")
             .navigationBarTitleDisplayMode(.inline)
+            .alert("Operation Failed", isPresented: $failed) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("Repost failed — try again")
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }

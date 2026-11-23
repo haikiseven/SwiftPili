@@ -327,13 +327,25 @@ private extension UIKitCommentFeedViewController {
             action(url)
             return .handled
         }
+        let liveContentLinkContext: ContentLinkContext? = env.contentLinkContext.map { current in
+            current.forwarded(
+                isCurrent: { [weak self] in
+                    self?.hostEnvironment.contentLinkContext?.isCurrent() ?? false
+                },
+                beforeNavigate: { [weak self] in
+                    self?.hostEnvironment.contentLinkContext?.beforeNavigate()
+                }
+            )
+        }
         cell.contentConfiguration = UIHostingConfiguration {
             body
                 .modifier(CommentFeedHostedEnvironmentModifier(
                     snapshot: env.snapshot,
+                    rawEnvironment: env.rawEnvironment,
                     resolvedColumnWidth: width,
                     coordinator: env.coordinator,
-                    contentLinkContext: env.contentLinkContext,
+                    noticeCenter: env.noticeCenter,
+                    contentLinkContext: liveContentLinkContext,
                     openURL: openURL
                 ))
         }
@@ -371,13 +383,16 @@ private extension UIKitCommentFeedViewController {
 
 private struct CommentFeedHostedEnvironmentModifier: ViewModifier {
     let snapshot: CommentFeedEnvironmentSnapshot
+    let rawEnvironment: EnvironmentValues
     let resolvedColumnWidth: CGFloat?
     let coordinator: AppCoordinator?
+    let noticeCenter: AppNoticeCenter?
     let contentLinkContext: ContentLinkContext?
     let openURL: OpenURLAction
 
     func body(content: Content) -> some View {
         content
+            .environment(\.self, rawEnvironment)
             .environment(\.colorScheme, snapshot.colorScheme)
             .environment(\.dynamicTypeSize, snapshot.dynamicTypeSize)
             .environment(\.horizontalSizeClass, snapshot.horizontalSizeClass)
@@ -390,6 +405,7 @@ private struct CommentFeedHostedEnvironmentModifier: ViewModifier {
             .environment(\.navigationZoomNamespace, snapshot.navigationZoomNamespace)
             .environment(\.contentLinkContext, contentLinkContext)
             .environment(\.openURL, openURL)
+            .environment(\.appNoticeCenter, noticeCenter)
             .rowCardColumnWidth(resolvedColumnWidth)
             .environment(coordinator)
     }

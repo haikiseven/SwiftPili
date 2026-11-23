@@ -29,6 +29,20 @@ extension View {
         modifier(ContentLinkScope(presentsFeedback: presentsFeedback, handlesURLs: handlesURLs,
                                   isCurrent: isCurrent, beforeNavigate: beforeNavigate))
     }
+
+    func contentLinkFeedback(
+        controller: ContentLinkController,
+        scopeID: UUID,
+        isEnabled: Bool = true,
+        bottomPadding: CGFloat = 0
+    ) -> some View {
+        modifier(ContentLinkFeedbackModifier(
+            controller: controller,
+            scopeID: scopeID,
+            isEnabled: isEnabled,
+            bottomPadding: bottomPadding
+        ))
+    }
 }
 
 private struct ContentLinkScope: ViewModifier {
@@ -56,11 +70,11 @@ private struct ContentLinkScope: ViewModifier {
                 upstream(url)
                 return .handled
             })
-            .overlay(alignment: .top) {
-                if presentsFeedback {
-                    ContentLinkFeedback(controller: coordinator.contentLinks, scopeID: origin.presentationID)
-                }
-            }
+            .contentLinkFeedback(
+                controller: coordinator.contentLinks,
+                scopeID: origin.presentationID,
+                isEnabled: presentsFeedback
+            )
             .onAppear { lifetime.activate() }
             .onDisappear {
                 lifetime.deactivate()
@@ -69,34 +83,124 @@ private struct ContentLinkScope: ViewModifier {
     }
 }
 
-struct ContentLinkFeedback: View {
+private struct ContentLinkFeedbackModifier: ViewModifier {
     let controller: ContentLinkController
     let scopeID: UUID
+    let isEnabled: Bool
+    let bottomPadding: CGFloat
+    @AppMotion private var motion
 
-    var body: some View {
-        if let state = controller.presentation, state.scopeID == scopeID {
-            VStack(alignment: .leading, spacing: 8) {
-                switch state.status {
-                case .loading:
-                    HStack { ProgressView(); Text("Opening Link") }
-                case .failed(let message):
-                    Text(message).font(.callout)
-                    Button("Retry") { controller.retry(state.id) }
-                case .unsupported:
-                    Text("Link Unavailable").font(.callout)
+    private var scopedPresentation: ContentLinkController.Presentation? {
+        guard isEnabled,
+              let state = controller.presentation,
+              state.scopeID == scopeID else { return nil }
+        return state
+    }
+
+    private var loadingPresentation: ContentLinkController.Presentation? {
+        guard let state = scopedPresentation, case .loading = state.status else { return nil }
+        return state
+    }
+
+    private var alertPresentation: ContentLinkController.Presentation? {
+        guard let state = scopedPresentation else { return nil }
+        switch state.status {
+        case .loading: return nil
+        case .failed, .unsupported: return state
+        }
+    }
+
+    private var alertPresented: Binding<Bool> {
+        Binding(
+            get: { alertPresentation != nil },
+            set: { presented in
+                if !presented, let state = alertPresentation {
+                    controller.cancel(requestID: state.id)
                 }
-                HStack {
+            }
+        )
+    }
+
+    private var alertTitle: LocalizedStringKey {
+        guard let state = alertPresentation else { return "Link Unavailable" }
+        switch state.status {
+        case .failed: return "Unable to Open Link"
+        case .unsupported, .loading: return "Link Unavailable"
+        }
+    }
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isEnabled {
+            content
+                .overlay(alignment: .bottom) {
+                    Group {
+                        if let state = loadingPresentation {
+                            ContentLinkLoadingCapsule {
+                                controller.cancel(requestID: state.id)
+                            }
+                            .padding(.horizontal, AppSpacing.l)
+                            .padding(.bottom, AppSpacing.m + bottomPadding)
+                            .transition(motion.transition(
+                                normal: .move(edge: .bottom).combined(with: .opacity)
+                            ))
+                        }
+                    }
+                    .animation(
+                        motion.feedbackAnimation(normal: .spring(duration: 0.25)),
+                        value: loadingPresentation?.id
+                    )
+                }
+                .alert(alertTitle, isPresented: alertPresented, presenting: alertPresentation) { state in
+                    if case .failed = state.status {
+                        Button("Retry") { controller.retry(state.id) }
+                    }
                     if BiliLinkHostPolicy.isSupportedScheme(state.pageURL.scheme) {
                         Button("Open Original Page") { controller.openPage(state.id) }
                     }
-                    Spacer()
-                    Button("Cancel") { controller.cancel(requestID: state.id) }
+                    Button("Cancel", role: .cancel) {
+                        controller.cancel(requestID: state.id)
+                    }
+                } message: { state in
+                    switch state.status {
+                    case .failed(let message):
+                        Text(message)
+                    case .unsupported:
+                        Text("This link cannot be opened in SwiftPili.")
+                    case .loading:
+                        EmptyView()
+                    }
                 }
-                .buttonStyle(.bordered)
-            }
-            .padding()
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: AppRadius.card))
-            .padding()
+        } else {
+            content
         }
+    }
+}
+
+private struct ContentLinkLoadingCapsule: View {
+    let cancel: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Opening Link")
+                .font(.subheadline.weight(.medium))
+                .lineLimit(1)
+            Button(action: cancel) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 28, minHeight: 28)
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(Text("Cancel"))
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, 8)
+        .padding(.vertical, 6)
+        .background(.regularMaterial, in: Capsule())
+        .shadow(color: .black.opacity(0.14), radius: 8, y: 3)
     }
 }

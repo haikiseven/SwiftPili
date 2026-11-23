@@ -61,13 +61,14 @@ struct CommentInlineRepliesSection: View {
         .padding(.vertical, 7)
         .padding(.horizontal, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            AppFill.nested,
-            in: RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous)
-        )
-        .contentShape(RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous))
-        .onTapGesture {
-            onViewThread?(comment)
+        .background {
+            let shape = RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous)
+            shape
+                .fill(AppFill.nested)
+                .contentShape(shape)
+                .onTapGesture {
+                    onViewThread?(comment)
+                }
         }
         .padding(.top, 5)
     }
@@ -100,9 +101,27 @@ struct CommentInlineRepliesSection: View {
     }
 
     private func subReplyBody(_ sub: CommentResult.CommentItem) -> some View {
-        subReplyContent(sub)
-            .contentShape(Rectangle())
-            .onTapGesture { onOpenReply?(comment, sub.rpid) }
+        VStack(alignment: .leading, spacing: 4) {
+            EmoteText(
+                message: sub.content.displayMessage,
+                emotes: CommentRowView.emoteMap(sub),
+                links: sub.content.resolvedLinks,
+                font: CommentRowView.subReplyFont(isRegularWidth: isRegularWidth),
+                detectTimestamps: true,
+                leadingText: subReplyAuthorPrefix(sub)
+            )
+            .lineSpacing(1.5)
+            .lineLimit(2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .linkAwareTap(isEnabled: onOpenReply != nil) {
+                onOpenReply?(comment, sub.rpid)
+            }
+
+            if let vote = sub.content.vote, let voteId = vote.id {
+                VoteCardView(voteId: voteId, initialTitle: vote.title)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func subReplyAuthorPrefix(_ sub: CommentResult.CommentItem) -> Text {
@@ -124,25 +143,5 @@ struct CommentInlineRepliesSection: View {
             return base + aiTag + colon
         }
         return base + colon
-    }
-
-    private func subReplyContent(_ sub: CommentResult.CommentItem) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            EmoteText(
-                message: sub.content.displayMessage,
-                emotes: CommentRowView.emoteMap(sub),
-                links: sub.content.resolvedLinks,
-                font: CommentRowView.subReplyFont(isRegularWidth: isRegularWidth),
-                detectTimestamps: true,
-                leadingText: subReplyAuthorPrefix(sub)
-            )
-            .lineSpacing(1.5)
-            .lineLimit(2)
-
-            if let vote = sub.content.vote, let voteId = vote.id {
-                VoteCardView(voteId: voteId, initialTitle: vote.title)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

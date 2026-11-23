@@ -28,6 +28,7 @@ struct CommentComposerMorphContainer<ExpandedComposer: View>: View {
 
     @State private var presentedExpanded: Bool
     @State private var measuredComposerSize = CGSize(width: 340, height: 108)
+    @State private var latestMeasuredSize: CGSize?
     @State private var hasMeasuredComposer = false
     @State private var windowIsLandscapeIPad = false
     @Namespace private var glassNamespace
@@ -216,16 +217,46 @@ struct CommentComposerMorphContainer<ExpandedComposer: View>: View {
     private func updateMeasuredComposerSize(_ newSize: CGSize) {
         guard newSize.width.isFinite, newSize.height.isFinite,
               newSize.width > 0, newSize.height > 0 else { return }
-        guard !hasMeasuredComposer || (presentedExpanded && isExpanded) else { return }
+        latestMeasuredSize = newSize
+        let sizeChanged = abs(measuredComposerSize.width - newSize.width) > 0.5
+            || abs(measuredComposerSize.height - newSize.height) > 0.5
+        if !hasMeasuredComposer || (!presentedExpanded && !isExpanded) {
+            hasMeasuredComposer = true
+            if sizeChanged {
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    measuredComposerSize = newSize
+                }
+            }
+            return
+        }
         hasMeasuredComposer = true
-        if abs(measuredComposerSize.width - newSize.width) > 0.5
-            || abs(measuredComposerSize.height - newSize.height) > 0.5 {
-            measuredComposerSize = newSize
+        guard sizeChanged else { return }
+        if presentedExpanded && isExpanded {
+            withAnimation(motion.animation(normal: KeyboardAnimation.panelExpand)) {
+                measuredComposerSize = newSize
+            }
+        } else {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                measuredComposerSize = newSize
+            }
         }
     }
 
     private func handleExpansionChange(_ expanded: Bool) {
         guard presentedExpanded != expanded else { return }
+        if expanded, let latest = latestMeasuredSize,
+           abs(measuredComposerSize.width - latest.width) > 0.5
+            || abs(measuredComposerSize.height - latest.height) > 0.5 {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                measuredComposerSize = latest
+            }
+        }
         let animation: Animation = motion.reducesGeometry
             ? motion.feedbackAnimation(normal: KeyboardAnimation.panelCollapse)
             : (expanded ? KeyboardAnimation.panelExpand : KeyboardAnimation.panelCollapse)
@@ -239,6 +270,7 @@ struct CommentComposerMorphContainer<ExpandedComposer: View>: View {
         transaction.disablesAnimations = true
         withTransaction(transaction) {
             hasMeasuredComposer = false
+            latestMeasuredSize = nil
             presentedExpanded = isExpanded
         }
     }

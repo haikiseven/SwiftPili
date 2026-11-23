@@ -289,6 +289,7 @@ private struct RecommendedListView: View {
         HomeFeedSurfaceContainer(
             feedback: snap.feedback,
             hasContent: hasContent,
+            isSelected: isSelected,
             title: title,
             onRetry: { failure in Task { await viewModel.retry(failure) } },
             content: {
@@ -395,6 +396,7 @@ private struct PopularListView: View {
         HomeFeedSurfaceContainer(
             feedback: snap.feedback,
             hasContent: hasContent,
+            isSelected: isSelected,
             title: title,
             onRetry: { failure in Task { await viewModel.retry(failure) } },
             content: {
@@ -415,7 +417,7 @@ private struct PopularListView: View {
                         scrollToTopTick: renderKey.scrollToTopTick,
                         onRefresh: {
                             await viewModel.refreshPopular()
-                            return false
+                            return !viewModel.popularItems.isEmpty
                         },
                         onLastAppear: {
                             Task { await viewModel.loadPopular() }
@@ -451,40 +453,65 @@ private struct PopularListView: View {
 private struct HomeFeedSurfaceContainer<Content: View>: View {
     let feedback: HomeFeedFeedback
     let hasContent: Bool
+    let isSelected: Bool
     let title: String
+    var secondaryFailure: (title: String, failure: HomeFeedFailure)? = nil
     let onRetry: (HomeFeedFailure) -> Void
     @ViewBuilder var content: () -> Content
 
+    @State private var dismissedReceipts: Set<UUID> = []
+
     var body: some View {
         let showsEmptyFeedback = !hasContent && (feedback.failure != nil || feedback.hasSucceeded)
-        VStack(spacing: 0) {
-            if hasContent, feedback.failure != nil {
+        let activeAlertFailure: (title: String, failure: HomeFeedFailure)? = {
+            guard isSelected, !showsEmptyFeedback else { return nil }
+            if hasContent, let failure = feedback.failure, !dismissedReceipts.contains(failure.receipt) {
+                return (title, failure)
+            }
+            if let secondary = secondaryFailure, !dismissedReceipts.contains(secondary.failure.receipt) {
+                return secondary
+            }
+            return nil
+        }()
+
+        ZStack {
+            content()
+                .opacity(showsEmptyFeedback ? 0 : 1)
+                .allowsHitTesting(!showsEmptyFeedback)
+                .accessibilityHidden(showsEmptyFeedback)
+            if showsEmptyFeedback {
                 HomeFeedFeedbackView(
                     feedback: feedback,
-                    hasContent: true,
+                    hasContent: false,
                     title: title,
                     emptyTitle: String(localized: "No Videos"),
                     showsLoadingIndicator: false,
                     retry: onRetry
                 )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            ZStack {
-                content()
-                    .opacity(showsEmptyFeedback ? 0 : 1)
-                    .allowsHitTesting(!showsEmptyFeedback)
-                    .accessibilityHidden(showsEmptyFeedback)
-                if showsEmptyFeedback {
-                    HomeFeedFeedbackView(
-                        feedback: feedback,
-                        hasContent: false,
-                        title: title,
-                        emptyTitle: String(localized: "No Videos"),
-                        showsLoadingIndicator: false,
-                        retry: onRetry
-                    )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .alert(
+            "Load Failed",
+            isPresented: Binding(
+                get: { activeAlertFailure != nil },
+                set: { isPresented in
+                    if !isPresented, let alert = activeAlertFailure {
+                        dismissedReceipts.insert(alert.failure.receipt)
+                    }
                 }
+            ),
+            presenting: activeAlertFailure
+        ) { alert in
+            Button("Retry") {
+                dismissedReceipts.insert(alert.failure.receipt)
+                onRetry(alert.failure)
             }
+            Button("Dismiss", role: .cancel) {
+                dismissedReceipts.insert(alert.failure.receipt)
+            }
+        } message: { alert in
+            Text(verbatim: "\(alert.title)\n\(alert.failure.message)")
         }
     }
 }
@@ -546,6 +573,7 @@ private struct RankingListView: View {
         HomeFeedSurfaceContainer(
             feedback: snap.feedback,
             hasContent: hasContent,
+            isSelected: isSelected,
             title: title,
             onRetry: { failure in Task { await viewModel.retry(failure) } },
             content: {
@@ -570,7 +598,7 @@ private struct RankingListView: View {
                         scrollToTopTick: renderKey.scrollToTopTick,
                         onRefresh: {
                             await viewModel.loadRanking()
-                            return false
+                            return !viewModel.rankingItems.isEmpty
                         },
                         onLastAppear: {},
                         onSelectVideo: { target in
@@ -729,51 +757,42 @@ private struct PGCListView: View {
             scrollToTopTick: coordinator.scrollToTopTick
         )
 
-        VStack(spacing: 0) {
-            if snap.canLoadFollowed, snap.followedFeedback.failure != nil {
-                HomeFeedFeedbackView(
-                    feedback: snap.followedFeedback,
-                    hasContent: !snap.followedItems.isEmpty,
-                    title: followedTitle,
-                    emptyTitle: nil,
-                    showsLoadingIndicator: false,
-                    retry: { failure in Task { await viewModel.retry(failure) } }
-                )
-            }
-
-            HomeFeedSurfaceContainer(
-                feedback: snap.pgcFeedback,
-                hasContent: hasItems,
-                title: pgcTitle,
-                onRetry: { failure in Task { await viewModel.retry(failure) } },
-                content: {
-                    EquatablePGCFeedHost(key: renderKey) {
-                        PGCFeedCollectionView(
-                            followedTitle: followedTitle,
-                            followedItems: snap.followedItems,
-                            items: snap.items,
-                            placeholderCount: placeholderCount,
-                            placeholderLabel: String(format: String(localized: "Loading %@"), pgcTitle),
-                            isActive: renderKey.isActive,
-                            isHomeTabSelected: renderKey.isHomeTabSelected,
-                            scrollToTopTick: renderKey.scrollToTopTick,
-                            onRefresh: {
-                                async let rail: Void = viewModel.loadFollowedBangumi(indexType: indexType)
-                                await viewModel.refreshPGC(indexType: indexType)
-                                await rail
-                                return false
-                            },
-                            onLastAppear: {
-                                Task { await viewModel.loadPGC(indexType: indexType) }
-                            },
-                            onSelectBangumi: { seasonID in
-                                coordinator.navigate(to: .bangumiDetail(seasonID, zoom: .none))
-                            }
-                        )
-                    }
+        HomeFeedSurfaceContainer(
+            feedback: snap.pgcFeedback,
+            hasContent: hasItems,
+            isSelected: isSelected,
+            title: pgcTitle,
+            secondaryFailure: snap.canLoadFollowed
+                ? snap.followedFeedback.failure.map { (title: followedTitle, failure: $0) }
+                : nil,
+            onRetry: { failure in Task { await viewModel.retry(failure) } },
+            content: {
+                EquatablePGCFeedHost(key: renderKey) {
+                    PGCFeedCollectionView(
+                        followedTitle: followedTitle,
+                        followedItems: snap.followedItems,
+                        items: snap.items,
+                        placeholderCount: placeholderCount,
+                        placeholderLabel: String(format: String(localized: "Loading %@"), pgcTitle),
+                        isActive: renderKey.isActive,
+                        isHomeTabSelected: renderKey.isHomeTabSelected,
+                        scrollToTopTick: renderKey.scrollToTopTick,
+                        onRefresh: {
+                            async let rail: Void = viewModel.loadFollowedBangumi(indexType: indexType)
+                            await viewModel.refreshPGC(indexType: indexType)
+                            await rail
+                            return true
+                        },
+                        onLastAppear: {
+                            Task { await viewModel.loadPGC(indexType: indexType) }
+                        },
+                        onSelectBangumi: { seasonID in
+                            coordinator.navigate(to: .bangumiDetail(seasonID, zoom: .none))
+                        }
+                    )
                 }
-            )
-        }
+            }
+        )
         .task {
             FeedPerformanceSignposts.screenAdmission(.home)
             if canLoadFollowed, followed.isEmpty, !viewModel.feedback(for: .followed(indexType)).hasSucceeded {
@@ -796,28 +815,13 @@ private struct HomeFeedFeedbackView: View {
 
     var body: some View {
         if let failure = feedback.failure {
-            if hasContent || emptyTitle == nil {
-                VStack(alignment: .leading, spacing: 8) {
-                    Label(title, systemImage: "wifi.exclamationmark")
-                        .font(.headline)
-                    Text("Load Failed")
-                        .font(.subheadline)
-                    Text(failure.message)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                    retryButton(failure)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding()
-            } else {
-                ContentUnavailableView {
-                    Label("Load Failed", systemImage: "wifi.exclamationmark")
-                } description: {
-                    Text(title)
-                    Text(failure.message)
-                } actions: {
-                    retryButton(failure)
-                }
+            ContentUnavailableView {
+                Label("Load Failed", systemImage: "wifi.exclamationmark")
+            } description: {
+                Text(title)
+                Text(failure.message)
+            } actions: {
+                retryButton(failure)
             }
         } else if !hasContent, feedback.isLoading, showsLoadingIndicator {
             VStack(spacing: 8) {
@@ -840,7 +844,7 @@ private struct HomeFeedFeedbackView: View {
 
     private func retryButton(_ failure: HomeFeedFailure) -> some View {
         Button("Retry") { retry(failure) }
-            .buttonStyle(.bordered)
+            .buttonStyle(.borderedProminent)
             .accessibilityLabel(Text(verbatim: "\(String(localized: "Retry")): \(title)"))
     }
 }

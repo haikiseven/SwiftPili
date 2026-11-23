@@ -37,8 +37,21 @@ final class CommentDrawerPassthroughView: UIView {
 @MainActor
 final class CommentDrawerViewController<Destination: View>: UIViewController,
     UIGestureRecognizerDelegate, CommentZoomDismissalHost {
+    private static var detachedTopCornerRadius: CGFloat { 20 }
+    private static var maxScrimAlpha: CGFloat { 0.28 }
+
     private var props: CommentDrawerPresenter<Destination>?
     private var host: UIHostingController<CommentDrawerRoot<Destination>>?
+    private let scrimView: UIView = {
+        let view = UIView()
+        view.backgroundColor = .black
+        view.alpha = 0
+        view.isHidden = true
+        view.isUserInteractionEnabled = false
+        view.isAccessibilityElement = false
+        view.translatesAutoresizingMaskIntoConstraints = false
+        return view
+    }()
     private weak var attachedPresentation: CommentZoomPresentation?
     private var pendingRoot: CommentDrawerRoot<Destination>?
     private var pendingAction: (@MainActor () -> Void)?
@@ -55,6 +68,13 @@ final class CommentDrawerViewController<Destination: View>: UIViewController,
     override func loadView() {
         view = CommentDrawerPassthroughView()
         view.backgroundColor = .clear
+        view.addSubview(scrimView)
+        NSLayoutConstraint.activate([
+            scrimView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scrimView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            scrimView.topAnchor.constraint(equalTo: view.topAnchor),
+            scrimView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
     }
 
     override func viewDidLayoutSubviews() {
@@ -125,7 +145,7 @@ final class CommentDrawerViewController<Destination: View>: UIViewController,
         let controller = UIHostingController(rootView: root)
         controller.view.backgroundColor = .clear
         controller.view.overrideUserInterfaceStyle = props.interfaceStyle
-        controller.view.layer.cornerRadius = 24
+        controller.view.layer.cornerRadius = 0
         controller.view.layer.cornerCurve = .continuous
         controller.view.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
         controller.view.layer.masksToBounds = true
@@ -157,11 +177,14 @@ final class CommentDrawerViewController<Destination: View>: UIViewController,
         guard let host else { return }
         if !mountedNow { flushRoot() }
         isDragging = false
+        scrimView.isHidden = false
         host.view.isHidden = false
         host.view.isUserInteractionEnabled = true
         if mountedNow || !isShown {
             host.view.transform = reduces ? .identity : CGAffineTransform(translationX: 0, y: hiddenOffset)
             host.view.alpha = reduces ? 0 : 1
+            host.view.layer.cornerRadius = reduces ? 0 : Self.detachedTopCornerRadius
+            scrimView.alpha = 0
         }
         isShown = true
         isAnimating = true
@@ -171,6 +194,8 @@ final class CommentDrawerViewController<Destination: View>: UIViewController,
                 reduces: reduces,
                 transform: .identity,
                 alpha: 1,
+                cornerRadius: 0,
+                scrimAlpha: Self.maxScrimAlpha,
                 token: token
             ) { [weak self] in
                 self?.finishSettling()
@@ -192,6 +217,8 @@ final class CommentDrawerViewController<Destination: View>: UIViewController,
         guard let host, isMounted, let props else {
             isShown = false
             isAnimating = false
+            scrimView.alpha = 0
+            scrimView.isHidden = true
             consumePendingAction()?()
             return
         }
@@ -202,12 +229,17 @@ final class CommentDrawerViewController<Destination: View>: UIViewController,
             reduces: props.reducesMotion,
             transform: CGAffineTransform(translationX: 0, y: hiddenOffset),
             alpha: 0,
+            cornerRadius: props.reducesMotion ? 0 : Self.detachedTopCornerRadius,
+            scrimAlpha: 0,
             token: token
         ) { [weak self] in
             guard let self, let host = self.host, lastPresented == false else { return }
             isAnimating = false
+            scrimView.alpha = 0
+            scrimView.isHidden = true
             host.view.isHidden = true
             host.view.alpha = 1
+            host.view.layer.cornerRadius = 0
             host.view.transform = CGAffineTransform(translationX: 0, y: hiddenOffset)
             props.onDismissed()
             consumePendingAction()?()
@@ -218,6 +250,8 @@ final class CommentDrawerViewController<Destination: View>: UIViewController,
         reduces: Bool,
         transform: CGAffineTransform,
         alpha: CGFloat,
+        cornerRadius: CGFloat,
+        scrimAlpha: CGFloat,
         token: UInt64,
         completion: @escaping @MainActor () -> Void
     ) {
@@ -228,7 +262,9 @@ final class CommentDrawerViewController<Destination: View>: UIViewController,
                 host.view.alpha = alpha
             } else {
                 host.view.transform = transform
+                host.view.layer.cornerRadius = cornerRadius
             }
+            self.scrimView.alpha = scrimAlpha
         }
         let done: (Bool) -> Void = { [weak self] _ in
             MainActor.assumeIsolated {
@@ -281,9 +317,15 @@ final class CommentDrawerViewController<Destination: View>: UIViewController,
             isAnimating = false
             isDragging = true
             host.view.layer.removeAllAnimations()
+            scrimView.layer.removeAllAnimations()
         case .changed:
             guard isDragging else { return }
-            host.view.transform = CGAffineTransform(translationX: 0, y: max(0, pan.translation(in: view).y))
+            let dragY = max(0, pan.translation(in: view).y)
+            host.view.transform = CGAffineTransform(translationX: 0, y: dragY)
+            let detachProgress = min(1, dragY / 36)
+            host.view.layer.cornerRadius = Self.detachedTopCornerRadius * detachProgress
+            let dismissProgress = min(1, dragY / max(hiddenOffset * 0.6, 220))
+            scrimView.alpha = Self.maxScrimAlpha * (1 - dismissProgress)
         case .ended, .cancelled, .failed:
             guard isDragging else { return }
             let dragY = max(0, pan.translation(in: view).y)
@@ -295,7 +337,14 @@ final class CommentDrawerViewController<Destination: View>: UIViewController,
                 transitionToken &+= 1
                 let token = transitionToken
                 isAnimating = true
-                animate(reduces: false, transform: .identity, alpha: 1, token: token) { [weak self] in
+                animate(
+                    reduces: false,
+                    transform: .identity,
+                    alpha: 1,
+                    cornerRadius: 0,
+                    scrimAlpha: Self.maxScrimAlpha,
+                    token: token
+                ) { [weak self] in
                     self?.finishSettling()
                 }
             }

@@ -157,7 +157,9 @@ struct CommentThreadView: View {
             focus: composerFocus,
             onCancelReply: {
                 guard composerCanInteract(composer) else { return }
-                composer.store.cancelReply(in: composer.source)
+                withAnimation(motion.animation(normal: CollapsibleComposer.composerCollapseAnimation)) {
+                    composer.store.cancelReply(in: composer.source)
+                }
                 composerFocus.dismiss()
             },
             onSend: { sendReply(from: composer) },
@@ -248,13 +250,15 @@ struct CommentThreadView: View {
 
     private func beginReply(to target: CommentResult.CommentItem?, from captured: ComposerCapture) {
         guard composerCanInteract(captured) else { return }
-        captured.store.beginReply(to: target, in: captured.source)
-        composerFocus.request()
-        if !isComposerExpanded {
+        if isComposerExpanded {
             withAnimation(motion.animation(normal: CollapsibleComposer.composerExpandAnimation)) {
-                isComposerExpanded = true
+                captured.store.beginReply(to: target, in: captured.source)
             }
+        } else {
+            captured.store.beginReply(to: target, in: captured.source)
+            isComposerExpanded = true
         }
+        composerFocus.request()
     }
 }
 
@@ -302,9 +306,7 @@ private extension CommentThreadView {
         captured.store.sendReply(in: captured.source, expectedComposer: captured.context) {
             guard composerIsCurrent(captured) else { return }
             composerFocus.dismiss()
-            withAnimation(motion.animation(normal: CollapsibleComposer.composerCollapseAnimation)) {
-                isComposerExpanded = false
-            }
+            isComposerExpanded = false
         }
     }
 

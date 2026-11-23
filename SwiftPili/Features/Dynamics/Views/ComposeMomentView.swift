@@ -42,21 +42,6 @@ struct ComposeMomentView: View {
                     }
                 }
 
-                if let errorMessage {
-                    HStack(spacing: AppSpacing.xs) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.caption2)
-                            .accessibilityHidden(true)
-                        Text(errorMessage)
-                            .font(.caption)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .foregroundStyle(.red)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 6)
-                }
-
                 HStack {
                     Text("\(charCount)")
                         .appFont(.messageMeta)
@@ -70,6 +55,18 @@ struct ComposeMomentView: View {
             .appAmbientBrowseBackground()
             .navigationTitle("New Moment")
             .navigationBarTitleDisplayMode(.inline)
+            .alert(
+                "Operation Failed",
+                isPresented: Binding(
+                    get: { errorMessage != nil },
+                    set: { if !$0 { errorMessage = nil } }
+                ),
+                presenting: errorMessage
+            ) { _ in
+                Button("OK", role: .cancel) { errorMessage = nil }
+            } message: { message in
+                Text(message)
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }

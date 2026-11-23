@@ -8,15 +8,36 @@ struct InAppWebView: View {
     var body: some View {
         InAppWebContent(url: url, close: close).id(url)
     }
+
+    @MainActor
+    static func bilibiliAuthCookies() -> [HTTPCookie] {
+        let pairs: [(name: String, value: String?)] = [
+            ("SESSDATA", AuthManager.shared.sessData),
+            ("bili_jct", AuthManager.shared.biliJct),
+            ("DedeUserID", AuthManager.shared.dedeUserID),
+            ("DedeUserID__ckMd5", AuthManager.shared.ckMd5),
+        ]
+        return pairs.compactMap { name, value in
+            guard let value, !value.isEmpty else { return nil }
+            return HTTPCookie(properties: [
+                .domain: ".bilibili.com",
+                .path: "/",
+                .name: name,
+                .value: value,
+                .secure: true,
+            ])
+        }
+    }
 }
 
 private struct InAppWebContent: View {
     let url: URL
     let close: @MainActor () -> Void
     @State private var page = InAppWebState()
+    @Environment(\.openURL) private var openURL
 
     var body: some View {
-        InAppWebSurface(url: url, page: page)
+        InAppWebSurface(url: url, page: page, onOpenNativeLink: { openURL($0) })
             .overlay(alignment: .top) {
                 if page.isLoading { ProgressView().padding(8).background(.regularMaterial, in: Capsule()) }
             }
@@ -32,7 +53,7 @@ private struct InAppWebContent: View {
                     .background(.background)
                 }
             }
-            .navigationTitle("Web Page")
+            .navigationTitle(page.title ?? String(localized: "Web Page"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItemGroup(placement: .bottomBar) {
@@ -53,6 +74,7 @@ private final class InAppWebState {
     var isLoading = true
     var canGoBack = false
     var failure: String?
+    var title: String?
     @ObservationIgnored weak var webView: WKWebView?
     @ObservationIgnored var navigation: WKNavigation?
     @ObservationIgnored var request: URLRequest?
@@ -81,11 +103,15 @@ private final class InAppWebState {
 private struct InAppWebSurface: UIViewRepresentable {
     let url: URL
     let page: InAppWebState
+    let onOpenNativeLink: @MainActor (URL) -> Void
 
-    func makeCoordinator() -> Coordinator { Coordinator(page: page) }
+    func makeCoordinator() -> Coordinator {
+        Coordinator(page: page, onOpenNativeLink: onOpenNativeLink)
+    }
 
     func makeUIView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .nonPersistent()
         configuration.mediaTypesRequiringUserActionForPlayback = .all
         let view = WKWebView(frame: .zero, configuration: configuration)
         view.navigationDelegate = context.coordinator
@@ -95,7 +121,15 @@ private struct InAppWebSurface: UIViewRepresentable {
         if BiliLinkHostPolicy.isSupportedScheme(url.scheme) {
             let request = URLRequest(url: url)
             page.request = request
-            page.navigation = view.load(request)
+            let store = configuration.websiteDataStore.httpCookieStore
+            let pageState = page
+            Task { @MainActor in
+                for cookie in InAppWebView.bilibiliAuthCookies() {
+                    await store.setCookie(cookie)
+                }
+                guard pageState.webView === view else { return }
+                pageState.navigation = view.load(request)
+            }
         } else {
             page.isLoading = false
             page.failure = String(localized: "Link Unavailable")
@@ -103,7 +137,9 @@ private struct InAppWebSurface: UIViewRepresentable {
         return view
     }
 
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
+    func updateUIView(_ uiView: WKWebView, context: Context) {
+        context.coordinator.onOpenNativeLink = onOpenNativeLink
+    }
 
     static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
         coordinator.page.webView = nil
@@ -117,13 +153,33 @@ private struct InAppWebSurface: UIViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
         let page: InAppWebState
+        var onOpenNativeLink: @MainActor (URL) -> Void
 
-        init(page: InAppWebState) { self.page = page }
+        init(page: InAppWebState, onOpenNativeLink: @escaping @MainActor (URL) -> Void) {
+            self.page = page
+            self.onOpenNativeLink = onOpenNativeLink
+        }
+
+        private func shouldInterceptNativeLink(_ targetURL: URL) -> Bool {
+            if targetURL.scheme?.lowercased() == "bilibili" {
+                return BiliURLParser.parse(targetURL) != nil
+            }
+            guard BiliLinkHostPolicy.isSupportedScheme(targetURL.scheme) else { return false }
+            if BiliLinkHostPolicy.isShortener(targetURL.host) { return true }
+            guard let route = BiliURLParser.parse(targetURL) else { return false }
+            if case .inAppWeb = route { return false }
+            return true
+        }
 
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction) async
             -> WKNavigationActionPolicy {
-            guard webView === page.webView,
-                  BiliLinkHostPolicy.isSupportedScheme(navigationAction.request.url?.scheme) else { return .cancel }
+            guard webView === page.webView, let targetURL = navigationAction.request.url else { return .cancel }
+            if navigationAction.navigationType == .linkActivated,
+               shouldInterceptNativeLink(targetURL) {
+                onOpenNativeLink(targetURL)
+                return .cancel
+            }
+            guard BiliLinkHostPolicy.isSupportedScheme(targetURL.scheme) else { return .cancel }
             if navigationAction.targetFrame?.isMainFrame == true {
                 page.request = navigationAction.request
             }
@@ -142,6 +198,10 @@ private struct InAppWebSurface: UIViewRepresentable {
             guard webView === page.webView, navigation === page.navigation else { return }
             page.isLoading = false
             page.canGoBack = webView.canGoBack
+            if let pageTitle = webView.title?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !pageTitle.isEmpty {
+                page.title = pageTitle
+            }
         }
 
         func webView(
@@ -175,7 +235,13 @@ private struct InAppWebSurface: UIViewRepresentable {
             for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures
         ) -> WKWebView? {
             guard webView === page.webView, navigationAction.targetFrame == nil,
-                  BiliLinkHostPolicy.isSupportedScheme(navigationAction.request.url?.scheme) else { return nil }
+                  let targetURL = navigationAction.request.url else { return nil }
+            if navigationAction.navigationType == .linkActivated,
+               shouldInterceptNativeLink(targetURL) {
+                onOpenNativeLink(targetURL)
+                return nil
+            }
+            guard BiliLinkHostPolicy.isSupportedScheme(targetURL.scheme) else { return nil }
             page.request = navigationAction.request
             page.navigation = webView.load(navigationAction.request)
             return nil

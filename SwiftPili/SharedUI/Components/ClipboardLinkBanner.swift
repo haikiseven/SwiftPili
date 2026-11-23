@@ -15,6 +15,7 @@ struct ClipboardLinkBanner: View {
         case .userSpace: String(localized: "Profile from your clipboard")
         case .moment: String(localized: "Moment from your clipboard")
         case .article: String(localized: "Article from your clipboard")
+        case .link: String(localized: "Link from your clipboard")
         }
     }
 

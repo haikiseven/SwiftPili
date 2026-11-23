@@ -125,7 +125,7 @@ struct ChatMessageRow: View {
             topTrailingRadius: 18,
             style: .continuous
         )
-        return Text(text.isEmpty ? String(localized: "[Unsupported message]") : text)
+        return linkifiedBubbleText(text, isMine: isMine)
             .appFont(.messageBody)
             .foregroundStyle(isMine ? Color.white : Color.primary)
             .padding(.horizontal, 14)
@@ -139,6 +139,31 @@ struct ChatMessageRow: View {
             }
             .textSelection(.enabled)
             .frame(maxWidth: bubbleMaxWidth, alignment: isMine ? .trailing : .leading)
+    }
+
+    private func linkifiedBubbleText(_ text: String, isMine: Bool) -> Text {
+        guard !text.isEmpty else {
+            return Text(verbatim: String(localized: "[Unsupported message]"))
+        }
+        let links = UIKitDynamicRichTextBuilder.inlineLinks(in: text)
+        guard !links.isEmpty else { return Text(verbatim: text) }
+        let runs = EmoteText.linkRuns(text, links: links)
+        guard runs.contains(where: { $0.url != nil }) else { return Text(verbatim: text) }
+        var result = Text(verbatim: "")
+        for run in runs {
+            guard let url = run.url else {
+                result = result + Text(verbatim: run.text)
+                continue
+            }
+            var attributed = AttributedString(run.text)
+            attributed.link = url
+            attributed.foregroundColor = isMine ? Color.white : Color.biliAccent
+            if isMine {
+                attributed.underlineStyle = Text.LineStyle.single
+            }
+            result = result + Text(attributed)
+        }
+        return result
     }
 
     private func systemNoticeRow(text: String, url: String?) -> some View {

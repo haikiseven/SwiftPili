@@ -178,9 +178,7 @@ struct CollapsibleComposer: View {
         guard isInteractionCurrent(), uploadScope?.isCurrent() ?? true else { return }
         if !isExpanded {
             PlayerLog.log("[Composer] expanding from launcher (collapsible)")
-            withAnimation(motion.animation(normal: Self.composerExpandAnimation)) {
-                expansionBinding.wrappedValue = true
-            }
+            expansionBinding.wrappedValue = true
         }
         focus.request()
     }
@@ -188,9 +186,7 @@ struct CollapsibleComposer: View {
     private func openForFocusRequest() {
         guard isInteractionCurrent(), uploadScope?.isCurrent() ?? true, !isExpanded else { return }
         PlayerLog.log("[Composer] expanding for focus request (collapsible)")
-        withAnimation(motion.animation(normal: Self.composerExpandAnimation)) {
-            expansionBinding.wrappedValue = true
-        }
+        expansionBinding.wrappedValue = true
     }
 
     private func collapse() {
@@ -199,9 +195,7 @@ struct CollapsibleComposer: View {
         PlayerLog.log(
             "[Composer] collapsing to launcher (collapsible) draft=\(hasDraft ? 1 : 0)"
         )
-        withAnimation(motion.animation(normal: Self.composerCollapseAnimation)) {
-            expansionBinding.wrappedValue = false
-        }
+        expansionBinding.wrappedValue = false
     }
 
     private func collapseIfNothingDrafted() {

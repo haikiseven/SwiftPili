@@ -168,7 +168,8 @@ struct DynamicRichBodyView: View {
         for block in blocks {
             guard case .text(let segment) = block else { continue }
             if let fallback = segment.fallback {
-                result[segment.id] = Text(verbatim: fallback)
+                let links = UIKitDynamicRichTextBuilder.inlineLinks(in: fallback)
+                result[segment.id] = EmoteText.linkified(fallback, links: links, accent: inputs.accent)
                 continue
             }
             let runs = segment.nodes.map { node -> Text in
@@ -185,7 +186,8 @@ struct DynamicRichBodyView: View {
                         label, links: [label: target], accent: inputs.accent
                     )
                 } else {
-                    return Text(verbatim: label)
+                    let links = UIKitDynamicRichTextBuilder.inlineLinks(in: label)
+                    return EmoteText.linkified(label, links: links, accent: inputs.accent)
                 }
             }
             result[segment.id] = runs.reduce(Text(verbatim: "")) { $0 + $1 }
@@ -194,19 +196,6 @@ struct DynamicRichBodyView: View {
     }
 
     private func linkTarget(_ node: Node) -> URL? {
-        switch node.type {
-        case "RICH_TEXT_NODE_TYPE_AT":
-            if let rid = node.rid, let mid = Int(rid), mid > 0 {
-                return URL(string: "https://space.bilibili.com/\(rid)")
-            }
-        case "RICH_TEXT_NODE_TYPE_BV", "RICH_TEXT_NODE_TYPE_AV":
-            if let rid = node.rid, !rid.isEmpty {
-                return URL(string: "https://www.bilibili.com/video/\(rid)")
-            }
-        default:
-            break
-        }
-        guard let jump = node.jumpUrl, !jump.isEmpty else { return nil }
-        return URL(string: jump.hasPrefix("//") ? "https:" + jump : jump)
+        UIKitDynamicRichTextBuilder.linkTarget(node)
     }
 }

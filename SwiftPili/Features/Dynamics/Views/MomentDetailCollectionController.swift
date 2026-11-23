@@ -418,8 +418,27 @@ private extension MomentDetailCollectionViewController {
         guard let content else { cell.contentConfiguration = nil; return }
         let env = hostEnvironment
         let innerWidth = max(1, readableCardWidth - AppSpacing.l * 2)
+        let liveOpenURL = OpenURLAction { [weak self] url in
+            guard let self else { return .systemAction }
+            self.hostEnvironment.openURL(url)
+            return .handled
+        }
+        let liveContentLinkContext: ContentLinkContext? = env.contentLinkContext.map { current in
+            current.forwarded(
+                isCurrent: { [weak self] in
+                    self?.hostEnvironment.contentLinkContext?.isCurrent() ?? false
+                },
+                beforeNavigate: { [weak self] in
+                    self?.hostEnvironment.contentLinkContext?.beforeNavigate()
+                }
+            )
+        }
         cell.contentConfiguration = UIHostingConfiguration {
-            content.environment(\.self, env).rowCardColumnWidth(innerWidth)
+            content
+                .environment(\.self, env)
+                .environment(\.openURL, liveOpenURL)
+                .environment(\.contentLinkContext, liveContentLinkContext)
+                .rowCardColumnWidth(innerWidth)
         }.margins(.all, 0).background(.clear)
     }
 
@@ -670,6 +689,9 @@ private extension MomentDetailCollectionViewController {
             || lhs.horizontalSizeClass != rhs.horizontalSizeClass
             || lhs.appSurface != rhs.appSurface
             || lhs.layoutDirection != rhs.layoutDirection
+            || lhs.accessibilityReduceMotion != rhs.accessibilityReduceMotion
+            || lhs.accessibilityReduceTransparency != rhs.accessibilityReduceTransparency
+            || lhs.contentLinkContext?.stateKey != rhs.contentLinkContext?.stateKey
     }
 
     func triggerPagination(

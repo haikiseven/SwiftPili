@@ -152,13 +152,19 @@ private struct MusicDetailContent: View {
     }
 
     private var failureContent: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        ContentUnavailableView {
+            Label("Load Failed", systemImage: "exclamationmark.triangle")
+        } description: {
             if let failure = model.failure {
-                Label("Load Failed", systemImage: "exclamationmark.triangle")
-                Text(failure).appFont(.screenSummary).foregroundStyle(.secondary)
+                Text(failure)
             }
-            Button("Retry") { Task { await model.load() } }.buttonStyle(.borderedProminent)
+        } actions: {
+            Button("Retry") {
+                Task { await model.load() }
+            }
+            .buttonStyle(.borderedProminent)
         }
+        .frame(maxWidth: .infinity)
     }
 
     private func nonblank(_ value: String?) -> String? {

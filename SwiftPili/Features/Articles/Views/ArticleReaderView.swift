@@ -14,6 +14,7 @@ struct ArticleReaderView: View {
     @State private var commentFocus = CommentComposerFocus()
     @State private var commentLinkLifetime = ContentLinkLifetime()
     @State private var containerSize = WindowMetricsFallback.currentSize
+    @AppMotion private var motion
     @Environment(AppCoordinator.self) private var coordinator
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
@@ -63,6 +64,7 @@ struct ArticleReaderView: View {
     private var nativeReader: some View {
         let composer = commentComposerCapture
         let model = composer.model
+        let requestedCvid = composer.requestedCvid
         let showsComments = !model.blocks.isEmpty && !model.commentsClosed
         let composerVisible = AuthManager.shared.isLoggedIn && showsComments
         return Group {
@@ -83,10 +85,7 @@ struct ArticleReaderView: View {
             if containerSize != size { containerSize = size }
         }
         .contentLinks(presentsFeedback: false, handlesURLs: true, isCurrent: {
-            composer.source != nil
-                && viewModel === model
-                && cvid == composer.requestedCvid
-                && model.commentSource(for: composer.requestedCvid) == composer.source
+            viewModel === model && cvid == requestedCvid
         })
         .sheet(item: $showThread) { root in
             threadSheet(for: root)
@@ -136,7 +135,9 @@ struct ArticleReaderView: View {
             focus: commentFocus,
             onCancelReply: {
                 guard composerIsCurrent(composer) else { return }
-                setCommentReplyTarget(nil, for: composer)
+                withAnimation(motion.animation(normal: CollapsibleComposer.composerCollapseAnimation)) {
+                    setCommentReplyTarget(nil, for: composer)
+                }
                 commentFocus.dismiss()
             },
             onSend: { sendComment(from: composer) },

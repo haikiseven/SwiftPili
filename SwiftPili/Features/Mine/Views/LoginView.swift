@@ -81,19 +81,26 @@ private struct QRLoginContent: View {
                     }
 
             case .expired:
-                Text("QR Code expired")
-                Button("Regenerate") {
-                    Task { await loginVM.generateQRCode() }
+                ContentUnavailableView {
+                    Label("QR Code expired", systemImage: "qrcode")
+                } actions: {
+                    Button("Regenerate") {
+                        Task { await loginVM.generateQRCode() }
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .buttonStyle(.bordered)
 
             case .failed(let message):
-                Text("Login failed: \(message)")
-                    .foregroundStyle(.red)
-                Button("Retry") {
-                    Task { await loginVM.generateQRCode() }
+                ContentUnavailableView {
+                    Label("Login Failed", systemImage: "exclamationmark.triangle")
+                } description: {
+                    Text(message)
+                } actions: {
+                    Button("Retry") {
+                        Task { await loginVM.generateQRCode() }
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .buttonStyle(.bordered)
             }
 
             Spacer()

@@ -14,24 +14,41 @@ struct CommentLoadFeedbackView: View {
 
     var body: some View {
         if hasVisibleContent || hasMore {
-            VStack(spacing: 10) {
+            Group {
                 if isLoading {
                     ProgressView("Loading comments…")
+                        .frame(maxWidth: .infinity, minHeight: 56)
+                        .padding(.vertical, 12)
                 } else if let failure = feedback.failure {
-                    Label(failureText(failure), systemImage: "exclamationmark.bubble")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                    Button("Retry", action: retry)
+                    ContentUnavailableView {
+                        Label("Couldn't Load", systemImage: "exclamationmark.bubble")
+                    } description: {
+                        Text(failureText(failure))
+                    } actions: {
+                        Button("Retry", action: retry)
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
                 } else if isEmpty, feedback.hasLoaded {
                     Text("Be the first to comment.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, minHeight: 56)
+                        .padding(.vertical, 12)
                 } else if isEmpty {
                     Button("Load comments", action: retry)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .frame(maxWidth: .infinity, minHeight: 56)
+                        .padding(.vertical, 12)
+                } else {
+                    Color.clear
+                        .frame(maxWidth: .infinity, minHeight: 56)
+                        .padding(.vertical, 12)
                 }
             }
-            .frame(maxWidth: .infinity, minHeight: 56)
-            .padding(.vertical, 12)
         }
     }
 

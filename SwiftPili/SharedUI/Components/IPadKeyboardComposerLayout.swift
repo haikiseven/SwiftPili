@@ -174,6 +174,10 @@ struct IPadKeyboardDockPresenter<Content: View>: UIViewRepresentable {
     }
 
     func updateUIView(_ view: AnchorView, context: Context) {
+        guard isPresented else {
+            view.dismiss(animated: true)
+            return
+        }
         let root = AnyView(
             VStack(spacing: 0) {
                 Spacer(minLength: 0)
@@ -185,7 +189,7 @@ struct IPadKeyboardDockPresenter<Content: View>: UIViewRepresentable {
             }
             .environment(\.self, environment)
         )
-        view.update(isPresented: isPresented, root: root)
+        view.update(isPresented: true, root: root)
     }
 
     static func dismantleUIView(_ view: AnchorView, coordinator: ()) {

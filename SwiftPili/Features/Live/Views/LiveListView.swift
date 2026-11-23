@@ -267,11 +267,12 @@ private struct LiveSectionFeedView: View, Equatable {
     let isSelected: Bool
     let coordinator: AppCoordinator
     let onLoadNextPage: () async -> Void
-    let onRefresh: () async -> Bool
+    let onRefresh: @MainActor @Sendable () async -> Bool
     let onRetry: (LiveListViewModel.LoadFailure) async -> Void
     let onOpenRoom: (Int) -> Void
 
     @State private var cache = LiveTabCache()
+    @State private var dismissedFailureID: UUID?
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.tabSection == rhs.tabSection && lhs.isSelected == rhs.isSelected
@@ -286,49 +287,64 @@ private struct LiveSectionFeedView: View, Equatable {
             paginationCursor: snap.paginationCursor, scrollToTopTick: coordinator.scrollToTopTick,
             coverPresentation: CoverPresentationStore.shared.presentation
         )
+        let inlineFailure: LiveListViewModel.LoadFailure? =
+            if isSelected, !snap.items.isEmpty, let failure = snap.loadFailure, failure.id != dismissedFailureID {
+                failure
+            } else {
+                nil
+            }
 
-        VStack(spacing: 0) {
-            if !snap.items.isEmpty, let failure = snap.loadFailure { inlineFailureBanner(failure) }
-            ZStack {
-                EquatableLiveCollectionHost(key: renderKey) {
-                    LiveFeedCollectionView(
-                        items: snap.items,
-                        showsSkeletons: snap.showsSkeletons,
-                        skeletonLabel: String(localized: "Loading live streams"),
-                        canLoadMore: snap.canLoadMore,
-                        paginationCursor: snap.paginationCursor,
-                        isActive: renderKey.isActive,
-                        isLiveTabSelected: renderKey.isLiveTabSelected,
-                        scrollToTopTick: renderKey.scrollToTopTick,
-                        onRefresh: onRefresh,
-                        onLastAppear: { Task { await onLoadNextPage() } },
-                        onSelectRoom: onOpenRoom
-                    )
-                }
-                .opacity(snap.showsEmptyFeedback ? 0 : 1)
-                .allowsHitTesting(!snap.showsEmptyFeedback)
-                .accessibilityHidden(snap.showsEmptyFeedback)
+        ZStack {
+            EquatableLiveCollectionHost(key: renderKey) {
+                LiveFeedCollectionView(
+                    items: snap.items,
+                    showsSkeletons: snap.showsSkeletons,
+                    skeletonLabel: String(localized: "Loading live streams"),
+                    canLoadMore: snap.canLoadMore,
+                    paginationCursor: snap.paginationCursor,
+                    isActive: renderKey.isActive,
+                    isLiveTabSelected: renderKey.isLiveTabSelected,
+                    scrollToTopTick: renderKey.scrollToTopTick,
+                    onRefresh: onRefresh,
+                    onLastAppear: { Task { await onLoadNextPage() } },
+                    onSelectRoom: onOpenRoom
+                )
+            }
+            .opacity(snap.showsEmptyFeedback ? 0 : 1)
+            .allowsHitTesting(!snap.showsEmptyFeedback)
+            .accessibilityHidden(snap.showsEmptyFeedback)
 
-                if snap.showsEmptyFeedback {
-                    ScrollView {
-                        emptyFeedbackView(failure: snap.loadFailure)
-                            .frame(maxWidth: .infinity)
-                            .containerRelativeFrame(.vertical)
-                    }
-                    .refreshable { _ = await onRefresh() }
+            if snap.showsEmptyFeedback {
+                ScrollView {
+                    emptyFeedbackView(failure: snap.loadFailure)
+                        .frame(maxWidth: .infinity)
+                        .containerRelativeFrame(.vertical)
                 }
+                .refreshable { _ = await onRefresh() }
             }
         }
-    }
-
-    private func inlineFailureBanner(_ failure: LiveListViewModel.LoadFailure) -> some View {
-        VStack(spacing: 8) {
-            Label("Couldn't Load", systemImage: "exclamationmark.triangle")
-            Text(failure.message).font(.footnote).foregroundStyle(.secondary)
-            Button("Retry") { Task { await onRetry(failure) } }
-                .buttonStyle(.bordered).frame(minWidth: 44, minHeight: 44)
+        .alert(
+            "Couldn't Load",
+            isPresented: Binding(
+                get: { inlineFailure != nil },
+                set: { isPresented in
+                    if !isPresented, let failure = inlineFailure {
+                        dismissedFailureID = failure.id
+                    }
+                }
+            ),
+            presenting: inlineFailure
+        ) { failure in
+            Button("Retry") {
+                dismissedFailureID = failure.id
+                Task { await onRetry(failure) }
+            }
+            Button("Dismiss", role: .cancel) {
+                dismissedFailureID = failure.id
+            }
+        } message: { failure in
+            Text(failure.message)
         }
-        .frame(maxWidth: .infinity).padding()
     }
 
     @ViewBuilder
@@ -340,7 +356,8 @@ private struct LiveSectionFeedView: View, Equatable {
                 Text(failure.message)
             } actions: {
                 Button("Retry") { Task { await onRetry(failure) } }
-                    .buttonStyle(.bordered).frame(minWidth: 44, minHeight: 44)
+                    .buttonStyle(.borderedProminent)
+                    .frame(minWidth: 44, minHeight: 44)
             }
         } else if tabSection == .follows {
             ContentUnavailableView(

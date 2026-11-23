@@ -15,10 +15,20 @@ private enum MessageCommentNavigation {
             coordinator.navigate(to: anchor)
             return
         }
-        guard let raw = nativeURI ?? uri,
-              let url = URL(string: raw)
-        else { return }
-        coordinator.handle(url: url, context: context)
+        let candidates = [nativeURI, uri]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .compactMap { raw -> URL? in
+                let normalized = raw.hasPrefix("//") ? "https:" + raw : raw
+                return URL(string: normalized) ?? URL(string: normalized, encodingInvalidCharacters: true)
+            }
+        if let nativeMatch = candidates.first(where: { BiliURLParser.parse($0) != nil }) {
+            coordinator.handle(url: nativeMatch, context: context)
+        } else if let webMatch = candidates.first(where: { BiliLinkHostPolicy.isSupportedScheme($0.scheme) }) {
+            coordinator.handle(url: webMatch, context: context)
+        } else if let first = candidates.first {
+            coordinator.handle(url: first, context: context)
+        }
     }
 }
 

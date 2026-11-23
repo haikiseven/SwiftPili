@@ -27,13 +27,50 @@ struct ClipboardSuggestionGate: Equatable, Sendable {
     }
 }
 
+enum ClipboardLinkTarget: Equatable, Sendable {
+    case video
+    case liveRoom
+    case userSpace
+    case moment
+    case article
+    case music
+    case link
+
+    init?(target: BiliLinkTarget) {
+        switch target {
+        case .video, .bangumi: self = .video
+        case .liveRoom: self = .liveRoom
+        case .userSpace: self = .userSpace
+        case .moment: self = .moment
+        case .article: self = .article
+        case .music: self = .music
+        case .search: return nil
+        }
+    }
+}
+
+enum ClipboardLinkAction: Equatable, Sendable {
+    case target(BiliLinkTarget)
+    case shortLink(URL)
+}
+
 struct ClipboardLinkSuggestion: Equatable, Sendable, Identifiable {
     let id: String
-    let target: BiliLinkTarget
+    let target: ClipboardLinkTarget
+    let action: ClipboardLinkAction
     let sourceContent: String
 
-    init(target: BiliLinkTarget, sourceContent: String) {
-        self.target = target
+    init?(target: BiliLinkTarget, sourceContent: String) {
+        guard let displayTarget = ClipboardLinkTarget(target: target) else { return nil }
+        self.target = displayTarget
+        action = .target(target)
+        self.sourceContent = sourceContent
+        id = ClipboardSuggestionGate.identity(sourceContent)
+    }
+
+    init(shortLink: URL, sourceContent: String) {
+        target = .link
+        action = .shortLink(shortLink)
         self.sourceContent = sourceContent
         id = ClipboardSuggestionGate.identity(sourceContent)
     }
@@ -43,9 +80,13 @@ enum ClipboardLinkDetector {
     static let settingsKey = "clipboard_link_detection"
 
     static func suggestion(for content: String) -> ClipboardLinkSuggestion? {
-        guard case .resolved(let target, _) = BiliLinkResolver.resolve(text: content) else {
+        switch BiliLinkResolver.resolve(text: content) {
+        case .resolved(let target, _):
+            return ClipboardLinkSuggestion(target: target, sourceContent: content)
+        case .needsRedirect(let url):
+            return ClipboardLinkSuggestion(shortLink: url, sourceContent: content)
+        case .none:
             return nil
         }
-        return ClipboardLinkSuggestion(target: target, sourceContent: content)
     }
 }
