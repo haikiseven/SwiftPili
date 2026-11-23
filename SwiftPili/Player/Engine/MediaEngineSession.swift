@@ -6039,7 +6039,13 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
             isBuffering = true
             disarmPresentFeed()
             applyPipelineDemand()
+            onEvent?(.tick(
+                mediaTime: clock.mediaTime,
+                duration: clock.duration,
+                buffered: bufferedTime
+            ))
             onEvent?(.buffering)
+            updateMultiConnectionPlayback()
         }
         requestSupplyWake()
         scheduleAudioDecodeIfNeeded()
@@ -9836,7 +9842,13 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
             "vQ=\(String(format: "%.2f", runway))s aQ=\(String(format: "%.2f", audioPacketQueue.contentSeconds))s " +
             "pcm=\(String(format: "%.2f", pendingAudioContentSeconds))s"
         )
+        onEvent?(.tick(
+            mediaTime: clock.mediaTime,
+            duration: clock.duration,
+            buffered: bufferedTime
+        ))
         onEvent?(.buffering)
+        updateMultiConnectionPlayback()
         requestSupplyWake()
     }
 

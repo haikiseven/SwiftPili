@@ -126,7 +126,7 @@ extension PlayerViewModel {
         clearNearEndStall()
         lastSeekRequest = time
         settledSeekDisplaySample = nil
-        invalidateBufferedDisplayForSeek()
+        prepareBufferedDisplayForSeek(to: time)
         armDurableResumeTarget(time > 2 ? time : nil, source: "seek")
         PlayerLog.log("[Player] seek-start target=\(String(format: "%.1f", time))s")
         logDemandSeekTrace(phase: "request", target: time, ready: backend.isReadyToPlay)
@@ -221,7 +221,6 @@ extension PlayerViewModel {
                 && self.nativeSeekCompletedRequestSerial != danmakuRequestSerial
             if isCurrentSeek {
                 self.nativeSeekCompletedRequestSerial = danmakuRequestSerial
-                self.invalidateBufferedDisplayForSeek()
                 if self.backendKind != .vlc {
                     if finished {
                         SeekTrace.mark("arrived")
@@ -288,7 +287,7 @@ extension PlayerViewModel {
 
     func refreshBufferedDisplayAfterSeek() {
         guard mode == .vod else { return }
-        invalidateBufferedDisplayForSeek()
+        bufferedTimeProjection.invalidateSampling()
         publishBufferedTime(backend.playableTime, display: { backend.bufferDisplaySample }, at: CACurrentMediaTime())
     }
 

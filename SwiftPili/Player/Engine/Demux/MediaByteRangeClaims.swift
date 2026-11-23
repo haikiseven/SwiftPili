@@ -354,20 +354,23 @@ extension MediaByteRangeStore {
         return cursor < range.upperBound ? cursor..<range.upperBound : nil
     }
 
-    func currentTailAssistSpan(
-        _ key: Key, within fragmentRange: Range<Int64>, minimumBytes: Int64
+    func currentFragmentAssistSpan(
+        _ key: Key, cursor: Int64, within fragmentRange: Range<Int64>, minimumTailSplitBytes: Int64
     ) -> Range<Int64>? {
-        guard minimumBytes > 0, fragmentRange.lowerBound >= 0,
+        guard minimumTailSplitBytes > 0, fragmentRange.lowerBound >= 0,
               fragmentRange.lowerBound < fragmentRange.upperBound,
               fragmentRange.upperBound <= key.contentLength else { return nil }
-        let sourceEnd = rangeClaims.activeSourceRanges(for: key)
+        let activeSources = rangeClaims.activeSourceRanges(for: key)
             .filter { $0.overlaps(fragmentRange) }
-            .map(\.upperBound)
-            .max()
-        guard let sourceEnd, sourceEnd > fragmentRange.lowerBound,
-              sourceEnd < fragmentRange.upperBound,
-              let tail = firstUnclaimedMissingSpan(key, within: sourceEnd..<fragmentRange.upperBound),
-              tail.upperBound - tail.lowerBound >= minimumBytes else { return nil }
-        return tail
+        if let sourceEnd = activeSources.map(\.upperBound).max() {
+            guard sourceEnd > fragmentRange.lowerBound,
+                  sourceEnd < fragmentRange.upperBound,
+                  let tail = firstUnclaimedMissingSpan(key, within: sourceEnd..<fragmentRange.upperBound),
+                  tail.upperBound - tail.lowerBound >= minimumTailSplitBytes else { return nil }
+            return tail
+        }
+        let effectiveStart = max(fragmentRange.lowerBound, min(cursor, fragmentRange.upperBound))
+        guard effectiveStart < fragmentRange.upperBound else { return nil }
+        return firstUnclaimedMissingSpan(key, within: effectiveStart..<fragmentRange.upperBound)
     }
 }

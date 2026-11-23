@@ -118,7 +118,7 @@ extension MultiConnectionPrefetcher {
         let diagnostics = await store.diagnostics()
         let sample = telemetry()
         let baseline = diagnosticBaseline
-        let inFlightHosts = works.values.flatMap { $0.flights.values.map(\.host) }
+        let inFlightHosts = works.values.flatMap { $0.allFlights.map(\.host) }
         let speeds = hosts.sorted { $0.key < $1.key }.map { entry in
             "\(entry.key):\(Int(entry.value.speed ?? 0))Bps,pieces=\(entry.value.pieces),fails=\(entry.value.failures)"
                 + (policy.auto ? ",k=\(inFlightHosts.filter { $0 == entry.key }.count)" : "")
@@ -129,7 +129,7 @@ extension MultiConnectionPrefetcher {
                       "dupBytes=\(max(0, diagnostics.dupBytes - (baseline?.dupBytes ?? 0))) " +
                       "globalAdmissionOverlapBytes=\(diagnostics.dupBytes) " +
                       "dedupWaits=\(diagnostics.dedupWaits) dedupTimeouts=\(diagnostics.dedupTimeouts) " +
-                      "hedges=0 drops=\(drops) cancelledStagingBytes=\(cancelledStagingBytes)" +
+                      "hedges=\(hedges) drops=\(drops) cancelledStagingBytes=\(cancelledStagingBytes)" +
                       ladderTickDescription())
     }
 
@@ -146,7 +146,7 @@ extension MultiConnectionPrefetcher {
         guard policy.auto else { return "" }
         var counts: [String: Int] = [:]
         for work in works.values {
-            for flight in work.flights.values { counts[edgeKey(flight.host), default: 0] += 1 }
+            for flight in work.allFlights { counts[edgeKey(flight.host), default: 0] += 1 }
         }
         let edges = allocation.slots.keys.sorted().map { "\($0):\(counts[$0] ?? 0)/\(allocation.slots[$0] ?? 0)" }
         defer {

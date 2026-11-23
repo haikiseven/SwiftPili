@@ -1,6 +1,17 @@
 import Foundation
 
 actor MultiConnectionPrefetcher {
+    struct StallPolicy: Sendable, Equatable {
+        var zeroByteDelay: TimeInterval = 0.75
+        var stallGapDelay: TimeInterval = 0.90
+        var slowDelay: TimeInterval = 1.10
+        var slowFloorBytesPerSec: Double = 256 * 1024
+        var demotionSeconds: TimeInterval = 15
+        var watchInterval: TimeInterval = 0.20
+
+        static let standard = Self()
+    }
+
     private let telemetryIdentity = UUID()
     let store: MediaByteRangeStore
     private let transport: any MultiConnectionTransport
@@ -19,11 +30,15 @@ actor MultiConnectionPrefetcher {
     var parked = false
     nonisolated let assistAvailability: MultiConnectionAssistAvailability
     var cooldownWakeTask: Task<Void, Never>?
+    var stallWatchTask: Task<Void, Never>?
+    var stallWatchID: UInt64 = 0
+    let stallPolicy: StallPolicy
     var failedAutoRetryUsed = false
     var position: TimeInterval
     var rate: Float
     var epoch: UInt64 = 0
     var completedFragments = 0
+    var hedges = 0
     var drops = 0
     var cancelledStagingBytes: Int64 = 0
     var lastLog: TimeInterval = 0
@@ -59,12 +74,14 @@ actor MultiConnectionPrefetcher {
         concurrencyLimit: Int = MultiConnectionPlanner.requestLimit(),
         workLimit: Int = MultiConnectionPlanner.workLimit(),
         policy: MultiConnectionPolicy? = nil,
+        stallPolicy: StallPolicy = .standard,
         memo: MultiConnectionLadderMemo = .shared,
         clock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         networkBytes: MediaNetworkByteCounter? = nil
     ) {
         let resolved = policy ?? .fixed(requestLimit: concurrencyLimit, workLimit: workLimit)
         self.policy = resolved
+        self.stallPolicy = stallPolicy
         self.memo = memo
         self.clock = clock
         let learned = memo.entryAndGeneration(for: resolved.networkClass)
@@ -88,6 +105,7 @@ actor MultiConnectionPrefetcher {
 
     deinit {
         cooldownWakeTask?.cancel()
+        stallWatchTask?.cancel()
     }
 
     nonisolated func isTailAssistAvailable(for trackIndex: Int) -> Bool {
@@ -137,6 +155,7 @@ actor MultiConnectionPrefetcher {
         if value || quiet {
             needsReschedule = false
             cancelCooldownWake()
+            cancelStallWatch()
         }
         if quietGate.quietReason == .policy, !works.isEmpty {
             PlayerLog.log("[Prefetch] policy quiet → cancel inflight=\(activeRequests) works=\(works.count)")
@@ -203,7 +222,7 @@ actor MultiConnectionPrefetcher {
             identity: telemetryIdentity, epoch: epoch,
             observedAt: ProcessInfo.processInfo.systemUptime, state: state,
             activeRequests: active, concurrencyLimit: level, level: level,
-            activeHelperHosts: works.values.flatMap { $0.flights.values.map(\.host) }.sorted(),
+            activeHelperHosts: works.values.flatMap { $0.allFlights.map(\.host) }.sorted(),
             candidateHosts: Set(tracks.flatMap { $0.helpers.compactMap(\.host) }).count,
             completedBytes: hosts.values.reduce(0) { $0 + $1.bytes },
             completedFragments: completedFragments, stagedBytes: stagedBytes,
@@ -217,16 +236,17 @@ actor MultiConnectionPrefetcher {
             completedFragments: completedFragments, drops: drops,
             cancelledStagingBytes: cancelledStagingBytes, hosts: hosts,
             activeWorks: works.count, activePayloadBytes: works.values.reduce(0) { $0 + $1.candidate.claimBytes },
-            level: level, peakEdgeRequests: peakEdgeRequests, refusals: refusals
+            level: level, peakEdgeRequests: peakEdgeRequests, refusals: refusals, hedges: hedges
         )
     }
 
-    var activeRequests: Int { works.values.reduce(0) { $0 + $1.flights.count } }
+    var activeRequests: Int { works.values.reduce(0) { $0 + $1.activeFlightCount } }
     var level: Int { policy.auto ? controller.level : concurrencyLimit }
     private var stagedBytes: Int64 { works.values.reduce(0) { $0 + $1.stagingBytes } }
 
     private func cancelAllWork() {
         epoch &+= 1
+        cancelStallWatch()
         for id in Array(works.keys) { cancelWork(id: id) }
     }
 
@@ -244,6 +264,7 @@ actor MultiConnectionPrefetcher {
         work.stagingBytes = 0
         work.pieces.removeAll()
         work.flights.removeAll()
+        work.hedgeFlights.removeAll()
         drops += 1
     }
 
@@ -303,6 +324,7 @@ extension MultiConnectionPrefetcher {
         pruneRetiredWork()
         refillQueues()
         updateAssistAvailability()
+        armStallWatchIfNeeded()
         if activeRequests > 0 {
             cancelCooldownWake()
         } else {
@@ -319,7 +341,8 @@ extension MultiConnectionPrefetcher {
             guard context.generation == epoch, canSchedule else { return }
             pruneRetiredWork()
             refillQueues()
-            guard claimAdmits(candidate) else { break }
+            let rankZeroCandidate = isRankZero(candidate)
+            guard rankZeroCandidate || claimAdmits(candidate) else { break }
             guard !availableHosts(track: candidate.track).isEmpty,
                   let missingRange = await resolveMissingSpan(for: candidate) else { continue }
             guard context.generation == epoch, canSchedule else { return }
@@ -327,6 +350,9 @@ extension MultiConnectionPrefetcher {
                 track: candidate.track, fragment: candidate.fragment,
                 claimRange: missingRange, deadline: candidate.deadline
             )
+            if rankZeroCandidate {
+                ensureRoomForRankZero(for: resolved, context: context)
+            }
             guard claimAdmits(resolved) else { break }
             await claimResolvedCandidate(resolved, context: context, blocked: &blockedTracks)
         }
@@ -346,7 +372,7 @@ extension MultiConnectionPrefetcher {
 
     func launchPieces(_ work: Work) {
         guard canSchedule, !work.cancellation.isCancelled else { return }
-        var occupied = Set(works.values.flatMap { $0.flights.values.map(\.host) })
+        var occupied = Set(works.values.flatMap { $0.allFlights.map(\.host) })
         var connections = Set(occupied.compactMap { hosts[$0]?.connection?.identity })
         for url in availableHosts(track: work.candidate.track) {
             guard activeRequests < concurrencyLimit, work.hasQueuedBytes else { break }
@@ -374,6 +400,16 @@ extension MultiConnectionPrefetcher {
             range = work.nextOffset..<(work.nextOffset + count)
             work.nextOffset = range.upperBound
         }
+        launchFlight(
+            work, pieceKey: range.lowerBound, requestRange: range,
+            url: url, host: host, options: options, isHedge: false
+        )
+    }
+
+    func launchFlight(
+        _ work: Work, pieceKey: Int64, requestRange: Range<Int64>,
+        url: URL, host: String, options: MultiConnectionFetchOptions, isHedge: Bool
+    ) {
         let id = work.id
         let flightID = UUID()
         let generation = work.epoch
@@ -385,57 +421,71 @@ extension MultiConnectionPrefetcher {
                 for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
                 request.setValue(
                     MediaByteRange.httpRangeHeader(
-                        offset: range.lowerBound, length: range.upperBound - range.lowerBound
+                        offset: requestRange.lowerBound, length: requestRange.upperBound - requestRange.lowerBound
                     ),
                     forHTTPHeaderField: "Range"
                 )
                 let response = try await transport.fetch(
-                    .init(request: request, range: range, resourceLength: key.contentLength),
+                    .init(request: request, range: requestRange, resourceLength: key.contentLength),
                     quietGate: quietGate, options: options
                 ) { prefix in
                     try await self.receivePrefix(
-                        id: id, flightID: flightID, generation: generation, range: range, prefix: prefix
+                        id: id, flightID: flightID, generation: generation, pieceKey: pieceKey, prefix: prefix
                     )
                 }
                 try Task.checkCancellation()
                 try MultiConnectionValidation.headers(
                     status: response.status, contentRange: response.contentRange,
                     contentLength: response.contentLength,
-                    range: range, resourceLength: key.contentLength, bodyCount: response.bodyCount
+                    range: requestRange, resourceLength: key.contentLength, bodyCount: response.bodyCount
                 )
                 await finish(
-                    id: id, flightID: flightID, range: range, response: response, started: started
+                    id: id, flightID: flightID, pieceKey: pieceKey,
+                    requestRange: requestRange, response: response, started: started
                 )
             } catch {
-                await finishFailure(id: id, flightID: flightID, host: host, range: range, error: error)
+                await finishFailure(
+                    id: id, flightID: flightID, host: host,
+                    pieceKey: pieceKey, range: requestRange, error: error
+                )
             }
         }
-        work.pieces[range.lowerBound] = Piece(id: flightID, range: range)
-        work.flights[range.lowerBound] = Flight(id: flightID, host: host, lane: options.lane, task: task)
+        let flight = Flight(
+            id: flightID, host: host, lane: options.lane,
+            startedAt: started, lastProgressAt: started,
+            requestRange: requestRange, task: task
+        )
+        if isHedge {
+            work.hedgeFlights[pieceKey] = flight
+            hedges += 1
+        } else {
+            work.pieces[pieceKey] = Piece(id: flightID, range: requestRange)
+            work.flights[pieceKey] = flight
+        }
         work.cancellation.insert(task)
+        armStallWatchIfNeeded()
     }
 
     func finish(
-        id: UUID, flightID: UUID, range: Range<Int64>,
+        id: UUID, flightID: UUID, pieceKey: Int64, requestRange: Range<Int64>,
         response: MultiConnectionResponse, started: TimeInterval
     ) async {
         guard let work = works[id], ownsWork(work),
-              let flight = work.flights[range.lowerBound], flight.id == flightID,
-              let piece = work.pieces[range.lowerBound], piece.id == flightID else { return }
-        let host = flight.host
-        guard piece.receivedThrough == range.upperBound else {
-            await fail(id: id, host: host, range: range, error: PathAHTTPMediaSource.SourceError.invalidRange)
+              let piece = work.pieces[pieceKey] else { return }
+        let isHedge = work.hedgeFlights[pieceKey]?.id == flightID
+        let flight: Flight
+        if isHedge, let activeHedge = work.hedgeFlights[pieceKey] {
+            flight = activeHedge
+            work.hedgeFlights[pieceKey] = nil
+        } else if let activePrimary = work.flights[pieceKey], activePrimary.id == flightID, piece.id == flightID {
+            flight = activePrimary
+        } else {
             return
         }
-        let generation = epoch
-        work.flights[range.lowerBound] = nil
-        if work.committing { work.refillAfterPublication = true }
-        piece.terminalSucceeded = true
-        work.completedResponseBytes += Int64(response.bodyCount)
-        if piece.pending.isEmpty { work.pieces[range.lowerBound] = nil }
-        var state = hosts[host] ?? Host()
+        let host = flight.host
         let finishedAt = clock()
         let speed = Double(response.bodyCount) / max(0.001, finishedAt - started)
+        var state = hosts[host] ?? Host()
         state.speed = MultiConnectionPlanner.updatedSpeed(previous: state.speed, sample: speed)
         state.failures = 0
         state.pieces += 1
@@ -447,6 +497,24 @@ extension MultiConnectionPrefetcher {
         if policy.auto {
             controller.noteCompletion(bytes: Int64(response.bodyCount), seconds: finishedAt - started, now: finishedAt)
         }
+        if isHedge {
+            await logTick()
+            return
+        }
+        guard piece.receivedThrough == piece.range.upperBound else {
+            await fail(
+                id: id, host: host, pieceKey: pieceKey, range: requestRange,
+                error: PathAHTTPMediaSource.SourceError.invalidRange
+            )
+            return
+        }
+        let generation = epoch
+        work.flights[pieceKey] = nil
+        work.hedgeFlights.removeValue(forKey: pieceKey)?.task.cancel()
+        if work.committing { work.refillAfterPublication = true }
+        piece.terminalSucceeded = true
+        work.completedResponseBytes += piece.range.upperBound - piece.range.lowerBound
+        if piece.pending.isEmpty { work.pieces[pieceKey] = nil }
         await publishContiguousPieces(work)
         completeWorkIfReady(work)
         await logTick()

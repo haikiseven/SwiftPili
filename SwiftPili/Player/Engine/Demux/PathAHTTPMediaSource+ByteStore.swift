@@ -101,9 +101,9 @@ struct PathAByteStoreBinding: Sendable {
         return pieces
     }
 
-    func admit(offset: Int64, data: Data) async {
+    func admit(offset: Int64, data: Data, noteRead: Bool = true) async {
         guard !data.isEmpty else { return }
-        await store.noteRead(key, offset: offset)
+        if noteRead { await store.noteRead(key, offset: offset) }
         await store.admit(key, offset: offset, data: data)
     }
 }

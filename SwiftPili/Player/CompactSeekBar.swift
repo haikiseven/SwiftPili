@@ -20,25 +20,36 @@ struct CompactSeekBar: View {
     @AppMotion private var motion
     @GestureState private var isTouching = false
 
+    private var scrubChromeAnimation: Animation? {
+        motion.animation(normal: .easeInOut(duration: 0.15))
+    }
+
     var body: some View {
-        chromeAnimated(strip)
+        strip
     }
 
     private var strip: some View {
         GeometryReader { geo in
             let width = max(geo.size.width, 1)
-            let fills = FillWidths(progress: progress, buffered: buffered, width: width)
+            let fills = FillWidths(
+                progress: progress,
+                buffered: buffered,
+                width: width,
+                isScrubbing: isScrubbing
+            )
             let barHeight: CGFloat = isScrubbing ? 6 : 2
             let knobSize: CGFloat = isScrubbing ? 14 : 10
             ZStack(alignment: .leading) {
-                Capsule()
-                    .fill(.white.opacity(prominent || isScrubbing ? 0.3 : 0.2))
+                chromeAnimated(Capsule().fill(.white.opacity(prominent || isScrubbing ? 0.3 : 0.2)))
                 timingFills(fills)
                 ForEach(segments) { seg in
                     sponsorBand(seg, width: width)
                 }
+                .transaction(value: width) { $0.animation = nil }
             }
+            .clipShape(Capsule())
             .frame(height: barHeight)
+            .animation(scrubChromeAnimation, value: isScrubbing)
             .overlay(alignment: .leading) {
                 playheadKnob(position: fills.played, size: knobSize)
             }
@@ -77,11 +88,13 @@ struct CompactSeekBar: View {
 
     private func timingFills(_ fills: FillWidths) -> some View {
         ZStack(alignment: .leading) {
-            chromeAnimated(Capsule().fill(.white.opacity(prominent || isScrubbing ? 0.5 : 0.35)))
-                .frame(width: fills.buffered)
-            chromeAnimated(Capsule().fill(Color.biliAccent.opacity(prominent || isScrubbing ? 1 : 0.85)))
+            chromeAnimated(Rectangle().fill(.white.opacity(prominent || isScrubbing ? 0.5 : 0.35)))
+                .frame(width: max(0, fills.buffered - fills.played))
+                .offset(x: fills.played)
+            chromeAnimated(Rectangle().fill(Color.biliAccent.opacity(prominent || isScrubbing ? 1 : 0.85)))
                 .frame(width: fills.played)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .transaction(value: fills) { $0.animation = nil }
     }
 
@@ -103,7 +116,7 @@ struct CompactSeekBar: View {
 
     private func chromeAnimated<Content: View>(_ content: Content) -> some View {
         content
-            .animation(motion.animation(normal: .easeInOut(duration: 0.15)), value: isScrubbing)
+            .animation(scrubChromeAnimation, value: isScrubbing)
             .animation(motion.animation(normal: .easeInOut(duration: 0.2)), value: prominent)
     }
 
@@ -111,10 +124,11 @@ struct CompactSeekBar: View {
         let played: CGFloat
         let buffered: CGFloat
 
-        init(progress: Double, buffered: Double, width: CGFloat) {
+        init(progress: Double, buffered: Double, width: CGFloat, isScrubbing: Bool) {
             let playhead = Self.normalized(progress)
+            let bufferedFraction = Self.normalized(buffered)
             played = playhead * width
-            self.buffered = max(playhead, Self.normalized(buffered)) * width
+            self.buffered = (isScrubbing ? bufferedFraction : max(playhead, bufferedFraction)) * width
         }
 
         private static func normalized(_ fraction: Double) -> Double {
@@ -126,14 +140,12 @@ struct CompactSeekBar: View {
     private func sponsorBand(_ seg: SeekBarSegment, width: CGFloat) -> some View {
         let start = min(max(seg.start, 0), 1) * width
         if seg.isPOI {
-            Capsule()
-                .fill(seg.color.opacity(prominent || isScrubbing ? 1 : 0.85))
+            chromeAnimated(Capsule().fill(seg.color.opacity(prominent || isScrubbing ? 1 : 0.85)))
                 .frame(width: 2)
                 .offset(x: start - 1)
         } else {
             let end = min(max(seg.end, 0), 1) * width
-            Capsule()
-                .fill(seg.color.opacity(prominent || isScrubbing ? 0.95 : 0.75))
+            chromeAnimated(Capsule().fill(seg.color.opacity(prominent || isScrubbing ? 0.95 : 0.75)))
                 .frame(width: max(end - start, 1.5))
                 .offset(x: start)
         }

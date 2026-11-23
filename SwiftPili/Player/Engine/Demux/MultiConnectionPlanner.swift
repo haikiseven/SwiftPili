@@ -211,7 +211,7 @@ enum MultiConnectionPlanner {
               tail.lowerBound >= fragment.range.lowerBound,
               tail.upperBound <= fragment.range.upperBound else { return nil }
         let bytes = tail.upperBound - tail.lowerBound
-        guard bytes >= minimumSplitBytes, bytes <= remaining else { return nil }
+        guard bytes > 0, bytes <= remaining else { return nil }
         return tail
     }
 

@@ -43,17 +43,15 @@ extension PlayerViewModel {
         return min(Self.normalizedBufferedTime(value), duration)
     }
 
-    func seekStripBufferedEnd(at position: TimeInterval, isScrubbing: Bool) -> TimeInterval? {
-        guard let range = displayedBufferedRange else { return nil }
-        guard !isScrubbing || position >= range.start else { return nil }
-        return clampedSeekableDisplayTime(range.end)
+    var seekStripBufferedEnd: TimeInterval? {
+        displayedBufferedRange.map { clampedSeekableDisplayTime($0.end) }
     }
 
     func displayedBufferAhead(gestureDisplay: PlayerGestureDisplay) -> TimeInterval? {
         guard mode.isSeekable, currentURL != nil, duration.isFinite, duration > 0 else { return nil }
         guard mode == .offline || backendKind != .vlc else { return nil }
         let position = seekStripDisplayPosition(gestureDisplay: gestureDisplay, samplingClock: false)
-        guard let end = seekStripBufferedEnd(at: position, isScrubbing: gestureDisplay.isSeeking) else { return nil }
+        guard let end = seekStripBufferedEnd else { return nil }
         return max(0, end - position)
     }
 
@@ -184,15 +182,24 @@ extension PlayerViewModel {
         }
     }
 
-    func invalidateBufferedDisplayForSeek() {
+    func prepareBufferedDisplayForSeek(to target: TimeInterval) {
         guard mode == .vod else { return }
+        let anchor = Self.normalizedBufferedTime(target)
+        let nextRange: BufferedDisplayRange?
+        if let range = bufferedTimeProjection.publishedRange,
+           anchor >= range.start - 0.5,
+           anchor <= range.end {
+            nextRange = BufferedDisplayRange(start: min(anchor, range.end), end: range.end)
+        } else {
+            nextRange = BufferedDisplayRange(start: anchor, end: anchor)
+        }
         bufferedDisplayDiagnostic = nil
-        guard bufferedTimeProjection.publishedRange != nil else {
+        guard bufferedTimeProjection.publishedRange != nextRange else {
             bufferedTimeProjection.invalidateSampling()
             return
         }
         withMutation(keyPath: \.bufferedTime) {
-            bufferedTimeProjection.reset()
+            bufferedTimeProjection.reset(range: nextRange)
         }
     }
 
@@ -203,16 +210,17 @@ extension PlayerViewModel {
         let becameZero = rawValue == 0 && bufferedTimeStorage != 0
         bufferedTimeStorage = rawValue
         guard canPublishBufferedDisplay else { return }
-        if mode == .vod, pendingSeekTarget != nil || isSeekInFlight {
-            invalidateBufferedDisplayForSeek()
-            return
-        }
         if mode == .offline {
             guard duration.isFinite, duration > 0, rawValue >= duration else { return }
         }
-        guard bufferedTimeProjection.admitSample(at: now, force: becameZero) else { return }
+        guard bufferedTimeProjection.canAdmitSample(at: now, force: becameZero) else { return }
         let sample = display()
+        let seekTarget = mode == .vod ? (pendingSeekTarget ?? backend.pendingSeekTarget) : nil
+        if let seekTarget, !Self.isSettledSeekBufferSample(sample, target: seekTarget) {
+            return
+        }
         let range = bufferDisplayRange(sample: sample, rawEndpoint: value)
+        bufferedTimeProjection.recordSample(at: now)
         bufferedDisplayDiagnostic = PlayerLog.isCapturing ? BufferedDisplayDiagnosticSample(
             backendIdentity: ObjectIdentifier(backend), runtimeGeneration: backend.runtimeGeneration,
             loadGeneration: loadGeneration, ownerLeaseGeneration: ownerLeaseGeneration,
@@ -221,6 +229,21 @@ extension PlayerViewModel {
         withMutation(keyPath: \.bufferedTime) {
             bufferedTimeProjection.ingest(range: range)
         }
+    }
+
+    private static func isSettledSeekBufferSample(
+        _ sample: MediaBufferDisplaySample?,
+        target: TimeInterval
+    ) -> Bool {
+        guard let sample,
+              sample.position.isFinite,
+              abs(sample.position - target) <= 0.5,
+              let end = sample.bufferedThrough,
+              end.isFinite,
+              end >= target else {
+            return false
+        }
+        return true
     }
 
     private func bufferDisplayRange(
@@ -317,16 +340,20 @@ struct BufferedTimeUIProjection: Equatable, Sendable {
         self.cadence = max(0, cadence)
     }
 
-    mutating func admitSample(at now: TimeInterval, force: Bool = false) -> Bool {
-        guard now.isFinite else {
-            invalidateSampling()
-            return false
-        }
+    func canAdmitSample(at now: TimeInterval, force: Bool = false) -> Bool {
+        guard now.isFinite else { return false }
         if !force, let lastSampleAt, now >= lastSampleAt, now - lastSampleAt < cadence {
             return false
         }
-        lastSampleAt = now
         return true
+    }
+
+    mutating func recordSample(at now: TimeInterval) {
+        if now.isFinite {
+            lastSampleAt = now
+        } else {
+            invalidateSampling()
+        }
     }
 
     mutating func invalidateSampling() {

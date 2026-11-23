@@ -288,11 +288,18 @@ actor PathAFMP4Demuxer: MediaDemuxing {
     ) -> Bool {
         guard generation == readerMutationGeneration, !Task.isCancelled,
               waitBudget?.isCancelled != true else { return false }
+        let previous = kind == .video ? video : audio
+        let fragmentChanged = previous?.cursor != reader.cursor
+            || previous?.activeFragment?.fragmentStart != reader.activeFragment?.fragmentStart
         switch kind {
         case .video: video = reader
         case .audio: audio = reader
         }
         relay?.publish(packets, track: kind)
+        if fragmentChanged, prefetchSeekGeneration == nil, multiConnectionPrefetcher != nil {
+            let generation = openGeneration
+            Task { await self.notifyPrimaryTailSplit(generation: generation) }
+        }
         return true
     }
 
@@ -2163,7 +2170,7 @@ actor PathAFMP4Demuxer: MediaDemuxing {
     ) async throws -> BoxHeader? {
         guard offset >= 0, end - offset >= 8 else { return nil }
         let count = min(16, end - offset)
-        let data = try await source.read(offset: Int64(offset), count: count)
+        let data = try await source.read(offset: Int64(offset), count: count, recordReadPosition: false)
         guard data.count == count, let header = parseBoxHeader(data, at: 0) else {
             throw PathAFMP4.ParseError.malformed(PathAFMP4.ParseFailure(
                 phase: .box, field: "header", reason: "truncated_or_invalid", offset: offset
@@ -2175,7 +2182,7 @@ actor PathAFMP4Demuxer: MediaDemuxing {
     private static func forwardFragmentProof(
         _ reader: TrackReader, offset: Int, size: Int, payload: Range<Int>
     ) async throws -> ForwardReferenceProof? {
-        let data = try await reader.source.read(offset: Int64(offset), count: size)
+        let data = try await reader.source.read(offset: Int64(offset), count: size, recordReadPosition: false)
         guard data.count == size else {
             throw PathAFMP4.ParseError.malformed(PathAFMP4.ParseFailure(
                 phase: .fragment, boxType: "moof", field: "size", reason: "truncated", offset: offset
@@ -2811,7 +2818,8 @@ actor PathAFMP4Demuxer: MediaDemuxing {
             guard let header = try await readBoxHeader(
                 reader.source,
                 at: fragmentOffset,
-                containingEnd: reader.endByte > 0 ? reader.endByte : nil
+                containingEnd: reader.endByte > 0 ? reader.endByte : nil,
+                recordReadPosition: false
             ), header.size >= header.headerLength else {
                 reader.fragmentIndexComplete = true
                 break
@@ -2830,7 +2838,8 @@ actor PathAFMP4Demuxer: MediaDemuxing {
             if header.type == "moof" {
                 let moof = try await reader.source.read(
                     offset: Int64(fragmentOffset),
-                    count: header.size
+                    count: header.size,
+                    recordReadPosition: false
                 )
                 guard moof.count <= header.size else {
                     throw PathAFMP4.ParseError.malformed(PathAFMP4.ParseFailure(
@@ -2857,7 +2866,8 @@ actor PathAFMP4Demuxer: MediaDemuxing {
                 guard let mdatHeader = try await readBoxHeader(
                     reader.source,
                     at: mdatOffset,
-                    containingEnd: reader.endByte > 0 ? reader.endByte : nil
+                    containingEnd: reader.endByte > 0 ? reader.endByte : nil,
+                    recordReadPosition: false
                 ) else {
                     throw PathAFMP4.ParseError.malformed(PathAFMP4.ParseFailure(
                         phase: .fragment, boxType: "moof", field: "mdat", reason: "missing",
@@ -3264,10 +3274,13 @@ actor PathAFMP4Demuxer: MediaDemuxing {
     private static func readBoxHeader(
         _ source: PathAHTTPMediaSource,
         at offset: Int,
-        containingEnd: Int? = nil
+        containingEnd: Int? = nil,
+        recordReadPosition: Bool = true
     ) async throws -> BoxHeader? {
         guard offset >= 0 else { return nil }
-        let bytes = try await source.read(offset: Int64(offset), count: 16)
+        let bytes = try await source.read(
+            offset: Int64(offset), count: 16, recordReadPosition: recordReadPosition
+        )
         guard bytes.count <= 16 else {
             throw PathAFMP4.ParseError.malformed(PathAFMP4.ParseFailure(
                 phase: .box, field: "readSize", reason: "exceeds_request",
@@ -3440,7 +3453,8 @@ private extension PathAFMP4Demuxer {
             }
             tracks.append(.init(
                 key: binding.key, helpers: helpers, tier1Hosts: tier1Hosts, fragments: fragments,
-                cursor: Int64(reader.activeFragment?.assembler.resumeOffset ?? reader.cursor)
+                cursor: Int64(reader.activeFragment?.assembler.resumeOffset ?? reader.cursor),
+                primaryHost: primary.host
             ))
             kinds.append(input.kind)
         }
@@ -3482,6 +3496,11 @@ private extension PathAFMP4Demuxer {
                 },
                 notifyTailAvailable: { [weak self] in
                     Task { await self?.notifyPrimaryTailSplit(generation: generation) }
+                },
+                requestUrgentAssist: { [weak prefetcher] range, excludePrimaryHost in
+                    await prefetcher?.assistUrgentRange(
+                        trackIndex: trackIndex, range: range, excludePrimaryHost: excludePrimaryHost
+                    ) ?? false
                 }
             )
             bindings.append((reader.source, hint))

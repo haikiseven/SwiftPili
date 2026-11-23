@@ -132,7 +132,7 @@ struct PlayerSeekStrip: View {
             return Projection(progress: 0, buffered: 0)
         }
         let position = player.seekStripDisplayPosition(gestureDisplay: gestureDisplay, samplingClock: samplingClock)
-        let end = player.seekStripBufferedEnd(at: position, isScrubbing: gestureDisplay.isSeeking) ?? 0
+        let end = player.seekStripBufferedEnd ?? 0
         return Projection(progress: position / player.duration, buffered: end / player.duration)
     }
 
@@ -142,13 +142,14 @@ struct PlayerSeekStrip: View {
         guard sceneIsActive, isVisible, isOwner,
               player.mode.isSeekable, player.currentURL != nil,
               !player.isFullscreen || player.showControls || gestureDisplay.isSeeking,
-              !gestureDisplay.isSeeking, player.canSampleSeekStripClock,
               player.duration.isFinite, player.duration > 0,
-              width.isFinite, width > 0, displayScale.isFinite, displayScale > 0,
+              width.isFinite, width > 0, displayScale.isFinite, displayScale > 0 else { return nil }
+        if gestureDisplay.isSeeking { return BufferedTimeUIProjection.defaultCadence }
+        guard player.canSampleSeekStripClock,
               player.playbackRate.isFinite, player.playbackRate > 0 else { return nil }
         let pixels = Double(width * displayScale)
         let interval = player.duration / pixels / Double(player.playbackRate)
-        return min(max(interval, 1.0 / 60), 0.25)
+        return min(max(interval, 1.0 / 60), BufferedTimeUIProjection.defaultCadence)
     }
 
     private struct SponsorCacheKey: Equatable {

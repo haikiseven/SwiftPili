@@ -67,6 +67,29 @@ actor PathAHTTPMediaSource {
         let trackByteRate: Double
         let isAvailable: @Sendable () -> Bool
         let notifyTailAvailable: @Sendable () -> Void
+        let requestUrgentAssist: (@Sendable (Range<Int64>, _ excludePrimaryHost: Bool) async -> Bool)?
+
+        init(
+            trackByteRate: Double,
+            isAvailable: @escaping @Sendable () -> Bool,
+            notifyTailAvailable: @escaping @Sendable () -> Void,
+            requestUrgentAssist: (@Sendable (Range<Int64>, _ excludePrimaryHost: Bool) async -> Bool)? = nil
+        ) {
+            self.trackByteRate = trackByteRate
+            self.isAvailable = isAvailable
+            self.notifyTailAvailable = notifyTailAvailable
+            self.requestUrgentAssist = requestUrgentAssist
+        }
+    }
+
+    struct PrimaryStallPolicy: Sendable, Equatable {
+        var stallTimeout: TimeInterval = 0.90
+        var slowCheckDelay: TimeInterval = 1.20
+        var slowFloorBytesPerSec: Double = 256 * 1024
+        var yieldCooldown: TimeInterval = 5.0
+        var watchInterval: TimeInterval = 0.25
+
+        static let standard = Self()
     }
 
     private static let minimumTailSplitBytes: Int64 = 2 * 1024 * 1024
@@ -74,6 +97,8 @@ actor PathAHTTPMediaSource {
     private var retrievalEstimate: RetrievalEstimate?
     private var primaryThroughputEWMA: Double?
     private var tailAssistHint: TailAssistHint?
+    private let primaryStallPolicy: PrimaryStallPolicy
+    private var primaryYieldedUntil: TimeInterval = 0
 
     func setTailAssistHint(_ hint: TailAssistHint?) {
         tailAssistHint = hint
@@ -111,7 +136,8 @@ actor PathAHTTPMediaSource {
         session: URLSession? = nil,
         byteStore: MediaByteRangeStore? = nil,
         networkBytes: MediaNetworkByteCounter? = nil,
-        bootstrapIdentity: MediaBootstrapIdentity? = nil
+        bootstrapIdentity: MediaBootstrapIdentity? = nil,
+        primaryStallPolicy: PrimaryStallPolicy = .standard
     ) {
         self.url = url
         self.networkBytes = url.isFileURL ? nil : networkBytes
@@ -119,6 +145,7 @@ actor PathAHTTPMediaSource {
         self.headers = headers
         self.isFile = url.isFileURL
         self.byteStore = url.isFileURL ? nil : byteStore
+        self.primaryStallPolicy = primaryStallPolicy
         if let session {
             self.session = session
             self.ownsSession = false
@@ -254,7 +281,8 @@ actor PathAHTTPMediaSource {
 
     func read(
         offset: Int64, count: Int, waitBudget: MediaSourceWaitBudget? = nil,
-        displayOwner: MediaDisplayByteOwner? = nil
+        displayOwner: MediaDisplayByteOwner? = nil,
+        recordReadPosition: Bool = true
     ) async throws -> Data {
         try checkWaitBudget(waitBudget)
         guard let window = PathAHTTPRangeValidator.makeByteWindow(offset: offset, count: count) else {
@@ -272,24 +300,28 @@ actor PathAHTTPMediaSource {
             )
             return slice
         }
-        releaseHeadIfPassed(offset: offset)
+        if recordReadPosition { releaseHeadIfPassed(offset: offset) }
         if let binding = storeBinding {
             return try await readStoredWindow(
-                window, binding: binding, waitBudget: waitBudget, displayOwner: displayOwner
+                window, binding: binding, waitBudget: waitBudget,
+                displayOwner: displayOwner, recordReadPosition: recordReadPosition
             )
         }
-        return try await readNetworkWindow(window, claim: nil, waitBudget: waitBudget).data
+        return try await readNetworkWindow(
+            window, claim: nil, waitBudget: waitBudget, recordReadPosition: recordReadPosition
+        ).data
     }
 
     private func readStoredWindow(
         _ window: ByteWindow, binding: PathAByteStoreBinding, waitBudget: MediaSourceWaitBudget?,
-        displayOwner: MediaDisplayByteOwner?
+        displayOwner: MediaDisplayByteOwner?, recordReadPosition: Bool
     ) async throws -> Data {
         let ticket = chunkOpenTicket
         let end = min(window.endExclusive, binding.key.contentLength)
         var cursor = window.offset
         var output = Data()
         var deadline: TimeInterval?
+        var assistAttemptedOffset: Int64?
         while cursor < end {
             try checkClaimFence(ticket, waitBudget: waitBudget)
             let count = Int(end - cursor)
@@ -297,10 +329,13 @@ actor PathAHTTPMediaSource {
                 binding.key, offset: cursor, count: count, displayOwner: displayOwner
             ) {
                 try checkClaimFence(ticket, waitBudget: waitBudget)
-                await binding.store.noteRead(binding.key, offset: cursor)
-                try checkClaimFence(ticket, waitBudget: waitBudget)
+                if recordReadPosition {
+                    await binding.store.noteRead(binding.key, offset: cursor)
+                    try checkClaimFence(ticket, waitBudget: waitBudget)
+                }
                 output.append(held)
                 cursor += Int64(held.count)
+                deadline = nil
                 continue
             }
             try checkClaimFence(ticket, waitBudget: waitBudget)
@@ -317,12 +352,18 @@ actor PathAHTTPMediaSource {
             let span = await binding.span(offset: cursor, end: end)
             try checkClaimFence(ticket, waitBudget: waitBudget)
             guard let hole = span else { break }
-            let response = try await readStoredHole(hole, binding: binding, ticket: ticket, waitBudget: waitBudget)
+            let canAssist = assistAttemptedOffset != hole.lowerBound
+            let response = try await readStoredHole(
+                hole, binding: binding, ticket: ticket, waitBudget: waitBudget,
+                recordReadPosition: recordReadPosition, canAssist: canAssist,
+                didAttemptAssist: { assistAttemptedOffset = hole.lowerBound; deadline = nil }
+            )
             try checkClaimFence(ticket, waitBudget: waitBudget)
             guard let response else { continue }
             displayOwner?.hold(cursor..<(cursor + Int64(response.data.count)))
             output.append(response.data)
             cursor += Int64(response.data.count)
+            deadline = nil
             if response.data.count < hole.count {
                 guard response.reachedResourceEnd else { throw SourceError.invalidRange }
                 return output
@@ -333,9 +374,19 @@ actor PathAHTTPMediaSource {
     }
 
     private func readStoredHole(
-        _ hole: Range<Int64>, binding: PathAByteStoreBinding, ticket: UInt64, waitBudget: MediaSourceWaitBudget?
+        _ hole: Range<Int64>, binding: PathAByteStoreBinding, ticket: UInt64,
+        waitBudget: MediaSourceWaitBudget?, recordReadPosition: Bool,
+        canAssist: Bool, didAttemptAssist: () -> Void
     ) async throws -> NetworkWindowResult? {
         try checkClaimFence(ticket, waitBudget: waitBudget)
+        if canAssist, primaryYieldedUntil > ProcessInfo.processInfo.systemUptime,
+           let hint = tailAssistHint, hint.isAvailable(), let assist = hint.requestUrgentAssist {
+            didAttemptAssist()
+            if await assist(hole, true) {
+                try checkClaimFence(ticket, waitBudget: waitBudget)
+                return nil
+            }
+        }
         let token = binding.claimForSource(offset: hole.lowerBound, count: hole.count)
         sourceClaims.insert(token, store: binding.store)
         defer { sourceClaims.release(token) }
@@ -345,18 +396,57 @@ actor PathAHTTPMediaSource {
         guard let window = PathAHTTPRangeValidator.makeByteWindow(offset: hole.lowerBound, count: hole.count) else {
             throw SourceError.invalidRange
         }
-        return try await readNetworkWindow(
-            window, claim: ReadClaim(token: token, waitTicket: ticket), waitBudget: waitBudget
-        )
+        let claim = ReadClaim(token: token, waitTicket: ticket)
+        guard canAssist, let hint = tailAssistHint, hint.isAvailable(),
+              let assist = hint.requestUrgentAssist else {
+            return try await readNetworkWindow(
+                window, claim: claim, waitBudget: waitBudget, recordReadPosition: recordReadPosition
+            )
+        }
+        let stallTimeout = primaryStallPolicy.stallTimeout
+        enum HoleRace: Sendable {
+            case result(NetworkWindowResult)
+            case stalled
+        }
+        let outcome = try await withThrowingTaskGroup(of: HoleRace.self) { group in
+            group.addTask {
+                .result(try await self.readNetworkWindow(
+                    window, claim: claim, waitBudget: waitBudget, recordReadPosition: recordReadPosition
+                ))
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(stallTimeout))
+                return .stalled
+            }
+            guard let first = try await group.next() else {
+                throw CancellationError()
+            }
+            group.cancelAll()
+            return first
+        }
+        switch outcome {
+        case .result(let response):
+            return response
+        case .stalled:
+            sourceClaims.release(token)
+            try checkClaimFence(ticket, waitBudget: waitBudget)
+            primaryYieldedUntil = ProcessInfo.processInfo.systemUptime + primaryStallPolicy.yieldCooldown
+            didAttemptAssist()
+            PlayerLog.log("[PathA] primary read stalled off=\(hole.lowerBound) len=\(hole.count)B → handoff to multi-conn")
+            _ = await assist(hole, true)
+            try checkClaimFence(ticket, waitBudget: waitBudget)
+            return nil
+        }
     }
 
-    private struct NetworkWindowResult {
+    private struct NetworkWindowResult: Sendable {
         let data: Data
         let reachedResourceEnd: Bool
     }
 
     private func readNetworkWindow(
-        _ window: ByteWindow, claim readClaim: ReadClaim?, waitBudget: MediaSourceWaitBudget?
+        _ window: ByteWindow, claim readClaim: ReadClaim?, waitBudget: MediaSourceWaitBudget?,
+        recordReadPosition: Bool = true
     ) async throws -> NetworkWindowResult {
         try checkReadClaim(readClaim, waitBudget: waitBudget)
         var request = makeRequest()
@@ -373,12 +463,16 @@ actor PathAHTTPMediaSource {
 
         switch http.statusCode {
         case 206:
-            let result = try await acceptPartialRead(data, http: http, window: window)
+            let result = try await acceptPartialRead(
+                data, http: http, window: window, recordReadPosition: recordReadPosition
+            )
             try checkReadClaim(readClaim, waitBudget: waitBudget)
             if !result.data.isEmpty, let issue { waitBudget?.notePrimaryDelivery(issue) }
             return result
         case 200:
-            let result = try await acceptCompleteRead(received, window: window)
+            let result = try await acceptCompleteRead(
+                received, window: window, recordReadPosition: recordReadPosition
+            )
             try checkReadClaim(readClaim, waitBudget: waitBudget)
             if !result.data.isEmpty, let issue { waitBudget?.notePrimaryDelivery(issue) }
             return result
@@ -390,7 +484,7 @@ actor PathAHTTPMediaSource {
     }
 
     private func acceptPartialRead(
-        _ data: Data, http: HTTPURLResponse, window: ByteWindow
+        _ data: Data, http: HTTPURLResponse, window: ByteWindow, recordReadPosition: Bool = true
     ) async throws -> NetworkWindowResult {
         let range = try PathAHTTPRangeValidator.validatePartialResponse(
             http.value(forHTTPHeaderField: "Content-Range"), requested: window, bodyCount: data.count
@@ -401,20 +495,20 @@ actor PathAHTTPMediaSource {
         )
         guard accountBytesRead(data.count) else { throw SourceError.invalidRange }
         if let binding = storeBinding, let range, binding.admits(resourceLength: range.total) {
-            await binding.admit(offset: window.offset, data: data)
+            await binding.admit(offset: window.offset, data: data, noteRead: recordReadPosition)
         }
         return NetworkWindowResult(data: data, reachedResourceEnd: range.map { $0.total == $0.end + 1 } ?? false)
     }
 
     private func acceptCompleteRead(
-        _ received: MediaNetworkResponse, window: ByteWindow
+        _ received: MediaNetworkResponse, window: ByteWindow, recordReadPosition: Bool = true
     ) async throws -> NetworkWindowResult {
         let data = received.data
         PlayerLog.log("[PathA] ⚠️ http 200 for ranged GET host=\(url.host ?? "?") — bounded window retained")
         guard let receivedCount = Int(exactly: received.receivedBodyBytes),
               accountBytesRead(receivedCount) else { throw SourceError.invalidRange }
         if let binding = storeBinding, binding.admits(resourceLength: received.resourceLength), !data.isEmpty {
-            await binding.admit(offset: window.offset, data: data)
+            await binding.admit(offset: window.offset, data: data, noteRead: recordReadPosition)
         }
         let reachedEnd = received.isCompleteBody
             || received.resourceLength.map { window.endExclusive >= $0 } == true
@@ -446,6 +540,7 @@ actor PathAHTTPMediaSource {
     private struct ChunkStreamSlot {
         let id: UInt64
         var network: NetworkSpan?
+        var stallMonitor: Task<Void, Never>?
         var networkGeneration: UInt64 = 0
         let baseOffset: Int64
         let requestedCount: Int64
@@ -472,6 +567,7 @@ actor PathAHTTPMediaSource {
         let offset: Int64
         let count: Int64
         let primaryDelivery: PrimaryDelivery?
+        let startedAt = ContinuousClock.now
         var claim: MediaByteRangeStore.ClaimToken?
         var storeAdmission: PathAByteStoreBinding?
         var responseKind: ChunkResponseKind = .pending
@@ -618,10 +714,78 @@ actor PathAHTTPMediaSource {
         let primary = waitBudget.map {
             PrimaryDelivery(budget: $0, issue: $0.notePrimaryRequest(range: offset..<end))
         }
-        slot.network = NetworkSpan(generation: slot.networkGeneration, task: task,
+        let spanGeneration = slot.networkGeneration
+        slot.network = NetworkSpan(generation: spanGeneration, task: task,
                                    offset: offset, count: Int64(count), primaryDelivery: primary, claim: claim)
+        slot.stallMonitor?.cancel()
+        if storeBinding != nil, let hint = tailAssistHint, hint.isAvailable(), hint.requestUrgentAssist != nil {
+            let interval = max(0.02, primaryStallPolicy.watchInterval)
+            slot.stallMonitor = Task { [weak self] in
+                while !Task.isCancelled {
+                    do { try await Task.sleep(for: .seconds(interval)) } catch { return }
+                    guard !Task.isCancelled else { return }
+                    let done = await self?.evaluateNetworkSpanStall(id, generation: spanGeneration) ?? true
+                    if done { return }
+                }
+            }
+        } else {
+            slot.stallMonitor = nil
+        }
         chunkSlot = slot
         task.resume()
+    }
+
+    private func evaluateNetworkSpanStall(_ id: UInt64, generation: UInt64) -> Bool {
+        guard var slot = chunkSlot, slot.id == id,
+              let network = slot.network, network.generation == generation,
+              !slot.tailEndedForBackpressure, !slot.finished, slot.failure == nil else {
+            return true
+        }
+        guard let hint = tailAssistHint, hint.isAvailable(), hint.requestUrgentAssist != nil else {
+            slot.stallMonitor = nil
+            chunkSlot = slot
+            return true
+        }
+        let now = ContinuousClock.now
+        let sinceStart = Double(network.startedAt.duration(to: now) / .seconds(1))
+        let sinceLastByte = Double((network.lastBodyAt ?? network.startedAt).duration(to: now) / .seconds(1))
+        var stalled = false
+        if network.responseBytes == 0 {
+            stalled = sinceStart >= primaryStallPolicy.stallTimeout
+        } else if sinceLastByte >= primaryStallPolicy.stallTimeout {
+            stalled = true
+        } else if sinceStart >= primaryStallPolicy.slowCheckDelay {
+            let rate = Double(network.responseBytes) / max(0.001, sinceStart)
+            let floor = max(primaryStallPolicy.slowFloorBytesPerSec, hint.trackByteRate * 1.1)
+            let remaining = Double(max(0, network.count - network.responseBytes))
+            stalled = rate < floor && (remaining / max(rate, 1)) > 1.0
+        }
+        guard stalled else { return false }
+        yieldStalledNetworkSpan(&slot)
+        return true
+    }
+
+    private func yieldStalledNetworkSpan(_ slot: inout ChunkStreamSlot) {
+        guard let network = slot.network else { return }
+        slot.stallMonitor?.cancel()
+        slot.stallMonitor = nil
+        network.task.cancel()
+        sourceClaims.release(network.claim)
+        slot.network = nil
+        slot.networkGeneration &+= 1
+        primaryYieldedUntil = ProcessInfo.processInfo.systemUptime + primaryStallPolicy.yieldCooldown
+        PlayerLog.log(
+            "[PathA] primary stream stalled/slow off=\(network.offset) " +
+            "recv=\(network.responseBytes)/\(network.count)B → handoff to multi-conn"
+        )
+        if let waiter = slot.waiter {
+            slot.waiter = nil
+            slot.waiterID = nil
+            chunkSlot = slot
+            waiter.resume(returning: StreamChunk(data: Data(), primaryDelivery: nil))
+        } else {
+            chunkSlot = slot
+        }
     }
 
     private func logHeldPrefix(offset: Int64, count: Int, primed: Int, cached: Int) {
@@ -755,6 +919,8 @@ actor PathAHTTPMediaSource {
     private func failChunkSlot(_ slot: inout ChunkStreamSlot, error: Error) {
         slot.failure = error
         slot.finished = false
+        slot.stallMonitor?.cancel()
+        slot.stallMonitor = nil
         slot.network?.task.cancel()
         sourceClaims.release(slot.network?.claim)
         slot.network?.claim = nil
@@ -886,6 +1052,7 @@ actor PathAHTTPMediaSource {
         let logicalEnd = original.baseOffset + original.requestedCount
         let end = min(logicalEnd, binding.key.contentLength)
         var deadline: TimeInterval?
+        var assistAttemptedPosition: Int64?
         while true {
             try checkWaitBudget(waitBudget)
             guard var current = chunkSlot, current.id == id, current.delivered == original.delivered,
@@ -910,6 +1077,17 @@ actor PathAHTTPMediaSource {
                 current.finished = position + Int64(current.bufferedBytes) >= end
                 chunkSlot = current
                 return
+            }
+            if assistAttemptedPosition != position,
+               primaryYieldedUntil > ProcessInfo.processInfo.systemUptime,
+               let hint = tailAssistHint, hint.isAvailable(), let assist = hint.requestUrgentAssist {
+                assistAttemptedPosition = position
+                let assisted = await assist(position..<end, true)
+                try checkStoredStreamFence(id, original: original, ticket: ticket, waitBudget: waitBudget)
+                if assisted {
+                    deadline = nil
+                    continue
+                }
             }
             let now = ProcessInfo.processInfo.systemUptime
             deadline = deadline ?? (now + 1.5)
@@ -1011,6 +1189,8 @@ actor PathAHTTPMediaSource {
         guard var slot = chunkSlot else { return }
         chunkSlot = nil
         logChunkStreamSummary(slot, outcome: outcome)
+        slot.stallMonitor?.cancel()
+        slot.stallMonitor = nil
         slot.network?.task.cancel()
         sourceClaims.release(slot.network?.claim)
         slot.network?.claim = nil
@@ -1215,6 +1395,8 @@ actor PathAHTTPMediaSource {
             slot.failure = SourceError.invalidRange
         }
         finishPrimaryStreamSpeedWindow(network, error: error, slot: slot)
+        slot.stallMonitor?.cancel()
+        slot.stallMonitor = nil
         slot.network = nil
         if let waiter = slot.waiter {
             slot.waiter = nil
@@ -1241,6 +1423,8 @@ actor PathAHTTPMediaSource {
             || slot.delivered + Int64(slot.bufferedBytes) >= slot.requestedCount
         slot.network?.task.cancel()
         finishPrimaryStreamSpeedWindow(network, error: nil, slot: slot)
+        slot.stallMonitor?.cancel()
+        slot.stallMonitor = nil
         slot.network = nil
         if let waiter = slot.waiter, slot.buffered.isEmpty {
             slot.waiter = nil

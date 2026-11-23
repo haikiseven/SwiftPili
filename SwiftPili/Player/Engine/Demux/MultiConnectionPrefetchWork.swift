@@ -40,19 +40,22 @@ extension MultiConnectionPrefetcher {
         let tier1Hosts: Set<String>
         let fragments: [MultiConnectionPlanner.Fragment]
         var cursor: Int64
+        let primaryHost: String?
 
         init(
             key: MediaByteRangeStore.Key,
             helpers: [URL],
             tier1Hosts: Set<String> = [],
             fragments: [MultiConnectionPlanner.Fragment],
-            cursor: Int64
+            cursor: Int64,
+            primaryHost: String? = nil
         ) {
             self.key = key
             self.helpers = helpers
             self.tier1Hosts = tier1Hosts
             self.fragments = fragments
             self.cursor = cursor
+            self.primaryHost = primaryHost.map(MultiConnectionPlanner.canonicalHost)
         }
     }
     struct Host: Sendable {
@@ -75,15 +78,20 @@ extension MultiConnectionPrefetcher {
         var level = 0
         var peakEdgeRequests = 0
         var refusals = 0
+        var hedges = 0
     }
     struct Flight {
         let id: UUID
         let host: String
         let lane: Int
+        let startedAt: TimeInterval
+        var lastProgressAt: TimeInterval
+        var bytesReceived: Int64 = 0
+        let requestRange: Range<Int64>
         let task: Task<Void, Never>
     }
     final class Piece {
-        let id: UUID
+        var id: UUID
         let range: Range<Int64>
         var receivedThrough: Int64
         var pendingOffset: Int64
@@ -127,6 +135,9 @@ extension MultiConnectionPrefetcher {
         var failedHostsByRange: [Range<Int64>: Set<String>] = [:]
         var rangeRetryCount: [Range<Int64>: Int] = [:]
         var flights: [Int64: Flight] = [:]
+        var hedgeFlights: [Int64: Flight] = [:]
+        var activeFlightCount: Int { flights.count + hedgeFlights.count }
+        var allFlights: [Flight] { Array(flights.values) + Array(hedgeFlights.values) }
         var hasQueuedBytes: Bool { nextOffset < candidate.claimRange.upperBound || !deferredRanges.isEmpty }
         var allBytesPublished: Bool { publishedThrough == candidate.claimRange.upperBound }
 
@@ -164,14 +175,18 @@ extension MultiConnectionPrefetcher {
         }
 
         static func fits(
-            _ candidate: MultiConnectionPlanner.Candidate, context: PlanContext, works: [Work]
+            _ candidate: MultiConnectionPlanner.Candidate, context: PlanContext, works: [Work],
+            isRankZero: Bool = false
         ) -> Bool {
             let reservationLimit = context.cap / 2
             guard let candidateReservation = claimReservationBytes(
                 payloadBytes: candidate.claimBytes, totalCap: context.cap
             ) else { return false }
-            var remaining = context.budget
-            var trackRemaining = context.shares[candidate.track]
+            let singleLimit = context.cap / 3
+            var remaining = isRankZero ? max(context.budget, min(context.capShares[candidate.track], singleLimit)) : context.budget
+            var trackRemaining = isRankZero
+                ? max(context.shares[candidate.track], min(context.capShares[candidate.track], singleLimit))
+                : context.shares[candidate.track]
             var reservedRemaining = reservationLimit
             for work in works {
                 let bytes = work.candidate.claimBytes
@@ -210,39 +225,105 @@ extension MultiConnectionPrefetcher {
     }
 
     func receivePrefix(
-        id: UUID, flightID: UUID, generation: UInt64, range: Range<Int64>, prefix: MultiConnectionPrefix
+        id: UUID, flightID: UUID, generation: UInt64, pieceKey: Int64, prefix: MultiConnectionPrefix
     ) async throws {
         try Task.checkCancellation()
         guard let work = works[id], generation == epoch, ownsWork(work),
-              work.flights[range.lowerBound]?.id == flightID,
-              let piece = work.pieces[range.lowerBound], piece.id == flightID, piece.range == range else {
+              let piece = work.pieces[pieceKey] else {
             throw CancellationError()
         }
+        let isPrimary = work.flights[pieceKey]?.id == flightID && piece.id == flightID
+        let isHedge = work.hedgeFlights[pieceKey]?.id == flightID
+        guard isPrimary || isHedge,
+              var flight = isPrimary ? work.flights[pieceKey] : work.hedgeFlights[pieceKey] else {
+            throw CancellationError()
+        }
+        let expectedOffset = flight.requestRange.lowerBound + flight.bytesReceived
         let remaining = work.candidate.claimRange.upperBound - work.publishedThrough
         guard !prefix.data.isEmpty, prefix.data.count <= MultiConnectionPlanner.minimumPieceBytes,
-              prefix.offset == piece.receivedThrough, prefix.offset < range.upperBound,
-              Int64(prefix.data.count) <= range.upperBound - prefix.offset,
-              work.stagingBytes <= remaining, Int64(prefix.data.count) <= remaining - work.stagingBytes else {
+              prefix.offset == expectedOffset,
+              prefix.offset >= piece.range.lowerBound,
+              prefix.offset < piece.range.upperBound,
+              Int64(prefix.data.count) <= piece.range.upperBound - prefix.offset else {
             throw PathAHTTPMediaSource.SourceError.invalidRange
         }
-        piece.pending.append(prefix.data)
-        piece.receivedThrough += Int64(prefix.data.count)
-        work.stagingBytes += Int64(prefix.data.count)
+        let now = clock()
+        flight.lastProgressAt = now
+        flight.bytesReceived += Int64(prefix.data.count)
+        if isPrimary {
+            work.flights[pieceKey] = flight
+        } else {
+            work.hedgeFlights[pieceKey] = flight
+        }
+        let prefixEnd = prefix.offset + Int64(prefix.data.count)
+        guard prefixEnd > piece.receivedThrough else {
+            return
+        }
+        let overlap = Int(max(0, piece.receivedThrough - prefix.offset))
+        let appendData = overlap > 0 ? Data(prefix.data.dropFirst(overlap)) : prefix.data
+        guard !appendData.isEmpty,
+              work.stagingBytes <= remaining,
+              Int64(appendData.count) <= remaining - work.stagingBytes else {
+            throw PathAHTTPMediaSource.SourceError.invalidRange
+        }
+        if isHedge {
+            promoteHedgeFlight(work, pieceKey: pieceKey, piece: piece, now: now)
+        }
+        piece.pending.append(appendData)
+        piece.receivedThrough += Int64(appendData.count)
+        work.stagingBytes += Int64(appendData.count)
         await publishContiguousPieces(work)
         try Task.checkCancellation()
         guard ownsWork(work) else { throw CancellationError() }
     }
 
-    func finishFailure(id: UUID, flightID: UUID, host: String, range: Range<Int64>, error: any Error) async {
-        guard let work = works[id], work.epoch == epoch,
-              work.flights[range.lowerBound]?.id == flightID else { return }
-        if case MultiConnectionTransportError.quiet = error, ownsWork(work) {
-            if work.committing { work.refillAfterPublication = true }
-            work.pieces[range.lowerBound] = nil
-            await deferPiece(id: id, host: host, range: range)
-        } else {
-            await fail(id: id, host: host, range: range, error: error)
+    private func promoteHedgeFlight(_ work: Work, pieceKey: Int64, piece: Piece, now: TimeInterval) {
+        guard let hedge = work.hedgeFlights.removeValue(forKey: pieceKey) else { return }
+        if let displaced = work.flights.removeValue(forKey: pieceKey) {
+            displaced.task.cancel()
+            penalizeStalledHost(displaced.host, now: now)
         }
+        piece.id = hedge.id
+        work.flights[pieceKey] = hedge
+    }
+
+    func finishFailure(
+        id: UUID, flightID: UUID, host: String, pieceKey: Int64, range: Range<Int64>, error: any Error
+    ) async {
+        guard let work = works[id], work.epoch == epoch else { return }
+        if work.hedgeFlights[pieceKey]?.id == flightID {
+            work.hedgeFlights[pieceKey] = nil
+            let isQuiet: Bool
+            if case MultiConnectionTransportError.quiet = error { isQuiet = true } else { isQuiet = false }
+            let cancelled = work.cancellation.isCancelled || error is CancellationError || !ownsWork(work)
+            if !cancelled, !isQuiet { recordFailure(host: host, error: error) }
+            if ownsWork(work), canSchedule {
+                refillQueues()
+                armStallWatchIfNeeded()
+                await schedule()
+            }
+            return
+        }
+        guard work.flights[pieceKey]?.id == flightID else { return }
+        if case MultiConnectionTransportError.quiet = error, ownsWork(work) {
+            work.hedgeFlights.removeValue(forKey: pieceKey)?.task.cancel()
+            if work.committing { work.refillAfterPublication = true }
+            await deferPiece(id: id, pieceKey: pieceKey, fallbackRange: range)
+            return
+        }
+        if ownsWork(work), let piece = work.pieces[pieceKey],
+           let hedge = work.hedgeFlights[pieceKey],
+           hedge.requestRange.lowerBound <= piece.receivedThrough {
+            let cancelled = work.cancellation.isCancelled || error is CancellationError
+            if !cancelled { recordFailure(host: host, error: error) }
+            work.hedgeFlights[pieceKey] = nil
+            piece.id = hedge.id
+            work.flights[pieceKey] = hedge
+            armStallWatchIfNeeded()
+            return
+        }
+        work.hedgeFlights.removeValue(forKey: pieceKey)?.task.cancel()
+        await fail(id: id, host: host, pieceKey: pieceKey, range: range, error: error)
     }
 
     func publishContiguousPieces(_ work: Work) async {
@@ -285,7 +366,7 @@ extension MultiConnectionPrefetcher {
         let expected = work.candidate.claimBytes
         guard ownsWork(work), !work.retirementSettled, work.allBytesPublished,
               work.completedResponseBytes + work.admittedBeforeRetryBytes == expected,
-              work.flights.isEmpty, !work.hasQueuedBytes, work.stagingBytes == 0,
+              work.activeFlightCount == 0, !work.hasQueuedBytes, work.stagingBytes == 0,
               work.pieces.isEmpty else { return }
         if work.candidate.claimRange.upperBound == work.candidate.fragment.range.upperBound {
             completedFragments += 1
@@ -296,21 +377,25 @@ extension MultiConnectionPrefetcher {
         store.release(work.claim)
     }
 
-    func deferPiece(id: UUID, host: String, range: Range<Int64>) async {
+    func deferPiece(id: UUID, pieceKey: Int64, fallbackRange: Range<Int64>) async {
         guard let work = works[id] else { return }
-        work.flights[range.lowerBound] = nil
-        work.enqueueDeferred(range)
+        let detached = detachFailedPiece(work, pieceKey: pieceKey, fallbackRange: fallbackRange)
+        work.admittedBeforeRetryBytes += detached.admittedPrefix
+        if !detached.retryRange.isEmpty {
+            work.enqueueDeferred(detached.retryRange)
+        }
         await schedule()
     }
 
-    func fail(id: UUID, host: String, range: Range<Int64>, error: any Error) async {
+    func fail(id: UUID, host: String, pieceKey: Int64, range: Range<Int64>, error: any Error) async {
         guard let work = works[id] else { return }
         let cancelled = work.cancellation.isCancelled || error is CancellationError || !ownsWork(work)
         if !cancelled { recordFailure(host: host, error: error) }
-        let detached = detachFailedPiece(work, range: range)
-        var failedHosts = work.failedHostsByRange.removeValue(forKey: range) ?? []
+        let fullRange = work.pieces[pieceKey]?.range ?? range
+        let detached = detachFailedPiece(work, pieceKey: pieceKey, fallbackRange: fullRange)
+        var failedHosts = work.failedHostsByRange.removeValue(forKey: fullRange) ?? []
         failedHosts.insert(host)
-        let retries = (work.rangeRetryCount.removeValue(forKey: range) ?? 0) + 1
+        let retries = (work.rangeRetryCount.removeValue(forKey: fullRange) ?? 0) + 1
         let hasUnfailedHost = availableHosts(track: work.candidate.track)
             .contains { !failedHosts.contains($0.host ?? "") }
         if !cancelled, !policyBlocked, canSchedule, ownsWork(work),
@@ -341,10 +426,11 @@ extension MultiConnectionPrefetcher {
     }
 
     private func detachFailedPiece(
-        _ work: Work, range: Range<Int64>
+        _ work: Work, pieceKey: Int64, fallbackRange: Range<Int64>
     ) -> (retryRange: Range<Int64>, admittedPrefix: Int64) {
-        work.flights[range.lowerBound] = nil
-        guard let piece = work.pieces.removeValue(forKey: range.lowerBound) else { return (range, 0) }
+        work.flights[pieceKey] = nil
+        guard let piece = work.pieces.removeValue(forKey: pieceKey) else { return (fallbackRange, 0) }
+        let range = piece.range
         let unsubmitted = max(0, piece.receivedThrough - piece.pendingOffset)
         piece.pending.clear()
         if unsubmitted > 0 {
@@ -358,7 +444,7 @@ extension MultiConnectionPrefetcher {
     func pruneRetiredWork() {
         for work in Array(works.values) where !work.committing {
             let claimLost = !work.allBytesPublished && !store.isClaimActive(work.claim)
-            let stuckUnlaunchable = work.flights.isEmpty && work.hasQueuedBytes
+            let stuckUnlaunchable = work.activeFlightCount == 0 && work.hasQueuedBytes
                 && !availableHosts(track: work.candidate.track).contains { work.canLaunch(on: $0.host ?? "") }
             if work.cancellation.isCancelled || claimLost || stuckUnlaunchable {
                 cancelWork(id: work.id)
@@ -376,9 +462,9 @@ extension MultiConnectionPrefetcher {
             let track = tracks[index]
             heldByTrack[index] = await store.segmentRanges(for: track.key)
             if let current = track.fragments.lastIndex(where: { $0.range.lowerBound <= track.cursor }),
-               let tail = await store.currentTailAssistSpan(
-                track.key, within: track.fragments[current].range,
-                minimumBytes: MultiConnectionPlanner.minimumSplitBytes
+               let tail = await store.currentFragmentAssistSpan(
+                track.key, cursor: track.cursor, within: track.fragments[current].range,
+                minimumTailSplitBytes: MultiConnectionPlanner.minimumSplitBytes
                ) {
                 currentTailByTrack[index] = tail
             }
@@ -391,9 +477,9 @@ extension MultiConnectionPrefetcher {
         let isCurrent = track.fragments.lastIndex(where: { $0.range.lowerBound <= track.cursor })
             .map { track.fragments[$0].range == candidate.fragment.range } ?? false
         if isCurrent {
-            return await store.currentTailAssistSpan(
-                track.key, within: candidate.fragment.range,
-                minimumBytes: MultiConnectionPlanner.minimumSplitBytes
+            return await store.currentFragmentAssistSpan(
+                track.key, cursor: track.cursor, within: candidate.fragment.range,
+                minimumTailSplitBytes: MultiConnectionPlanner.minimumSplitBytes
             )
         }
         return await store.firstUnclaimedMissingSpan(track.key, within: candidate.fragment.range)
@@ -416,12 +502,40 @@ extension MultiConnectionPrefetcher {
     }
 
     func trackCandidateBudget(track index: Int, context: PlanContext) -> Int64 {
-        let held = heldWindowBytes(track: index, heldRanges: context.heldByTrack[index] ?? [])
+        let heldRanges = context.heldByTrack[index] ?? []
+        let held = heldWindowBytes(track: index, heldRanges: heldRanges)
         let headroom = max(0, context.capShares[index] - held)
+        let singleLimit = context.cap / 3
+        let rankZeroCeiling = min(context.capShares[index], singleLimit > 0 ? singleLimit : context.shares[index])
         let tailFloor = context.currentTailByTrack[index].map {
-            min(context.shares[index], $0.upperBound - $0.lowerBound)
+            min(rankZeroCeiling, $0.upperBound - $0.lowerBound)
         } ?? 0
-        return max(min(context.shares[index], headroom), tailFloor)
+        let gapFloor = earlierGapRankZeroFloor(track: index, context: context, heldRanges: heldRanges)
+        return max(min(context.shares[index], headroom), tailFloor, gapFloor)
+    }
+
+    private func earlierGapRankZeroFloor(
+        track index: Int, context: PlanContext, heldRanges: [Range<Int64>]
+    ) -> Int64 {
+        let track = tracks[index]
+        guard position.isFinite, ahead.isFinite, ahead > 0,
+              let current = track.fragments.lastIndex(where: { $0.range.lowerBound <= track.cursor }) else {
+            return 0
+        }
+        let horizon = position + ahead
+        guard horizon.isFinite else { return 0 }
+        let futureFragments = track.fragments.dropFirst(current + 1).prefix { $0.startSeconds <= horizon }
+        guard let firstMissing = futureFragments.first(where: {
+            MultiConnectionPlanner.firstMissingSpan(in: $0.range, heldRanges: heldRanges) != nil
+        }), let missingSpan = MultiConnectionPlanner.firstMissingSpan(in: firstMissing.range, heldRanges: heldRanges) else {
+            return 0
+        }
+        // Only bypass heldWindowBytes when cached bytes already exist after this gap.
+        let hasHeldAfterGap = heldRanges.contains { $0.upperBound > missingSpan.upperBound }
+        guard hasHeldAfterGap else { return 0 }
+        let singleLimit = context.cap / 3
+        let ceiling = min(context.capShares[index], singleLimit > 0 ? singleLimit : context.shares[index])
+        return min(ceiling, missingSpan.upperBound - missingSpan.lowerBound)
     }
 
     func candidates(track: Int, context: PlanContext) -> [MultiConnectionPlanner.Candidate] {
@@ -447,7 +561,7 @@ extension MultiConnectionPrefetcher {
     }
 
     func fits(_ candidate: MultiConnectionPlanner.Candidate, context: PlanContext) -> Bool {
-        Work.fits(candidate, context: context, works: Array(works.values))
+        Work.fits(candidate, context: context, works: Array(works.values), isRankZero: isRankZero(candidate))
     }
 
     func precedes(

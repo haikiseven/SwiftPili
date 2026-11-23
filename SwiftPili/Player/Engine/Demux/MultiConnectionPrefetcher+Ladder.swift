@@ -68,7 +68,7 @@ extension MultiConnectionPrefetcher {
         let now = clock()
         var inFlight: [String: Int] = [:]
         for work in works.values {
-            for flight in work.flights.values { inFlight[edgeKey(flight.host), default: 0] += 1 }
+            for flight in work.allFlights { inFlight[edgeKey(flight.host), default: 0] += 1 }
         }
         return works.values.contains { work in
             guard !work.committing, !work.cancellation.isCancelled, work.hasQueuedBytes else { return false }
@@ -78,10 +78,37 @@ extension MultiConnectionPrefetcher {
 
     func claimLoopAdmits(_ candidates: inout [MultiConnectionPlanner.Candidate], blocked: Set<Int>) -> Bool {
         candidates.removeAll { blocked.contains($0.track) }
-        guard !candidates.isEmpty,
-              claimAdmits(nil) || (policy.auto && candidates.contains(where: isRankZero)) else { return false }
+        guard !candidates.isEmpty else { return false }
+        if !claimAdmits(nil) {
+            let hasUrgent = candidates.contains(where: isRankZero)
+                && works.values.contains { !isRankZero($0.candidate) && !$0.committing }
+            guard hasUrgent else { return false }
+        }
         candidates.sort { policy.auto ? claimPrecedes($0, $1) : precedes($0, $1, preferAbsentTrack: true) }
         return true
+    }
+
+    func ensureRoomForRankZero(
+        for candidate: MultiConnectionPlanner.Candidate, context: PlanContext
+    ) {
+        let limit = policy.auto ? MultiConnectionPolicy.maxWorks : workLimit
+        while works.count >= limit || !fits(candidate, context: context) {
+            guard let victim = furthestPreemptableWork(for: candidate) else { break }
+            cancelWork(id: victim.id)
+        }
+    }
+
+    private func furthestPreemptableWork(for candidate: MultiConnectionPlanner.Candidate) -> Work? {
+        works.values
+            .filter {
+                !isRankZero($0.candidate) && !$0.committing && $0.candidate.claimRange != candidate.claimRange
+            }
+            .max { lhs, rhs in
+                if lhs.candidate.deadline != rhs.candidate.deadline {
+                    return lhs.candidate.deadline < rhs.candidate.deadline
+                }
+                return lhs.publishedThrough < rhs.publishedThrough
+            }
     }
 
     func fitsOrBlocks(
@@ -162,7 +189,7 @@ extension MultiConnectionPrefetcher {
         var inFlight: [String: Int] = [:]
         var laneLoads: [String: [Int]] = [:]
         for work in works.values {
-            for flight in work.flights.values {
+            for flight in work.allFlights {
                 let edge = edgeKey(flight.host)
                 inFlight[edge, default: 0] += 1
                 var loads = laneLoads[edge] ?? Array(repeating: 0, count: laneCount)
@@ -447,7 +474,7 @@ extension MultiConnectionPrefetcher {
     private func rankZeroProjectedLate() -> Bool {
         works.values.contains { work in
             guard isRankZero(work.candidate), !work.committing, rate > 0 else { return false }
-            let flightHosts = Set(work.flights.values.map(\.host))
+            let flightHosts = Set(work.allFlights.map(\.host))
             let speed = flightHosts.reduce(0.0) { $0 + (hosts[$1]?.speed ?? 0) }
             guard speed > 0 else { return false }
             let fragment = work.candidate.fragment
@@ -455,5 +482,254 @@ extension MultiConnectionPrefetcher {
             let deadline = max(0, fragment.startSeconds - position) / Double(rate)
             return remaining / speed > deadline
         }
+    }
+
+    // MARK: - Urgent assist & stall hedging
+
+    func assistUrgentRange(
+        trackIndex: Int, range: Range<Int64>, excludePrimaryHost: Bool
+    ) async -> Bool {
+        guard canSchedule, tracks.indices.contains(trackIndex),
+              range.lowerBound >= 0, range.lowerBound < range.upperBound else { return false }
+        if excludePrimaryHost { demotePrimaryHostIfAlternativesExist(track: trackIndex) }
+        guard let fragmentIndex = tracks[trackIndex].fragments.lastIndex(where: {
+            $0.range.lowerBound <= range.lowerBound
+        }) else { return false }
+        let fragment = tracks[trackIndex].fragments[fragmentIndex]
+        let boundedEnd = min(range.upperBound, fragment.range.upperBound)
+        guard range.lowerBound < boundedEnd else { return false }
+
+        if let existing = works.values.first(where: {
+            $0.candidate.track == trackIndex && $0.candidate.claimRange.overlaps(range.lowerBound..<boundedEnd)
+                && !$0.cancellation.isCancelled
+        }) {
+            rankZero[trackIndex] = existing.candidate.fragment.range
+            refillQueues()
+            evaluateStalledFlights(expectedEpoch: epoch)
+            armStallWatchIfNeeded()
+            return true
+        }
+
+        let track = tracks[trackIndex]
+        guard let missing = await store.firstUnclaimedMissingSpan(
+            track.key, within: range.lowerBound..<boundedEnd
+        ) else {
+            let hasBytes = await store.prefix(track.key, offset: range.lowerBound, count: 1) != nil
+            let hasWork = works.values.contains {
+                $0.candidate.track == trackIndex && $0.candidate.claimRange.overlaps(range.lowerBound..<boundedEnd)
+            }
+            return hasBytes || hasWork
+        }
+        guard canSchedule, !availableHosts(track: trackIndex).isEmpty else { return false }
+        let generation = epoch
+        let cap = await store.caps.totalBytes
+        guard generation == epoch, canSchedule else { return false }
+        let singleLimit = max(1, cap / 3)
+        let claimEnd = min(missing.upperBound, missing.lowerBound + singleLimit)
+        let claimRange = missing.lowerBound..<claimEnd
+        guard let reservation = Work.claimReservationBytes(
+            payloadBytes: claimRange.upperBound - claimRange.lowerBound, totalCap: cap
+        ) else { return false }
+
+        if tracks[trackIndex].cursor > missing.lowerBound {
+            tracks[trackIndex].cursor = missing.lowerBound
+        }
+        rankZero[trackIndex] = fragment.range
+        let candidate = MultiConnectionPlanner.Candidate(
+            track: trackIndex, fragment: fragment, claimRange: claimRange, deadline: 0
+        )
+        failedCandidates = failedCandidates.filter {
+            !($0.track == trackIndex && $0.claimRange.overlaps(claimRange))
+        }
+        let workLimitCap = policy.auto ? MultiConnectionPolicy.maxWorks : workLimit
+        while works.count >= workLimitCap
+                || store.rangeClaims.reservedBytes() + reservation > cap / 2 {
+            guard let victim = furthestPreemptableWork(for: candidate) else { break }
+            cancelWork(id: victim.id)
+        }
+        let cancellation = MultiConnectionCancellation()
+        guard let claim = await store.claim(
+            track.key, range: claimRange, reservationBytes: reservation,
+            onCancel: { cancellation.cancel() }
+        ) else { return false }
+        guard generation == epoch, canSchedule, store.isClaimActive(claim),
+              !cancellation.isCancelled else {
+            store.release(claim)
+            return false
+        }
+        let lease = ClaimLease(token: claim, reservationBytes: reservation, cancellation: cancellation)
+        let work = Work(
+            candidate: candidate, lease: lease,
+            pieceCap: pieceCap(candidate, bytes: candidate.claimBytes), epoch: generation
+        )
+        works[work.id] = work
+        refillQueues()
+        updateAssistAvailability()
+        armStallWatchIfNeeded()
+        return true
+    }
+
+    private func demotePrimaryHostIfAlternativesExist(track index: Int) {
+        guard tracks.indices.contains(index), let primaryHost = tracks[index].primaryHost else { return }
+        let now = clock()
+        let currentDate = Date()
+        let hasAlternative = tracks[index].helpers.contains { url in
+            let host = url.host ?? ""
+            return MultiConnectionPlanner.canonicalHost(host) != primaryHost
+                && MultiConnectionPlanner.isFresh(url, now: currentDate)
+                && (hosts[host]?.demotedUntil ?? 0) <= now
+        }
+        guard hasAlternative else { return }
+        for url in tracks[index].helpers {
+            let host = url.host ?? ""
+            if MultiConnectionPlanner.canonicalHost(host) == primaryHost {
+                var state = hosts[host] ?? Host()
+                state.demotedUntil = max(state.demotedUntil, now + min(5.0, stallPolicy.demotionSeconds))
+                hosts[host] = state
+            }
+        }
+        updateAssistAvailability()
+    }
+
+    func penalizeStalledHost(_ host: String, now: TimeInterval) {
+        let hasOtherFreshHost = tracks.contains { track in
+            let currentDate = Date()
+            return track.helpers.contains { url in
+                let candidate = url.host ?? ""
+                return candidate != host
+                    && MultiConnectionPlanner.isFresh(url, now: currentDate)
+                    && (hosts[candidate]?.demotedUntil ?? 0) <= now
+            }
+        }
+        guard hasOtherFreshHost else { return }
+        var state = hosts[host] ?? Host()
+        state.demotedUntil = max(state.demotedUntil, now + stallPolicy.demotionSeconds)
+        hosts[host] = state
+        updateAssistAvailability()
+    }
+
+    func cancelStallWatch() {
+        stallWatchID &+= 1
+        stallWatchTask?.cancel()
+        stallWatchTask = nil
+    }
+
+    func armStallWatchIfNeeded() {
+        guard canSchedule, hasWatchableWork else {
+            cancelStallWatch()
+            return
+        }
+        guard stallWatchTask == nil else { return }
+        stallWatchID &+= 1
+        let watchID = stallWatchID
+        let expectedEpoch = epoch
+        let interval = max(0.02, stallPolicy.watchInterval)
+        stallWatchTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(interval)) } catch { return }
+                guard !Task.isCancelled else { return }
+                let keepWatching = await self?.evaluateStalledFlights(
+                    expectedEpoch: expectedEpoch, watchID: watchID
+                ) ?? false
+                if !keepWatching { return }
+            }
+        }
+    }
+
+    private var hasWatchableWork: Bool {
+        works.values.contains { work in
+            !work.cancellation.isCancelled && !work.flights.isEmpty
+                && (isRankZero(work.candidate) || work.stagingBytes > 0 || !policy.auto)
+        }
+    }
+
+    @discardableResult
+    func evaluateStalledFlights(expectedEpoch: UInt64, watchID: UInt64? = nil) -> Bool {
+        guard canSchedule, epoch == expectedEpoch else {
+            if watchID == nil || watchID == stallWatchID {
+                stallWatchTask = nil
+            }
+            return false
+        }
+        let now = clock()
+        let ordered = works.values
+            .filter { !$0.committing && !$0.cancellation.isCancelled && !$0.flights.isEmpty }
+            .sorted {
+                let lhs = isRankZero($0.candidate), rhs = isRankZero($1.candidate)
+                return lhs != rhs ? lhs : precedes($0.candidate, $1.candidate)
+            }
+        for work in ordered {
+            let urgent = isRankZero(work.candidate) || !policy.auto
+            let pieces = work.pieces.values.sorted { $0.range.lowerBound < $1.range.lowerBound }
+            for piece in pieces {
+                let isBlockingHead = piece.range.lowerBound == work.publishedThrough
+                guard urgent || (isBlockingHead && work.stagingBytes > 0) else { continue }
+                let pieceKey = piece.range.lowerBound
+                guard work.hedgeFlights[pieceKey] == nil,
+                      let flight = work.flights[pieceKey],
+                      piece.receivedThrough < piece.range.upperBound,
+                      isFlightStalled(flight, piece: piece, track: work.candidate.track, now: now),
+                      let hedgeURL = pickHedgeURL(work: work, piece: piece, excludingHost: flight.host, now: now) else {
+                    continue
+                }
+                let hedgeHost = hedgeURL.host ?? ""
+                let hedgeRange = piece.receivedThrough..<piece.range.upperBound
+                launchFlight(
+                    work, pieceKey: pieceKey, requestRange: hedgeRange,
+                    url: hedgeURL, host: hedgeHost,
+                    options: .init(lane: 0, priority: URLSessionTask.highPriority),
+                    isHedge: true
+                )
+            }
+        }
+        let keepWatching = hasWatchableWork
+        if !keepWatching, watchID == nil || watchID == stallWatchID {
+            stallWatchTask = nil
+        }
+        return keepWatching
+    }
+
+    private func isFlightStalled(
+        _ flight: Flight, piece: Piece, track: Int, now: TimeInterval
+    ) -> Bool {
+        let elapsed = now - flight.startedAt
+        let idle = now - flight.lastProgressAt
+        if flight.bytesReceived == 0 {
+            return idle >= stallPolicy.zeroByteDelay
+        }
+        if idle >= stallPolicy.stallGapDelay {
+            return true
+        }
+        guard elapsed >= stallPolicy.slowDelay else { return false }
+        let currentRate = Double(flight.bytesReceived) / max(0.001, elapsed)
+        let bestOtherRate = availableHosts(track: track)
+            .filter { ($0.host ?? "") != flight.host }
+            .compactMap { hosts[$0.host ?? ""]?.speed }
+            .max() ?? 0
+        let floor = max(stallPolicy.slowFloorBytesPerSec, bestOtherRate * 0.15)
+        let remaining = Double(max(0, piece.range.upperBound - piece.receivedThrough))
+        return currentRate < floor && (remaining / max(currentRate, 1)) > stallPolicy.slowDelay
+    }
+
+    private func pickHedgeURL(
+        work: Work, piece: Piece, excludingHost: String, now: TimeInterval
+    ) -> URL? {
+        let failed = work.failedHostsByRange[piece.range] ?? []
+        let activeHosts = Set(works.values.flatMap { $0.allFlights.map(\.host) })
+        let candidates = availableHosts(track: work.candidate.track).filter { url in
+            let host = url.host ?? ""
+            return !host.isEmpty && host != excludingHost && !failed.contains(host)
+        }
+        guard !candidates.isEmpty else { return nil }
+        if let idleUnpruned = candidates.first(where: { url in
+            let host = url.host ?? ""
+            return !activeHosts.contains(host) && !controller.isPruned(edgeKey(host), now: now)
+        }) {
+            return idleUnpruned
+        }
+        if let unpruned = candidates.first(where: { !controller.isPruned(edgeKey($0.host ?? ""), now: now) }) {
+            return unpruned
+        }
+        return candidates.first
     }
 }
