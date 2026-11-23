@@ -101,9 +101,23 @@ final class DanmakuHostView: UIView {
         preferenceObserver = nil
     }
 
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        syncDisplayScale()
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
+        syncDisplayScale()
         syncBounds()
+    }
+
+    private func syncDisplayScale() {
+        let scale = window?.windowScene?.screen.scale
+            ?? (traitCollection.displayScale > 0 ? traitCollection.displayScale : 0)
+        if scale > 0 {
+            controller.setDisplayScale(scale)
+        }
     }
 
     func syncBounds() {

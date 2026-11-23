@@ -66,13 +66,22 @@ final class DanmakuRenderController: DanmakuTimelineSink {
     private var appliedViewport: CGSize
     private var appliedPicture: CGRect
     private var generation: UInt64 = 0
+    private(set) var displayScale: CGFloat
+
+    private static var fallbackDisplayScale: CGFloat {
+        let scale = AppWindowMetrics.current?.windowScene?.screen.scale ?? 0
+        return scale > 0 ? scale : 2
+    }
 
     init(
         viewport: CGSize = CGSize(width: 1, height: 1),
         laneCount: Int = 8,
+        displayScale: CGFloat? = nil,
         rasterize: Rasterize? = nil,
         canDisplay: @escaping @MainActor () -> Bool = { UIApplication.shared.applicationState == .active }
     ) {
+        let resolvedScale = max(displayScale ?? Self.fallbackDisplayScale, 1)
+        self.displayScale = resolvedScale
         self.canDisplay = canDisplay
         let rasterizer = DanmakuTextRasterizer.shared
         self.rasterize = rasterize ?? { key, canRender, completion in
@@ -88,12 +97,26 @@ final class DanmakuRenderController: DanmakuTimelineSink {
         allocator = DanmakuTrackLayout.Allocator(metrics: metrics)
         updateRasterClock(0)
         container.masksToBounds = true
+        container.contentsScale = resolvedScale
         container.actions = Self.disabledLayerActions
         for _ in 0..<Self.poolCapacity {
             let layer = CALayer()
-            layer.contentsScale = UIScreen.main.scale
+            layer.contentsScale = resolvedScale
             layer.actions = Self.disabledLayerActions
             pool.append(layer)
+        }
+    }
+
+    func setDisplayScale(_ scale: CGFloat) {
+        let normalized = scale.isFinite && scale > 0 ? scale : Self.fallbackDisplayScale
+        guard abs(normalized - displayScale) > 0.001 else { return }
+        displayScale = normalized
+        container.contentsScale = normalized
+        for layer in pool {
+            layer.contentsScale = normalized
+        }
+        for bullet in live.values {
+            bullet.layer.contentsScale = normalized
         }
     }
 
@@ -233,7 +256,7 @@ final class DanmakuRenderController: DanmakuTimelineSink {
             fontSize: item.fontSize,
             colorRGB: item.color,
             hasStroke: true,
-            scale: UIScreen.main.scale,
+            scale: displayScale,
             fontScale: CGFloat(fontScale),
             presentation: presentation,
             selfSentFrame: item.isSelfSent
@@ -286,7 +309,7 @@ final class DanmakuRenderController: DanmakuTimelineSink {
         let progress = item.progress
         let fontSize = item.fontSize
         let color = item.color
-        let scale = UIScreen.main.scale
+        let scale = displayScale
         let ticket = generation
         let work = rasterWork
         let preferences = DanmakuRenderPreferences.load()

@@ -3,10 +3,11 @@ import UIKit
 
 struct DetailCoverEdgePopHost: UIViewRepresentable {
     let isAtRoot: Bool
+    var isBlocked: @MainActor () -> Bool = { false }
     let onPop: @MainActor () -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(isAtRoot: isAtRoot, onPop: onPop)
+        Coordinator(isAtRoot: isAtRoot, isBlocked: isBlocked, onPop: onPop)
     }
 
     func makeUIView(context: Context) -> AnchorView {
@@ -23,6 +24,7 @@ struct DetailCoverEdgePopHost: UIViewRepresentable {
 
     func updateUIView(_ view: AnchorView, context: Context) {
         context.coordinator.isAtRoot = isAtRoot
+        context.coordinator.isBlocked = isBlocked
         context.coordinator.onPop = onPop
         context.coordinator.attachIfNeeded(from: view)
     }
@@ -54,6 +56,7 @@ struct DetailCoverEdgePopHost: UIViewRepresentable {
         var isAtRoot: Bool {
             didSet { recognizer.isEnabled = isAtRoot }
         }
+        var isBlocked: @MainActor () -> Bool
         var onPop: @MainActor () -> Void
 
         private let recognizer = UIScreenEdgePanGestureRecognizer()
@@ -65,8 +68,13 @@ struct DetailCoverEdgePopHost: UIViewRepresentable {
         private var savedShadowRadius: CGFloat = 0
         private var savedShadowOffset: CGSize = .zero
 
-        init(isAtRoot: Bool, onPop: @escaping @MainActor () -> Void) {
+        init(
+            isAtRoot: Bool,
+            isBlocked: @escaping @MainActor () -> Bool,
+            onPop: @escaping @MainActor () -> Void
+        ) {
             self.isAtRoot = isAtRoot
+            self.isBlocked = isBlocked
             self.onPop = onPop
             super.init()
             recognizer.edges = .left
@@ -123,7 +131,7 @@ struct DetailCoverEdgePopHost: UIViewRepresentable {
 
         @objc private func handleEdgePan(_ sender: UIScreenEdgePanGestureRecognizer) {
             guard !isFinishingPop, let targetView = sender.view else { return }
-            guard isAtRoot, !PlayerViewModel.shared.isFullscreen else {
+            guard isAtRoot, !isBlocked() else {
                 cancelDrag(on: targetView, animated: false)
                 return
             }
@@ -230,7 +238,7 @@ struct DetailCoverEdgePopHost: UIViewRepresentable {
         }
 
         func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-            guard isAtRoot, !isFinishingPop, !PlayerViewModel.shared.isFullscreen,
+            guard isAtRoot, !isFinishingPop, !isBlocked(),
                   coverController?.presentedViewController == nil,
                   let edgePan = gestureRecognizer as? UIScreenEdgePanGestureRecognizer else {
                 return false
@@ -252,7 +260,7 @@ struct DetailCoverEdgePopHost: UIViewRepresentable {
             _ gestureRecognizer: UIGestureRecognizer,
             shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer
         ) -> Bool {
-            guard isAtRoot, !PlayerViewModel.shared.isFullscreen,
+            guard isAtRoot, !isBlocked(),
                   coverController?.presentedViewController == nil,
                   otherGestureRecognizer !== gestureRecognizer else {
                 return false

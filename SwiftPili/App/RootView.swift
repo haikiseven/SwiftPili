@@ -4,6 +4,7 @@ import UIKit
 struct RootView: View {
     @Environment(AppCoordinator.self) var coordinator
     @Environment(AppNoticeCenter.self) private var noticeCenter: AppNoticeCenter?
+    @Environment(\.appSceneID) private var appSceneID
     @Environment(\.horizontalSizeClass) var horizontalSizeClass
     @AppMotion private var motion
     @AppStorage("sidebar-customization") var tabCustomization: TabViewCustomization
@@ -95,13 +96,17 @@ struct RootView: View {
                     }
             }
             .background {
-                DetailCoverEdgePopHost(isAtRoot: isAtRoot) {
+                DetailCoverEdgePopHost(
+                    isAtRoot: isAtRoot,
+                    isBlocked: { PlayerViewModel.existingShared?.chrome.isFullscreen ?? false }
+                ) {
                     coordinator.goBack()
                 }
                 .frame(width: 0, height: 0)
                 .allowsHitTesting(false)
                 .accessibilityHidden(true)
             }
+            .environment(\.appSceneID, appSceneID)
             .environment(coordinator)
             .environment(noticeCenter)
             .environment(\.appNoticeCenter, noticeCenter)
@@ -278,7 +283,7 @@ struct RootView: View {
         }
         .preferredColorScheme((AppearanceMode(rawValue: appearanceRaw) ?? .system).colorScheme)
         .onChange(of: FullscreenLoginHandoff.shared.isReady) { _, ready in
-            if ready, FullscreenLoginHandoff.shared.consume() {
+            if ready, FullscreenLoginHandoff.shared.consume(for: appSceneID) {
                 coordinator.presentLogin()
             }
         }

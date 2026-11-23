@@ -43,11 +43,16 @@ extension PlayerViewModel {
     }
 
     func claimOwnerLease(owner: String) -> PlayerOwnerLease {
+        claimOwnerLease(owner: owner, sceneID: nil)
+    }
+
+    func claimOwnerLease(owner: String, sceneID: UUID?) -> PlayerOwnerLease {
         retireFullscreenPresentation()
         let outgoingOwner = currentOwnerLease
         let retainsRunningSession = !ownerKey.isEmpty
             && ownerKey == owner
             && outgoingOwner != nil
+            && (sceneID == nil || routeOwnership.activeSceneID == nil || routeOwnership.activeSceneID == sceneID)
         if !retainsRunningSession {
             invalidateSurfaceSlot(reason: "owner-lease-replacement")
         }
@@ -59,6 +64,7 @@ extension PlayerViewModel {
         if let recoveryCover { clearRecoveryCover(matching: recoveryCover.identity) }
         retireCDNFrameCover()
         ownerLeaseGeneration &+= 1
+        routeOwnership.activeSceneID = sceneID
         let incomingOwner = PlayerOwnerLease(owner: owner, generation: ownerLeaseGeneration)
         if retainsRunningSession {
             upgradeOrInvalidateSurfaceSlot(from: outgoingOwner, to: incomingOwner)
@@ -95,10 +101,11 @@ extension PlayerViewModel {
     }
 
     func isCurrentOwner(_ lease: PlayerOwnerLease) -> Bool {
-        lease.matches(
-            currentOwner: ownerKey,
-            currentGeneration: ownerLeaseGeneration
-        )
+        routeOwnership.isCurrentOwner(lease, in: nil)
+    }
+
+    func isCurrentOwner(_ lease: PlayerOwnerLease, in sceneID: UUID?) -> Bool {
+        routeOwnership.isCurrentOwner(lease, in: sceneID)
     }
 
     @discardableResult
@@ -147,6 +154,7 @@ extension PlayerViewModel {
             PlayerLog.log("[Player] owner exit parking session owner=\(owner)")
             stop(reason: .ownerExit, preservingParkedBackend: true)
             ownerKey = ""
+            routeOwnership.activeSceneID = nil
             ambientCoverURL = nil
             ambientOwnerLease = nil
             ambientStoryboard = []
@@ -159,6 +167,7 @@ extension PlayerViewModel {
         PlayerLog.log("[Player] owner exit stopping owner=\(owner)")
         stop(reason: .ownerExit)
         ownerKey = ""
+        routeOwnership.activeSceneID = nil
         ambientCoverURL = nil
         ambientOwnerLease = nil
         ambientStoryboard = []

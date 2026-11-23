@@ -5,6 +5,7 @@ struct PlayerBottomControlBar: View {
     let owner: String
     let gestureDisplay: PlayerGestureDisplay
     let chromeInsets: PlayerChromeInsets
+    @Environment(\.appSceneID) private var appSceneID
     @AppStorage(DanmakuFeatureGate.defaultsKey) private var danmakuEnabled = false
 
     var body: some View {
@@ -89,7 +90,7 @@ struct PlayerBottomControlBar: View {
                     isFullscreen: player.isFullscreen
                 ) {
                     Button {
-                        player.requestLoginFromFullscreen()
+                        player.requestLoginFromFullscreen(sceneID: appSceneID)
                     } label: {
                         Text("Log in to send danmaku")
                             .playerChromeCapsule(minHeight: 44)

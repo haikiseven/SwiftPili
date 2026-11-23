@@ -98,7 +98,7 @@ struct FullscreenDanmakuComposer: View {
     }
 
     private static var maxFieldWidth: CGFloat {
-        UIDevice.current.userInterfaceIdiom == .pad ? IPadKeyboardComposerLayout.maxWidth : .infinity
+        DeviceCapability.supportsPadKeyboardDock ? IPadKeyboardComposerLayout.maxWidth : .infinity
     }
 
     private var canSend: Bool {

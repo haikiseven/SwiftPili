@@ -809,9 +809,18 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         guard let cgImage else {
             return nil
         }
+        let displayScale: CGFloat = {
+            if let windowScale = displayView.window?.windowScene?.screen.scale, windowScale > 0 {
+                return windowScale
+            }
+            if displayView.traitCollection.displayScale > 0 {
+                return displayView.traitCollection.displayScale
+            }
+            return AppWindowMetrics.current?.windowScene?.screen.scale ?? 2
+        }()
         return UIImage(
             cgImage: cgImage,
-            scale: UIScreen.main.scale,
+            scale: max(displayScale, 1),
             orientation: .up
         )
     }

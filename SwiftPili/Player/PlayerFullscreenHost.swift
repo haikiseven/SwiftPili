@@ -166,7 +166,7 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
     }
 
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
-        UIDevice.current.userInterfaceIdiom == .pad ? .all : AppOrientation.shared.mask
+        DeviceCapability.supportsOrientationLock ? AppOrientation.shared.mask : .all
     }
 
     override var prefersStatusBarHidden: Bool { true }

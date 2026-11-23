@@ -47,23 +47,56 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     @ObservationIgnored
     var backendInstances: [PlayerEngineKind: PlayerBackend] = [:]
 
-    var isPlaying = false {
-        willSet { if !newValue { revokeEqualizerMaintenancePermission() } }
+    // MARK: - Modular Sub-Stores (Isolated Observation Scopes)
+
+    @ObservationIgnored
+    let clock = PlaybackClockState()
+    @ObservationIgnored
+    let chrome = PlayerChromeState()
+    @ObservationIgnored
+    let routeOwnership = PlayerRouteOwnershipCoordinator()
+    @ObservationIgnored
+    let session = PlayerSessionState()
+
+    // MARK: - Session State Facade
+
+    var isPlaying: Bool {
+        get { session.isPlaying }
+        set {
+            if !newValue { revokeEqualizerMaintenancePermission() }
+            session.isPlaying = newValue
+        }
     }
 
-    var mediaTime: TimeInterval = 0
+    // MARK: - Playback Clock State Facade
 
-    @ObservationIgnored
-    var bufferedTimeStorage: TimeInterval = 0
-    @ObservationIgnored
-    var bufferedTimeProjection = BufferedTimeUIProjection()
-    @ObservationIgnored
-    var bufferedDisplayDiagnostic: BufferedDisplayDiagnosticSample?
+    var mediaTime: TimeInterval {
+        get { clock.mediaTime }
+        set { clock.mediaTime = newValue }
+    }
+
+    var mediaTimeMovedAt: TimeInterval {
+        get { clock.mediaTimeMovedAt }
+        set { clock.mediaTimeMovedAt = newValue }
+    }
+
+    var bufferedTimeStorage: TimeInterval {
+        get { clock.bufferedTimeStorage }
+        set { clock.bufferedTimeStorage = newValue }
+    }
+
+    var bufferedTimeProjection: BufferedTimeUIProjection {
+        get { clock.bufferedTimeProjection }
+        set { clock.bufferedTimeProjection = newValue }
+    }
+
+    var bufferedDisplayDiagnostic: BufferedDisplayDiagnosticSample? {
+        get { clock.bufferedDisplayDiagnostic }
+        set { clock.bufferedDisplayDiagnostic = newValue }
+    }
+
     var bufferedTime: TimeInterval {
-        get {
-            access(keyPath: \.bufferedTime)
-            return bufferedTimeStorage
-        }
+        get { clock.bufferedTime }
         set {
             let value = Self.normalizedBufferedTime(newValue)
             resetBufferedTime(raw: value, displayedEnd: value > 0 ? value : nil)
@@ -73,19 +106,46 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     var canPublishBufferedDisplay: Bool { !terminalOpenFailure && error == nil }
 
     var displayedBufferedRange: BufferedDisplayRange? {
-        access(keyPath: \.bufferedTime)
-        return canPublishBufferedDisplay ? bufferedTimeProjection.publishedRange : nil
+        let range = clock.publishedBufferedRange
+        return canPublishBufferedDisplay ? range : nil
     }
 
     var displayedBufferedTime: TimeInterval? { displayedBufferedRange?.end }
-    var duration: TimeInterval = 0
-    var isBuffering = false
-    var unavailability: PlaybackUnavailability?
-    var playbackRate: Float = 1.0
-    var currentQuality: Int = 116 {
-        willSet { if newValue != currentQuality { revokeEqualizerMaintenancePermission() } }
+
+    var duration: TimeInterval {
+        get { clock.duration }
+        set { clock.duration = newValue }
     }
-    var isFullscreen = false
+
+    var isBuffering: Bool {
+        get { clock.isBuffering }
+        set { clock.isBuffering = newValue }
+    }
+
+    var unavailability: PlaybackUnavailability? {
+        get { session.unavailability }
+        set { session.unavailability = newValue }
+    }
+
+    var playbackRate: Float {
+        get { session.playbackRate }
+        set { session.playbackRate = newValue }
+    }
+
+    var currentQuality: Int {
+        get { session.currentQuality }
+        set {
+            if newValue != session.currentQuality { revokeEqualizerMaintenancePermission() }
+            session.currentQuality = newValue
+        }
+    }
+
+    // MARK: - Chrome State Facade
+
+    var isFullscreen: Bool {
+        get { chrome.isFullscreen }
+        set { chrome.isFullscreen = newValue }
+    }
 
     @ObservationIgnored
     var fullscreenTransition = FullscreenTransitionCoalescer()
@@ -95,28 +155,70 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
 
     @ObservationIgnored
     var fullscreenPresentationReceipt: PlayerPresentationReceipt?
-    var isPortraitContent = false
+
+    var isPortraitContent: Bool {
+        get { chrome.isPortraitContent }
+        set { chrome.isPortraitContent = newValue }
+    }
 
     var danmakuPortraitHint: Bool? {
         guard mode == .vod else { return nil }
         return portraitPropagation.apiHint
     }
-    var inlineCondensed = false
-    var portraitCondenseLocked = false
-    var showControls = true
-    var showStats = false
-    var ambientModeEnabled = ExperimentalSettingsPolicy.isAllowed(.ambient)
-    var videoSuperResolutionMode: VideoSuperResolutionMode = ExperimentalSettingsPolicy.videoEnhancementEnabled
-        ? VideoEnhancementPreferences.defaultSRMode
-        : .off
-    var videoFrameInterpolationEnabled = ExperimentalSettingsPolicy.videoEnhancementEnabled
-        ? VideoEnhancementPreferences.defaultFrameInterpolationEnabled
-        : false
-    var videoInterpolationRate = ExperimentalSettingsStore.shared.videoEnhancementDefaultRate
-    var videoSuperResolutionScale = ExperimentalSettingsStore.shared.videoEnhancementDefaultScale
+
+    var inlineCondensed: Bool {
+        get { chrome.inlineCondensed }
+        set { chrome.inlineCondensed = newValue }
+    }
+
+    var portraitCondenseLocked: Bool {
+        get { chrome.portraitCondenseLocked }
+        set { chrome.portraitCondenseLocked = newValue }
+    }
+
+    var showControls: Bool {
+        get { chrome.showControls }
+        set { chrome.showControls = newValue }
+    }
+
+    var showStats: Bool {
+        get { chrome.showStats }
+        set { chrome.showStats = newValue }
+    }
+
+    var ambientModeEnabled: Bool {
+        get { chrome.ambientModeEnabled }
+        set { chrome.ambientModeEnabled = newValue }
+    }
+
+    var videoSuperResolutionMode: VideoSuperResolutionMode {
+        get { session.videoSuperResolutionMode }
+        set { session.videoSuperResolutionMode = newValue }
+    }
+
+    var videoFrameInterpolationEnabled: Bool {
+        get { session.videoFrameInterpolationEnabled }
+        set { session.videoFrameInterpolationEnabled = newValue }
+    }
+
+    var videoInterpolationRate: VideoInterpolationRate {
+        get { session.videoInterpolationRate }
+        set { session.videoInterpolationRate = newValue }
+    }
+
+    var videoSuperResolutionScale: VideoSuperResolutionScale {
+        get { session.videoSuperResolutionScale }
+        set { session.videoSuperResolutionScale = newValue }
+    }
+
     /// Defaults last applied to the per-player choices above; tuning-only changes don't reset them.
     @ObservationIgnored var appliedVideoEnhancementDefaults = VideoEnhancementDefaultsSnapshot.current
-    var equalizerConfiguration = PlayerEqualizerPreferences.equalizerConfiguration
+
+    var equalizerConfiguration: PlayerEqualizerConfiguration {
+        get { session.equalizerConfiguration }
+        set { session.equalizerConfiguration = newValue }
+    }
+
     @ObservationIgnored var currentEqualizerMaintenancePermit: AudioMaintenancePermit?
 
     var equalizerStatus: PlayerEqualizerStatus { backend.equalizerStatus }
@@ -135,26 +237,80 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         if !ExperimentalSettingsPolicy.isAllowed(.equalizer) { effective.enabled = false }
         return effective
     }
-    var ambientCoverURL: String?
-    @ObservationIgnored
-    var ambientOwnerLease: PlayerOwnerLease?
-    var ambientStoryboard: [PlayerAmbientStoryboardFrame] = []
-    @ObservationIgnored
-    var ambientStoryboardOwnerLease: PlayerOwnerLease?
-    @ObservationIgnored
-    var ambientStoryboardLoadGeneration: Int?
-    @ObservationIgnored var ambientStoryboardContent: PlayerAmbientStoryboardLoader.Content?
-    @ObservationIgnored
-    var ambientSelectionMediaTime: TimeInterval?
-    @ObservationIgnored var ambientSelectionContent: PlayerAmbientStoryboardLoader.Content?
-    var ambientSelectionSource: PlayerAmbientSource?
-    var ambientVideoLoadedOwner: PlayerOwnerLease?
-    var ambientLiveImage: UIImage?
-    var ambientLiveFrameSerial: UInt64 = 0
-    @ObservationIgnored
-    var lastAmbientLiveSampleWall: TimeInterval = 0
-    let ambientStoryboardLoader = PlayerAmbientStoryboardLoader()
-    @ObservationIgnored var ambientStoryboardRequest: PlayerAmbientStoryboardLoader.Request?
+
+    var ambientCoverURL: String? {
+        get { chrome.ambientCoverURL }
+        set { chrome.ambientCoverURL = newValue }
+    }
+
+    var ambientOwnerLease: PlayerOwnerLease? {
+        get { chrome.ambientOwnerLease }
+        set { chrome.ambientOwnerLease = newValue }
+    }
+
+    var ambientStoryboard: [PlayerAmbientStoryboardFrame] {
+        get { chrome.ambientStoryboard }
+        set { chrome.ambientStoryboard = newValue }
+    }
+
+    var ambientStoryboardOwnerLease: PlayerOwnerLease? {
+        get { chrome.ambientStoryboardOwnerLease }
+        set { chrome.ambientStoryboardOwnerLease = newValue }
+    }
+
+    var ambientStoryboardLoadGeneration: Int? {
+        get { chrome.ambientStoryboardLoadGeneration }
+        set { chrome.ambientStoryboardLoadGeneration = newValue }
+    }
+
+    var ambientStoryboardContent: PlayerAmbientStoryboardLoader.Content? {
+        get { chrome.ambientStoryboardContent }
+        set { chrome.ambientStoryboardContent = newValue }
+    }
+
+    var ambientSelectionMediaTime: TimeInterval? {
+        get { chrome.ambientSelectionMediaTime }
+        set { chrome.ambientSelectionMediaTime = newValue }
+    }
+
+    var ambientSelectionContent: PlayerAmbientStoryboardLoader.Content? {
+        get { chrome.ambientSelectionContent }
+        set { chrome.ambientSelectionContent = newValue }
+    }
+
+    var ambientSelectionSource: PlayerAmbientSource? {
+        get { chrome.ambientSelectionSource }
+        set { chrome.ambientSelectionSource = newValue }
+    }
+
+    var ambientVideoLoadedOwner: PlayerOwnerLease? {
+        get { chrome.ambientVideoLoadedOwner }
+        set { chrome.ambientVideoLoadedOwner = newValue }
+    }
+
+    var ambientLiveImage: UIImage? {
+        get { chrome.ambientLiveImage }
+        set { chrome.ambientLiveImage = newValue }
+    }
+
+    var ambientLiveFrameSerial: UInt64 {
+        get { chrome.ambientLiveFrameSerial }
+        set { chrome.ambientLiveFrameSerial = newValue }
+    }
+
+    var lastAmbientLiveSampleWall: TimeInterval {
+        get { chrome.lastAmbientLiveSampleWall }
+        set { chrome.lastAmbientLiveSampleWall = newValue }
+    }
+
+    var ambientStoryboardLoader: PlayerAmbientStoryboardLoader {
+        chrome.ambientStoryboardLoader
+    }
+
+    var ambientStoryboardRequest: PlayerAmbientStoryboardLoader.Request? {
+        get { chrome.ambientStoryboardRequest }
+        set { chrome.ambientStoryboardRequest = newValue }
+    }
 
     var ambientSource: PlayerAmbientSource? {
         guard let request = ambientStoryboardRequest,
@@ -164,24 +320,28 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         return ambientSelectionSource
     }
 
-    var mode: PlayerMode = .vod {
-        willSet { if newValue != mode { revokeEqualizerMaintenancePermission() } }
-        didSet {
+    var mode: PlayerMode {
+        get { session.mode }
+        set {
+            let oldValue = session.mode
+            if newValue != oldValue { revokeEqualizerMaintenancePermission() }
+            session.mode = newValue
             retireRecoveryCoverIfAuthorityChanged()
-            guard mode != oldValue, mode != .vod else { return }
+            guard newValue != oldValue, newValue != .vod else { return }
             releaseDanmaku()
         }
     }
+
     var error: String? {
-        willSet {
+        get { session.error }
+        set {
             if newValue != nil {
                 backgroundExecution.end(reason: "playback-error")
                 revokeEqualizerMaintenancePermission()
             }
-        }
-        didSet {
-            if error != nil { retireCDNFrameCover() }
-            if error != nil, let recoveryCover {
+            session.error = newValue
+            if session.error != nil { retireCDNFrameCover() }
+            if session.error != nil, let recoveryCover {
                 clearRecoveryCover(matching: recoveryCover.identity)
             }
         }
@@ -212,92 +372,180 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     @ObservationIgnored var multiConnectionRateResetAt: TimeInterval = 0
     @ObservationIgnored var multiConnectionPayloadSampler = MultiConnectionPayloadSampler()
     @ObservationIgnored var multiConnectionTelemetry = MultiConnectionTelemetry.unsupported
-    var availableQualities: [(id: Int, desc: String)] = []
-    var availableCodecs: [VideoCodecPreference] = []
-    var availableAudioTiers: [AudioQualityTier] = []
-    var playingAudioTier: AudioQualityTier?
+    var availableQualities: [(id: Int, desc: String)] {
+        get { session.availableQualities }
+        set { session.availableQualities = newValue }
+    }
+
+    var availableCodecs: [VideoCodecPreference] {
+        get { session.availableCodecs }
+        set { session.availableCodecs = newValue }
+    }
+
+    var availableAudioTiers: [AudioQualityTier] {
+        get { session.availableAudioTiers }
+        set { session.availableAudioTiers = newValue }
+    }
+
+    var playingAudioTier: AudioQualityTier? {
+        get { session.playingAudioTier }
+        set { session.playingAudioTier = newValue }
+    }
+
     @ObservationIgnored
     var audioTierOverride: AudioQualityTier?
+
     var currentURL: URL? {
-        willSet { if newValue != currentURL { revokeEqualizerMaintenancePermission() } }
+        get { session.currentURL }
+        set {
+            if newValue != session.currentURL { revokeEqualizerMaintenancePermission() }
+            session.currentURL = newValue
+        }
     }
+
     var currentDASHAudioURL: URL? {
-        willSet { if newValue != currentDASHAudioURL { revokeEqualizerMaintenancePermission() } }
+        get { session.currentDASHAudioURL }
+        set {
+            if newValue != session.currentDASHAudioURL { revokeEqualizerMaintenancePermission() }
+            session.currentDASHAudioURL = newValue
+        }
     }
+
     @ObservationIgnored var multiConnectionVideoURLs: [String] = []
     @ObservationIgnored var multiConnectionAudioURLs: [String] = []
     @ObservationIgnored var multiConnectionQuietWindows = MultiConnectionQuietWindows()
     @ObservationIgnored var multiConnectionWasEnabled = false
     @ObservationIgnored var multiConnectionLoadClass: MultiConnectionNetworkClass?
     @ObservationIgnored private var multiConnectionSweepObserver: CDNMeasurementObservation?
-    var ownerKey = "" {
-        willSet {
-            if newValue != ownerKey {
+
+    // MARK: - Route Ownership Facade
+
+    var ownerKey: String {
+        get { routeOwnership.ownerKey }
+        set {
+            if newValue != routeOwnership.ownerKey {
                 backgroundExecution.end(reason: "owner-change")
                 revokeEqualizerMaintenancePermission()
             }
+            routeOwnership.ownerKey = newValue
         }
     }
-    var ownerLeaseGeneration: UInt64 = 0 {
-        willSet {
+
+    var ownerLeaseGeneration: UInt64 {
+        get { routeOwnership.ownerLeaseGeneration }
+        set {
             backgroundExecution.end(reason: "owner-lease-change")
             revokeEqualizerMaintenancePermission()
+            routeOwnership.ownerLeaseGeneration = newValue
         }
     }
-    @ObservationIgnored
-    var presentationResetPendingForOwnerChange = false
-    var surfaceAuthority = PlayerSurfaceAuthority()
-    var activeSurfaceLease: PlayerSurfaceLease?
-    var deferredPiPOwnerExit = DeferredPiPOwnerExit()
+
+    var activeSceneID: UUID? {
+        get { routeOwnership.activeSceneID }
+        set { routeOwnership.activeSceneID = newValue }
+    }
+
+    var presentationResetPendingForOwnerChange: Bool {
+        get { routeOwnership.presentationResetPendingForOwnerChange }
+        set { routeOwnership.presentationResetPendingForOwnerChange = newValue }
+    }
+
+    var surfaceAuthority: PlayerSurfaceAuthority {
+        get { routeOwnership.surfaceAuthority }
+        set { routeOwnership.surfaceAuthority = newValue }
+    }
+
+    var activeSurfaceLease: PlayerSurfaceLease? {
+        get { routeOwnership.activeSurfaceLease }
+        set { routeOwnership.activeSurfaceLease = newValue }
+    }
+
+    var deferredPiPOwnerExit: DeferredPiPOwnerExit {
+        get { routeOwnership.deferredPiPOwnerExit }
+        set { routeOwnership.deferredPiPOwnerExit = newValue }
+    }
+
     @ObservationIgnored
     var portraitPropagation = PlayerPortraitPropagationState(
         mode: .vod,
         apiHint: nil,
         initialIsPortrait: false
     )
-    var playerGeneration = 0
+
+    var playerGeneration: Int {
+        get { routeOwnership.playerGeneration }
+        set { routeOwnership.playerGeneration = newValue }
+    }
+
     @ObservationIgnored
     weak var renderAttachment: (any PlayerRenderAttachment)?
     @ObservationIgnored
     var renderAttachmentSurfaceLease: PlayerSurfaceLease?
-    var inlineReturnTarget: PlayerInlineReturnTarget?
+
+    var inlineReturnTarget: PlayerInlineReturnTarget? {
+        get { routeOwnership.inlineReturnTarget }
+        set { routeOwnership.inlineReturnTarget = newValue }
+    }
 
     var currentAid: Int? {
-        willSet {
-            if newValue != currentAid {
+        get { session.currentAid }
+        set {
+            if newValue != session.currentAid {
                 backgroundExecution.end(reason: "content-change")
                 revokeEqualizerMaintenancePermission()
             }
+            session.currentAid = newValue
+            retireRecoveryCoverIfAuthorityChanged()
         }
-        didSet { retireRecoveryCoverIfAuthorityChanged() }
     }
+
     var currentCid: Int? {
-        willSet {
-            if newValue != currentCid {
+        get { session.currentCid }
+        set {
+            let oldValue = session.currentCid
+            if newValue != oldValue {
                 backgroundExecution.end(reason: "part-change")
                 revokeEqualizerMaintenancePermission()
             }
-        }
-        didSet {
+            session.currentCid = newValue
             retireRecoveryCoverIfAuthorityChanged()
-            guard currentCid != oldValue, currentCid == nil else { return }
+            guard newValue != oldValue, newValue == nil else { return }
             releaseDanmaku()
         }
     }
 
-    var currentBvid: String?
-    var offlineAsset: OfflinePlaybackAsset? {
-        willSet { if newValue != offlineAsset { revokeEqualizerMaintenancePermission() } }
+    var currentBvid: String? {
+        get { session.currentBvid }
+        set { session.currentBvid = newValue }
     }
+
+    var offlineAsset: OfflinePlaybackAsset? {
+        get { session.offlineAsset }
+        set {
+            if newValue != session.offlineAsset { revokeEqualizerMaintenancePermission() }
+            session.offlineAsset = newValue
+        }
+    }
+
     @ObservationIgnored
     var offlineDecoderLabelTask: Task<Void, Never>?
     @ObservationIgnored
     var offlineDecoderLabelRequestID: UUID?
+
     var currentRoomID: Int? {
-        willSet { if newValue != currentRoomID { revokeEqualizerMaintenancePermission() } }
+        get { session.currentRoomID }
+        set {
+            if newValue != session.currentRoomID { revokeEqualizerMaintenancePermission() }
+            session.currentRoomID = newValue
+        }
     }
-    var currentLiveQuality = LiveAPI.defaultLiveQuality {
-        willSet { if newValue != currentLiveQuality { revokeEqualizerMaintenancePermission() } }
+
+    var currentLiveQuality: Int {
+        get { session.currentLiveQuality }
+        set {
+            if newValue != session.currentLiveQuality { revokeEqualizerMaintenancePermission() }
+            session.currentLiveQuality = newValue
+        }
     }
     var historyReportTask: Task<Void, Never>?
     var offlineProgressTask: Task<Void, Never>?
@@ -336,24 +584,39 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         willSet { if newValue { revokeEqualizerMaintenancePermission() } }
     }
 
-    var isDASHMode = false
-    var currentVideoIsAV1 = false
+    var isDASHMode: Bool {
+        get { session.isDASHMode }
+        set { session.isDASHMode = newValue }
+    }
+
+    var currentVideoIsAV1: Bool {
+        get { session.currentVideoIsAV1 }
+        set { session.currentVideoIsAV1 = newValue }
+    }
+
     @ObservationIgnored
     var lastOnPlayAt: CFTimeInterval = 0
-    var lastDisplayUpdate: CFTimeInterval = 0
+
+    var lastDisplayUpdate: CFTimeInterval {
+        get { clock.lastDisplayUpdate }
+        set { clock.lastDisplayUpdate = newValue }
+    }
+
     enum PlaybackIntent {
         case playing
         case pausedByUser
         case pausedBySystem
     }
 
-    var playbackIntent: PlaybackIntent = .playing {
-        willSet {
+    var playbackIntent: PlaybackIntent {
+        get { session.playbackIntent }
+        set {
             if newValue != .playing {
                 backgroundExecution.end(reason: "intent-paused")
                 revokeEqualizerMaintenancePermission()
                 suspendStreamRecovery()
             }
+            session.playbackIntent = newValue
         }
     }
     var userWantsPlaying: Bool { playbackIntent != .pausedByUser }
@@ -375,12 +638,15 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
             syncDanmakuTransport()
         }
     }
-    var playbackTerminalState: PlaybackTerminalState = .active {
-        willSet {
+
+    var playbackTerminalState: PlaybackTerminalState {
+        get { session.playbackTerminalState }
+        set {
             if newValue.isTerminal {
                 backgroundExecution.end(reason: "terminal")
                 revokeEqualizerMaintenancePermission()
             }
+            session.playbackTerminalState = newValue
         }
     }
 
@@ -409,12 +675,26 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     static let freezeFrameSafetyTimeout: CFTimeInterval = 8
     @ObservationIgnored
     var transitionCoverExpiry = PlayerTransitionCoverExpiry()
-    var outgoingRouteStills: [String: UIImage] = [:]
-    @ObservationIgnored
-    var outgoingRouteStillExpiry = PlayerOutgoingRouteStillExpiry()
-    @ObservationIgnored
-    var departedRouteStillOwners: [String] = []
-    var outgoingRouteStill: OutgoingRouteStill?
+
+    var outgoingRouteStills: [String: UIImage] {
+        get { routeOwnership.outgoingRouteStills }
+        set { routeOwnership.outgoingRouteStills = newValue }
+    }
+
+    var outgoingRouteStillExpiry: PlayerOutgoingRouteStillExpiry {
+        routeOwnership.outgoingRouteStillExpiry
+    }
+
+    var departedRouteStillOwners: [String] {
+        get { routeOwnership.departedRouteStillOwners }
+        set { routeOwnership.departedRouteStillOwners = newValue }
+    }
+
+    var outgoingRouteStill: OutgoingRouteStill? {
+        get { routeOwnership.outgoingRouteStill }
+        set { routeOwnership.outgoingRouteStill = newValue }
+    }
+
     var lastSeekRequest: TimeInterval?
 
     var fpsEverLive = false
@@ -436,7 +716,12 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     var muteAuthority = MuteAuthority()
 
     var isSeekInFlight: Bool { backend.pendingSeekTarget != nil }
-    var pendingSeekTarget: TimeInterval?
+
+    var pendingSeekTarget: TimeInterval? {
+        get { clock.pendingSeekTarget }
+        set { clock.pendingSeekTarget = newValue }
+    }
+
     var pendingSeekTask: Task<Void, Never>?
     var reopenSeekTask: Task<Void, Never>?
     @ObservationIgnored var activeSeekToken: SeekSettlementToken?
@@ -463,7 +748,12 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     static let nearEndFreezeThreshold: TimeInterval = NearEndClockPolicy.freezeThreshold
     var nearEndStallWallStart: CFTimeInterval?
     var nearEndStallMediaStart: TimeInterval?
-    var nearEndDisplayTime: TimeInterval?
+
+    var nearEndDisplayTime: TimeInterval? {
+        get { clock.nearEndDisplayTime }
+        set { clock.nearEndDisplayTime = newValue }
+    }
+
     var nearEndStallDriveTask: Task<Void, Never>?
     var nearEndFreezeArmTask: Task<Void, Never>?
     var nearEndFreezeCandidateMedia: TimeInterval?
@@ -477,7 +767,11 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         let owner: String
         let url: URL?
     }
-    var settledSeekDisplaySample: SettledSeekDisplaySample?
+
+    var settledSeekDisplaySample: SettledSeekDisplaySample? {
+        get { clock.settledSeekDisplaySample }
+        set { clock.settledSeekDisplaySample = newValue }
+    }
     @ObservationIgnored var nativeSeekCompletedRequestSerial: UInt64?
 
     var settledSeekDisplayTime: TimeInterval? {
@@ -891,8 +1185,12 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
 
     // MARK: - Playback Order & Hold Fast-Forward
 
-    var playbackOrder = PlayerPlaybackPreferences.playbackOrder {
-        didSet { PlayerPlaybackPreferences.playbackOrder = playbackOrder }
+    var playbackOrder: PlaybackOrder {
+        get { session.playbackOrder }
+        set {
+            session.playbackOrder = newValue
+            PlayerPlaybackPreferences.playbackOrder = newValue
+        }
     }
 
     var onPlaybackEnded: (() -> Void)?
@@ -902,7 +1200,10 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
 
     var pgcSeasonContext: (sid: Int, type: Int?)?
 
-    var rateBeforeHold: Float?
+    var rateBeforeHold: Float? {
+        get { session.rateBeforeHold }
+        set { session.rateBeforeHold = newValue }
+    }
 
     var isHoldFastForwarding: Bool { rateBeforeHold != nil }
 
@@ -912,8 +1213,12 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
 
     // MARK: - Video Scale Mode (fullscreen aspect options)
 
-    var scaleMode: VideoScaleMode = .fit {
-        didSet { applyScaleMode() }
+    var scaleMode: VideoScaleMode {
+        get { session.scaleMode }
+        set {
+            session.scaleMode = newValue
+            applyScaleMode()
+        }
     }
 
     // MARK: - CC Subtitles (x/player/wbi/v2 subtitle list)
@@ -1018,7 +1323,10 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
 
     static let danmakuMode7LifetimeCeiling: TimeInterval = 10
 
-    var fullscreenDanmakuComposerPresented = false
+    var fullscreenDanmakuComposerPresented: Bool {
+        get { chrome.fullscreenDanmakuComposerPresented }
+        set { chrome.fullscreenDanmakuComposerPresented = newValue }
+    }
 
     var fullscreenDanmakuSendFailure: String?
     var fullscreenDanmakuSendFailureDraft: String?
@@ -1144,8 +1452,7 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     }
 
     var currentOwnerLease: PlayerOwnerLease? {
-        guard !ownerKey.isEmpty else { return nil }
-        return PlayerOwnerLease(owner: ownerKey, generation: ownerLeaseGeneration)
+        routeOwnership.currentOwnerLease
     }
 
     // MARK: - VOD
@@ -1155,13 +1462,21 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         case pgc(epId: Int)
     }
 
-    var currentSource: StreamSource = .ugc {
-        willSet { if newValue != currentSource { revokeEqualizerMaintenancePermission() } }
-        didSet { retireRecoveryCoverIfAuthorityChanged() }
+    var currentSource: StreamSource {
+        get { session.currentSource }
+        set {
+            if newValue != session.currentSource { revokeEqualizerMaintenancePermission() }
+            session.currentSource = newValue
+            retireRecoveryCoverIfAuthorityChanged()
+        }
     }
 
-    var loadGeneration = 0 {
-        willSet { revokeEqualizerMaintenancePermission() }
+    var loadGeneration: Int {
+        get { session.loadGeneration }
+        set {
+            revokeEqualizerMaintenancePermission()
+            session.loadGeneration = newValue
+        }
     }
     var lastCDNLogGeneration = -1
     var startupTraceToken: StartupTrace.Token?
@@ -1326,10 +1641,15 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     @ObservationIgnored
     var lastReportedVerticalSizeClass = "nil"
 
-    @ObservationIgnored
-    var hideControlsTask: Task<Void, Never>?
+    var hideControlsTask: Task<Void, Never>? {
+        get { chrome.hideControlsTask }
+        set { chrome.hideControlsTask = newValue }
+    }
 
-    var danmakuSettingsHold = false
+    var danmakuSettingsHold: Bool {
+        get { chrome.danmakuSettingsHold }
+        set { chrome.danmakuSettingsHold = newValue }
+    }
 
     func stop(
         reason: PlayerTeardownReason = .ownerExit,

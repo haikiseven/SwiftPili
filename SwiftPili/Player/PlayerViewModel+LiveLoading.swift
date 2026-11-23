@@ -442,8 +442,7 @@ extension PlayerViewModel {
     }
 
     func seedLivePortraitOrientation(from playInfo: LivePlayInfo?, sameContent: Bool) {
-        let isPad = UIDevice.current.userInterfaceIdiom == .pad
-        let hint = isPad ? false : playInfo?.isPortrait
+        let hint = DeviceCapability.usesCompactPortraitVideoFraming ? playInfo?.isPortrait : false
         if !sameContent {
             isPortraitContent = hint ?? false
         } else if let hint, !portraitPropagation.hasValidVideoGeometry {

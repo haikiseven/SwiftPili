@@ -177,18 +177,11 @@ extension PlayerViewModel {
     // MARK: - Private
 
     static func normalizedBufferedTime(_ value: TimeInterval) -> TimeInterval {
-        value.isFinite ? max(0, value) : 0
+        PlaybackClockState.normalizedBufferedTime(value)
     }
 
     func resetBufferedTime(raw: TimeInterval, displayedEnd: TimeInterval?) {
-        withMutation(keyPath: \.bufferedTime) {
-            bufferedTimeStorage = raw
-            let range = displayedEnd.flatMap { end in
-                BufferedDisplayRange(start: mode == .offline ? 0 : end, end: end)
-            }
-            bufferedTimeProjection.reset(range: range)
-            bufferedDisplayDiagnostic = nil
-        }
+        clock.resetBufferedTime(raw: raw, displayedEnd: displayedEnd, isOffline: mode == .offline)
     }
 
     func prepareBufferedDisplayForSeek(to target: TimeInterval) {
@@ -207,7 +200,7 @@ extension PlayerViewModel {
             bufferedTimeProjection.invalidateSampling()
             return
         }
-        withMutation(keyPath: \.bufferedTime) {
+        clock.mutateBufferedTime {
             bufferedTimeProjection.reset(range: nextRange)
         }
     }
@@ -235,7 +228,7 @@ extension PlayerViewModel {
             loadGeneration: loadGeneration, ownerLeaseGeneration: ownerLeaseGeneration,
             sampledAt: now, rawEndpoint: rawValue, display: sample
         ) : nil
-        withMutation(keyPath: \.bufferedTime) {
+        clock.mutateBufferedTime {
             bufferedTimeProjection.ingest(range: range)
         }
     }
@@ -271,7 +264,7 @@ extension PlayerViewModel {
         let changed = state.applyVideoGeometry(
             width: Double(size.width),
             height: Double(size.height),
-            isPad: UIDevice.current.userInterfaceIdiom == .pad
+            isPad: !DeviceCapability.usesCompactPortraitVideoFraming
         )
         portraitPropagation = state
         if changed {

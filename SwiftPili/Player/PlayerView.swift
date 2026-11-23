@@ -99,6 +99,7 @@ struct PlayerView: View {
     }
 
     private var vm: PlayerViewModel { PlayerViewModel.shared }
+    @Environment(\.appSceneID) private var appSceneID
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage(DanmakuFeatureGate.defaultsKey) private var danmakuEnabled = false
@@ -180,7 +181,7 @@ struct PlayerView: View {
     }
 
     private var isOwner: Bool {
-        guard let screenLease, vm.isCurrentOwner(screenLease) else { return false }
+        guard let screenLease, vm.isCurrentOwner(screenLease, in: appSceneID) else { return false }
         guard let presentationReceipt else { return surfaceRole == .inline }
         guard let fullscreenHostIdentity else { return false }
         return vm.isCurrentPresentationReceipt(presentationReceipt, hostIdentity: fullscreenHostIdentity)
@@ -195,6 +196,7 @@ struct PlayerView: View {
 
     private func claimScreenSurfaceIfCurrent() {
         guard isOwner, let screenLease else { return }
+        vm.routeOwnership.bindActiveSceneIfUnbound(appSceneID)
         if let lease = vm.claimSurfaceSlot(ownerLease: screenLease, role: surfaceRole) {
             claimedSurfaceLease = lease
         }
@@ -567,7 +569,7 @@ struct PlayerView: View {
             claimScreenSurfaceIfCurrent()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
-            guard isOwner, UIDevice.current.userInterfaceIdiom == .phone else { return }
+            guard isOwner, DeviceCapability.supportsOrientationLock else { return }
             let orientation = UIDevice.current.orientation
             if vm.isPortraitContent, !AppOrientation.shared.mask.contains(.landscape) {
                 return
@@ -584,7 +586,7 @@ struct PlayerView: View {
         }
         .onChange(of: verticalSizeClass) { _, newValue in
             recordGeometrySettlement(size: surfaceSize)
-            guard isOwner, UIDevice.current.userInterfaceIdiom == .phone else { return }
+            guard isOwner, DeviceCapability.supportsOrientationLock else { return }
             if newValue == .regular, vm.isFullscreen, AppOrientation.shared.mask.contains(.landscape) {
                 PlayerLog.log("[Player] window rotated to portrait behind isFullscreen — reconciling")
                 vm.requestFullscreenTransition(target: false, source: .verticalSizeClass)
@@ -701,11 +703,12 @@ struct PlayerView: View {
                             return
                         }
                         surfaceHoldTask?.cancel()
-                        let width = surfaceSize.width > 0 ? surfaceSize.width : UIScreen.main.bounds.width
+                        let fallbackSize = WindowMetricsFallback.currentSize
+                        let width = surfaceSize.width > 0 ? surfaceSize.width : fallbackSize.width
                         verticalAdjustIsVolume = surfaceStartLocation.x > width / 2
                         verticalAdjustBase = verticalAdjustIsVolume
                             ? Double(SystemVolumeController.shared.volume)
-                            : Double(UIScreen.main.brightness)
+                            : Double(AppWindowMetrics.current?.windowScene?.screen.brightness ?? 0.5)
                         gestureDisplay.verticalAdjustValue = verticalAdjustBase
                         verticalAdjustActive = true
                         PlayerLog.log("[PlayerGesture] vertical \(verticalAdjustIsVolume ? "volume" : "brightness") engaged at \(Int(verticalAdjustBase * 100))%")
@@ -720,7 +723,8 @@ struct PlayerView: View {
                 }
 
                 if verticalAdjustActive {
-                    let height = Double(surfaceSize.height > 0 ? surfaceSize.height : UIScreen.main.bounds.height)
+                    let fallbackHeight = WindowMetricsFallback.currentSize.height
+                    let height = Double(surfaceSize.height > 0 ? surfaceSize.height : fallbackHeight)
                     let value = min(max(verticalAdjustBase - Double(dy) / height, 0), 1)
                     gestureDisplay.verticalAdjustValue = value
                     let applied = surfaceDrag.appliedAdjust
@@ -733,12 +737,12 @@ struct PlayerView: View {
                     if verticalAdjustIsVolume {
                         SystemVolumeController.shared.setVolume(Float(value))
                     } else {
-                        UIScreen.main.brightness = CGFloat(value)
+                        AppWindowMetrics.current?.windowScene?.screen.brightness = CGFloat(value)
                     }
                     return
                 }
 
-                let width = max(surfaceSize.width > 0 ? surfaceSize.width : UIScreen.main.bounds.width, 1)
+                let width = max(surfaceSize.width > 0 ? surfaceSize.width : WindowMetricsFallback.currentWidth, 1)
                 let span = min(max(vm.duration * 0.25, 60), 300)
                 let target = swipeSeekBase + Double(dx / width) * span
                 gestureDisplay.seekValue = min(max(target, 0), vm.duration)
@@ -814,9 +818,9 @@ struct PlayerView: View {
 
     private var surfaceGeometryPublicationContext: PlayerSurfaceGeometryPublicationPolicy.Context {
         let deviceClass: PlayerSurfaceGeometryPublicationPolicy.DeviceClass
-        if UIDevice.current.userInterfaceIdiom == .phone {
+        if DeviceCapability.supportsOrientationLock {
             deviceClass = .iPhone
-        } else if UIDevice.current.userInterfaceIdiom == .pad {
+        } else if DeviceCapability.supportsPadDetailSplit {
             deviceClass = .iPad
         } else {
             deviceClass = .other

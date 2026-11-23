@@ -36,7 +36,7 @@ extension PlayerViewModel {
     }
 
     func noteInlineVideoRect(from attachment: any PlayerRenderAttachment) {
-        if UIDevice.current.userInterfaceIdiom == .phone, isFullscreenPresentationActive {
+        if DeviceCapability.supportsOrientationLock, isFullscreenPresentationActive {
             return
         }
         guard !isFullscreen, renderAttachment === attachment,
@@ -70,7 +70,7 @@ extension PlayerViewModel {
     }
 
     func noteInlineSlotGeometry(from view: UIView, cornerRadius: CGFloat) {
-        if UIDevice.current.userInterfaceIdiom == .phone, isFullscreenPresentationActive {
+        if DeviceCapability.supportsOrientationLock, isFullscreenPresentationActive {
             return
         }
         guard let window = view.window,
@@ -124,7 +124,7 @@ extension PlayerViewModel {
               target.receipt == receipt,
               target.window.windowID == window.windowID,
               target.window.screenID == window.screenID else { return nil }
-        if UIDevice.current.userInterfaceIdiom == .pad, target.window != window { return nil }
+        if DeviceCapability.supportsPadDetailSplit, target.window != window { return nil }
         return target.frameInScreen
     }
 

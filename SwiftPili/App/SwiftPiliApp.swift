@@ -66,12 +66,14 @@ private enum AppProcessBootstrap {
 
 private struct AppSceneRootView: View {
     let modelContainer: ModelContainer
+    @State private var sceneID = UUID()
     @State private var coordinator = AppCoordinator()
     @State private var noticeCenter = AppNoticeCenter()
 
     var body: some View {
         RootView()
             .id(AccountManager.shared.identityRevision)
+            .environment(\.appSceneID, sceneID)
             .environment(coordinator)
             .environment(noticeCenter)
             .environment(\.appNoticeCenter, noticeCenter)

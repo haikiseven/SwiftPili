@@ -134,10 +134,10 @@ extension PlayerViewModel {
         reconcileAmbientStoryboard()
         let effectivePortraitHint = portraitHint ?? retainedPortraitHint
         if !sameContent {
-            isPortraitContent = UIDevice.current.userInterfaceIdiom != .pad
+            isPortraitContent = DeviceCapability.usesCompactPortraitVideoFraming
                 && (effectivePortraitHint ?? false)
         } else if let effectivePortraitHint {
-            isPortraitContent = UIDevice.current.userInterfaceIdiom != .pad
+            isPortraitContent = DeviceCapability.usesCompactPortraitVideoFraming
                 && effectivePortraitHint
         }
         portraitPropagation = PlayerPortraitPropagationState(

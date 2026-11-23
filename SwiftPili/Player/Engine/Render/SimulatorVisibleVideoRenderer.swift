@@ -142,7 +142,7 @@ final class SimulatorVisibleVideoRenderer: NSObject, MediaVideoPresentation {
             pixelBuffer: frame.pixelBuffer
         )
 
-        let screenScale = surfaceView.window?.screen.scale ?? UIScreen.main.scale
+        let screenScale = currentDisplayScale
         surfaceView.image = UIImage(
             cgImage: cgImage,
             scale: max(screenScale, 1),
@@ -253,6 +253,16 @@ final class SimulatorVisibleVideoRenderer: NSObject, MediaVideoPresentation {
         }
     }
 
+    private var currentDisplayScale: CGFloat {
+        if let windowScale = surfaceView.window?.windowScene?.screen.scale, windowScale > 0 {
+            return windowScale
+        }
+        if surfaceView.traitCollection.displayScale > 0 {
+            return surfaceView.traitCollection.displayScale
+        }
+        return AppWindowMetrics.current?.windowScene?.screen.scale ?? 2
+    }
+
     private func destinationPixelSize() -> CGSize? {
         guard hostViewController.viewIfLoaded === surfaceView,
               surfaceView.window != nil,
@@ -263,7 +273,7 @@ final class SimulatorVisibleVideoRenderer: NSObject, MediaVideoPresentation {
             return nil
         }
 
-        let scale = surfaceView.window?.screen.scale ?? UIScreen.main.scale
+        let scale = currentDisplayScale
         let size = CGSize(
             width: surfaceView.bounds.width * scale,
             height: surfaceView.bounds.height * scale
@@ -312,7 +322,7 @@ final class SimulatorVisibleVideoRenderer: NSObject, MediaVideoPresentation {
         let windowAttached = surfaceView.window != nil
         let hostWindowAttached = hostView?.window != nil
         let superviewAttached = surfaceView.superview != nil
-        let scale = surfaceView.window?.screen.scale ?? UIScreen.main.scale
+        let scale = currentDisplayScale
         let pixelSize = CGSize(
             width: max(surfaceView.bounds.width, 0) * scale,
             height: max(surfaceView.bounds.height, 0) * scale

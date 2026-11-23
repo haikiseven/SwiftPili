@@ -192,7 +192,7 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
 
     func applyOrientation(mask: UIInterfaceOrientationMask, label: String) {
         guard isCurrent else { return }
-        guard UIDevice.current.userInterfaceIdiom == .phone else {
+        guard DeviceCapability.supportsOrientationLock else {
             pendingMask = nil
             pendingMaskLabel = nil
             rotationInFlight = false
@@ -227,7 +227,7 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
         rotationFallbackTask = nil
         reservedHost = nil
         outgoingHost?.cancelActiveTransition()
-        if UIDevice.current.userInterfaceIdiom == .phone, AppOrientation.shared.mask != .portrait {
+        if DeviceCapability.supportsOrientationLock, AppOrientation.shared.mask != .portrait {
             AppOrientation.shared.set(.portrait)
             let window = outgoingHost?.viewIfLoaded?.window ?? AppWindowMetrics.current
             window?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
@@ -397,7 +397,7 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
         guard accepts(controller) else {
             return .init(generation: 0, mode: .steadyFullscreen)
         }
-        let isPhone = UIDevice.current.userInterfaceIdiom == .phone
+        let isPhone = DeviceCapability.supportsOrientationLock
         let isLandscapeSize = size.width > size.height
 
         if !PlayerViewModel.shared.isFullscreen {
@@ -449,7 +449,7 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
             commitPendingOrientation(reason: "rotationCompleted")
         }
         if PlayerViewModel.shared.isFullscreen {
-            if UIDevice.current.userInterfaceIdiom == .phone,
+            if DeviceCapability.supportsOrientationLock,
                !PlayerViewModel.shared.isPortraitContent,
                sceneWillRotate(to: .landscape) {
                 if !rotationInFlight {
@@ -472,7 +472,7 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
             return
         }
         if phase == .leaving {
-            if UIDevice.current.userInterfaceIdiom == .phone, sceneWillRotate(to: .portrait) {
+            if DeviceCapability.supportsOrientationLock, sceneWillRotate(to: .portrait) {
                 if !rotationInFlight {
                     pendingMask = .portrait
                     pendingMaskLabel = "portrait"
@@ -498,7 +498,7 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
     }
 
     private func sceneWillRotate(to mask: UIInterfaceOrientationMask) -> Bool {
-        guard UIDevice.current.userInterfaceIdiom == .phone else { return false }
+        guard DeviceCapability.supportsOrientationLock else { return false }
         let window = host?.viewIfLoaded?.window ?? AppWindowMetrics.current
         guard let scene = window?.windowScene else { return false }
         let current = PlayerPresentationCensus.mask(for: scene.interfaceOrientation)

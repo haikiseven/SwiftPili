@@ -182,7 +182,7 @@ extension PlayerViewModel {
             return
         }
         FullscreenLoginHandoff.shared.cancel()
-        if UIDevice.current.userInterfaceIdiom == .phone {
+        if DeviceCapability.supportsOrientationLock {
             AppWindowMetrics.current?.endEditing(true)
         }
         if fullscreenPresentation != nil {
@@ -192,7 +192,7 @@ extension PlayerViewModel {
                 isFullscreen = true
             }
         }
-        if UIDevice.current.userInterfaceIdiom == .phone {
+        if DeviceCapability.supportsOrientationLock {
             let targetMask: UIInterfaceOrientationMask = isPortraitContent ? .portrait : .landscape
             applyOrientation(targetMask)
         }
@@ -224,24 +224,24 @@ extension PlayerViewModel {
                 isFullscreen = false
             }
         }
-        if UIDevice.current.userInterfaceIdiom == .phone {
+        if DeviceCapability.supportsOrientationLock {
             applyOrientation(.portrait)
         }
         fullscreenPresentation?.reconcile()
         settleFullscreenPresentation(actualState: false)
     }
 
-    func requestLoginFromFullscreen() {
+    func requestLoginFromFullscreen(sceneID: UUID? = nil) {
         guard isFullscreen else { return }
         let handoff = FullscreenLoginHandoff.shared
-        handoff.arm()
+        handoff.arm(sceneID: sceneID ?? routeOwnership.activeSceneID)
         let waitsForHost = fullscreenPresentation?.hasPresentedHost == true
         exitFullscreen()
         if !waitsForHost { handoff.release() }
     }
 
     private func applyOrientation(_ mask: UIInterfaceOrientationMask) {
-        guard UIDevice.current.userInterfaceIdiom == .phone else { return }
+        guard DeviceCapability.supportsOrientationLock else { return }
         if let presentation = fullscreenPresentation {
             presentation.applyOrientation(
                 mask: mask,
