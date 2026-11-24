@@ -1,7 +1,7 @@
 import Foundation
 
-/// The settings that seed per-player enhancement choices. Changes to tuning settings (buffer
-/// memory, sensitivity, …) are synced without touching what the user picked in the player.
+/// The settings that seed per-player enhancement choices. Changes to global display limits
+/// are synced without touching what the user picked in the player.
 struct VideoEnhancementDefaultsSnapshot: Equatable {
     let allowed: Bool
     let superResolutionMode: VideoSuperResolutionMode
@@ -79,10 +79,6 @@ extension PlayerViewModel {
             superResolutionSharpness: videoSuperResolutionSharpness,
             maxInputResolution: videoEnhancementMaxInputResolution,
             isLiveStream: mode == .live,
-            adaptiveQualityEnabled: ExperimentalSettingsStore.shared.videoEnhancementAdaptiveQuality,
-            adaptiveSensitivity: ExperimentalSettingsStore.shared.videoEnhancementAdaptiveSensitivity,
-            bufferBudget: ExperimentalSettingsStore.shared.videoEnhancementBufferBudget,
-            maxLookahead: ExperimentalSettingsStore.shared.videoEnhancementMaxLookahead,
             limitToScreenResolution: ExperimentalSettingsStore.shared.videoEnhancementLimitToScreen
         )
     }

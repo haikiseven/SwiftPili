@@ -81,12 +81,18 @@ private extension VideoToolboxFrameInterpolationBackend {
         plan: VideoFrameInterpolationPlan?,
         hasTimeRemaining: @Sendable () -> Bool
     ) async -> VideoInterpolationBackendOutcome {
-        guard hasTimeRemaining() else { return bypass("VT FI deadline") }
         guard VideoFrameInterpolationTiming.sourceFPS(frame) != nil else {
             return bypass("VT FI invalid source timing")
         }
         if let reason = VideoFramePairFormat.interpolationBypassReason(frame.pixelBuffer) {
             return bypass(reason)
+        }
+        guard hasTimeRemaining() else {
+            // Preserve the current frame as reference so the very next pair interpolates immediately
+            // via `.random` mode instead of dropping two consecutive pairs.
+            previousFrame = StoredFrame(frame)
+            hasSubmittedPair = false
+            return .bypassed(reason: VTInterpolationFailure.deadline.reason)
         }
         guard let plan, let previous = previousFrame,
               VideoFrameInterpolationTiming(
@@ -120,6 +126,11 @@ private extension VideoToolboxFrameInterpolationBackend {
             )
         } catch let failure as VTInterpolationFailure {
             if let detail = failure.detail { logOnce(raster, event: failure.reason, detail) }
+            if failure.preservesReference {
+                previousFrame = StoredFrame(frame)
+                hasSubmittedPair = false
+                return .bypassed(reason: failure.reason)
+            }
             return bypass(failure.reason)
         } catch {
             let error = error as NSError
@@ -217,7 +228,6 @@ private extension VideoToolboxFrameInterpolationBackend {
         session: VTInterpolationSession,
         hasTimeRemaining: @Sendable () -> Bool
     ) async throws -> VideoInterpolationBackendOutcome {
-        guard hasTimeRemaining() else { throw VTInterpolationFailure.deadline }
         let previousInput = previous.staged.flatMap(session.directInput) ?? session.directInput(previous.pixelBuffer)
         let currentInput = session.directInput(current.pixelBuffer)
         if previousInput == nil || currentInput == nil {
@@ -227,26 +237,30 @@ private extension VideoToolboxFrameInterpolationBackend {
         }
         session.recordPhaseCount(plan.phases.count)
         let destinations = try plan.phases.map { _ in
-            guard hasTimeRemaining() else { throw VTInterpolationFailure.deadline }
-            let output = try session.destination.allocate()
-            VideoFramePairFormat.copyInterpretation(from: current.pixelBuffer, to: output)
-            return output
+            try session.destination.allocate()
         }
-        guard hasTimeRemaining() else { throw VTInterpolationFailure.deadline }
-        let prev = try previousInput ?? session.stage(previous.pixelBuffer)
-        guard hasTimeRemaining() else { throw VTInterpolationFailure.deadline }
-        let next = try currentInput ?? session.stage(current.pixelBuffer)
+        let prev: CVPixelBuffer
+        if let previousInput {
+            prev = previousInput
+        } else {
+            prev = try await session.stage(previous.pixelBuffer)
+        }
+        let next: CVPixelBuffer
+        if let currentInput {
+            next = currentInput
+        } else {
+            next = try await session.stage(current.pixelBuffer)
+        }
         guard hasTimeRemaining() else { throw VTInterpolationFailure.deadline }
         let request = VTInterpolationSession.Request(
             previous: (prev, previous.pts), current: (next, current.pts),
             plan: plan, destinations: destinations, sequential: hasSubmittedPair
         )
-        try await session.process(request, hasTimeRemaining: hasTimeRemaining)
-        guard hasTimeRemaining() else { throw VTInterpolationFailure.deadline }
+        try await session.process(request)
+        // Never discard already-computed hardware output once `process` succeeds.
         for output in destinations {
             VideoFramePairFormat.copyInterpretation(from: current.pixelBuffer, to: output)
         }
-        guard hasTimeRemaining() else { throw VTInterpolationFailure.deadline }
         previousFrame = StoredFrame(current, staged: currentInput == nil ? next : nil)
         hasSubmittedPair = true
         return .interpolated(frames: plan.makeFrames(buffers: destinations))
@@ -485,14 +499,16 @@ private final class VTInterpolationSession {
         source.accepts(input) ? input : nil
     }
 
-    func stage(_ input: CVPixelBuffer) throws -> CVPixelBuffer {
+    func stage(_ input: CVPixelBuffer) async throws -> CVPixelBuffer {
         guard canStageNV12 else {
             throw VTInterpolationFailure(reason: "VT FI decoded buffers do not meet source requirements")
         }
-        let pool = try stagingPool ?? VTInterpolationPool(requirements: source, role: "source staging", limit: 6)
+        let pool = try stagingPool ?? VTInterpolationPool(
+            requirements: source, role: "source staging", limit: 6, metalCompatible: true
+        )
         stagingPool = pool
         let staged = try pool.allocate()
-        try VTNV12StagingCopy.copy(from: input, to: staged)
+        try await VTNV12StagingCopy.copyAsync(from: input, to: staged)
         return staged
     }
 
@@ -504,11 +520,10 @@ private final class VTInterpolationSession {
         let sequential: Bool
     }
 
-    func process(_ request: Request, hasTimeRemaining: @Sendable () -> Bool) async throws {
+    func process(_ request: Request) async throws {
         guard let parameters = parameters(for: request) else {
             throw VTInterpolationFailure(reason: "VT FI params invalid")
         }
-        guard hasTimeRemaining() else { throw VTInterpolationFailure.deadline }
         if kind == .lowLatency { lastLLFISourcePTS = request.current.pts }
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             processor.process(parameters: parameters) { _, error in
@@ -573,8 +588,9 @@ struct VTInterpolationFailure: Error {
     let reason: String
     var detail: String?
     var isIncompatible = false
+    var preservesReference = false
 
-    static let deadline = Self(reason: "VT FI deadline")
+    static let deadline = Self(reason: "VT FI deadline", preservesReference: true)
     static let unsupported = Self(reason: "VT FI native configuration unsupported")
 
     static func incompatible(_ detail: String) -> Self {

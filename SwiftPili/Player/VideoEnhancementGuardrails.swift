@@ -1,9 +1,28 @@
 import CoreVideo
 import Foundation
+import os
+import UIKit
 
 enum VideoEnhancementGuardrails {
     static let maxInputLongEdge = 1920
     static let maxInputShortEdge = 1080
+
+    private static let memoryPressureCooldown: Duration = .seconds(30)
+    private static let lastMemoryWarning = OSAllocatedUnfairLock<ContinuousClock.Instant?>(initialState: nil)
+    private nonisolated(unsafe) static let memoryWarningObserver: NSObjectProtocol =
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: nil
+        ) { _ in
+            lastMemoryWarning.withLock { $0 = .now }
+        }
+
+    static var isUnderMemoryPressure: Bool {
+        _ = memoryWarningObserver
+        guard let last = lastMemoryWarning.withLock({ $0 }) else { return false }
+        return last.duration(to: .now) < memoryPressureCooldown
+    }
 
     static func isWithin(
         width: Int,
@@ -35,10 +54,9 @@ enum VideoEnhancementGuardrails {
             kCVImageBufferTransferFunctionKey,
             nil
         ) {
-            let transferString = String(describing: transfer)
-            if transferString == (kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String)
-                || transferString == (kCVImageBufferTransferFunction_ITU_R_2100_HLG as String)
-                || transferString == (kCVImageBufferTransferFunction_Linear as String) {
+            if CFEqual(transfer, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ)
+                || CFEqual(transfer, kCVImageBufferTransferFunction_ITU_R_2100_HLG)
+                || CFEqual(transfer, kCVImageBufferTransferFunction_Linear) {
                 return false
             }
         }
@@ -48,13 +66,17 @@ enum VideoEnhancementGuardrails {
     static func commonBypassReason(
         configuration: VideoEnhancementConfiguration,
         pixelBuffer: CVPixelBuffer,
-        thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState
+        thermalState: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState,
+        memoryPressure: Bool = VideoEnhancementGuardrails.isUnderMemoryPressure
     ) -> String? {
         if configuration.isLiveStream {
             return "VOD only"
         }
         if isThermalThrottled(thermalState) {
             return "Thermal throttling"
+        }
+        if memoryPressure {
+            return "Memory pressure"
         }
         if !isSDR8Bit(pixelBuffer) {
             return "HDR / 10-bit"
@@ -75,6 +97,34 @@ enum VideoEnhancementGuardrails {
 }
 
 enum VideoFramePairFormat {
+    private nonisolated(unsafe) static let fieldKeys: [CFString] = [
+        kCVImageBufferFieldCountKey,
+        kCVImageBufferFieldDetailKey,
+        kCVImageBufferChromaLocationBottomFieldKey,
+    ]
+
+    private nonisolated(unsafe) static let interpretationKeys: [CFString] = [
+        kCVImageBufferColorPrimariesKey,
+        kCVImageBufferTransferFunctionKey,
+        kCVImageBufferYCbCrMatrixKey,
+        kCVImageBufferGammaLevelKey,
+        kCVImageBufferICCProfileKey,
+        kCVImageBufferCGColorSpaceKey,
+        kCVImageBufferCleanApertureKey,
+        kCVImageBufferPreferredCleanApertureKey,
+        kCVImageBufferPixelAspectRatioKey,
+        kCVImageBufferDisplayDimensionsKey,
+        kCVImageBufferChromaLocationTopFieldKey,
+        kCVImageBufferLogTransferFunctionKey,
+        kCVImageBufferMasteringDisplayColorVolumeKey,
+        kCVImageBufferContentLightLevelInfoKey,
+        kCVImageBufferAmbientViewingEnvironmentKey,
+        kCVImageBufferAlphaChannelModeKey,
+        kCVImageBufferAlphaChannelIsOpaque,
+    ]
+
+    private nonisolated(unsafe) static let allKeys: [CFString] = interpretationKeys + fieldKeys
+
     static func hasSameStorageFormat(_ source: CVPixelBuffer, _ destination: CVPixelBuffer) -> Bool {
         CVPixelBufferGetWidth(source) == CVPixelBufferGetWidth(destination)
             && CVPixelBufferGetHeight(source) == CVPixelBufferGetHeight(destination)
@@ -85,14 +135,18 @@ enum VideoFramePairFormat {
         guard hasSameStorageFormat(previous, current) else { return false }
         let previousIsInterlaced = isInterlaced(previous)
         guard previousIsInterlaced == isInterlaced(current) else { return false }
-        let keys = previousIsInterlaced ? interpretationKeys + fieldKeys : interpretationKeys
-        return keys.allSatisfy { key in
+        let keys = previousIsInterlaced ? allKeys : interpretationKeys
+        for key in keys {
             switch (CVBufferCopyAttachment(previous, key, nil), CVBufferCopyAttachment(current, key, nil)) {
-            case (nil, nil): true
-            case let (lhs?, rhs?): CFEqual(lhs, rhs)
-            default: false
+            case (nil, nil):
+                continue
+            case let (lhs?, rhs?):
+                if !CFEqual(lhs, rhs) { return false }
+            default:
+                return false
             }
         }
+        return true
     }
 
     static func interpolationBypassReason(_ buffer: CVPixelBuffer) -> String? {
@@ -112,18 +166,15 @@ enum VideoFramePairFormat {
             return count == 2
         }
         guard let detail = CVBufferCopyAttachment(buffer, kCVImageBufferFieldDetailKey, nil) else { return false }
-        let fieldOrders = [
-            kCVImageBufferFieldDetailTemporalTopFirst,
-            kCVImageBufferFieldDetailTemporalBottomFirst,
-            kCVImageBufferFieldDetailSpatialFirstLineEarly,
-            kCVImageBufferFieldDetailSpatialFirstLineLate,
-        ]
-        return fieldOrders.contains { CFEqual(detail, $0) }
+        return CFEqual(detail, kCVImageBufferFieldDetailTemporalTopFirst)
+            || CFEqual(detail, kCVImageBufferFieldDetailTemporalBottomFirst)
+            || CFEqual(detail, kCVImageBufferFieldDetailSpatialFirstLineEarly)
+            || CFEqual(detail, kCVImageBufferFieldDetailSpatialFirstLineLate)
     }
 
     static func copyInterpretation(from source: CVPixelBuffer, to destination: CVPixelBuffer) {
         precondition(hasSameStorageFormat(source, destination))
-        for key in interpretationKeys + fieldKeys {
+        for key in allKeys {
             var mode = CVAttachmentMode.shouldPropagate
             if let value = CVBufferCopyAttachment(source, key, &mode) {
                 CVBufferSetAttachment(destination, key, value, mode)
@@ -131,21 +182,6 @@ enum VideoFramePairFormat {
                 CVBufferRemoveAttachment(destination, key)
             }
         }
-    }
-
-    private static var fieldKeys: [CFString] {
-        [kCVImageBufferFieldCountKey, kCVImageBufferFieldDetailKey, kCVImageBufferChromaLocationBottomFieldKey]
-    }
-
-    private static var interpretationKeys: [CFString] {
-        [kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunctionKey, kCVImageBufferYCbCrMatrixKey,
-         kCVImageBufferGammaLevelKey, kCVImageBufferICCProfileKey, kCVImageBufferCGColorSpaceKey,
-         kCVImageBufferCleanApertureKey, kCVImageBufferPreferredCleanApertureKey,
-         kCVImageBufferPixelAspectRatioKey, kCVImageBufferDisplayDimensionsKey,
-         kCVImageBufferChromaLocationTopFieldKey, kCVImageBufferLogTransferFunctionKey,
-         kCVImageBufferMasteringDisplayColorVolumeKey, kCVImageBufferContentLightLevelInfoKey,
-         kCVImageBufferAmbientViewingEnvironmentKey, kCVImageBufferAlphaChannelModeKey,
-         kCVImageBufferAlphaChannelIsOpaque]
     }
 }
 

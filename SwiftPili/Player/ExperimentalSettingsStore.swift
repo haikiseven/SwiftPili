@@ -33,10 +33,6 @@ final class ExperimentalSettingsStore {
         videoEnhancementDefaultTargetResolution = VideoEnhancementPreferences.superResolutionTargetResolution
         videoEnhancementDefaultSharpness = VideoEnhancementPreferences.superResolutionSharpness
         videoEnhancementMaxInputResolution = VideoEnhancementPreferences.maxInputResolution
-        videoEnhancementAdaptiveQuality = VideoEnhancementPreferences.adaptiveQualityEnabled
-        videoEnhancementAdaptiveSensitivity = VideoEnhancementPreferences.adaptiveSensitivity
-        videoEnhancementBufferBudget = VideoEnhancementPreferences.bufferBudget
-        videoEnhancementMaxLookahead = VideoEnhancementPreferences.maxLookahead
         videoEnhancementLimitToScreen = VideoEnhancementPreferences.limitToScreenResolution
         storageError = record.storageError
         publish(record.snapshot)
@@ -98,41 +94,7 @@ final class ExperimentalSettingsStore {
         VideoEnhancementPreferences.superResolutionTargetResolution
     private(set) var videoEnhancementDefaultSharpness = VideoEnhancementPreferences.superResolutionSharpness
     private(set) var videoEnhancementMaxInputResolution = VideoEnhancementPreferences.maxInputResolution
-    private(set) var videoEnhancementAdaptiveQuality = VideoEnhancementPreferences.adaptiveQualityEnabled
-    private(set) var videoEnhancementAdaptiveSensitivity = VideoEnhancementPreferences.adaptiveSensitivity
-    private(set) var videoEnhancementBufferBudget = VideoEnhancementPreferences.bufferBudget
-    private(set) var videoEnhancementMaxLookahead = VideoEnhancementPreferences.maxLookahead
     private(set) var videoEnhancementLimitToScreen = VideoEnhancementPreferences.limitToScreenResolution
-
-    @discardableResult
-    func setVideoEnhancementAdaptiveSensitivity(_ value: VideoEnhancementAdaptiveSensitivity) -> Bool {
-        guard isAllowed(.videoEnhancement), storageError == nil else { return false }
-        guard videoEnhancementAdaptiveSensitivity != value else { return true }
-        VideoEnhancementPreferences.adaptiveSensitivity = value
-        videoEnhancementAdaptiveSensitivity = value
-        notifyObservers([.videoEnhancement])
-        return true
-    }
-
-    @discardableResult
-    func setVideoEnhancementBufferBudget(_ value: VideoEnhancementBufferBudget) -> Bool {
-        guard isAllowed(.videoEnhancement), storageError == nil else { return false }
-        guard videoEnhancementBufferBudget != value else { return true }
-        VideoEnhancementPreferences.bufferBudget = value
-        videoEnhancementBufferBudget = value
-        notifyObservers([.videoEnhancement])
-        return true
-    }
-
-    @discardableResult
-    func setVideoEnhancementMaxLookahead(_ value: VideoEnhancementLookahead) -> Bool {
-        guard isAllowed(.videoEnhancement), storageError == nil else { return false }
-        guard videoEnhancementMaxLookahead != value else { return true }
-        VideoEnhancementPreferences.maxLookahead = value
-        videoEnhancementMaxLookahead = value
-        notifyObservers([.videoEnhancement])
-        return true
-    }
 
     @discardableResult
     func setVideoEnhancementLimitToScreen(_ value: Bool) -> Bool {
@@ -140,16 +102,6 @@ final class ExperimentalSettingsStore {
         guard videoEnhancementLimitToScreen != value else { return true }
         VideoEnhancementPreferences.limitToScreenResolution = value
         videoEnhancementLimitToScreen = value
-        notifyObservers([.videoEnhancement])
-        return true
-    }
-
-    @discardableResult
-    func setVideoEnhancementAdaptiveQuality(_ enabled: Bool) -> Bool {
-        guard isAllowed(.videoEnhancement), storageError == nil else { return false }
-        guard videoEnhancementAdaptiveQuality != enabled else { return true }
-        VideoEnhancementPreferences.adaptiveQualityEnabled = enabled
-        videoEnhancementAdaptiveQuality = enabled
         notifyObservers([.videoEnhancement])
         return true
     }

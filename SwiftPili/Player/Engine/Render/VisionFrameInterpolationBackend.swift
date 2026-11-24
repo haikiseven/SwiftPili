@@ -45,6 +45,7 @@ final class VisionFrameInterpolationBackend {
 
     func tearDown() {
         previousFrame = nil
+        resources?.flushTextures()
         resources = nil
     }
 
@@ -78,14 +79,18 @@ final class VisionFrameInterpolationBackend {
             flush()
             return .bypassed(reason: reason)
         }
-        guard !Task.isCancelled else {
-            flush()
-            return .bypassed(reason: VisionInterpolationFailure.cancelled.rawValue)
-        }
+        // Advance `previousFrame` even if this frame misses its deadline so the very next pair
+        // can interpolate immediately without waiting an extra frame to rebuild reference state.
         let previous = previousFrame
         previousFrame = frame
+        guard !Task.isCancelled else {
+            return .bypassed(reason: VisionInterpolationFailure.cancelled.rawValue)
+        }
         guard let plan, let previous else { return .passthrough }
         guard !plan.phases.isEmpty else { return .passthrough }
+        guard hasTimeRemaining() else {
+            return .bypassed(reason: VisionInterpolationFailure.deadline.rawValue)
+        }
         guard let timing = VideoFrameInterpolationTiming(
             previousPTS: previous.pts,
             previousDuration: previous.duration,
@@ -99,7 +104,6 @@ final class VisionFrameInterpolationBackend {
             return .bypassed(reason: "Vision FI frame format changed")
         }
         do {
-            try Self.checkBudget(hasTimeRemaining)
             let resources = try metalResources(for: format)
             let candidates = try await interpolate(
                 previous: previous.pixelBuffer, current: buffer, plan: plan,
@@ -107,7 +111,6 @@ final class VisionFrameInterpolationBackend {
             )
             return .interpolated(frames: plan.makeFrames(buffers: candidates))
         } catch {
-            if Task.isCancelled { flush() }
             let reason = (error as? VisionInterpolationSetupFailure)?.reason
                 ?? (error as? VisionInterpolationFailure)?.rawValue
                 ?? "Vision FI unexpected failure"
@@ -136,38 +139,35 @@ final class VisionFrameInterpolationBackend {
         resources: VisionInterpolationMetal,
         hasTimeRemaining: @Sendable () -> Bool
     ) async throws -> [CVPixelBuffer] {
-        let outputs = try plan.phases.map { phase in
-            try Self.checkBudget(hasTimeRemaining)
-            let buffer = try resources.allocateOutput(phaseCount: plan.phases.count)
-            guard VideoFramePairFormat.hasSameStorageFormat(current, buffer) else {
-                throw VisionInterpolationFailure.outputFormat
-            }
-            return (phase: phase, buffer: buffer)
-        }
         try Self.checkBudget(hasTimeRemaining)
         let input = try resources.makePair(previous: previous, current: current)
-        try Self.checkBudget(hasTimeRemaining)
         try await resources.prepareAnalysis(input)
-        try Self.checkBudget(hasTimeRemaining)
-        try resources.uploadFlow(try await Self.flow(
+
+        let forwardBuffer = try await Self.flow(
             from: input.previousAnalysis, to: input.currentAnalysis, hasTimeRemaining: hasTimeRemaining
-        ), forward: true)
-        try Self.checkBudget(hasTimeRemaining)
-        try resources.uploadFlow(try await Self.flow(
+        )
+        let forwardFlow = try resources.bindFlow(forwardBuffer, forward: true)
+
+        let backwardBuffer = try await Self.flow(
             from: input.currentAnalysis, to: input.previousAnalysis, hasTimeRemaining: hasTimeRemaining
-        ), forward: false)
-        try Self.checkBudget(hasTimeRemaining)
-        let verticalSign = try await resources.validateMotion(input: input)
-        try Self.checkBudget(hasTimeRemaining)
-        try await resources.synthesize(input, verticalSign: verticalSign, outputs: outputs) {
+        )
+        let backwardFlow = try resources.bindFlow(backwardBuffer, forward: false)
+
+        let outputs = try await resources.validateAndSynthesize(
+            input,
+            forwardFlow: forwardFlow,
+            backwardFlow: backwardFlow,
+            phases: plan.phases,
+            currentBuffer: current
+        ) {
             try Self.checkBudget(hasTimeRemaining)
         }
-        try Self.checkBudget(hasTimeRemaining)
+
+        // Never discard already-computed GPU output once synthesis finishes.
         for output in outputs {
-            VideoFramePairFormat.copyInterpretation(from: current, to: output.buffer)
+            VideoFramePairFormat.copyInterpretation(from: current, to: output)
         }
-        try Self.checkBudget(hasTimeRemaining)
-        return outputs.map { $0.buffer }
+        return outputs
     }
 
     private static let signposter = OSSignposter(subsystem: "com.swiftpili.app", category: "VisionFrameInterpolation")
@@ -177,13 +177,13 @@ final class VisionFrameInterpolationBackend {
         to destination: CVPixelBuffer,
         hasTimeRemaining: @Sendable () -> Bool
     ) async throws -> CVPixelBuffer {
+        try checkBudget(hasTimeRemaining)
         let request = VNGenerateOpticalFlowRequest(targetedCVPixelBuffer: source, orientation: .up, options: [:])
         request.computationAccuracy = .low
         request.outputPixelFormat = kCVPixelFormatType_TwoComponent16Half
         request.keepNetworkOutput = false
         let cancellation = VisionRequestCancellation(request: request)
         return try await withTaskCancellationHandler {
-            try checkBudget(hasTimeRemaining)
             let handler = VNImageRequestHandler(cvPixelBuffer: destination, orientation: .up, options: [:])
             do {
                 try signposter.withIntervalSignpost("Optical flow") { try handler.perform([request]) }
@@ -191,7 +191,6 @@ final class VisionFrameInterpolationBackend {
                 try checkBudget(hasTimeRemaining)
                 throw VisionInterpolationFailure.vision
             }
-            try checkBudget(hasTimeRemaining)
             guard let buffer = request.results?.first?.pixelBuffer else { throw VisionInterpolationFailure.flowLayout }
             return buffer
         } onCancel: {

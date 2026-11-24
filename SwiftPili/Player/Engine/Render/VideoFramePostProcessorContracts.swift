@@ -5,6 +5,19 @@ import Foundation
 import VideoToolbox
 #endif
 
+/// Fixed, memory-pressure-aware output pool limits and steady presentation lookahead.
+enum VideoEnhancementPoolLimits {
+    static let defaultLead: TimeInterval = 0.35
+
+    static var superResolutionFrames: Int {
+        VideoEnhancementGuardrails.isUnderMemoryPressure ? 6 : 12
+    }
+
+    static func interpolationFrames(phaseCount: Int) -> Int {
+        max(1, phaseCount) * (VideoEnhancementGuardrails.isUnderMemoryPressure ? 3 : 5)
+    }
+}
+
 struct PostProcessFrameBox: @unchecked Sendable {
     let frame: MediaVideoFrame
 }
@@ -28,6 +41,30 @@ struct VideoEnhancementDeadlines: Sendable {
     func workDeadline(upscaling: Bool) -> ContinuousClock.Instant {
         upscaling ? original : midpoint ?? original
     }
+}
+
+struct VideoEnhancementSuperResolutionPlan: Equatable, Sendable {
+    let scaleCap: Float
+    let targetDimensions: VideoSuperResolutionDimensions?
+}
+
+/// Single-pass admission snapshot for a `(previous, current)` frame pair, capturing guardrails,
+/// super-resolution sizing, and frame-interpolation planning without redundant re-evaluation.
+struct VideoEnhancementAdmission: Sendable {
+    let configuration: VideoEnhancementConfiguration
+    let superResolution: VideoEnhancementSuperResolutionPlan?
+    let superResolutionBypassReason: String?
+    let interpolationPlan: VideoFrameInterpolationPlan?
+    let interpolationBypassReason: String?
+    let activeOriginalDuration: TimeInterval?
+
+    var canUpscale: Bool { superResolution != nil }
+    var hasInterpolationPhases: Bool { interpolationPlan.map { !$0.phases.isEmpty } ?? false }
+}
+
+enum VideoEnhancementAdmissionOutcome: Sendable {
+    case eligible(VideoEnhancementAdmission)
+    case ineligible(bypassReason: String?, activeOriginalDuration: TimeInterval?)
 }
 
 struct VideoFrameEnhancementResult: Sendable {
@@ -63,19 +100,34 @@ enum VideoFrameEnhancementUpdate: Sendable {
 /// Tracks actual inter-frame presentation cadence from decoded PTS deltas, insulating
 /// interpolation decisions from misdeclared container durations (e.g. 30 fps content in a 60 fps
 /// track) and single-tick timescale quantization jitter (e.g. 19/600s on a 30 fps stream).
+///
+/// Uses a fixed 16-element inline ring buffer and caches `medianInterval` / `isConstantRate`
+/// on insertion so per-frame reads perform zero heap allocations and zero sorting.
 struct VideoFrameCadenceEstimator: Sendable {
     private static let maxSamples = 16
     private static let minimumDelta: TimeInterval = 1.0 / 240.0
     private static let maximumDelta: TimeInterval = 0.25
 
-    private var lastObservedPTS: TimeInterval?
-    private var deltas: [TimeInterval] = []
+    private typealias SampleRing = (
+        TimeInterval, TimeInterval, TimeInterval, TimeInterval,
+        TimeInterval, TimeInterval, TimeInterval, TimeInterval,
+        TimeInterval, TimeInterval, TimeInterval, TimeInterval,
+        TimeInterval, TimeInterval, TimeInterval, TimeInterval
+    )
 
-    var sampleCount: Int { deltas.count }
+    private var lastObservedPTS: TimeInterval?
+    private var ring: SampleRing = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    private var writeIndex = 0
+    private(set) var sampleCount = 0
+    private(set) var medianInterval: TimeInterval?
+    /// True when observed deltas behave like constant-frame-rate content (interquartile spread
+    /// within 8% of the median). Returns `true` before 4 deltas are collected so standard CFR
+    /// streams can immediately enter the fast dyadic path when their declared duration matches.
+    private(set) var isConstantRate = true
 
     mutating func reset() {
         lastObservedPTS = nil
-        deltas.removeAll(keepingCapacity: true)
+        clearSamples()
     }
 
     mutating func observe(pts: TimeInterval) {
@@ -86,35 +138,20 @@ struct VideoFrameCadenceEstimator: Sendable {
         let delta = pts - previous
         guard delta.isFinite, delta >= Self.minimumDelta, delta <= Self.maximumDelta else {
             if delta < 0 || delta > 0.5 {
-                deltas.removeAll(keepingCapacity: true)
+                clearSamples()
             }
             return
         }
-        if deltas.count == Self.maxSamples {
-            deltas.removeFirst()
+        let slot = writeIndex
+        withUnsafeMutableBytes(of: &ring) { raw in
+            let buffer = raw.bindMemory(to: TimeInterval.self)
+            buffer[slot] = delta
         }
-        deltas.append(delta)
-    }
-
-    var medianInterval: TimeInterval? {
-        guard !deltas.isEmpty else { return nil }
-        let sorted = deltas.sorted()
-        let mid = sorted.count / 2
-        if sorted.count.isMultiple(of: 2) {
-            return (sorted[mid - 1] + sorted[mid]) * 0.5
+        writeIndex = (slot + 1) & 15
+        if sampleCount < Self.maxSamples {
+            sampleCount += 1
         }
-        return sorted[mid]
-    }
-
-    /// True when observed deltas behave like constant-frame-rate content (interquartile spread
-    /// within 8% of the median). Returns `true` before 4 deltas are collected so standard CFR
-    /// streams can immediately enter the fast dyadic path when their declared duration matches.
-    var isConstantRate: Bool {
-        guard deltas.count >= 4, let median = medianInterval, median > 0 else { return true }
-        let sorted = deltas.sorted()
-        let q1 = sorted[sorted.count / 4]
-        let q3 = sorted[(sorted.count * 3) / 4]
-        return (q3 - q1) / median <= 0.08
+        recomputeStats()
     }
 
     func estimatedInterval(fallbackDuration: TimeInterval) -> TimeInterval? {
@@ -123,6 +160,50 @@ struct VideoFrameCadenceEstimator: Sendable {
         }
         guard fallbackDuration.isFinite, fallbackDuration > 0 else { return nil }
         return fallbackDuration
+    }
+
+    private mutating func clearSamples() {
+        writeIndex = 0
+        sampleCount = 0
+        medianInterval = nil
+        isConstantRate = true
+    }
+
+    private mutating func recomputeStats() {
+        let count = sampleCount
+        guard count > 0 else {
+            medianInterval = nil
+            isConstantRate = true
+            return
+        }
+        var sorted = ring
+        let stats: (median: TimeInterval, constant: Bool) = withUnsafeMutableBytes(of: &sorted) { raw in
+            let values = raw.bindMemory(to: TimeInterval.self)
+            for i in 1..<count {
+                let key = values[i]
+                var j = i - 1
+                while j >= 0 && values[j] > key {
+                    values[j + 1] = values[j]
+                    j -= 1
+                }
+                values[j + 1] = key
+            }
+            let mid = count / 2
+            let median = count.isMultiple(of: 2)
+                ? (values[mid - 1] + values[mid]) * 0.5
+                : values[mid]
+            let constant: Bool
+            if count >= 4, median > 0 {
+                let q1 = values[count / 4]
+                let q3 = values[(count * 3) / 4]
+                constant = (q3 - q1) / median <= 0.08
+            } else {
+                constant = true
+            }
+            return (median, constant)
+        }
+        medianInterval = stats.median
+        isConstantRate = stats.constant
     }
 }
 
@@ -334,51 +415,6 @@ struct VideoFrameInterpolationPlan: Sendable {
             targetPeriod: mediaTargetPeriod,
             targetFPS: cap,
             gridNextPTS: gridNextPTS
-        )
-    }
-
-    /// Synthesizes a non-empty plan preceding `currentPTS` so backends can prewarm the exact
-    /// session mode (dyadic LLFI vs persistent arbitrary-phase FRC) before real playback frames.
-    static func prewarmPlan(
-        before currentPTS: TimeInterval,
-        interval: TimeInterval,
-        cadenceInterval: TimeInterval? = nil,
-        isCadenceStable: Bool = true,
-        rate: VideoInterpolationRate,
-        playbackRate: Double = 1.0,
-        supportsArbitraryPhases: Bool = Self.supportsArbitraryPhases
-    ) -> VideoFrameInterpolationPlan? {
-        guard interval.isFinite, interval > 0, currentPTS.isFinite else { return nil }
-        let previousPTS = currentPTS - 2 * interval
-        let pairEndPTS = currentPTS - interval
-        guard case let .plan(resolved) = plan(
-            previousPTS: previousPTS,
-            currentPTS: pairEndPTS,
-            interval: interval,
-            cadenceInterval: cadenceInterval,
-            isCadenceStable: isCadenceStable,
-            gridNextPTS: nil,
-            rate: rate,
-            playbackRate: playbackRate,
-            supportsArbitraryPhases: supportsArbitraryPhases
-        ) else {
-            return nil
-        }
-        if !resolved.phases.isEmpty {
-            return resolved
-        }
-        guard !resolved.allowsLowLatency else { return nil }
-        let midpointPTS = previousPTS + interval * 0.5
-        guard midpointPTS > previousPTS, midpointPTS < pairEndPTS else { return nil }
-        return VideoFrameInterpolationPlan(
-            phases: [0.5],
-            pts: [midpointPTS],
-            sourceInterval: interval,
-            allowsLowLatency: false,
-            emitsOriginal: false,
-            outputFrameDuration: resolved.outputFrameDuration,
-            nextGridPTS: resolved.nextGridPTS,
-            targetOutputFPS: resolved.targetOutputFPS
         )
     }
 

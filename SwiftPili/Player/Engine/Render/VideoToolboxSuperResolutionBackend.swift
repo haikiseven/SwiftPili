@@ -131,13 +131,16 @@ final class VideoToolboxSuperResolutionBackend {
             )
             return .processed(output)
         } catch {
-            flush()
+            if let failure = error as? VTSRFailure {
+                return .bypassed(reason: failure.reason)
+            }
+            if let poolFailure = error as? VideoSuperResolutionPool.Failure {
+                return .bypassed(reason: poolFailure.reason)
+            }
             if Task.isCancelled || !hasTimeRemaining() {
                 return .bypassed(reason: VTSRFailure.deadline.reason)
             }
-            let reason = (error as? VTSRFailure)?.reason ?? (error as? VideoSuperResolutionPool.Failure)?.reason
-                ?? "VT SR buffer preparation failed"
-            return .bypassed(reason: reason)
+            return .bypassed(reason: "VT SR buffer preparation failed")
         }
         #endif
     }
@@ -323,14 +326,6 @@ private struct VTSRFailure: Error {
 
     static func checkDeadline(_ hasTimeRemaining: @Sendable () -> Bool) throws {
         guard !Task.isCancelled, hasTimeRemaining() else { throw deadline }
-    }
-}
-
-private extension VTInterpolationRaster {
-    init(width: Int, height: Int, format: OSType) {
-        self.width = width
-        self.height = height
-        self.format = format
     }
 }
 
@@ -640,9 +635,8 @@ private final class VTSRSession {
         try VTSRFailure.checkDeadline(hasTimeRemaining)
         if let lastSubmittedPTS, pts <= lastSubmittedPTS { endSession() }
         let pair = try await prepareFrames(
-            input, pts: pts, isDirect: isDirect, pixelConverter: pixelConverter, hasTimeRemaining: hasTimeRemaining
+            input, pts: pts, isDirect: isDirect, pixelConverter: pixelConverter
         )
-        try VTSRFailure.checkDeadline(hasTimeRemaining)
         guard let parameters = makeParameters(pair) else { throw VTSRFailure("VT SR parameters invalid") }
         let processor = try startIfNeeded(hasTimeRemaining: hasTimeRemaining)
         try VTSRFailure.checkDeadline(hasTimeRemaining)
@@ -652,12 +646,11 @@ private final class VTSRSession {
         } catch {
             throw handleNativeError(error, operation: "process")
         }
-        try VTSRFailure.checkDeadline(hasTimeRemaining)
+        // Never discard already-computed hardware output once `process` succeeds.
         let output = pair.output.buffer
         let outputColorSpace: ScaledVideoOutputMetadata.OutputColorSpace =
             configuration.destination.raster.format == kCVPixelFormatType_32BGRA ? .rgbConverted : .yuvSameAsSource
         ScaledVideoOutputMetadata.copy(from: input, to: output, colorSpace: outputColorSpace)
-        try VTSRFailure.checkDeadline(hasTimeRemaining)
         if case .legacyVideo = configuration.id { history = pair }
         return output
     }
@@ -666,25 +659,20 @@ private final class VTSRSession {
         _ input: CVPixelBuffer,
         pts: CMTime,
         isDirect: Bool,
-        pixelConverter: MetalNV12PixelConverter,
-        hasTimeRemaining: @Sendable () -> Bool
+        pixelConverter: MetalNV12PixelConverter
     ) async throws -> FramePair {
-        try VTSRFailure.checkDeadline(hasTimeRemaining)
         let source = if isDirect {
             input
         } else {
-            try await stage(input, pixelConverter: pixelConverter, hasTimeRemaining: hasTimeRemaining)
+            try await stage(input, pixelConverter: pixelConverter)
         }
-        try VTSRFailure.checkDeadline(hasTimeRemaining)
         let requirements = configuration.destination
         let pool = try destinationPool ?? VideoSuperResolutionPool(
             attributes: requirements.poolAttributes, label: "VT SR destination", followsDisplayLookahead: true,
             isCompatible: requirements.accepts
         )
         destinationPool = pool
-        try VTSRFailure.checkDeadline(hasTimeRemaining)
         let output = try pool.allocate()
-        try VTSRFailure.checkDeadline(hasTimeRemaining)
         guard let sourceFrame = VTFrameProcessorFrame(buffer: source, presentationTimeStamp: pts),
               let outputFrame = VTFrameProcessorFrame(buffer: output, presentationTimeStamp: pts) else {
             throw VTSRFailure("VT SR frame parameters invalid")
@@ -694,21 +682,18 @@ private final class VTSRSession {
 
     private func stage(
         _ input: CVPixelBuffer,
-        pixelConverter: MetalNV12PixelConverter,
-        hasTimeRemaining: @Sendable () -> Bool
+        pixelConverter: MetalNV12PixelConverter
     ) async throws -> CVPixelBuffer {
         let requirements = configuration.source
         let inputFormat = CVPixelBufferGetPixelFormatType(input)
         let targetFormat = requirements.raster.format
         let sameNV12 = inputFormat == targetFormat && MetalNV12PixelConverter.isNV12(inputFormat)
-        let pool = try stagingPool ?? makeStagingPool(requirements: requirements, needsMetal: !sameNV12)
+        let pool = try stagingPool ?? makeStagingPool(requirements: requirements)
         stagingPool = pool
-        try VTSRFailure.checkDeadline(hasTimeRemaining)
         let staged = try pool.allocate()
-        try VTSRFailure.checkDeadline(hasTimeRemaining)
         if sameNV12 {
             do {
-                try VTNV12StagingCopy.copy(from: input, to: staged)
+                try await VTNV12StagingCopy.copyAsync(from: input, to: staged)
             } catch {
                 throw VTSRFailure("VT SR NV12 staging failed")
             }
@@ -720,13 +705,6 @@ private final class VTSRSession {
             let dstCC = VTSRNegotiation.fourCC(targetFormat)
             throw VTSRFailure("VT SR GPU staging failed (\(srcCC)->\(dstCC))")
         }
-        try VTSRFailure.checkDeadline(hasTimeRemaining)
-        if !VTInterpolationPadding(staged).isEmpty {
-            let status = CVPixelBufferFillExtendedPixels(staged)
-            guard status == kCVReturnSuccess else {
-                throw VTSRFailure("VT SR staging padding failed (\(status))")
-            }
-        }
         let stagedColorSpace: ScaledVideoOutputMetadata.OutputColorSpace =
             targetFormat == kCVPixelFormatType_32BGRA ? .rgbConverted : .yuvSameAsSource
         ScaledVideoOutputMetadata.copy(from: input, to: staged, colorSpace: stagedColorSpace)
@@ -734,20 +712,15 @@ private final class VTSRSession {
     }
 
     private func makeStagingPool(
-        requirements: VTInterpolationBufferRequirements, needsMetal: Bool
+        requirements: VTInterpolationBufferRequirements
     ) throws -> VideoSuperResolutionPool {
-        if needsMetal {
-            var resolved: CFDictionary?
-            let metalAttrs = [kCVPixelBufferMetalCompatibilityKey as String: true] as CFDictionary
-            let status = CVPixelBufferCreateResolvedAttributesDictionary(
-                kCFAllocatorDefault, [requirements.poolAttributes, metalAttrs] as CFArray, &resolved
-            )
-            if status == kCVReturnSuccess, let resolved,
-               let pool = try? VideoSuperResolutionPool(
-                attributes: resolved, label: "VT SR staging", limit: 6, isCompatible: requirements.accepts
-               ) {
-                return pool
-            }
+        if let pool = try? VideoSuperResolutionPool(
+            attributes: requirements.metalCompatiblePoolAttributes(),
+            label: "VT SR staging",
+            limit: 6,
+            isCompatible: requirements.accepts
+        ) {
+            return pool
         }
         return try VideoSuperResolutionPool(
             attributes: requirements.poolAttributes, label: "VT SR staging", limit: 6,
@@ -759,9 +732,13 @@ private final class VTSRSession {
         if case .lowLatency = configuration.id {
             return VTLowLatencySuperResolutionScalerParameters(sourceFrame: pair.source, destinationFrame: pair.output)
         }
-        let previous = history.flatMap { reference in
-            reference.source.presentationTimeStamp < pair.source.presentationTimeStamp
-                && VideoFramePairFormat.matches(reference.source.buffer, pair.source.buffer) ? reference : nil
+        let previous = history.flatMap { reference -> FramePair? in
+            let delta = CMTimeSubtract(pair.source.presentationTimeStamp, reference.source.presentationTimeStamp).seconds
+            guard delta.isFinite, delta > 0, delta <= 0.25,
+                  VideoFramePairFormat.matches(reference.source.buffer, pair.source.buffer) else {
+                return nil
+            }
+            return reference
         }
         return VTSuperResolutionScalerParameters(
             sourceFrame: pair.source, previousFrame: previous?.source, previousOutputFrame: previous?.output,
@@ -773,7 +750,6 @@ private final class VTSRSession {
         if let processor { return processor }
         try VTSRFailure.checkDeadline(hasTimeRemaining)
         let newProcessor = VTFrameProcessor()
-        try VTSRFailure.checkDeadline(hasTimeRemaining)
         do {
             try newProcessor.startSession(configuration: configuration.native)
         } catch {

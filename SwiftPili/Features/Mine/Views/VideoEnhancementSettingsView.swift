@@ -26,8 +26,6 @@ struct VideoEnhancementSettingsView: View {
 
             superResolutionSection
             interpolationSection
-            adaptiveQualitySection
-            resourcesSection
 
             Section {
                 capabilityRow("VideoToolbox ML", status: capabilities.videoToolboxML)
@@ -157,73 +155,6 @@ struct VideoEnhancementSettingsView: View {
             Text("Frame Interpolation")
         } footer: {
             Text("Applies to supported progressive SDR Demand VOD streams. High temperatures pause enhancement.")
-        }
-        .disabled(!canMutate)
-    }
-
-    // MARK: Adaptive quality
-
-    private var adaptiveQualitySection: some View {
-        Section {
-            Toggle(isOn: binding(\.videoEnhancementAdaptiveQuality, experiments.setVideoEnhancementAdaptiveQuality)) {
-                Label {
-                    Text("Adaptive Quality")
-                } icon: {
-                    SettingsIcon(symbol: "gauge.with.dots.needle.33percent")
-                }
-            }
-
-            if experiments.videoEnhancementAdaptiveQuality {
-                Picker(
-                    "Degradation Sensitivity",
-                    selection: binding(
-                        \.videoEnhancementAdaptiveSensitivity, experiments.setVideoEnhancementAdaptiveSensitivity
-                    )
-                ) {
-                    ForEach(VideoEnhancementAdaptiveSensitivity.allCases) { value in
-                        Text(value.label).tag(value)
-                    }
-                }
-                .pickerStyle(.menu)
-                .menuOrder(.fixed)
-            }
-        } header: {
-            Text("Performance")
-        } footer: {
-            Text("When the device can't keep up, runs warm, or is in Low Power Mode, enhancement steps down gradually (lower interpolation rate, smaller scale, lighter upscaler, no interpolation) and recovers automatically. Turning this off keeps your settings; frames that miss their deadline are shown unenhanced and the device may heat up faster.")
-        }
-        .disabled(!canMutate)
-    }
-
-    // MARK: Resources
-
-    private var resourcesSection: some View {
-        Section {
-            Picker(
-                "Buffer Memory",
-                selection: binding(\.videoEnhancementBufferBudget, experiments.setVideoEnhancementBufferBudget)
-            ) {
-                ForEach(VideoEnhancementBufferBudget.allCases) { value in
-                    Text(value.label).tag(value)
-                }
-            }
-            .pickerStyle(.menu)
-            .menuOrder(.fixed)
-
-            Picker(
-                "Lookahead",
-                selection: binding(\.videoEnhancementMaxLookahead, experiments.setVideoEnhancementMaxLookahead)
-            ) {
-                ForEach(VideoEnhancementLookahead.allCases) { value in
-                    Text(value.label).tag(value)
-                }
-            }
-            .pickerStyle(.menu)
-            .menuOrder(.fixed)
-        } header: {
-            Text("Advanced")
-        } footer: {
-            Text("VideoEnhancementResourcesFooter", tableName: nil, comment: "Buffer memory / lookahead footer")
         }
         .disabled(!canMutate)
     }

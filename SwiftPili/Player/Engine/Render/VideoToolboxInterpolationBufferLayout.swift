@@ -1,11 +1,18 @@
 import CoreVideo
 import Foundation
+import Metal
 
 #if !targetEnvironment(simulator)
 struct VTInterpolationRaster: Equatable {
     let width: Int
     let height: Int
     let format: OSType
+
+    init(width: Int, height: Int, format: OSType) {
+        self.width = width
+        self.height = height
+        self.format = format
+    }
 
     init(_ buffer: CVPixelBuffer) {
         width = CVPixelBufferGetWidth(buffer)
@@ -33,13 +40,21 @@ struct VTInterpolationRaster: Equatable {
 }
 
 struct VTInterpolationPadding: CustomStringConvertible {
-    private var left = 0
-    private var right = 0
-    private var top = 0
-    private var bottom = 0
+    let left: Int
+    let right: Int
+    let top: Int
+    let bottom: Int
 
     init(_ buffer: CVPixelBuffer) {
+        var left = 0
+        var right = 0
+        var top = 0
+        var bottom = 0
         CVPixelBufferGetExtendedPixels(buffer, &left, &right, &top, &bottom)
+        self.left = left
+        self.right = right
+        self.top = top
+        self.bottom = bottom
     }
 
     init(attributes: [String: Any]) {
@@ -88,6 +103,18 @@ struct VTInterpolationBufferRequirements {
         return []
     }
 
+    func metalCompatiblePoolAttributes() -> CFDictionary {
+        var resolved: CFDictionary?
+        let metalAttrs = [kCVPixelBufferMetalCompatibilityKey as String: true] as CFDictionary
+        let status = CVPixelBufferCreateResolvedAttributesDictionary(
+            kCFAllocatorDefault, [poolAttributes, metalAttrs] as CFArray, &resolved
+        )
+        if status == kCVReturnSuccess, let resolved {
+            return resolved
+        }
+        return poolAttributes
+    }
+
     func accepts(_ buffer: CVPixelBuffer) -> Bool {
         VTInterpolationRaster(buffer) == raster && CVPixelBufferGetIOSurface(buffer) != nil
             && CVPixelBufferIsCompatibleWithAttributes(buffer, compatibilityAttributes)
@@ -100,14 +127,35 @@ struct VTInterpolationPool {
     private let pool: CVPixelBufferPool
     private let limit: () -> Int
 
-    init(requirements: VTInterpolationBufferRequirements, role: String, limit: Int) throws {
-        try self.init(requirements: requirements, role: role, dynamicLimit: { limit })
+    init(
+        requirements: VTInterpolationBufferRequirements,
+        role: String,
+        limit: Int,
+        metalCompatible: Bool = false
+    ) throws {
+        try self.init(
+            requirements: requirements, role: role, metalCompatible: metalCompatible, dynamicLimit: { limit }
+        )
     }
 
     /// `dynamicLimit` is evaluated per allocation so output pools follow the display lookahead.
-    init(requirements: VTInterpolationBufferRequirements, role: String, dynamicLimit: @escaping () -> Int) throws {
+    init(
+        requirements: VTInterpolationBufferRequirements,
+        role: String,
+        metalCompatible: Bool = false,
+        dynamicLimit: @escaping () -> Int
+    ) throws {
         var pool: CVPixelBufferPool?
-        let status = CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, requirements.poolAttributes, &pool)
+        var status: CVReturn = kCVReturnError
+        if metalCompatible {
+            status = CVPixelBufferPoolCreate(
+                kCFAllocatorDefault, nil, requirements.metalCompatiblePoolAttributes(), &pool
+            )
+        }
+        if status != kCVReturnSuccess || pool == nil {
+            pool = nil
+            status = CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, requirements.poolAttributes, &pool)
+        }
         guard status == kCVReturnSuccess, let pool else {
             throw VTInterpolationFailure(reason: "VT FI \(role) pool failed", detail: "poolCreate=\(status)")
         }
@@ -124,7 +172,7 @@ struct VTInterpolationPool {
             kCFAllocatorDefault, pool, allocationAttributes, &buffer
         )
         if status == kCVReturnWouldExceedAllocationThreshold {
-            throw VTInterpolationFailure(reason: "VT FI \(role) pool busy")
+            throw VTInterpolationFailure(reason: "VT FI \(role) pool busy", preservesReference: true)
         }
         guard status == kCVReturnSuccess, let buffer else {
             throw VTInterpolationFailure(reason: "VT FI \(role) buffer unavailable", detail: "poolAllocate=\(status)")
@@ -142,15 +190,45 @@ struct VTInterpolationPool {
 }
 
 enum VTNV12StagingCopy {
-    static func copy(from source: CVPixelBuffer, to destination: CVPixelBuffer) throws {
-        let pixelFormat = CVPixelBufferGetPixelFormatType(source)
-        let isNV12 = pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-            || pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-        guard VideoFramePairFormat.hasSameStorageFormat(source, destination),
-              isNV12,
-              CVPixelBufferGetPlaneCount(source) == 2, CVPixelBufferGetPlaneCount(destination) == 2 else {
-            throw VTInterpolationFailure(reason: "VT FI staging layout incompatible")
+    /// Zero-stall GPU NV12 staging copy via `VideoEnhancementMetalContext.shared`, clamp-filling
+    /// extended right/bottom padding directly in Metal when exposed by the destination IOSurface
+    /// and falling back to CPU `copyPlanes` only when Metal texture mapping is unavailable.
+    static func copyAsync(from source: CVPixelBuffer, to destination: CVPixelBuffer) async throws {
+        let layout = try validateNV12Layout(from: source, to: destination)
+        let srcPadding = VTInterpolationPadding(source)
+        let dstPadding = VTInterpolationPadding(destination)
+
+        var copiedOnGPU = false
+        var paddingCoveredByGPU = dstPadding.isEmpty
+
+        if srcPadding.left == 0, srcPadding.top == 0,
+           CVPixelBufferGetIOSurface(source) != nil,
+           CVPixelBufferGetIOSurface(destination) != nil {
+            let gpuResult = await copyPlanesGPU(
+                from: source, to: destination, layout: layout, dstPadding: dstPadding
+            )
+            copiedOnGPU = gpuResult.succeeded
+            paddingCoveredByGPU = gpuResult.paddingCovered
         }
+
+        if !copiedOnGPU {
+            try copyPlanes(from: source, to: destination)
+            paddingCoveredByGPU = dstPadding.isEmpty
+        }
+
+        if !dstPadding.isEmpty, !paddingCoveredByGPU {
+            let status = CVPixelBufferFillExtendedPixels(destination)
+            guard status == kCVReturnSuccess else {
+                throw VTInterpolationFailure(
+                    reason: "VT FI staging padding failed", detail: "fillExtendedPixels=\(status)"
+                )
+            }
+        }
+        VideoFramePairFormat.copyInterpretation(from: source, to: destination)
+    }
+
+    static func copy(from source: CVPixelBuffer, to destination: CVPixelBuffer) throws {
+        _ = try validateNV12Layout(from: source, to: destination)
         try copyPlanes(from: source, to: destination)
         if !VTInterpolationPadding(destination).isEmpty {
             let status = CVPixelBufferFillExtendedPixels(destination)
@@ -161,6 +239,176 @@ enum VTNV12StagingCopy {
             }
         }
         VideoFramePairFormat.copyInterpretation(from: source, to: destination)
+    }
+
+    private struct NV12Layout {
+        let lumaWidth: Int
+        let lumaHeight: Int
+        let chromaWidth: Int
+        let chromaHeight: Int
+    }
+
+    private static func validateNV12Layout(
+        from source: CVPixelBuffer, to destination: CVPixelBuffer
+    ) throws -> NV12Layout {
+        let pixelFormat = CVPixelBufferGetPixelFormatType(source)
+        let isNV12 = pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            || pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        guard VideoFramePairFormat.hasSameStorageFormat(source, destination),
+              isNV12,
+              CVPixelBufferGetPlaneCount(source) == 2, CVPixelBufferGetPlaneCount(destination) == 2 else {
+            throw VTInterpolationFailure(reason: "VT FI staging layout incompatible")
+        }
+        let lumaW = CVPixelBufferGetWidthOfPlane(source, 0)
+        let lumaH = CVPixelBufferGetHeightOfPlane(source, 0)
+        let chromaW = CVPixelBufferGetWidthOfPlane(source, 1)
+        let chromaH = CVPixelBufferGetHeightOfPlane(source, 1)
+        guard lumaW > 0, lumaH > 0, chromaW > 0, chromaH > 0,
+              lumaW == CVPixelBufferGetWidthOfPlane(destination, 0),
+              lumaH == CVPixelBufferGetHeightOfPlane(destination, 0),
+              chromaW == CVPixelBufferGetWidthOfPlane(destination, 1),
+              chromaH == CVPixelBufferGetHeightOfPlane(destination, 1) else {
+            throw VTInterpolationFailure(reason: "VT FI staging layout incompatible")
+        }
+        return NV12Layout(lumaWidth: lumaW, lumaHeight: lumaH, chromaWidth: chromaW, chromaHeight: chromaH)
+    }
+
+    private static func copyPlanesGPU(
+        from source: CVPixelBuffer,
+        to destination: CVPixelBuffer,
+        layout: NV12Layout,
+        dstPadding: VTInterpolationPadding
+    ) async -> (succeeded: Bool, paddingCovered: Bool) {
+        let metal = VideoEnhancementMetalContext.shared
+        guard let resources = try? metal.resources(),
+              let commandBuffer = resources.commandQueue.makeCommandBuffer(),
+              let srcY = metal.makeTexture(
+                buffer: source, format: .r8Unorm, width: layout.lumaWidth, height: layout.lumaHeight, plane: 0
+              ),
+              let srcCbCr = metal.makeTexture(
+                buffer: source, format: .rg8Unorm, width: layout.chromaWidth, height: layout.chromaHeight, plane: 1
+              ) else {
+            return (false, false)
+        }
+
+        // Fast DMA blit when destination has no extended pixels.
+        if dstPadding.isEmpty,
+           let dstY = metal.makeTexture(
+            buffer: destination, format: .r8Unorm, width: layout.lumaWidth, height: layout.lumaHeight, plane: 0
+           ),
+           let dstCbCr = metal.makeTexture(
+            buffer: destination, format: .rg8Unorm, width: layout.chromaWidth, height: layout.chromaHeight, plane: 1
+           ),
+           let blit = commandBuffer.makeBlitCommandEncoder() {
+            blit.copy(
+                from: srcY.texture, sourceSlice: 0, sourceLevel: 0,
+                sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                sourceSize: MTLSize(width: layout.lumaWidth, height: layout.lumaHeight, depth: 1),
+                to: dstY.texture, destinationSlice: 0, destinationLevel: 0,
+                destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+            )
+            blit.copy(
+                from: srcCbCr.texture, sourceSlice: 0, sourceLevel: 0,
+                sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                sourceSize: MTLSize(width: layout.chromaWidth, height: layout.chromaHeight, depth: 1),
+                to: dstCbCr.texture, destinationSlice: 0, destinationLevel: 0,
+                destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+            )
+            blit.endEncoding()
+            let retained = [srcY.bridge, srcCbCr.bridge, dstY.bridge, dstCbCr.bridge]
+            let succeeded = await VideoEnhancementMetalContext.commitAndWait(commandBuffer)
+            withExtendedLifetime(retained) {}
+            return (succeeded, true)
+        }
+
+        // Compute copy + extended right/bottom pixel clamp-fill in a single GPU pass when exposed by IOSurface.
+        guard let yPipe = try? metal.pipeline(for: .nv12StageCopyY),
+              let cbcrPipe = try? metal.pipeline(for: .nv12StageCopyCbCr) else {
+            return (false, false)
+        }
+
+        let lumaTarget = VideoEnhancementMetalContext.gpuPaddedPlaneSize(
+            for: destination, plane: 0,
+            activeWidth: layout.lumaWidth, activeHeight: layout.lumaHeight,
+            padLeft: dstPadding.left, padRight: dstPadding.right,
+            padTop: dstPadding.top, padBottom: dstPadding.bottom
+        )
+        let chromaTarget = VideoEnhancementMetalContext.gpuPaddedPlaneSize(
+            for: destination, plane: 1,
+            activeWidth: layout.chromaWidth, activeHeight: layout.chromaHeight,
+            padLeft: dstPadding.left, padRight: dstPadding.right,
+            padTop: dstPadding.top, padBottom: dstPadding.bottom
+        )
+
+        var dstY: VideoEnhancementMetalContext.MappedTexture?
+        var dstCbCr: VideoEnhancementMetalContext.MappedTexture?
+        var paddingCovered = false
+
+        if lumaTarget.coversAllPadding, chromaTarget.coversAllPadding,
+           let paddedY = metal.makeTexture(
+            buffer: destination, format: .r8Unorm,
+            width: lumaTarget.width, height: lumaTarget.height, plane: 0, usage: .shaderWrite
+           ),
+           let paddedCbCr = metal.makeTexture(
+            buffer: destination, format: .rg8Unorm,
+            width: chromaTarget.width, height: chromaTarget.height, plane: 1, usage: .shaderWrite
+           ),
+           paddedY.texture.width == lumaTarget.width, paddedY.texture.height == lumaTarget.height,
+           paddedCbCr.texture.width == chromaTarget.width, paddedCbCr.texture.height == chromaTarget.height {
+            dstY = paddedY
+            dstCbCr = paddedCbCr
+            paddingCovered = true
+        }
+
+        if dstY == nil || dstCbCr == nil {
+            dstY = metal.makeTexture(
+                buffer: destination, format: .r8Unorm,
+                width: layout.lumaWidth, height: layout.lumaHeight, plane: 0, usage: .shaderWrite
+            )
+            dstCbCr = metal.makeTexture(
+                buffer: destination, format: .rg8Unorm,
+                width: layout.chromaWidth, height: layout.chromaHeight, plane: 1, usage: .shaderWrite
+            )
+            paddingCovered = dstPadding.isEmpty
+        }
+
+        guard let dstY, let dstCbCr, let compute = commandBuffer.makeComputeCommandEncoder() else {
+            return (false, false)
+        }
+
+        var yParams = VideoEnhancementNV12StageCopyParams(
+            activeWidth: UInt32(layout.lumaWidth),
+            activeHeight: UInt32(layout.lumaHeight),
+            padLeft: 0,
+            padTop: 0
+        )
+        compute.setComputePipelineState(yPipe)
+        compute.setTexture(srcY.texture, index: 0)
+        compute.setTexture(dstY.texture, index: 1)
+        compute.setBytes(&yParams, length: MemoryLayout<VideoEnhancementNV12StageCopyParams>.size, index: 0)
+        VideoEnhancementMetalContext.dispatchThreads(
+            encoder: compute, pipeline: yPipe, width: dstY.texture.width, height: dstY.texture.height
+        )
+
+        var cbcrParams = VideoEnhancementNV12StageCopyParams(
+            activeWidth: UInt32(layout.chromaWidth),
+            activeHeight: UInt32(layout.chromaHeight),
+            padLeft: 0,
+            padTop: 0
+        )
+        compute.setComputePipelineState(cbcrPipe)
+        compute.setTexture(srcCbCr.texture, index: 0)
+        compute.setTexture(dstCbCr.texture, index: 1)
+        compute.setBytes(&cbcrParams, length: MemoryLayout<VideoEnhancementNV12StageCopyParams>.size, index: 0)
+        VideoEnhancementMetalContext.dispatchThreads(
+            encoder: compute, pipeline: cbcrPipe, width: dstCbCr.texture.width, height: dstCbCr.texture.height
+        )
+        compute.endEncoding()
+
+        let retained = [srcY.bridge, srcCbCr.bridge, dstY.bridge, dstCbCr.bridge]
+        let succeeded = await VideoEnhancementMetalContext.commitAndWait(commandBuffer)
+        withExtendedLifetime(retained) {}
+        return (succeeded, paddingCovered)
     }
 
     private static func copyPlanes(from source: CVPixelBuffer, to destination: CVPixelBuffer) throws {
