@@ -71,8 +71,76 @@ struct DownloadByteRange: Codable, Equatable, Hashable, Sendable {
         return missing
     }
 
+    @discardableResult
+    static func insert(_ incoming: DownloadByteRange, into sortedCoalesced: inout [DownloadByteRange]) -> Int64 {
+        guard incoming.start >= 0, incoming.end > incoming.start else { return 0 }
+        let count = sortedCoalesced.count
+        if count == 0 {
+            sortedCoalesced.append(incoming)
+            return incoming.length
+        }
+        // Fast path: appending at or past the tail.
+        let lastIndex = count - 1
+        let last = sortedCoalesced[lastIndex]
+        if incoming.start > last.end {
+            sortedCoalesced.append(incoming)
+            return incoming.length
+        }
+        if incoming.start >= last.start {
+            guard incoming.end > last.end else { return 0 }
+            let added = incoming.end - last.end
+            sortedCoalesced[lastIndex] = DownloadByteRange(start: last.start, end: incoming.end)
+            return added
+        }
+
+        // Binary search for the first range whose end >= incoming.start.
+        var low = 0
+        var high = count
+        while low < high {
+            let mid = low + (high - low) / 2
+            if sortedCoalesced[mid].end < incoming.start {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+
+        if low == count || sortedCoalesced[low].start > incoming.end {
+            sortedCoalesced.insert(incoming, at: low)
+            return incoming.length
+        }
+
+        let mergedStart = min(incoming.start, sortedCoalesced[low].start)
+        var mergedEnd = max(incoming.end, sortedCoalesced[low].end)
+        var replacedBytes = sortedCoalesced[low].length
+        var mergeEndIndex = low + 1
+        while mergeEndIndex < count, sortedCoalesced[mergeEndIndex].start <= mergedEnd {
+            let next = sortedCoalesced[mergeEndIndex]
+            replacedBytes += next.length
+            if next.end > mergedEnd { mergedEnd = next.end }
+            mergeEndIndex += 1
+        }
+        let merged = DownloadByteRange(start: mergedStart, end: mergedEnd)
+        sortedCoalesced[low] = merged
+        if mergeEndIndex > low + 1 {
+            sortedCoalesced.removeSubrange((low + 1)..<mergeEndIndex)
+        }
+        return merged.length - replacedBytes
+    }
+
     static func totalBytes(in ranges: [DownloadByteRange]) -> Int64 {
-        coalesce(ranges).reduce(into: Int64(0)) { total, range in
+        guard !ranges.isEmpty else { return 0 }
+        var isAlreadyCoalesced = true
+        var previousEnd: Int64 = -1
+        for range in ranges {
+            if range.start < 0 || range.end <= range.start || range.start <= previousEnd {
+                isAlreadyCoalesced = false
+                break
+            }
+            previousEnd = range.end
+        }
+        let source = isAlreadyCoalesced ? ranges : coalesce(ranges)
+        return source.reduce(into: Int64(0)) { total, range in
             let (sum, overflow) = total.addingReportingOverflow(range.length)
             total = overflow ? Int64.max : sum
         }

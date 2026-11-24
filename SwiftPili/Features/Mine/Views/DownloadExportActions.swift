@@ -67,10 +67,7 @@ extension DownloadsView {
         }
         .padding(AppSpacing.m)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            AppFill.card,
-            in: RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
-        )
+        .appCardSurface(in: RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous))
         .videoCardSurface()
     }
 
@@ -96,73 +93,26 @@ extension DownloadsView {
     }
 
     func presentExport(_ item: DownloadedVideo) {
-        guard pendingExportRequestID == nil, exportRequest == nil else { return }
-        let snapshot = item.fileSnapshot
-        let title = item.title
-        let navigationRevision = exportNavigationRevision
-        let requestID = UUID()
-        pendingExportRequestID = requestID
-        exportPreparation = Task {
-            defer {
-                if pendingExportRequestID == requestID {
-                    pendingExportRequestID = nil
-                    exportPreparation = nil
-                }
+        guard exportRequest == nil else { return }
+        do {
+            let source = try exports.source(snapshot: item.fileSnapshot, title: item.title)
+            exportRequest = ExportPresentation(source: source)
+        } catch {
+            if error as? ExportFailure == .sourceUnavailable {
+                brokenIDs.insert(item.id)
             }
-            do {
-                let source = try await exports.source(snapshot: snapshot, title: title)
-                guard !Task.isCancelled, pendingExportRequestID == requestID, isDownloadsVisible,
-                      exportNavigationRevision == navigationRevision,
-                      downloads.first(where: { $0.id == snapshot.id })?.fileSnapshot == snapshot else { return }
-                exportRequest = ExportPresentation(source: source)
-            } catch {
-                guard !Task.isCancelled, pendingExportRequestID == requestID, isDownloadsVisible,
-                      exportNavigationRevision == navigationRevision,
-                      downloads.first(where: { $0.id == snapshot.id })?.fileSnapshot == snapshot else { return }
-                exportError = error.localizedDescription
-            }
+            exportError = error.localizedDescription
         }
     }
 
-    func presentSave(_ artifact: ExportArtifact) {
-        guard saveRequest == nil, pendingSaveID == nil else { return }
-        let navigationRevision = exportNavigationRevision
-        pendingSaveID = artifact.id
-        Task {
-            do {
-                let url = try await exports.prepareSave(id: artifact.id)
-                guard pendingSaveID == artifact.id, isDownloadsVisible,
-                      exportNavigationRevision == navigationRevision else {
-                    try await exports.finishSave(id: artifact.id, destination: nil)
-                    if pendingSaveID == artifact.id { pendingSaveID = nil }
-                    return
-                }
-                saveRequest = ExportSavePresentation(id: artifact.id, fileURL: url)
-            } catch {
-                if pendingSaveID == artifact.id { pendingSaveID = nil }
-                if isDownloadsVisible, exportNavigationRevision == navigationRevision {
-                    exportError = error.localizedDescription
-                }
-            }
+    func presentSaveToFiles(_ artifact: ExportArtifact) {
+        guard saveRequest == nil, exports.savingArtifactID == nil else { return }
+        guard FileManager.default.fileExists(atPath: artifact.fileURL.path) else {
+            exports.discard(id: artifact.id)
+            exportError = ExportFailure.invalidOutput.errorDescription
+            return
         }
-    }
-
-    func finishExportSave(id: UUID, destination: URL?) {
-        let navigationRevision = exportNavigationRevision
-        Task {
-            do { try await exports.finishSave(id: id, destination: destination) } catch {
-                if isDownloadsVisible, exportNavigationRevision == navigationRevision {
-                    exportError = error.localizedDescription
-                }
-            }
-        }
-    }
-
-    func settleCancelledSave() {
-        guard let id = pendingSaveID else { return }
-        finishExportSave(id: id, destination: nil)
-        pendingSaveID = nil
-        saveRequest = nil
+        saveRequest = ExportSavePresentation(id: artifact.id, fileURL: artifact.fileURL)
     }
 
     func requestMutation(_ item: DownloadedVideo, redownload: Bool) {

@@ -3,6 +3,7 @@ import UIKit
 
 struct DownloadExportSheet: View {
     let source: DownloadExportSource
+    @AppMotion private var motion
     @Environment(\.dismiss) private var dismiss
     @State private var inventory: ExportMediaInventory?
     @State private var filename = ""
@@ -38,13 +39,19 @@ struct DownloadExportSheet: View {
                     } header: {
                         Text("File")
                     } footer: {
-                        Text("MP4 · Choose a location in Files after export finishes.")
+                        Text("MP4 · Save to Photos, Files, or Share after export finishes.")
                     }
 
                     if loading {
                         Section {
-                            ProgressView("Reading local tracks…")
-                                .frame(maxWidth: .infinity, alignment: .center)
+                            HStack(spacing: AppSpacing.s) {
+                                ProgressView()
+                                Text("Reading local tracks…")
+                                    .appFont(.libraryRowMeta)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .padding(.vertical, AppSpacing.xs)
                         }
                     } else if let inventory {
                         sourceSection(inventory)
@@ -69,6 +76,8 @@ struct DownloadExportSheet: View {
             }
             .scrollContentBackground(.hidden)
             .appAmbientBrowseBackground()
+            .animation(motion.animation(normal: .snappy(duration: 0.22)), value: loading)
+            .animation(motion.animation(normal: .snappy(duration: 0.22)), value: mode)
             .navigationTitle("Export video")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -127,10 +136,16 @@ struct DownloadExportSheet: View {
     private func sourceSection(_ inventory: ExportMediaInventory) -> some View {
         Section("Local source") {
             LabeledContent("Video", value: inventory.videoCodec)
-            LabeledContent("Dimensions", value: "\(inventory.width) × \(inventory.height)")
+            LabeledContent("Dimensions") {
+                Text(verbatim: "\(inventory.width) × \(inventory.height)")
+                    .monospacedDigit()
+            }
             if let audio = inventory.audioCodec { LabeledContent("Audio", value: audio) }
             if let profile = inventory.dolbyVisionProfile {
-                LabeledContent("Dolby Vision", value: "Profile \(profile)")
+                LabeledContent("Dolby Vision") {
+                    Text(verbatim: "Profile \(profile)")
+                        .monospacedDigit()
+                }
             } else {
                 LabeledContent("Color", value: inventory.hdr ? "HDR" : "SDR")
             }

@@ -2,7 +2,8 @@ import SwiftUI
 import UIKit
 
 struct ExportProgressView: View {
-    let save: (ExportArtifact) -> Void
+    let saveToFiles: (ExportArtifact) -> Void
+    @AppMotion private var motion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var discardID: UUID?
     @State private var presentedError: String?
@@ -37,10 +38,9 @@ struct ExportProgressView: View {
         }
         .padding(.horizontal, AppSpacing.l)
         .padding(.vertical, AppSpacing.m)
-        .background(
-            AppFill.card,
-            in: RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
-        )
+        .appCardSurface(in: RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous))
+        .animation(motion.animation(normal: .snappy(duration: 0.22)), value: exports.savingArtifactID)
+        .animation(motion.animation(normal: .snappy(duration: 0.22)), value: exports.activeJob?.state)
         .onChange(of: currentJobErrorToken) { _, token in
             guard let token, token != lastAutoPresentedJobError else { return }
             lastAutoPresentedJobError = token
@@ -68,13 +68,8 @@ struct ExportProgressView: View {
             get: { discardID != nil }, set: { if !$0 { discardID = nil } }
         )) {
             Button("Discard", role: .destructive) {
-                guard let id = discardID else { return }
-                Task {
-                    do {
-                        try await exports.discard(id: id)
-                    } catch {
-                        presentedError = error.localizedDescription
-                    }
+                if let id = discardID {
+                    exports.discard(id: id)
                 }
                 discardID = nil
             }
@@ -90,8 +85,13 @@ struct ExportProgressView: View {
         return VStack(alignment: .leading, spacing: AppSpacing.s) {
             HStack(alignment: .center, spacing: AppSpacing.m) {
                 Image(systemName: stateIcon(job.state))
-                    .font(.title3)
+                    .font(.subheadline.weight(.semibold))
                     .foregroundStyle(stateTint(job.state))
+                    .frame(width: 36, height: 36)
+                    .background(
+                        stateTint(job.state).opacity(0.14),
+                        in: RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous)
+                    )
                     .accessibilityHidden(true)
 
                 VStack(alignment: .leading, spacing: 2) {
@@ -121,6 +121,16 @@ struct ExportProgressView: View {
                     .controlSize(.small)
                     .buttonBorderShape(.capsule)
                     .disabled(job.state == .stopping)
+                } else {
+                    Button {
+                        exports.dismissInactiveJob()
+                    } label: {
+                        Image(systemName: "xmark")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .buttonBorderShape(.circle)
+                    .accessibilityLabel(Text("Dismiss"))
                 }
             }
 
@@ -166,6 +176,12 @@ struct ExportProgressView: View {
     }
 
     private func artifactRow(_ artifact: ExportArtifact) -> some View {
+        let isSavingThis = exports.savingArtifactID == artifact.id
+        let isAnySaving = exports.savingArtifactID != nil
+        let sizeText = ByteCountFormatter.string(
+            fromByteCount: artifact.fileSizeBytes,
+            countStyle: .file
+        )
         let layout: AnyLayout = dynamicTypeSize.isAccessibilitySize
             ? AnyLayout(VStackLayout(alignment: .leading, spacing: AppSpacing.s))
             : AnyLayout(HStackLayout(alignment: .center, spacing: AppSpacing.m))
@@ -187,22 +203,58 @@ struct ExportProgressView: View {
                         .fontWeight(.medium)
                         .foregroundStyle(.primary)
                         .lineLimit(2)
-                    Text(artifact.filename)
-                        .appFont(.libraryRowMeta)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                    HStack(spacing: AppSpacing.xs) {
+                        Text(artifact.filename)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text(verbatim: "·")
+                        Text(sizeText)
+                            .monospacedDigit()
+                            .fixedSize()
+                    }
+                    .appFont(.libraryRowMeta)
+                    .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             HStack(spacing: AppSpacing.s) {
-                Button("Save") {
-                    save(artifact)
+                Menu {
+                    Button {
+                        saveToPhotos(artifact)
+                    } label: {
+                        Label("Save to Photos", systemImage: "photo.on.rectangle")
+                    }
+                    Button {
+                        saveToFiles(artifact)
+                    } label: {
+                        Label("Save to Files", systemImage: "folder")
+                    }
+                    Button {
+                        shareArtifact(artifact)
+                    } label: {
+                        Label("Share…", systemImage: "square.and.arrow.up")
+                    }
+                } label: {
+                    if isSavingThis {
+                        HStack(spacing: AppSpacing.xs) {
+                            ProgressView()
+                                .controlSize(.mini)
+                            Text("Saving")
+                        }
+                    } else {
+                        HStack(spacing: 4) {
+                            Text("Save")
+                            Image(systemName: "chevron.down")
+                                .font(.caption2.weight(.bold))
+                        }
+                    }
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .buttonBorderShape(.capsule)
                 .tint(.biliAccent)
+                .disabled(isAnySaving)
 
                 Button(role: .destructive) {
                     discardID = artifact.id
@@ -212,7 +264,43 @@ struct ExportProgressView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 .buttonBorderShape(.circle)
+                .disabled(isSavingThis)
                 .accessibilityLabel(Text("Discard exported file"))
+            }
+        }
+    }
+
+    private func saveToPhotos(_ artifact: ExportArtifact) {
+        guard exports.savingArtifactID == nil else { return }
+        let id = artifact.id
+        Task {
+            do {
+                try await exports.saveToPhotoLibrary(id: id)
+            } catch {
+                presentedError = error.localizedDescription
+            }
+        }
+    }
+
+    private func shareArtifact(_ artifact: ExportArtifact) {
+        guard exports.savingArtifactID == nil else { return }
+        guard FileManager.default.fileExists(atPath: artifact.fileURL.path) else {
+            exports.discard(id: artifact.id)
+            presentedError = ExportFailure.invalidOutput.errorDescription
+            return
+        }
+        let id = artifact.id
+        let fileURL = artifact.fileURL
+        let coordinator = exports
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(200))
+            guard coordinator.savingArtifactID == nil,
+                  coordinator.artifacts.contains(where: { $0.id == id }) else { return }
+            ActivitySharePresenter.present(items: [fileURL]) { completed in
+                guard completed else { return }
+                Task { @MainActor in
+                    coordinator.completeExternalSave(id: id)
+                }
             }
         }
     }
@@ -227,24 +315,22 @@ struct ExportProgressView: View {
 
     private func stateIcon(_ state: ExportJobState) -> String {
         switch state {
-        case .failed, .interrupted:
-            "exclamationmark.circle.fill"
-        case .finalized, .readyToSave, .saved:
-            "checkmark.circle.fill"
-        default:
-            "square.and.arrow.up.circle.fill"
+        case .failed:
+            "exclamationmark.triangle.fill"
+        case .cancelled:
+            "xmark.circle.fill"
+        case .preparing, .exporting, .stopping:
+            "square.and.arrow.up"
         }
     }
 
     private func stateTint(_ state: ExportJobState) -> Color {
         switch state {
-        case .failed, .interrupted:
+        case .failed:
             .red
         case .cancelled:
             .secondary
-        case .finalized, .readyToSave, .saved:
-            .green
-        default:
+        case .preparing, .exporting, .stopping:
             .biliAccent
         }
     }
@@ -252,15 +338,10 @@ struct ExportProgressView: View {
     private func stateLabel(_ state: ExportJobState) -> String {
         switch state {
         case .preparing: String(localized: "Preparing export")
-        case .awaitingExecution: String(localized: "Waiting to start")
         case .exporting: String(localized: "Exporting")
         case .stopping: String(localized: "Stopping export")
-        case .finalized, .readyToSave: String(localized: "Ready to save")
-        case .saving: String(localized: "Saving")
-        case .saved: String(localized: "Saved")
         case .cancelled: String(localized: "Export cancelled")
         case .failed: String(localized: "Export failed")
-        case .interrupted: String(localized: "Export interrupted")
         }
     }
 }

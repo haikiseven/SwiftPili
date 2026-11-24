@@ -45,13 +45,18 @@ struct DownloadProgressEventCoalescer: Sendable {
             return beginCandidate(event)
         }
         let timestamp = ProcessInfo.processInfo.systemUptime
-        guard minimumInterval > 0 else {
+        let reachedCompletion = event.expectedBytes.map { $0 > 0 && event.bytesTransferred >= $0 } ?? false
+        guard minimumInterval > 0, !reachedCompletion else {
             pendingEvent = nil
             lastEmissionTime = timestamp.isFinite ? timestamp : nil
             return event
         }
-        guard let lastEmissionTime,
-              timestamp.isFinite,
+        guard let lastEmissionTime else {
+            pendingEvent = nil
+            self.lastEmissionTime = timestamp.isFinite ? timestamp : nil
+            return event
+        }
+        guard timestamp.isFinite,
               lastEmissionTime.isFinite,
               timestamp >= lastEmissionTime,
               timestamp - lastEmissionTime >= minimumInterval
@@ -397,9 +402,12 @@ struct DownloadProgressAccumulator: Sendable {
     }
 
     private var isAllActiveRetrying: Bool {
-        let active = stages.values.filter(\.isActive)
-        guard !active.isEmpty else { return false }
-        return active.allSatisfy(\.isRetrying)
+        var sawActive = false
+        for stage in stages.values where stage.isActive {
+            sawActive = true
+            if !stage.isRetrying { return false }
+        }
+        return sawActive
     }
 
     private mutating func refreshSnapshot() {

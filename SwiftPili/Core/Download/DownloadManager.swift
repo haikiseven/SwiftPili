@@ -69,6 +69,7 @@ final class DownloadManager {
         var acceptingCallbacks = true
         var accounting: DownloadProgressAccumulator
         var callbackFence: DownloadCallbackFence
+        var lastProgressPublishTime: TimeInterval = 0
     }
 
     private var operations: [String: Operation] = [:]
@@ -81,7 +82,7 @@ final class DownloadManager {
     @ObservationIgnored
     private var qualityCache = DownloadQualityCache()
 
-    struct ActiveDownload: Identifiable, Sendable {
+    struct ActiveDownload: Identifiable, Equatable, Sendable {
         let id: String
         let aid: Int
         let bvid: String
@@ -1234,6 +1235,8 @@ final class DownloadManager {
         return operation.stagePhases[.audio]
     }
 
+    private static let progressPublishMinimumInterval: TimeInterval = 0.20
+
     private func applySegmentedProgress(
         id: String,
         token: UUID,
@@ -1254,11 +1257,16 @@ final class DownloadManager {
             expectedBytes: expectedBytes
         )
         operation.stagePhases[stage] = stage == .video ? .downloadingVideo : .downloadingAudio
+        let combined = resolvedStagePhase(for: operation)
+        let reachedStageEnd = expectedBytes > 0 && transferredBytes >= expectedBytes
+        publishSnapshot(
+            id: id,
+            token: token,
+            operation: &operation,
+            phase: combined,
+            force: reachedStageEnd
+        )
         operations[id] = operation
-        if let combined = resolvedStagePhase(for: operation) {
-            updatePhase(id: id, token: token, combined)
-        }
-        publishSnapshot(id: id, token: token, operation: operation)
     }
 
     private func applySegmentedCheckpoint(
@@ -1330,11 +1338,16 @@ final class DownloadManager {
                 ? .retryingAudio : .downloadingAudio
         }
         operation.stagePhases[event.stage] = stagePhase
+        let combined = resolvedStagePhase(for: operation)
+        let isStateTransition = candidateChanged || event.kind != .progress
+        publishSnapshot(
+            id: id,
+            token: event.operationToken,
+            operation: &operation,
+            phase: combined,
+            force: isStateTransition
+        )
         operations[id] = operation
-        if let combined = resolvedStagePhase(for: operation) {
-            updatePhase(id: id, token: event.operationToken, combined)
-        }
-        publishSnapshot(id: id, token: event.operationToken, operation: operation)
     }
 
     private func updateQuality(id: String, token: UUID, code: Int) {
@@ -1359,8 +1372,9 @@ final class DownloadManager {
             default:
                 break
             }
+            publishSnapshot(id: id, token: token, operation: &operation, phase: phase, force: true)
             operations[id] = operation
-            publishSnapshot(id: id, token: token, operation: operation)
+            return
         }
         if active[index].phase != phase {
             active[index].phase = phase
@@ -1372,16 +1386,51 @@ final class DownloadManager {
         token: UUID,
         operation: Operation
     ) {
+        var copy = operation
+        publishSnapshot(id: id, token: token, operation: &copy, phase: nil, force: true)
+        if operations[id]?.token == token {
+            operations[id]?.lastProgressPublishTime = copy.lastProgressPublishTime
+        }
+    }
+
+    private func publishSnapshot(
+        id: String,
+        token: UUID,
+        operation: inout Operation,
+        phase: ActiveDownload.Phase?,
+        force: Bool
+    ) {
         guard operation.token == token,
               let index = active.firstIndex(where: { $0.id == id })
         else { return }
+        let current = active[index]
         let snapshot = operation.accounting.snapshot
-        var row = active[index]
+        var row = current
         row.bytesTransferred = snapshot.bytesTransferred
         row.expectedBytes = snapshot.expectedBytes
         row.fraction = snapshot.fraction
         row.speedBytesPerSecond = snapshot.speedBytesPerSecond
         row.fractionIsEstimated = snapshot.fractionIsEstimated
+        if let phase {
+            row.phase = phase
+        }
+        guard row != current else { return }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        if !force {
+            let phaseChanged = row.phase != current.phase
+            let expectedRevealed = current.expectedBytes == nil && row.expectedBytes != nil
+            let reachedCompletion = row.expectedBytes.map { $0 > 0 && row.bytesTransferred >= $0 } ?? false
+            if !phaseChanged, !expectedRevealed, !reachedCompletion,
+               now.isFinite, operation.lastProgressPublishTime > 0,
+               now >= operation.lastProgressPublishTime,
+               now - operation.lastProgressPublishTime < Self.progressPublishMinimumInterval {
+                return
+            }
+        }
+        if now.isFinite {
+            operation.lastProgressPublishTime = now
+        }
         active[index] = row
     }
 
@@ -2423,11 +2472,30 @@ final class FileDownloader: NSObject, URLSessionDataDelegate, @unchecked Sendabl
             pending.writeOffset += Int64(data.count)
             sink = pending
         } catch {
-                failure = DownloadTransferError.classify(error)
-                    ?? DownloadTransferError.partialFileUnwritable(error.localizedDescription)
+            failure = DownloadTransferError.classify(error)
+                ?? DownloadTransferError.partialFileUnwritable(error.localizedDescription)
         }
-        let bytes = pending.writeOffset
-        let expected = pending.expectedTotal
+        var emitted: DownloadTransferEvent?
+        var sinkToNotify: (@Sendable (DownloadTransferEvent) -> Void)?
+        if failure == nil,
+           let operationToken,
+           let stage,
+           let eventSink {
+            sequence &+= 1
+            let event = DownloadTransferEvent(
+                operationToken: operationToken,
+                stage: stage,
+                stageGeneration: stageGeneration,
+                candidateGeneration: candidateGeneration,
+                taskIdentifier: dataTask.taskIdentifier,
+                sequence: sequence,
+                bytesTransferred: max(0, pending.writeOffset),
+                expectedBytes: pending.expectedTotal,
+                kind: .progress
+            )
+            emitted = eventCoalescer.offer(event)
+            if emitted != nil { sinkToNotify = eventSink }
+        }
         lock.unlock()
 
         if let failure {
@@ -2435,7 +2503,7 @@ final class FileDownloader: NSObject, URLSessionDataDelegate, @unchecked Sendabl
             finish(.failure(failure), taskIdentifier: dataTask.taskIdentifier)
             return
         }
-        emitProgress(taskIdentifier: dataTask.taskIdentifier, bytes: bytes, expected: expected)
+        if let emitted { sinkToNotify?(emitted) }
     }
 
     func urlSession(

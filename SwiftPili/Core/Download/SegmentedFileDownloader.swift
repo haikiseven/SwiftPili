@@ -536,9 +536,9 @@ private final class RandomAccessFileSink: @unchecked Sendable {
     }
 
     @discardableResult
-    func write(at offset: Int64, data: Data) throws -> (completedBytes: Int64, ranges: [DownloadByteRange]) {
+    func write(at offset: Int64, data: Data) throws -> Int64 {
         guard !data.isEmpty else {
-            return lock.withLock { (completedBytes, completedRanges) }
+            return lock.withLock { completedBytes }
         }
         guard offset >= 0 else {
             throw DownloadTransferError.partialFileUnwritable("negative write offset")
@@ -576,15 +576,18 @@ private final class RandomAccessFileSink: @unchecked Sendable {
             }
 
             if written > 0 {
-                completedRanges.append(DownloadByteRange(start: offset, end: offset + Int64(written)))
-                completedRanges = DownloadByteRange.coalesce(completedRanges)
-                completedBytes = DownloadByteRange.totalBytes(in: completedRanges)
+                let added = DownloadByteRange.insert(
+                    DownloadByteRange(start: offset, end: offset + Int64(written)),
+                    into: &completedRanges
+                )
+                let (sum, overflow) = completedBytes.addingReportingOverflow(added)
+                completedBytes = overflow ? Int64.max : sum
             }
 
             if let writeError {
                 throw writeError
             }
-            return (completedBytes, completedRanges)
+            return completedBytes
         }
     }
 
@@ -911,7 +914,7 @@ private struct ProbeSeed: Sendable {
 private actor SegmentedDownloadCoordinator {
     private static let maxPieceRetries = 10
     private static let maxCooldownWaits = 3
-    private static let progressReportInterval: TimeInterval = 0.20
+    private static let progressReportInterval: TimeInterval = DownloadProgressEventCoalescer.defaultMinimumInterval
     private static let checkpointInterval: TimeInterval = 1.5
     private static let checkpointByteThreshold: Int64 = 4 * 1024 * 1024
     private static let stallWatchInterval: TimeInterval = 0.50
@@ -1706,9 +1709,9 @@ private actor SegmentedDownloadCoordinator {
             piece.hedge = nil
         }
 
-        let writeResult: (completedBytes: Int64, ranges: [DownloadByteRange])
+        let completedBytes: Int64
         do {
-            writeResult = try sink.write(at: writeOffset, data: writeData)
+            completedBytes = try sink.write(at: writeOffset, data: writeData)
         } catch {
             activePieces[pieceKey] = piece
             if !finished {
@@ -1725,10 +1728,10 @@ private actor SegmentedDownloadCoordinator {
             || now - lastCheckpointAt >= Self.checkpointInterval {
             bytesSinceCheckpoint = 0
             lastCheckpointAt = now
-            onCheckpoint(writeResult.ranges, totalLength)
+            onCheckpoint(sink.completedRangesSnapshot(), totalLength)
         }
 
-        let monotonicBytes = max(lastReportedBytes, writeResult.completedBytes)
+        let monotonicBytes = max(lastReportedBytes, completedBytes)
         if monotonicBytes > lastReportedBytes,
            monotonicBytes >= totalLength || now - lastProgressReportAt >= Self.progressReportInterval {
             lastReportedBytes = monotonicBytes

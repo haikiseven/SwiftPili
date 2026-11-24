@@ -45,6 +45,7 @@ me_export_result me_export_job_execute(me_export_job *job, me_export_progress_ca
 me_export_result me_export_job_check_capability(me_export_job *job);
 me_export_result me_export_job_validate_output(me_export_job *job);
 const char *me_export_job_error(const me_export_job *job);
+const char *me_export_codec_name(int codec_id);
 void me_export_job_destroy(me_export_job *job);
 uint32_t me_export_abi_version(void);
 #ifdef __cplusplus

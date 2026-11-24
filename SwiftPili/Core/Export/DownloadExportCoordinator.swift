@@ -1,41 +1,44 @@
 import Foundation
 import Observation
-import UIKit
+import Photos
+import Synchronization
 
 @MainActor @Observable
 final class DownloadExportCoordinator {
     static let shared = DownloadExportCoordinator()
+
     private(set) var activeJob: ExportJobView?
     private(set) var artifacts: [ExportArtifact] = []
     private(set) var hasActiveOperation = false
+    private(set) var savingArtifactID: UUID?
+
     @ObservationIgnored private var native: (any DownloadExportNativeBackend)?
-    @ObservationIgnored private let journal = ExportJobJournal()
+    @ObservationIgnored private let rootDirectory: URL
+    @ObservationIgnored private let photoSaver: @Sendable (URL) async throws -> Void
     @ObservationIgnored private var lockedSource: DownloadExportSource?
     @ObservationIgnored private var cancellation: ExportCancellation?
     @ObservationIgnored private var operation: Task<Void, Never>?
     @ObservationIgnored private var progressRelay: ExportProgressRelay?
-    @ObservationIgnored private var savingID: UUID?
-    @ObservationIgnored private var savePhase: SavePhase?
-    @ObservationIgnored private var discardingIDs: Set<UUID> = []
-    @ObservationIgnored private var recovery: Task<Void, Never>?
-    @ObservationIgnored private var recoveryPending = false
     @ObservationIgnored private var waiters: [CheckedContinuation<Void, Never>] = []
-    @ObservationIgnored private var observers: [NSObjectProtocol] = []
 
-    private enum SavePhase { case preparing, presented, finishing }
-
-    private init() {}
+    init(
+        rootDirectory: URL? = nil,
+        photoSaver: (@Sendable (URL) async throws -> Void)? = nil
+    ) {
+        self.rootDirectory = rootDirectory
+            ?? FileManager.default.temporaryDirectory.appendingPathComponent("SwiftPiliExports", isDirectory: true)
+        self.photoSaver = photoSaver ?? Self.defaultSaveVideoToPhotoLibrary
+    }
 
     func configure(native: any DownloadExportNativeBackend) {
         guard self.native == nil else { return }
         self.native = native
-        requestRecovery()
-        observers.append(NotificationCenter.default.addObserver(
-            forName: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil, queue: .main
-        ) { [weak self] _ in Task { @MainActor [weak self] in self?.requestRecovery() } })
+        cleanStaleStagingDirectories()
     }
 
-    func sourceIsLocked(downloadID: String) -> Bool { lockedSource?.downloadID == downloadID }
+    func sourceIsLocked(downloadID: String) -> Bool {
+        lockedSource?.downloadID == downloadID
+    }
 
     func cancelAndWaitForSource(downloadID: String) async {
         guard sourceIsLocked(downloadID: downloadID) else { return }
@@ -44,118 +47,101 @@ final class DownloadExportCoordinator {
         await withCheckedContinuation { waiters.append($0) }
     }
 
-    func source(snapshot: DownloadFileSnapshot, title: String) async throws -> DownloadExportSource {
-        try checkProtectedData()
-        return try await journal.perform { _ in try DownloadExportSource(snapshot: snapshot, title: title) }
+    func source(snapshot: DownloadFileSnapshot, title: String) throws -> DownloadExportSource {
+        try DownloadExportSource(snapshot: snapshot, title: title)
     }
 
     func prepare(source: DownloadExportSource) async throws -> ExportMediaInventory {
         guard let native else { throw ExportFailure.backendUnavailable }
-        let id = UUID()
-        let token = try acquire(source: source, id: id)
-        defer { release(id: id) }
+        guard !hasActiveOperation else { throw ExportFailure.busy }
+        guard source.filesExist else { throw ExportFailure.sourceUnavailable }
+        let token = ExportCancellation()
         return try await withTaskCancellationHandler {
-            await awaitRecovery()
-            try checkAdmission(token)
-            try await journal.perform { _ in try source.validate() }
-            try checkAdmission(token)
             let info = try await native.probe(source: source, cancellation: token)
-            try checkAdmission(token)
-            try await journal.perform { _ in try source.validate() }
-            try checkAdmission(token)
+            if token.isCancelled || Task.isCancelled { throw ExportFailure.cancelled }
             return info
-        } onCancel: { token.cancel() }
+        } onCancel: {
+            token.cancel()
+        }
     }
 
     func start(source: DownloadExportSource, options: ExportOptions) async throws {
         guard let native else { throw ExportFailure.backendUnavailable }
         try options.validate()
+        guard source.filesExist else { throw ExportFailure.sourceUnavailable }
         let id = UUID()
         let token = try acquire(source: source, id: id)
-        let record = ExportJobRecord(id: id, source: source, options: options, state: .preparing)
+        let jobDir = directory(for: id)
+        let outputURL = jobDir.appendingPathComponent(options.sanitizedFilename)
+
         do {
-            try await withTaskCancellationHandler {
-                await awaitRecovery()
-                try checkAdmission(token)
-                try await journal.perform { files in
-                    try source.validate()
-                    try files.create(record, estimate: nil)
-                }
-                try checkAdmission(token)
-            } onCancel: { token.cancel() }
-            operation = Task { [self] in
-                await execute(record: record, native: native, token: token)
-            }
+            try prepareJobDirectory(jobDir, sourceBytes: source.sourceByteCount, estimatedBytes: nil)
         } catch {
-            try? await journal.perform { try $0.discard(id) }
+            removeDirectory(jobDir)
             release(id: id)
             throw error
+        }
+
+        operation = Task { [self] in
+            await execute(
+                id: id,
+                source: source,
+                options: options,
+                outputURL: outputURL,
+                jobDirectory: jobDir,
+                native: native,
+                token: token
+            )
         }
     }
 
     func cancel() {
-        guard lockedSource != nil else { return }
+        guard hasActiveOperation else { return }
         activeJob?.state = .stopping
         cancellation?.cancel()
         progressRelay?.finish(flush: false)
     }
 
-    func prepareSave(id: UUID) async throws -> URL {
-        guard savingID == nil, !discardingIDs.contains(id),
-              UIApplication.shared.applicationState == .active,
-              let artifact = artifacts.first(where: { $0.id == id }) else { throw ExportFailure.busy }
-        try checkProtectedData()
-        savingID = id
-        savePhase = .preparing
-        do {
-            await awaitRecovery()
-            try Task.checkCancellation()
-            try checkProtectedData()
-            let url = try await journal.perform { try $0.prepareHandoff(artifact) }
-            try Task.checkCancellation()
-            try checkProtectedData()
-            guard UIApplication.shared.applicationState == .active else { throw ExportFailure.busy }
-            savePhase = .presented
-            return url
-        } catch {
-            try? await journal.perform { try $0.cancelHandoff(id) }
-            clearSave(id: id)
-            throw error
-        }
+    func dismissInactiveJob() {
+        guard !hasActiveOperation else { return }
+        activeJob = nil
     }
 
-    func finishSave(id: UUID, destination: URL?) async throws {
-        guard savingID == id, savePhase == .presented else { return }
-        savePhase = .finishing
-        defer { clearSave(id: id) }
-        try await journal.perform { files in
-            if destination != nil {
-                try files.markSaving(id, state: .saved)
-                try files.discard(id)
-            } else {
-                try files.cancelHandoff(id)
-            }
+    func saveToPhotoLibrary(id: UUID) async throws {
+        guard savingArtifactID == nil else {
+            throw ExportFailure.busy
         }
-        if destination != nil { artifacts.removeAll { $0.id == id } }
+        guard let artifact = artifacts.first(where: { $0.id == id }) else {
+            throw ExportFailure.invalidOutput
+        }
+        guard FileManager.default.fileExists(atPath: artifact.fileURL.path) else {
+            removeArtifact(id: id)
+            throw ExportFailure.invalidOutput
+        }
+        savingArtifactID = id
+        defer { if savingArtifactID == id { savingArtifactID = nil } }
+        try await photoSaver(artifact.fileURL)
+        removeArtifact(id: id)
     }
 
-    func discard(id: UUID) async throws {
-        guard savingID != id, !discardingIDs.contains(id),
-              !(hasActiveOperation && activeJob?.id == id) else { throw ExportFailure.busy }
-        discardingIDs.insert(id)
-        defer {
-            discardingIDs.remove(id)
-            beginRecoveryIfPossible()
-        }
-        await awaitRecovery()
-        try checkProtectedData()
-        try await journal.perform { try $0.discard(id) }
-        artifacts.removeAll { $0.id == id }
+    func completeExternalSave(id: UUID) {
+        guard savingArtifactID != id else { return }
+        removeArtifact(id: id)
+    }
+
+    func discard(id: UUID) {
+        guard savingArtifactID != id else { return }
+        removeArtifact(id: id)
+    }
+
+    // MARK: - Execution & File Lifecycle
+
+    private func directory(for id: UUID) -> URL {
+        rootDirectory.appendingPathComponent(id.uuidString, isDirectory: true)
     }
 
     private func acquire(source: DownloadExportSource, id: UUID) throws -> ExportCancellation {
-        guard lockedSource == nil else { throw ExportFailure.busy }
-        try checkProtectedData()
+        guard !hasActiveOperation, lockedSource == nil else { throw ExportFailure.busy }
         lockedSource = source
         hasActiveOperation = true
         let token = ExportCancellation()
@@ -164,39 +150,52 @@ final class DownloadExportCoordinator {
         return token
     }
 
-    private func checkProtectedData() throws {
-        guard UIApplication.shared.isProtectedDataAvailable else { throw ExportFailure.protectedData }
-    }
-
-    private func checkAdmission(_ token: ExportCancellation) throws {
-        guard !token.isCancelled, !Task.isCancelled else { throw ExportFailure.cancelled }
-        try checkProtectedData()
+    private func prepareJobDirectory(_ jobDir: URL, sourceBytes: Int64, estimatedBytes: Int64?) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: rootDirectory, withIntermediateDirectories: true)
+        let estimate = estimatedBytes ?? max(Int64(32 * 1024 * 1024), Int64(Double(sourceBytes) * 1.2))
+        if let available = try? rootDirectory
+            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+            .volumeAvailableCapacityForImportantUsage,
+           available < estimate {
+            throw ExportFailure.diskSpace
+        }
+        if fm.fileExists(atPath: jobDir.path) {
+            try fm.removeItem(at: jobDir)
+        }
+        try fm.createDirectory(at: jobDir, withIntermediateDirectories: true)
     }
 
     private func execute(
-        record: ExportJobRecord, native: any DownloadExportNativeBackend, token: ExportCancellation
+        id: UUID,
+        source: DownloadExportSource,
+        options: ExportOptions,
+        outputURL: URL,
+        jobDirectory: URL,
+        native: any DownloadExportNativeBackend,
+        token: ExportCancellation
     ) async {
-        let id = record.id
         defer { release(id: id) }
         do {
-            let info = try await native.probe(source: record.source, cancellation: token)
-            try checkAdmission(token)
-            guard record.options.mode != .original || info.canRemuxOriginal else { throw ExportFailure.invalidOutput }
-            if record.options.mode == .transcode {
-                let recipe = ExportRecipe(codec: record.options.codec, resolution: record.options.resolution,
-                                          color: record.options.color)
+            let info = try await native.probe(source: source, cancellation: token)
+            try checkNotCancelled(token)
+            guard options.mode != .original || info.canRemuxOriginal else {
+                throw ExportFailure.invalidOutput
+            }
+            if options.mode == .transcode {
+                let recipe = ExportRecipe(codec: options.codec, resolution: options.resolution, color: options.color)
                 guard info.recipes.contains(recipe) else {
                     throw ExportFailure.native(String(localized: "This export configuration is unavailable."))
                 }
             }
-            try await journal.perform { files in
-                try record.source.validate()
-                try files.checkCapacity(record, estimate: info.estimatedOutputBytes)
-                var running = record
-                running.state = .exporting
-                try files.save(running)
+            if let estimated = info.estimatedOutputBytes,
+               let available = try? rootDirectory
+                   .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+                   .volumeAvailableCapacityForImportantUsage,
+               available < estimated {
+                throw ExportFailure.diskSpace
             }
-            try checkAdmission(token)
+
             activeJob?.state = .exporting
             let relay = ExportProgressRelay { [weak self] fraction in
                 guard let self, self.activeJob?.id == id,
@@ -205,89 +204,128 @@ final class DownloadExportCoordinator {
             }
             progressRelay = relay
             defer { relay.finish(flush: false) }
+
             let result = try await native.execute(
-                request: ExportNativeRequest(source: record.source, options: record.options,
-                                             output: journal.output(id)),
-                cancellation: token, progress: { relay.offer($0) }
+                request: ExportNativeRequest(source: source, options: options, output: outputURL),
+                cancellation: token,
+                progress: { relay.offer($0) }
             )
             relay.finish(flush: !token.isCancelled)
-            try checkAdmission(token)
-            guard result.validated else { throw ExportFailure.invalidOutput }
-            let artifact = try await journal.perform { files in
-                try record.source.validate()
-                return try files.finalize(record)
+            try checkNotCancelled(token)
+
+            let size = (try? FileManager.default.attributesOfItem(atPath: outputURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+            guard result.validated, size > 0 else {
+                throw ExportFailure.invalidOutput
             }
-            try checkAdmission(token)
-            artifacts.append(artifact)
-            activeJob?.progress = 1
-            activeJob?.state = .readyToSave
+
+            artifacts.append(
+                ExportArtifact(
+                    id: id,
+                    title: source.title,
+                    filename: options.sanitizedFilename,
+                    fileURL: outputURL,
+                    fileSizeBytes: size
+                )
+            )
+            // Transition cleanly to artifacts list without leaving a duplicate activeJob row.
+            activeJob = nil
         } catch {
-            activeJob?.state = token.isCancelled ? .cancelled : .failed
-            activeJob?.error = error.localizedDescription
-            try? await journal.perform { try $0.discard(id) }
+            removeDirectory(jobDirectory)
+            if token.isCancelled || error is CancellationError || error as? ExportFailure == .cancelled {
+                activeJob = nil
+            } else {
+                activeJob?.state = .failed
+                activeJob?.error = error.localizedDescription
+            }
+        }
+    }
+
+    private func checkNotCancelled(_ token: ExportCancellation) throws {
+        if token.isCancelled || Task.isCancelled {
+            throw ExportFailure.cancelled
         }
     }
 
     private func release(id: UUID) {
-        guard activeJob?.id == id else { return }
+        guard lockedSource != nil else { return }
         lockedSource = nil
         hasActiveOperation = false
         cancellation = nil
         operation = nil
         progressRelay?.finish(flush: false)
         progressRelay = nil
-        if activeJob?.state == .preparing || activeJob?.state == .stopping { activeJob = nil }
+        if let current = activeJob, current.id == id, current.state != .failed {
+            activeJob = nil
+        }
         let pending = waiters
         waiters = []
         for waiter in pending { waiter.resume() }
-        beginRecoveryIfPossible()
     }
 
-    private func clearSave(id: UUID) {
-        guard savingID == id else { return }
-        savingID = nil
-        savePhase = nil
-        beginRecoveryIfPossible()
+    private func removeArtifact(id: UUID) {
+        artifacts.removeAll { $0.id == id }
+        removeDirectory(directory(for: id))
     }
 
-    private func awaitRecovery() async {
-        while let recovery { await recovery.value }
+    private func removeDirectory(_ url: URL) {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: url.path) {
+            try? fm.removeItem(at: url)
+        }
     }
 
-    private func requestRecovery() {
-        recoveryPending = true
-        beginRecoveryIfPossible()
-    }
-
-    private func beginRecoveryIfPossible() {
-        guard recoveryPending, recovery == nil, lockedSource == nil,
-              savingID == nil, discardingIDs.isEmpty,
-              UIApplication.shared.isProtectedDataAvailable else { return }
-        recoveryPending = false
-        recovery = Task { [self] in
-            do {
-                let recovered = try await journal.perform { try $0.recover() }
-                artifacts = recovered
-            } catch {
-                if !(error is ExportFailure) { activeJob?.error = error.localizedDescription }
+    private func cleanStaleStagingDirectories() {
+        guard !hasActiveOperation, artifacts.isEmpty else { return }
+        let fm = FileManager.default
+        guard let staleEntries = try? fm.contentsOfDirectory(
+            at: rootDirectory,
+            includingPropertiesForKeys: nil
+        ), !staleEntries.isEmpty else { return }
+        Task.detached(priority: .utility) {
+            let fm = FileManager.default
+            for entry in staleEntries {
+                try? fm.removeItem(at: entry)
             }
-            recovery = nil
-            beginRecoveryIfPossible()
+        }
+    }
+
+    private nonisolated static func defaultSaveVideoToPhotoLibrary(_ fileURL: URL) async throws {
+        let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+        guard status == .authorized || status == .limited else {
+            throw ExportFailure.photoLibraryDenied
+        }
+        let created = PhotoCreationFlag()
+        try await PHPhotoLibrary.shared().performChanges {
+            if PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: fileURL) != nil {
+                created.markCreated()
+            }
+        }
+        guard created.wasCreated else {
+            throw ExportFailure.invalidOutput
         }
     }
 }
 
-private final class ExportProgressRelay: @unchecked Sendable {
+private final class PhotoCreationFlag: Sendable {
+    private let state = Mutex(false)
+    func markCreated() { state.withLock { $0 = true } }
+    var wasCreated: Bool { state.withLock { $0 } }
+}
+
+private final class ExportProgressRelay: Sendable {
     private static let updateInterval: Duration = .milliseconds(100)
 
     private struct Update: Sendable {
         let fraction: Double?
     }
 
-    private let lock = NSLock()
-    private var latest: Update?
-    private var scheduled = false
-    private var closed = false
+    private struct State: Sendable {
+        var latest: Update?
+        var scheduled = false
+        var closed = false
+    }
+
+    private let state = Mutex(State())
     private let publish: @MainActor @Sendable (Double?) -> Void
 
     init(publish: @escaping @MainActor @Sendable (Double?) -> Void) {
@@ -295,11 +333,11 @@ private final class ExportProgressRelay: @unchecked Sendable {
     }
 
     func offer(_ fraction: Double) {
-        let shouldSchedule = lock.withLock {
-            guard !closed else { return false }
-            latest = Update(fraction: fraction.isFinite ? min(1, max(0, fraction)) : nil)
-            guard !scheduled else { return false }
-            scheduled = true
+        let shouldSchedule = state.withLock { state in
+            guard !state.closed else { return false }
+            state.latest = Update(fraction: fraction.isFinite ? min(1, max(0, fraction)) : nil)
+            guard !state.scheduled else { return false }
+            state.scheduled = true
             return true
         }
         guard shouldSchedule else { return }
@@ -318,23 +356,23 @@ private final class ExportProgressRelay: @unchecked Sendable {
     }
 
     private func takeLatest() -> Update? {
-        lock.withLock {
-            guard !closed, let update = latest else {
-                scheduled = false
+        state.withLock { state in
+            guard !state.closed, let update = state.latest else {
+                state.scheduled = false
                 return nil
             }
-            latest = nil
+            state.latest = nil
             return update
         }
     }
 
     @MainActor
     func finish(flush: Bool) {
-        let update: Update? = lock.withLock {
-            guard !closed else { return nil }
-            closed = true
-            defer { latest = nil }
-            return latest
+        let update: Update? = state.withLock { state in
+            guard !state.closed else { return nil }
+            state.closed = true
+            defer { state.latest = nil }
+            return state.latest
         }
         if flush, let update { publish(update.fraction) }
     }

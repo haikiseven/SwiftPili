@@ -1,59 +1,39 @@
 import Foundation
-import Observation
 import Synchronization
 
-struct ExportFileIdentity: Codable, Sendable, Equatable {
-    let path: String
-    let size: Int64
-    let modificationDate: Date
-    let fileNumber: UInt64
-
-    init(url: URL) throws {
-        let resolved = url.standardizedFileURL.resolvingSymlinksInPath()
-        let attributes = try FileManager.default.attributesOfItem(atPath: resolved.path)
-        guard attributes[.type] as? FileAttributeType == .typeRegular,
-              let size = attributes[.size] as? NSNumber, size.int64Value > 0,
-              let date = attributes[.modificationDate] as? Date,
-              let number = attributes[.systemFileNumber] as? NSNumber else {
-            throw ExportFailure.sourceUnavailable
-        }
-        path = resolved.path
-        self.size = size.int64Value
-        modificationDate = date
-        fileNumber = number.uint64Value
-    }
-
-    func validate() throws {
-        guard try ExportFileIdentity(url: URL(fileURLWithPath: path)) == self else {
-            throw ExportFailure.sourceChanged
-        }
-    }
-}
-
-struct DownloadExportSource: Codable, Sendable, Equatable {
+struct DownloadExportSource: Hashable, Sendable {
     let downloadID: String
     let title: String
-    let video: ExportFileIdentity
-    let audio: ExportFileIdentity?
+    let videoURL: URL
+    let audioURL: URL?
 
-    init(downloadID: String, title: String, video: ExportFileIdentity, audio: ExportFileIdentity?) {
+    init(downloadID: String, title: String, videoURL: URL, audioURL: URL?) {
         self.downloadID = downloadID
         self.title = title
-        self.video = video
-        self.audio = audio
+        self.videoURL = videoURL
+        self.audioURL = audioURL
     }
 
     init(snapshot: DownloadFileSnapshot, title: String) throws {
         guard snapshot.filesExist else { throw ExportFailure.sourceUnavailable }
-        downloadID = snapshot.id
+        self.downloadID = snapshot.id
         self.title = title
-        video = try ExportFileIdentity(url: snapshot.videoFileURL)
-        audio = try snapshot.audioFileURL.map { try ExportFileIdentity(url: $0) }
+        self.videoURL = snapshot.videoFileURL
+        self.audioURL = snapshot.audioFileURL
     }
 
-    func validate() throws {
-        try video.validate()
-        try audio?.validate()
+    var filesExist: Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: videoURL.path) else { return false }
+        if let audioURL, !fm.fileExists(atPath: audioURL.path) { return false }
+        return true
+    }
+
+    var sourceByteCount: Int64 {
+        let fm = FileManager.default
+        let vSize = (try? fm.attributesOfItem(atPath: videoURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+        let aSize = audioURL.flatMap { (try? fm.attributesOfItem(atPath: $0.path)[.size] as? NSNumber)?.int64Value } ?? 0
+        return max(0, vSize) + max(0, aSize)
     }
 }
 
@@ -103,12 +83,15 @@ struct ExportMediaInventory: Sendable {
     let estimatedOutputBytes: Int64?
 }
 
-enum ExportJobState: String, Codable, Sendable {
-    case preparing, awaitingExecution, exporting, stopping, finalized, readyToSave
-    case saving, saved, cancelled, failed, interrupted
+enum ExportJobState: String, Sendable, Equatable {
+    case preparing
+    case exporting
+    case stopping
+    case cancelled
+    case failed
 }
 
-struct ExportJobView: Identifiable, Sendable {
+struct ExportJobView: Identifiable, Sendable, Equatable {
     let id: UUID
     let title: String
     var state: ExportJobState
@@ -116,46 +99,72 @@ struct ExportJobView: Identifiable, Sendable {
     var error: String?
 }
 
-struct ExportArtifact: Identifiable, Sendable {
+struct ExportArtifact: Identifiable, Sendable, Equatable {
     let id: UUID
     let title: String
     let filename: String
     let fileURL: URL
+    let fileSizeBytes: Int64
 }
 
-enum ExportFailure: Error, LocalizedError, Sendable {
-    case sourceUnavailable, sourceChanged, busy, backendUnavailable, invalidFilename
-    case diskSpace, protectedData, cancelled, invalidOutput
+enum ExportSaveDestination: Sendable, Equatable {
+    case photos
+    case files
+    case share
+}
+
+enum ExportFailure: Error, LocalizedError, Sendable, Equatable {
+    case sourceUnavailable
+    case busy
+    case backendUnavailable
+    case invalidFilename
+    case diskSpace
+    case cancelled
+    case invalidOutput
+    case photoLibraryDenied
     case native(String)
 
     var errorDescription: String? {
         switch self {
         case .sourceUnavailable: String(localized: "Downloaded files are unavailable.")
-        case .sourceChanged: String(localized: "The downloaded files changed. Open export again.")
         case .busy: String(localized: "Another export is still running.")
         case .backendUnavailable: String(localized: "The export component is not ready.")
         case .invalidFilename: String(localized: "Enter a file name.")
         case .diskSpace: String(localized: "There is not enough space for this export.")
-        case .protectedData: String(localized: "Unlock the device to access the export files.")
         case .cancelled: String(localized: "Export cancelled.")
         case .invalidOutput: String(localized: "The exported file could not be validated.")
+        case .photoLibraryDenied: String(localized: "Photo Library access was denied. Enable it in Settings to save videos.")
         case .native(let message): message
         }
     }
 }
 
 final class ExportCancellation: Sendable {
-    private struct State { var cancelled = false; var handler: (@Sendable () -> Void)? }
+    private struct State: Sendable {
+        var cancelled = false
+        var handler: (@Sendable () -> Void)?
+    }
     private let value = Mutex(State())
+
     func cancel() {
-        let handler = value.withLock { state in state.cancelled = true; return state.handler }
+        let handler = value.withLock { state -> (@Sendable () -> Void)? in
+            guard !state.cancelled else { return nil }
+            state.cancelled = true
+            return state.handler
+        }
         handler?()
     }
+
     var isCancelled: Bool { value.withLock { $0.cancelled } }
+
     func install(_ handler: @escaping @Sendable () -> Void) {
-        let alreadyCancelled = value.withLock { state in state.handler = handler; return state.cancelled }
+        let alreadyCancelled = value.withLock { state in
+            state.handler = handler
+            return state.cancelled
+        }
         if alreadyCancelled { handler() }
     }
+
     func uninstall() { value.withLock { $0.handler = nil } }
 }
 
