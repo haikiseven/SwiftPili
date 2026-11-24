@@ -173,7 +173,7 @@ private enum DynamicsFeedbackKey: Equatable, Sendable {
 }
 
 private struct DynamicsRenderKey: Equatable {
-    let fingerprints: [DynamicsItemFingerprint]
+    let itemsRevision: UInt64
     let peopleHeader: DynamicsPeopleHeaderState?
     let inlineFeedback: DynamicsFeedbackKey
     let placeholderCount, scrollToTopTick: Int
@@ -192,14 +192,19 @@ private final class DynamicsTabCache {
     struct Snapshot {
         let items: [DynamicFeedResult.DynamicItem]
         let fingerprints: [DynamicsItemFingerprint]
+        let itemsRevision: UInt64
         let peopleHeader: DynamicsPeopleHeaderState?
         let feedbackState: DynamicsEmptyFeedbackState
         let usesInlinePeopleFeedback, showsPaginationSpinner: Bool
         let placeholderCount: Int
     }
 
+    private var hasSynced = false
+    private var lastSelection: DynamicFeedSelection?
+    private var lastSourceRevision: UInt64 = 0
+    private var localRevision: UInt64 = 0
     var snapshot = Snapshot(
-        items: [], fingerprints: [], peopleHeader: nil, feedbackState: .none,
+        items: [], fingerprints: [], itemsRevision: 0, peopleHeader: nil, feedbackState: .none,
         usesInlinePeopleFeedback: false, showsPaginationSpinner: false, placeholderCount: 0
     )
 
@@ -210,6 +215,7 @@ private final class DynamicsTabCache {
         isAccessibilitySize: Bool
     ) -> Snapshot {
         let tabItems = viewModel.displayedItems(for: tabSelection)
+        let sourceRevision = viewModel.itemsRevision
         let isLoggedIn = AuthManager.shared.isLoggedIn
         let feedbackState: DynamicsEmptyFeedbackState = if !isLoggedIn {
             .signIn
@@ -221,18 +227,34 @@ private final class DynamicsTabCache {
             .none
         }
         let usesInline = isLoggedIn && tabSelection.isPeopleMode && feedbackState != .none
-        let peopleHeader: DynamicsPeopleHeaderState? = (isLoggedIn && tabSelection.isPeopleMode)
-            ? DynamicsPeopleHeaderState(
+        let peopleHeader: DynamicsPeopleHeaderState?
+        if isLoggedIn && tabSelection.isPeopleMode {
+            let selectedPerson = peopleCatalog.person(for: tabSelection.authorMID)
+            peopleHeader = DynamicsPeopleHeaderState(
                 people: peopleCatalog.recentPeople, selectedMID: tabSelection.authorMID,
-                selectedPerson: peopleCatalog.person(for: tabSelection.authorMID),
-                viewingPersonName: peopleCatalog.person(for: tabSelection.authorMID)?.displayName,
+                selectedPerson: selectedPerson,
+                viewingPersonName: selectedPerson?.displayName,
                 isLoading: peopleCatalog.isLoadingRecent, hasLoaded: peopleCatalog.recentHasLoaded,
                 hasMore: peopleCatalog.recentHasMore, failure: peopleCatalog.recentFailure,
                 usesAccessibilityLayout: isAccessibilitySize
             )
-            : nil
+        } else {
+            peopleHeader = nil
+        }
+
+        let fingerprints: [DynamicsItemFingerprint]
+        if hasSynced, lastSelection == tabSelection, lastSourceRevision == sourceRevision {
+            fingerprints = snapshot.fingerprints
+        } else {
+            hasSynced = true
+            lastSelection = tabSelection
+            lastSourceRevision = sourceRevision
+            localRevision &+= 1
+            fingerprints = tabItems.map(DynamicsItemFingerprint.init)
+        }
+
         snapshot = Snapshot(
-            items: tabItems, fingerprints: tabItems.map(DynamicsItemFingerprint.init),
+            items: tabItems, fingerprints: fingerprints, itemsRevision: localRevision,
             peopleHeader: peopleHeader, feedbackState: feedbackState, usesInlinePeopleFeedback: usesInline,
             showsPaginationSpinner: viewModel.displayedIsLoading(for: tabSelection) && !tabItems.isEmpty,
             placeholderCount: (isLoggedIn && tabItems.isEmpty && feedbackState == .none) ? 3 : 0
@@ -273,7 +295,7 @@ private struct DynamicsFeedTabView: View, Equatable {
         let showsOverlay = !snap.usesInlinePeopleFeedback && snap.feedbackState != .none
         let inlineFeedback = snap.usesInlinePeopleFeedback ? snap.feedbackState : .none
         let renderKey = DynamicsRenderKey(
-            fingerprints: snap.fingerprints, peopleHeader: snap.peopleHeader,
+            itemsRevision: snap.itemsRevision, peopleHeader: snap.peopleHeader,
             inlineFeedback: DynamicsFeedbackKey(inlineFeedback), placeholderCount: snap.placeholderCount,
             scrollToTopTick: coordinator.scrollToTopTick, showsPaginationSpinner: snap.showsPaginationSpinner,
             isActive: isSelected, isDynamicsTabSelected: coordinator.selectedTab == .dynamics
@@ -283,6 +305,8 @@ private struct DynamicsFeedTabView: View, Equatable {
             EquatableDynamicsCollectionHost(key: renderKey) {
                 DynamicsFeedCollectionView(
                     items: snap.items,
+                    fingerprints: snap.fingerprints,
+                    itemsRevision: snap.itemsRevision,
                     interactionStore: viewModel.interactions,
                     peopleHeader: snap.peopleHeader,
                     inlineFeedback: inlineFeedback,

@@ -126,16 +126,19 @@ enum DanmakuMaskFormat {
 
     static func segmentCount(header data: Data) throws -> Int {
         guard data.count >= headerLength else { throw DanmakuMaskFormatError.truncated("header") }
-        let bytes = [UInt8](data.prefix(headerLength))
-        guard bytes[0 ..< 4] == [0x4D, 0x41, 0x53, 0x4B] else { throw DanmakuMaskFormatError.badMagic }
-        let version = readUInt32(bytes, at: 4)
-        let kind = bytes[8]
-        guard version == 1, kind == webmaskKind else {
-            throw DanmakuMaskFormatError.unsupported(version: version, kind: kind)
+        return try data.withUnsafeBytes { raw -> Int in
+            guard raw[0] == 0x4D, raw[1] == 0x41, raw[2] == 0x53, raw[3] == 0x4B else {
+                throw DanmakuMaskFormatError.badMagic
+            }
+            let version = readUInt32(raw, at: 4)
+            let kind = raw[8]
+            guard version == 1, kind == webmaskKind else {
+                throw DanmakuMaskFormatError.unsupported(version: version, kind: kind)
+            }
+            let count = Int(readUInt32(raw, at: 12))
+            guard count > 0 else { throw DanmakuMaskFormatError.empty }
+            return count
         }
-        let count = Int(readUInt32(bytes, at: 12))
-        guard count > 0 else { throw DanmakuMaskFormatError.empty }
-        return count
     }
 
     static func indexByteCount(segments: Int) -> Int {
@@ -146,20 +149,22 @@ enum DanmakuMaskFormat {
         let count = try segmentCount(header: data)
         let needed = indexByteCount(segments: count)
         guard data.count >= needed else { throw DanmakuMaskFormatError.truncated("index") }
-        let bytes = [UInt8](data.prefix(needed))
-        var entries: [DanmakuMaskIndex.Entry] = []
-        entries.reserveCapacity(count)
-        for slot in 0 ..< count {
-            let base = headerLength + slot * indexEntryLength
-            let start = Int64(bitPattern: readUInt64(bytes, at: base))
-            let offset = Int64(bitPattern: readUInt64(bytes, at: base + 8))
-            guard start >= 0, offset >= Int64(needed) else {
-                throw DanmakuMaskFormatError.truncated("index entry \(slot)")
+        let entries = try data.withUnsafeBytes { raw -> [DanmakuMaskIndex.Entry] in
+            var entries: [DanmakuMaskIndex.Entry] = []
+            entries.reserveCapacity(count)
+            for slot in 0 ..< count {
+                let base = headerLength + slot * indexEntryLength
+                let start = Int64(bitPattern: readUInt64(raw, at: base))
+                let offset = Int64(bitPattern: readUInt64(raw, at: base + 8))
+                guard start >= 0, offset >= Int64(needed) else {
+                    throw DanmakuMaskFormatError.truncated("index entry \(slot)")
+                }
+                if let previous = entries.last, start < previous.startMs || offset <= previous.offset {
+                    throw DanmakuMaskFormatError.truncated("index order at \(slot)")
+                }
+                entries.append(.init(startMs: start, offset: offset))
             }
-            if let previous = entries.last, start < previous.startMs || offset <= previous.offset {
-                throw DanmakuMaskFormatError.truncated("index order at \(slot)")
-            }
-            entries.append(.init(startMs: start, offset: offset))
+            return entries
         }
         return DanmakuMaskIndex(entries: entries)
     }
@@ -173,22 +178,25 @@ enum DanmakuMaskFormat {
         let raw = try gunzip(compressed)
         var frames: [DanmakuMaskFrame] = []
         var canvas: CGSize?
-        var cursor = 0
-        let bytes = [UInt8](raw)
-        while cursor < bytes.count {
-            guard cursor + 12 <= bytes.count else { throw DanmakuMaskFormatError.truncated("frame header") }
-            let length = Int(readUInt32(bytes, at: cursor))
-            let timeMs = Int64(bitPattern: readUInt64(bytes, at: cursor + 4))
-            let body = cursor + 12
-            guard length > 0, body + length <= bytes.count else {
-                throw DanmakuMaskFormatError.truncated("frame body")
+        try raw.withUnsafeBytes { bytes in
+            var cursor = 0
+            let total = bytes.count
+            let baseIndex = raw.startIndex
+            while cursor < total {
+                guard cursor + 12 <= total else { throw DanmakuMaskFormatError.truncated("frame header") }
+                let length = Int(readUInt32(bytes, at: cursor))
+                let timeMs = Int64(bitPattern: readUInt64(bytes, at: cursor + 4))
+                let body = cursor + 12
+                guard length > 0, body + length <= total else {
+                    throw DanmakuMaskFormatError.truncated("frame body")
+                }
+                let payload = raw[(baseIndex + body) ..< (baseIndex + body + length)]
+                let svg = try DanmakuMaskSVG.text(fromDataURL: payload)
+                let parsed = try DanmakuMaskSVG.path(svg)
+                if canvas == nil { canvas = parsed.canvas }
+                frames.append(DanmakuMaskFrame(time: TimeInterval(timeMs) / 1000, path: parsed.path))
+                cursor = body + length
             }
-            let payload = Data(bytes[body ..< body + length])
-            let svg = try DanmakuMaskSVG.text(fromDataURL: payload)
-            let parsed = try DanmakuMaskSVG.path(svg)
-            if canvas == nil { canvas = parsed.canvas }
-            frames.append(DanmakuMaskFrame(time: TimeInterval(timeMs) / 1000, path: parsed.path))
-            cursor = body + length
         }
         guard let canvas, let last = frames.last else { throw DanmakuMaskFormatError.empty }
         let interval: TimeInterval = frames.count >= 2
@@ -207,42 +215,42 @@ enum DanmakuMaskFormat {
     // MARK: - gzip
 
     static func gunzip(_ data: Data) throws -> Data {
-        let bytes = [UInt8](data)
-        guard bytes.count >= 18, bytes[0] == 0x1F, bytes[1] == 0x8B, bytes[2] == 8 else {
-            throw DanmakuMaskFormatError.gzip
-        }
-        let flags = bytes[3]
-        var cursor = 10
-        if flags & 0x04 != 0 {
-            guard cursor + 2 <= bytes.count else { throw DanmakuMaskFormatError.gzip }
-            let extraLength = Int(bytes[cursor]) | (Int(bytes[cursor + 1]) << 8)
-            cursor += 2 + extraLength
-        }
-        if flags & 0x08 != 0 { cursor = try skipZeroTerminated(bytes, from: cursor) }
-        if flags & 0x10 != 0 { cursor = try skipZeroTerminated(bytes, from: cursor) }
-        if flags & 0x02 != 0 { cursor += 2 }
-        let trailer = bytes.count - 8
-        guard cursor < trailer else { throw DanmakuMaskFormatError.gzip }
-        let declared = Int(bytes[trailer + 4]) | Int(bytes[trailer + 5]) << 8
-            | Int(bytes[trailer + 6]) << 16 | Int(bytes[trailer + 7]) << 24
-        let capacity = max(declared, 1)
-        guard capacity <= 64 << 20 else { throw DanmakuMaskFormatError.gzip }
-        var output = [UInt8](repeating: 0, count: capacity)
-        let written = bytes.withUnsafeBufferPointer { source -> Int in
-            output.withUnsafeMutableBufferPointer { destination -> Int in
-                guard let input = source.baseAddress, let target = destination.baseAddress else { return 0 }
+        try data.withUnsafeBytes { bytes -> Data in
+            guard bytes.count >= 18, bytes[0] == 0x1F, bytes[1] == 0x8B, bytes[2] == 8 else {
+                throw DanmakuMaskFormatError.gzip
+            }
+            let flags = bytes[3]
+            var cursor = 10
+            if flags & 0x04 != 0 {
+                guard cursor + 2 <= bytes.count else { throw DanmakuMaskFormatError.gzip }
+                let extraLength = Int(bytes[cursor]) | (Int(bytes[cursor + 1]) << 8)
+                cursor += 2 + extraLength
+            }
+            if flags & 0x08 != 0 { cursor = try skipZeroTerminated(bytes, from: cursor) }
+            if flags & 0x10 != 0 { cursor = try skipZeroTerminated(bytes, from: cursor) }
+            if flags & 0x02 != 0 { cursor += 2 }
+            let trailer = bytes.count - 8
+            guard cursor < trailer else { throw DanmakuMaskFormatError.gzip }
+            let declared = Int(bytes[trailer + 4]) | Int(bytes[trailer + 5]) << 8
+                | Int(bytes[trailer + 6]) << 16 | Int(bytes[trailer + 7]) << 24
+            let capacity = max(declared, 1)
+            guard capacity <= 64 << 20 else { throw DanmakuMaskFormatError.gzip }
+            var output = Data(count: capacity)
+            let written = output.withUnsafeMutableBytes { destination -> Int in
+                guard let input = bytes.bindMemory(to: UInt8.self).baseAddress,
+                      let target = destination.bindMemory(to: UInt8.self).baseAddress else { return 0 }
                 return compression_decode_buffer(
                     target, capacity,
                     input + cursor, trailer - cursor,
                     nil, COMPRESSION_ZLIB
                 )
             }
+            guard written == declared, written > 0 else { throw DanmakuMaskFormatError.gzip }
+            return output
         }
-        guard written == declared, written > 0 else { throw DanmakuMaskFormatError.gzip }
-        return Data(output)
     }
 
-    private static func skipZeroTerminated(_ bytes: [UInt8], from start: Int) throws -> Int {
+    private static func skipZeroTerminated(_ bytes: UnsafeRawBufferPointer, from start: Int) throws -> Int {
         var cursor = start
         while cursor < bytes.count, bytes[cursor] != 0 { cursor += 1 }
         guard cursor < bytes.count else { throw DanmakuMaskFormatError.gzip }
@@ -251,12 +259,12 @@ enum DanmakuMaskFormat {
 
     // MARK: - bytes
 
-    private static func readUInt32(_ bytes: [UInt8], at offset: Int) -> UInt32 {
+    private static func readUInt32(_ bytes: UnsafeRawBufferPointer, at offset: Int) -> UInt32 {
         UInt32(bytes[offset]) << 24 | UInt32(bytes[offset + 1]) << 16
             | UInt32(bytes[offset + 2]) << 8 | UInt32(bytes[offset + 3])
     }
 
-    private static func readUInt64(_ bytes: [UInt8], at offset: Int) -> UInt64 {
+    private static func readUInt64(_ bytes: UnsafeRawBufferPointer, at offset: Int) -> UInt64 {
         UInt64(readUInt32(bytes, at: offset)) << 32 | UInt64(readUInt32(bytes, at: offset + 4))
     }
 }

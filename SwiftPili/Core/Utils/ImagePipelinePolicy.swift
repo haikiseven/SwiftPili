@@ -6,9 +6,9 @@ enum ImagePipelinePolicy {
 
     static let suppressDiagnosticsKey = "image_ab_suppress_diagnostics"
 
-    nonisolated(unsafe) static var suppressesDiagnostics: Bool = false
+    nonisolated(unsafe) static var suppressesDiagnostics: Bool = true
 
-    static var emitsImageDiagnostics: Bool { !suppressesDiagnostics }
+    static var emitsImageDiagnostics: Bool { false }
 
     // MARK: - Arm D: stabilised request geometry
 
@@ -66,13 +66,7 @@ enum ImagePipelinePolicy {
         return capturing || splitArm
     }
 
-    static var installsCoverGeometryProbes: Bool {
-        installsCoverGeometryProbes(
-            armed: ImageDiagnostics.isRecordingImageEvents,
-            capturing: PlayerLog.isCapturing,
-            splitArm: splitsLayoutProbes
-        )
-    }
+    static var installsCoverGeometryProbes: Bool { false }
 
     // MARK: - Settings entry points
 

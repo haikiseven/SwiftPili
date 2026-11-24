@@ -51,6 +51,7 @@ final class SearchUserCardCell: UICollectionViewCell {
     private var onSelectVideoAtIndex: ((Int) -> Void)?
 
     private static let avatarSize: CGFloat = 48
+    private static let avatarPlaceholder = UIImage(systemName: "person.crop.circle.fill")
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -228,7 +229,7 @@ final class SearchUserCardCell: UICollectionViewCell {
             to: avatarView,
             request: avatarReq,
             activeRequest: &activeAvatarRequest,
-            placeholderImage: UIImage(systemName: "person.crop.circle.fill")
+            placeholderImage: Self.avatarPlaceholder
         )
         avatarView.tintColor = .tertiaryLabel
 

@@ -76,14 +76,16 @@ private struct ChatConversationView: View {
                             .frame(minHeight: 44)
                             .disabled(viewModel.isReading)
                         }
-                        ForEach(Array(viewModel.messages.enumerated()), id: \.element.id) { index, msg in
+                        ForEach(viewModel.displayRows) { row in
                             ChatMessageRow(
-                                message: msg,
-                                previous: index > 0 ? viewModel.messages[index - 1] : nil,
-                                talkerID: viewModel.talkerId, face: face, myUID: viewModel.myUID,
+                                message: row.message,
+                                previousTimestamp: row.previousTimestamp,
+                                talkerID: viewModel.talkerId,
+                                face: face,
+                                myUID: viewModel.myUID,
                                 bubbleMaxWidth: bubbleMaxWidth
                             )
-                            .id(msg.id)
+                            .id(row.id)
                         }
                     }
                     .padding(.horizontal, 16)

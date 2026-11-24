@@ -163,29 +163,72 @@ final class DanmakuSegmentStore {
 
     func elements(from: TimeInterval, to: TimeInterval) -> [DanmakuElem] {
         guard from < to, !isServerClosed else { return [] }
+        let hasPackages = !metadataOwner.packages.isEmpty
+        let hasSelfSent = !selfSent.isEmpty
+        if segments.isEmpty, !hasPackages, !hasSelfSent { return [] }
+
         var out: [DanmakuElem] = []
-        for index in segments.keys.sorted() {
-            guard let segment = segments[index] else { continue }
-            out.append(contentsOf: segment.elements(from: from, to: to))
-        }
-        for url in metadataOwner.packages.keys.sorted(by: { $0.absoluteString < $1.absoluteString }) {
-            guard let package = metadataOwner.packages[url] else { continue }
-            out.append(contentsOf: package.elements(from: from, to: to))
-        }
-        let ownIDs = Set(selfSent.compactMap(\.identityKey))
-        out.removeAll { $0.identityKey.map(ownIDs.contains) ?? false }
-        out.append(contentsOf: selfSent.filter { $0.progress >= from && $0.progress < to })
-        var seenIDs: Set<String> = []
-        out = out.filter {
-            $0.identityKey.map { seenIDs.insert($0).inserted } ?? true
-        }
-        return out.enumerated()
-            .sorted { lhs, rhs in
-                lhs.element.progress == rhs.element.progress
-                    ? lhs.offset < rhs.offset
-                    : lhs.element.progress < rhs.element.progress
+        if segments.count == 1, let segment = segments.values.first {
+            let slice = segment.elements(from: from, to: to)
+            if !slice.isEmpty {
+                out.reserveCapacity(slice.count)
+                out.append(contentsOf: slice)
             }
-            .map(\.element)
+        } else if !segments.isEmpty {
+            for index in segments.keys.sorted() {
+                guard let segment = segments[index] else { continue }
+                let slice = segment.elements(from: from, to: to)
+                if !slice.isEmpty { out.append(contentsOf: slice) }
+            }
+        }
+        if hasPackages {
+            if metadataOwner.packages.count == 1, let package = metadataOwner.packages.values.first {
+                let slice = package.elements(from: from, to: to)
+                if !slice.isEmpty { out.append(contentsOf: slice) }
+            } else {
+                for url in metadataOwner.packages.keys.sorted(by: { $0.absoluteString < $1.absoluteString }) {
+                    guard let package = metadataOwner.packages[url] else { continue }
+                    let slice = package.elements(from: from, to: to)
+                    if !slice.isEmpty { out.append(contentsOf: slice) }
+                }
+            }
+        }
+        if hasSelfSent {
+            let ownIDs = Set(selfSent.compactMap(\.identityKey))
+            if !ownIDs.isEmpty, !out.isEmpty {
+                out.removeAll { $0.identityKey.map(ownIDs.contains) ?? false }
+            }
+            for item in selfSent where item.progress >= from && item.progress < to {
+                out.append(item)
+            }
+        }
+        guard out.count > 1 else { return out }
+
+        var seenIDs = Set<String>(minimumCapacity: out.count)
+        var writeIndex = 0
+        var isSorted = true
+        var previousProgress = -TimeInterval.infinity
+        for readIndex in 0 ..< out.count {
+            let item = out[readIndex]
+            if let key = item.identityKey, !seenIDs.insert(key).inserted {
+                continue
+            }
+            if item.progress < previousProgress {
+                isSorted = false
+            }
+            previousProgress = item.progress
+            if writeIndex != readIndex {
+                out[writeIndex] = item
+            }
+            writeIndex += 1
+        }
+        if writeIndex < out.count {
+            out.removeSubrange(writeIndex ..< out.count)
+        }
+        if !isSorted {
+            out.sort { $0.progress < $1.progress }
+        }
+        return out
     }
 
     func admitCursor(from: TimeInterval, to: TimeInterval) -> TimeInterval {
@@ -294,14 +337,30 @@ extension DanmakuSegmentStore {
     var metadata: DanmakuMetadata? { metadataOwner.metadata }
 
     func specialElements(from: TimeInterval, to end: TimeInterval) -> [DanmakuElem] {
-        guard from < end, !isServerClosed else { return [] }
-        let own = Set(selfSent.compactMap(\.identityKey))
-        var seen: Set<String> = []
-        return metadataOwner.packages.values.flatMap { $0.elements(from: from, to: end) }
-            .filter { item in
-                guard let key = item.identityKey else { return true }
-                return !own.contains(key) && seen.insert(key).inserted
+        guard from < end, !isServerClosed, !metadataOwner.packages.isEmpty else { return [] }
+        var out: [DanmakuElem] = []
+        for package in metadataOwner.packages.values {
+            let slice = package.elements(from: from, to: end)
+            if !slice.isEmpty { out.append(contentsOf: slice) }
+        }
+        guard !out.isEmpty else { return [] }
+        let own = selfSent.isEmpty ? Set<String>() : Set(selfSent.compactMap(\.identityKey))
+        var seen = Set<String>(minimumCapacity: out.count)
+        var writeIndex = 0
+        var isSorted = true
+        var previousProgress = -TimeInterval.infinity
+        for readIndex in 0 ..< out.count {
+            let item = out[readIndex]
+            if let key = item.identityKey {
+                if own.contains(key) || !seen.insert(key).inserted { continue }
             }
-            .sorted { $0.progress < $1.progress }
+            if item.progress < previousProgress { isSorted = false }
+            previousProgress = item.progress
+            if writeIndex != readIndex { out[writeIndex] = item }
+            writeIndex += 1
+        }
+        if writeIndex < out.count { out.removeSubrange(writeIndex ..< out.count) }
+        if !isSorted { out.sort { $0.progress < $1.progress } }
+        return out
     }
 }

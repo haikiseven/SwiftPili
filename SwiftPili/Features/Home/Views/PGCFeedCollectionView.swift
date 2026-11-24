@@ -20,7 +20,9 @@ struct PGCPosterItemData: Identifiable, Equatable, Sendable {
 private struct PGCFeedConfiguration {
     let followedTitle: String
     let followedItems: [PGCFollowedPosterData]
+    let followedRevision: UInt64?
     let items: [PGCPosterItemData]
+    let itemsRevision: UInt64?
     let placeholderCount: Int
     let placeholderLabel: String
     let onLastAppear: () -> Void
@@ -42,7 +44,9 @@ private enum PGCCellKey: Hashable, Sendable {
 struct PGCFeedCollectionView: View {
     let followedTitle: String
     let followedItems: [PGCFollowedPosterData]
+    var followedRevision: UInt64? = nil
     let items: [PGCPosterItemData]
+    var itemsRevision: UInt64? = nil
     var placeholderCount = 0
     var placeholderLabel = ""
     var isActive = true
@@ -56,7 +60,9 @@ struct PGCFeedCollectionView: View {
         let config = PGCFeedConfiguration(
             followedTitle: followedTitle,
             followedItems: followedItems,
+            followedRevision: followedRevision,
             items: items,
+            itemsRevision: itemsRevision,
             placeholderCount: placeholderCount,
             placeholderLabel: placeholderLabel,
             onLastAppear: onLastAppear,
@@ -82,10 +88,13 @@ private final class PGCFeedCollectionViewController: UIKitBaseCollectionViewCont
     }
 
     private var dataSource: UICollectionViewDiffableDataSource<PGCSectionKey, PGCCellKey>?
+    private var currentSections: [PGCSectionKey] = []
     private var followedTitle = ""
     private var followedItems: [PGCFollowedPosterData] = []
+    private var lastFollowedRevision: UInt64?
     private var followedByID: [Int: PGCFollowedPosterData] = [:]
     private var items: [PGCPosterItemData] = []
+    private var lastItemsRevision: UInt64?
     private var itemByID: [Int: PGCPosterItemData] = [:]
     private var itemIndexByID: [Int: Int] = [:]
     private var placeholderCount = 0
@@ -113,7 +122,7 @@ private final class PGCFeedCollectionViewController: UIKitBaseCollectionViewCont
     override func makeCollectionLayout() -> UICollectionViewLayout {
         UICollectionViewCompositionalLayout { [weak self] sectionIndex, environment in
             guard let self else { return nil }
-            let sections = dataSource?.snapshot().sectionIdentifiers ?? []
+            let sections = currentSections
             guard sectionIndex < sections.count else { return nil }
             let effectiveWidth = environment.container.effectiveContentSize.width
             let contentWidth = max(1, effectiveWidth - UIKitFeedLayoutMetrics.horizontalInset * 2)
@@ -153,8 +162,22 @@ private final class PGCFeedCollectionViewController: UIKitBaseCollectionViewCont
         onLastAppear = config.onLastAppear
         onSelectBangumi = config.onSelectBangumi
 
-        let followedChanged = config.followedItems != followedItems || config.followedTitle != followedTitle
-        let itemsChanged = config.items != items
+        let followedListChanged: Bool
+        if let incomingRev = config.followedRevision, let currentRev = lastFollowedRevision,
+           incomingRev == currentRev {
+            followedListChanged = false
+        } else {
+            followedListChanged = config.followedItems != followedItems
+        }
+        let followedChanged = followedListChanged || config.followedTitle != followedTitle
+
+        let itemsChanged: Bool
+        if let incomingRev = config.itemsRevision, let currentRev = lastItemsRevision,
+           incomingRev == currentRev {
+            itemsChanged = false
+        } else {
+            itemsChanged = config.items != items
+        }
         let placeholderChanged = config.placeholderCount != placeholderCount
             || config.placeholderLabel != placeholderLabel
 
@@ -165,12 +188,18 @@ private final class PGCFeedCollectionViewController: UIKitBaseCollectionViewCont
         let previousItems = itemByID
 
         followedTitle = config.followedTitle
-        followedItems = config.followedItems
-        followedByID = Dictionary(uniqueKeysWithValues: followedItems.map { ($0.id, $0) })
+        lastFollowedRevision = config.followedRevision
+        if followedListChanged {
+            followedItems = config.followedItems
+            followedByID = Dictionary(uniqueKeysWithValues: followedItems.map { ($0.id, $0) })
+        }
 
-        items = config.items
-        itemByID = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
-        itemIndexByID = Dictionary(uniqueKeysWithValues: items.enumerated().map { ($0.element.id, $0.offset) })
+        lastItemsRevision = config.itemsRevision
+        if itemsChanged {
+            items = config.items
+            itemByID = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
+            itemIndexByID = Dictionary(uniqueKeysWithValues: items.enumerated().map { ($0.element.id, $0.offset) })
+        }
 
         placeholderCount = config.placeholderCount
         placeholderLabel = config.placeholderLabel
@@ -181,11 +210,15 @@ private final class PGCFeedCollectionViewController: UIKitBaseCollectionViewCont
 
         if isViewLoaded {
             var reconfigure: [PGCCellKey] = []
-            for item in followedItems where previousFollowed[item.id] != item {
-                reconfigure.append(.followed(item.id))
+            if followedListChanged {
+                for item in followedItems where previousFollowed[item.id] != item {
+                    reconfigure.append(.followed(item.id))
+                }
             }
-            for item in items where previousItems[item.id] != item {
-                reconfigure.append(.poster(item.id))
+            if itemsChanged {
+                for item in items where previousItems[item.id] != item {
+                    reconfigure.append(.poster(item.id))
+                }
             }
             applySnapshot(reconfigureKeys: reconfigure)
         }
@@ -423,6 +456,7 @@ private extension PGCFeedCollectionViewController {
         }
 
         lastReconfiguredWidth = currentContentWidth
+        currentSections = snapshot.sectionIdentifiers
         dataSource.apply(snapshot, animatingDifferences: false)
     }
 

@@ -164,10 +164,10 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
     private var activePausedRunwayRefreshID: UInt64?
     private var videoPacketQueue = ContentSecondQueue(highWater: 20, lowWater: 4)
     private var audioPacketQueue = ContentSecondQueue(highWater: 20, lowWater: 4)
-    private var videoPackets: [MediaPacket] = []
-    private var audioPackets: [MediaPacket] = []
-    private var residualVideoPackets: [MediaPacket] = []
-    private var residualAudioPackets: [MediaPacket] = []
+    private var videoPackets = PacketRingBuffer()
+    private var audioPackets = PacketRingBuffer()
+    private var residualVideoPackets = PacketRingBuffer()
+    private var residualAudioPackets = PacketRingBuffer()
     private var suspendedVideoGOP: [MediaPacket] = []
     private var suspendedVideoGOPContentSeconds: TimeInterval = 0
     private var suspendedVideoGOPBytes = 0
@@ -3133,7 +3133,10 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         }
         let surfaceEnded = ContinuousClock.now
 
-        let retainedPackets = videoPackets + residualVideoPackets
+        var retainedPackets: [MediaPacket] = []
+        retainedPackets.reserveCapacity(videoPackets.count + residualVideoPackets.count)
+        for packet in videoPackets { retainedPackets.append(packet) }
+        for packet in residualVideoPackets { retainedPackets.append(packet) }
         videoPackets = []
         residualVideoPackets = []
         videoPacketQueue.reset()
@@ -4599,11 +4602,20 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
     }
 
     private func videoPacketEndPTS() -> TimeInterval? {
-        (videoPackets + residualVideoPackets)
-            .filter { $0.pts.isFinite && $0.duration.isFinite && $0.duration > 0 }
-            .map { $0.pts + $0.duration }
-            .filter(\.isFinite)
-            .max()
+        var result: TimeInterval?
+        for packet in videoPackets {
+            guard packet.pts.isFinite, packet.duration.isFinite, packet.duration > 0 else { continue }
+            let end = packet.pts + packet.duration
+            guard end.isFinite else { continue }
+            result = result.map { max($0, end) } ?? end
+        }
+        for packet in residualVideoPackets {
+            guard packet.pts.isFinite, packet.duration.isFinite, packet.duration > 0 else { continue }
+            let end = packet.pts + packet.duration
+            guard end.isFinite else { continue }
+            result = result.map { max($0, end) } ?? end
+        }
+        return result
     }
 
     private func finiteMediaIntervalEnd(
@@ -7086,9 +7098,9 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         while let head = pendingVideoFrames.first, head.pts <= due + 1e-9 {
             guard isVideoFrameUsableAtOutputFloor(head, floor: outputMediaFloor) else {
                 _ = pendingVideoFrames.removeFirst()
-                pendingVideoContentSeconds = pendingVideoFrames.reduce(0) {
-                    $0 + max(0, $1.duration)
-                }
+                pendingVideoContentSeconds = pendingVideoFrames.isEmpty
+                    ? 0
+                    : max(0, pendingVideoContentSeconds - max(0, head.duration))
                 noteStaleVideoOutputRejection(head)
                 continue
             }
@@ -7126,9 +7138,9 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
                 pipeWindowNotReady += 1
                 logPresentBackpressureIfNeeded(error)
                 _ = pendingVideoFrames.removeFirst()
-                pendingVideoContentSeconds = pendingVideoFrames.reduce(0) {
-                    $0 + max(0, $1.duration)
-                }
+                pendingVideoContentSeconds = pendingVideoFrames.isEmpty
+                    ? 0
+                    : max(0, pendingVideoContentSeconds - max(0, head.duration))
                 consecutiveVideoPresentErrorCount += 1
                 if consecutiveVideoPresentErrorCount >= 3 {
                     disarmPresentFeed()
@@ -7161,7 +7173,9 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         consecutiveVideoPresentErrorCount = 0
         tracing.mark(.firstVout, token: activeStartupTraceToken)
         _ = pendingVideoFrames.removeFirst()
-        pendingVideoContentSeconds = max(0, pendingVideoContentSeconds - head.duration)
+        pendingVideoContentSeconds = pendingVideoFrames.isEmpty
+            ? 0
+            : max(0, pendingVideoContentSeconds - max(0, head.duration))
         presentedVideoFrameCount += 1
         pipeWindowPresentFrames += 1
         pipeWindowRendererAdmitted += 1
@@ -7212,9 +7226,9 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         while let head = pendingVideoFrames.first, head.pts <= due + 1e-9 {
             guard isVideoFrameUsableAtOutputFloor(head, floor: outputMediaFloor) else {
                 _ = pendingVideoFrames.removeFirst()
-                pendingVideoContentSeconds = pendingVideoFrames.reduce(0) {
-                    $0 + max(0, $1.duration)
-                }
+                pendingVideoContentSeconds = pendingVideoFrames.isEmpty
+                    ? 0
+                    : max(0, pendingVideoContentSeconds - max(0, head.duration))
                 noteStaleVideoOutputRejection(head)
                 continue
             }
@@ -10132,7 +10146,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
     private func enqueueFullPacket(
         _ packet: MediaPacket,
         queue: inout ContentSecondQueue,
-        store: inout [MediaPacket]
+        store: inout PacketRingBuffer
     ) -> Bool {
         let packet = normalizingZeroDuration(packet)
         let room = queue.highWater - queue.contentSeconds
@@ -10233,5 +10247,91 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         if emitPaused {
             onEvent?(.paused)
         }
+    }
+}
+
+private struct PacketRingBuffer: Sequence, ExpressibleByArrayLiteral {
+    private var storage: [MediaPacket?] = []
+    private var head: Int = 0
+    private(set) var count: Int = 0
+
+    init() {}
+
+    init(arrayLiteral elements: MediaPacket...) {
+        guard !elements.isEmpty else { return }
+        var capacity = 16
+        while capacity < elements.count {
+            capacity &<<= 1
+        }
+        storage = [MediaPacket?](repeating: nil, count: capacity)
+        for (index, element) in elements.enumerated() {
+            storage[index] = element
+        }
+        count = elements.count
+    }
+
+    var isEmpty: Bool { count == 0 }
+    var underestimatedCount: Int { count }
+    var first: MediaPacket? { count > 0 ? storage[head] : nil }
+
+    mutating func append(_ packet: MediaPacket) {
+        if count == storage.count {
+            grow()
+        }
+        storage[(head + count) & (storage.count - 1)] = packet
+        count += 1
+    }
+
+    @discardableResult
+    mutating func removeFirst() -> MediaPacket {
+        precondition(count > 0, "Cannot removeFirst from empty PacketRingBuffer")
+        let packet = storage[head]!
+        storage[head] = nil
+        head = (head + 1) & (storage.count - 1)
+        count -= 1
+        if count == 0 {
+            head = 0
+        }
+        return packet
+    }
+
+    private mutating func grow() {
+        let oldCapacity = storage.count
+        let newCapacity = Swift.max(16, oldCapacity * 2)
+        var newStorage = [MediaPacket?](repeating: nil, count: newCapacity)
+        if count > 0 {
+            let mask = oldCapacity - 1
+            for i in 0..<count {
+                newStorage[i] = storage[(head + i) & mask]
+            }
+        }
+        storage = newStorage
+        head = 0
+    }
+
+    struct Iterator: IteratorProtocol {
+        private let storage: [MediaPacket?]
+        private let mask: Int
+        private var index: Int
+        private var remaining: Int
+
+        fileprivate init(storage: [MediaPacket?], head: Int, count: Int) {
+            self.storage = storage
+            self.mask = storage.count - 1
+            self.index = head
+            self.remaining = count
+        }
+
+        mutating func next() -> MediaPacket? {
+            guard remaining > 0 else { return nil }
+            let element = storage[index]
+            index = (index + 1) & mask
+            remaining -= 1
+            return element
+        }
+    }
+
+    func makeIterator() -> Iterator {
+        Iterator(storage: storage, head: head, count: count)
     }
 }

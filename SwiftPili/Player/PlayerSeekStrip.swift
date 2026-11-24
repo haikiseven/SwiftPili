@@ -24,9 +24,7 @@ struct PlayerSeekStrip: View {
                 width: stripWidth, displayScale: displayScale
             )
             TimelineView(.animation(minimumInterval: interval ?? 0.25, paused: interval == nil)) { _ in
-                let shown = UIHitchMonitor.measureCounted(interval == nil ? "strip.body" : "strip.tl") {
-                    projection(samplingClock: interval != nil)
-                }
+                let shown = projection(samplingClock: interval != nil)
                 CompactSeekBar(
                     progress: shown.progress,
                     buffered: shown.buffered,

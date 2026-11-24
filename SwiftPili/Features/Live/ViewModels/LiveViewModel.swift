@@ -816,20 +816,6 @@ extension LiveRoomViewModel {
             AppNoticeCenter.shared.showError(String(localized: "Follow failed"))
         }
     }
-
-    func prefetchMetadata(roomID: Int, requestAdmission: (@MainActor () -> Bool)? = nil) async {
-        guard !Task.isCancelled, requestAdmission?() ?? true else { return }
-        if roomInfo?.roomId == roomID { return }
-        do {
-            let room = try await LiveAPI.getRoomInfo(roomID: roomID)
-            guard !Task.isCancelled, requestAdmission?() ?? true else { return }
-            if roomInfo == nil || roomInfo?.roomId == roomID {
-                isPortraitHint = room.isPortrait
-                roomInfo = room
-            }
-        } catch {
-        }
-    }
 }
 
 private extension LiveRoomViewModel {

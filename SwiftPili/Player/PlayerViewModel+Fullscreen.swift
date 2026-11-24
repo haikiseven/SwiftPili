@@ -331,6 +331,7 @@ extension PlayerViewModel {
     @discardableResult
     func beginPortraitPagingHandoff(lease: PlayerOwnerLease) -> Bool {
         guard isCurrentOwner(lease), (mode == .vod || mode == .offline) else { return false }
+        hasRenderedFirstFrame = false
         error = nil
         unavailability = nil
         terminalOpenFailure = false

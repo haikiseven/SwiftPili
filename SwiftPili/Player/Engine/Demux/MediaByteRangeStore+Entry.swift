@@ -75,11 +75,23 @@ extension MediaByteRangeStore {
             return min(cursor - offset, maximumCount)
         }
 
+        func overlaps(_ range: Range<Int64>) -> Bool {
+            guard !range.isEmpty, !blocks.isEmpty else { return false }
+            let index = firstIndex(endingAfter: range.lowerBound)
+            return index < blocks.count && blocks[index].offset < range.upperBound
+        }
+
         func copyPrefix(offset: Int64, count: Int) -> Data? {
             var index = firstIndex(endingAfter: offset)
             guard index < blocks.count, blocks[index].offset <= offset else { return nil }
             let available = contiguousCount(from: offset, startingAt: index, maximumCount: Int64(count))
             let windowEnd = offset + available
+            let firstBlock = blocks[index]
+            if windowEnd <= firstBlock.end {
+                let from = firstBlock.data.startIndex + Int(offset - firstBlock.offset)
+                let upTo = firstBlock.data.startIndex + Int(windowEnd - firstBlock.offset)
+                return firstBlock.data.subdata(in: from..<upTo)
+            }
             var output = Data(capacity: Int(available))
             var cursor = offset
             while cursor < windowEnd {
@@ -94,6 +106,7 @@ extension MediaByteRangeStore {
         }
 
         func overlapByteCount(offset: Int64, end: Int64) -> Int64 {
+            guard let last = blocks.last, offset < last.end else { return 0 }
             var total: Int64 = 0
             var index = firstIndex(endingAfter: offset)
             while index < blocks.count, blocks[index].offset < end {
@@ -130,6 +143,7 @@ extension MediaByteRangeStore {
         }
 
         func agrees(with data: Data, at offset: Int64) -> Bool {
+            guard let last = blocks.last, offset < last.end else { return true }
             let end = offset + Int64(data.count)
             var index = firstIndex(endingAfter: offset)
             while index < blocks.count, blocks[index].offset < end {
@@ -149,6 +163,10 @@ extension MediaByteRangeStore {
 
         mutating func insertMissing(_ data: Data, at offset: Int64, blockLimit: Int) {
             let end = offset + Int64(data.count)
+            if blocks.isEmpty || offset >= blocks[blocks.count - 1].end {
+                appendTailGap(offset..<end, of: data, at: offset, blockLimit: blockLimit)
+                return
+            }
             var gaps: [Range<Int64>] = []
             var cursor = offset
             var index = firstIndex(endingAfter: offset)
@@ -164,6 +182,36 @@ extension MediaByteRangeStore {
             }
             for gap in gaps {
                 insertGap(gap, of: data, at: offset, blockLimit: blockLimit)
+            }
+        }
+
+        private mutating func appendTailGap(
+            _ gap: Range<Int64>,
+            of data: Data,
+            at offset: Int64,
+            blockLimit: Int
+        ) {
+            var cursor = gap.lowerBound
+            while cursor < gap.upperBound {
+                let from = data.startIndex + Int(cursor - offset)
+                let lastIndex = blocks.count - 1
+                if lastIndex >= 0,
+                   blocks[lastIndex].end == cursor,
+                   blocks[lastIndex].data.count < blockLimit {
+                    let room = Int64(blockLimit - blocks[lastIndex].data.count)
+                    let length = Int(min(room, gap.upperBound - cursor))
+                    blocks[lastIndex].data.append(data[from..<from + length])
+                    byteCount += Int64(length)
+                    cursor += Int64(length)
+                    continue
+                }
+                let length = Int(min(Int64(blockLimit), gap.upperBound - cursor))
+                let slice: Data = (from == data.startIndex && length == data.count)
+                    ? data
+                    : data.subdata(in: from..<from + length)
+                blocks.append(Block(offset: cursor, data: slice))
+                byteCount += Int64(length)
+                cursor += Int64(length)
             }
         }
 

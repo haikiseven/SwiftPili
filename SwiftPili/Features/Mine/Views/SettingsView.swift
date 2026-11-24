@@ -50,22 +50,6 @@ struct SettingsView: View {
             currentCDNLabel = CDNService.current.label
         }
         .task { await refreshCacheSize() }
-        .routeAppearanceProbe { event in
-            switch event {
-            case .willAppear:
-                AnimationFrameDiagnostics.cancel(.settingsExit)
-                AnimationFrameDiagnostics.begin(.settingsEnter)
-            case .didAppear:
-                AnimationFrameDiagnostics.settle(.settingsEnter)
-            case .willDisappear:
-                AnimationFrameDiagnostics.cancel(.settingsEnter)
-                AnimationFrameDiagnostics.begin(.settingsExit)
-            case .didDisappear:
-                AnimationFrameDiagnostics.settle(.settingsExit)
-            case .routeActivity:
-                break
-            }
-        }
     }
 
     private func refreshCacheSize() async {
@@ -94,7 +78,11 @@ private extension SettingsView {
                     HStack(spacing: 6) {
                         Circle()
                             .fill(AccentStore.shared.theme?.color ?? Color.accentColor)
-                            .frame(width: 10, height: 10)
+                            .overlay(
+                                Circle()
+                                    .strokeBorder(Color.primary.opacity(0.14), lineWidth: AppStroke.hairlineWidth)
+                            )
+                            .frame(width: 11, height: 11)
                         if let theme = AccentStore.shared.theme {
                             Text(LocalizedStringKey(theme.rawValue))
                         } else {

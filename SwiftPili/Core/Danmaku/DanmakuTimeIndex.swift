@@ -7,27 +7,35 @@ struct DanmakuTimeIndex: Sendable, Equatable {
     var count: Int { elements.count }
 
     init(_ unsorted: [DanmakuElem]) {
-        elements = unsorted.enumerated()
-            .sorted { lhs, rhs in
-                lhs.element.progress == rhs.element.progress
-                    ? lhs.offset < rhs.offset
-                    : lhs.element.progress < rhs.element.progress
-            }
-            .map(\.element)
+        var sorted = unsorted
+        sorted.sort { $0.progress < $1.progress }
+        elements = sorted
     }
 
     func elements(from: TimeInterval, to: TimeInterval) -> ArraySlice<DanmakuElem> {
         guard from < to, !elements.isEmpty else { return [] }
-        let lower = lowerBound(for: from)
+        let lower = lowerBound(for: from, in: 0 ..< elements.count)
         guard lower < elements.count else { return [] }
-        let upper = lowerBound(for: to)
+        let upper = upperBoundGalloping(for: to, from: lower)
         guard lower < upper else { return [] }
         return elements[lower ..< upper]
     }
 
-    private func lowerBound(for time: TimeInterval) -> Int {
-        var low = 0
-        var high = elements.count
+    private func upperBoundGalloping(for time: TimeInterval, from start: Int) -> Int {
+        let count = elements.count
+        if elements[start].progress >= time { return start }
+        var step = 1
+        var probe = start + 1
+        while probe < count, elements[probe].progress < time {
+            step <<= 1
+            probe = start + step
+        }
+        return lowerBound(for: time, in: (start + (step >> 1)) ..< min(probe, count))
+    }
+
+    private func lowerBound(for time: TimeInterval, in range: Range<Int>) -> Int {
+        var low = range.lowerBound
+        var high = range.upperBound
         while low < high {
             let mid = low + (high - low) / 2
             if elements[mid].progress < time {

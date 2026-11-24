@@ -201,6 +201,7 @@ struct CommentDecorationBadge: View {
            )) {
             KFImage(url)
                 .setProcessor(DownsamplingImageProcessor(size: CGSize(width: 80, height: 24)))
+                .backgroundDecode()
                 .scaleFactor(scale)
                 .cancelOnDisappear(true)
                 .onSuccess { _ in loadedURL = url }

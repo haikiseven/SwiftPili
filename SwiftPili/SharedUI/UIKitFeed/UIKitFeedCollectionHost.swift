@@ -321,19 +321,6 @@ class UIKitBaseCollectionViewController: UIViewController,
 
     func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
         cancelPendingRefreshScrollToTop()
-        if ImageDiagnostics.isEnabled { ImageDiagnostics.isScrolling = true }
-    }
-
-    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
-        if ImageDiagnostics.isEnabled, !decelerate { ImageDiagnostics.isScrolling = false }
-    }
-
-    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
-        if ImageDiagnostics.isEnabled { ImageDiagnostics.isScrolling = false }
-    }
-
-    func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
-        if ImageDiagnostics.isEnabled { ImageDiagnostics.isScrolling = false }
     }
 
     // MARK: - Private Helpers

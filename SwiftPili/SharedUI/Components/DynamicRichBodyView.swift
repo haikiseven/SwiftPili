@@ -144,18 +144,43 @@ struct DynamicRichBodyView: View {
 
     private func prepareEmotes(_ blocks: [DynamicRichContent.Block], inputs: RenderInputs) async {
         guard !Task.isCancelled, let height = inputs.emoteHeight else { return }
-        let emojiNodes = (inputs.nodes ?? []).filter { $0.type == "RICH_TEXT_NODE_TYPE_EMOJI" }
-        guard !emojiNodes.isEmpty else { return }
-        var images: [String: UIImage] = [:]
-        var attemptedSources: Set<String> = []
-        for node in emojiNodes {
+        var sources: [String] = []
+        var seen: Set<String> = []
+        for node in inputs.nodes ?? [] where node.type == "RICH_TEXT_NODE_TYPE_EMOJI" {
             guard let source = DynamicRichContent.imageURL(node.emoji?.source)?.absoluteString,
-                  attemptedSources.insert(source).inserted else { continue }
-            let image = await EmoteImageLoader.shared.image(
-                for: source, height: height, scale: inputs.scale
-            )
-            guard !Task.isCancelled else { return }
-            images[source] = image
+                  seen.insert(source).inserted else { continue }
+            sources.append(source)
+        }
+        guard !sources.isEmpty else { return }
+
+        var images: [String: UIImage] = [:]
+        let scale = inputs.scale
+        if sources.count == 1 {
+            let source = sources[0]
+            if let image = await EmoteImageLoader.shared.image(
+                for: source, height: height, scale: scale
+            ) {
+                guard !Task.isCancelled else { return }
+                images[source] = image
+            }
+        } else {
+            await withTaskGroup(of: (String, UIImage?).self) { group in
+                for source in sources {
+                    group.addTask {
+                        let image = await EmoteImageLoader.shared.image(
+                            for: source, height: height, scale: scale
+                        )
+                        return (source, image)
+                    }
+                }
+                for await (source, image) in group {
+                    if Task.isCancelled {
+                        group.cancelAll()
+                        break
+                    }
+                    if let image { images[source] = image }
+                }
+            }
         }
         guard !Task.isCancelled, !images.isEmpty else { return }
         rendered = Rendered(inputs: inputs, texts: prepare(blocks, images: images, inputs: inputs))

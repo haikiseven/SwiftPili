@@ -62,7 +62,6 @@ struct CommentComposerBar: View {
     }
 
     var body: some View {
-        let _ = UIHitchMonitor.countBody("composer")
         composerShell
             .sheet(isPresented: $showEmotePicker) { emotePicker }
             .sheet(isPresented: $showMentionPicker) { mentionPicker }

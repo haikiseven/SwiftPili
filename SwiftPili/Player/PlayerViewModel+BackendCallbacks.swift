@@ -39,6 +39,12 @@ extension PlayerViewModel {
         backend.setRuntimeFaultHandler { [weak self] fault in
             self?.handleDemandRuntimeFault(fault)
         }
+        backend.setFirstVideoFrameHandler { [weak self] generation in
+            guard let self, !self.invalidatedBackendResources,
+                  ObjectIdentifier(self.backend as AnyObject) == callbackBackendIdentity,
+                  generation == self.backend.runtimeGeneration else { return }
+            self.markFirstVideoFrameRendered()
+        }
         backend.onStateChanged = { [weak self] event in
             guard let self, !self.invalidatedBackendResources,
                   ObjectIdentifier(self.backend as AnyObject) == callbackBackendIdentity else { return }
@@ -258,8 +264,6 @@ extension PlayerViewModel {
 
         backend.onTickWithGeneration = { [weak self] currentTime, totalTime, generation, traceToken in
             guard let self else { return }
-            let tickSpan = UIHitchMonitor.beginSpan("tick.vm")
-            defer { UIHitchMonitor.endSpan(tickSpan) }
             guard ObjectIdentifier(self.backend) == callbackBackendIdentity,
                   generation == self.backend.runtimeGeneration else { return }
             if self.streamRecoveryOwnsWork, self.streamRecovery?.requestID == nil { return }
@@ -274,9 +278,7 @@ extension PlayerViewModel {
             }
             self.noteBackgroundPlaybackProgress(currentTime)
             let now = CACurrentMediaTime()
-            let liveSpan = UIHitchMonitor.beginSpan("tick.live")
             self.updateDemandVideoLivenessContext()
-            UIHitchMonitor.endSpan(liveSpan)
 
             let seeking = self.isSeekInFlight
             self.setMute(.seekTravel, seeking)
@@ -325,11 +327,9 @@ extension PlayerViewModel {
                     ? (self.backendKind != .demandPaced && self.stats.fps >= 1)
                     : true
                 if self.freezeFrame != nil,
-                   (replacementFrameIsProven
-                    && self.pendingSeekTarget == nil
-                    && !self.isBuffering)
-                   || (!self.freezeFrameAwaitingFreshProof
-                       && now - self.freezeFrameSetAt > Self.freezeFrameSafetyTimeout) {
+                   replacementFrameIsProven,
+                   self.pendingSeekTarget == nil,
+                   !self.isBuffering {
                     self.clearFreezeFrame()
                 }
                 if self.pendingSeekTarget != nil, !seeking, !self.isBuffering {
@@ -339,24 +339,18 @@ extension PlayerViewModel {
                     self.ambientSelectionMediaTime = currentTime
                 }
                 self.refreshAmbientSelection()
-                let danmakuSpan = UIHitchMonitor.beginSpan("tick.dm")
                 self.noteDanmakuMediaTick(currentTime)
-                UIHitchMonitor.endSpan(danmakuSpan)
                 self.lastDisplayUpdate = now
             }
             self.sampleAmbientLiveFrameIfNeeded(at: now)
             self.lastOnPlayAt = now
-            let bufferSpan = UIHitchMonitor.beginSpan("tick.buf")
             self.publishBufferedTime(
                 self.backend.playableTime, display: { self.backend.bufferDisplaySample }, at: now
             )
-            UIHitchMonitor.endSpan(bufferSpan)
 
-            let skipSpan = UIHitchMonitor.beginSpan("tick.subs")
             self.updateSubtitle(at: currentTime)
             self.autoSkipIfNeeded(at: currentTime)
             self.autoSkipSponsorIfNeeded(at: currentTime)
-            UIHitchMonitor.endSpan(skipSpan)
             // Faster cadence while the stats overlay is visible; enhancement telemetry is a cheap
             // window summary, so it refreshes at 4 Hz there.
             if now - (self.lastDropSample?.at ?? 0) >= (self.showStats ? 0.5 : 1.0) {

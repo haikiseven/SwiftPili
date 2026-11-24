@@ -12,6 +12,7 @@ final class UIKitDynamicActionBarView: UIView {
     private weak var interactionStore: MomentInteractionStore?
     private var fallbackLikeState: (liked: Bool, count: Int) = (false, 0)
     private var lastRenderedLike: (liked: Bool, count: Int)?
+    private var lastButtonKeys: [ObjectIdentifier: RenderedButtonKey] = [:]
     private var observationToken = UUID()
     private var onRepost: (() -> Void)?
     private var onComment: (() -> Void)?
@@ -88,12 +89,19 @@ final class UIKitDynamicActionBarView: UIView {
         onLike = nil
     }
 
-    private struct ButtonAppearance {
+    private struct ButtonAppearance: Equatable {
         let icon: String
         let title: String
         let count: Int
         let isActive: Bool
         let isEnabled: Bool
+    }
+
+    private struct RenderedButtonKey: Equatable {
+        let appearance: ButtonAppearance
+        let contentSizeCategory: UIContentSizeCategory
+        let interfaceStyle: UIUserInterfaceStyle
+        let themeKey: String
     }
 
     private func refreshAllButtons() {
@@ -140,7 +148,18 @@ final class UIKitDynamicActionBarView: UIView {
 
     private func configureButton(_ button: UIButton, appearance: ButtonAppearance) {
         let traits = traitCollection
-        let accent = UIColor(AccentStore.shared.semanticAccent)
+        let store = AccentStore.shared
+        let renderKey = RenderedButtonKey(
+            appearance: appearance,
+            contentSizeCategory: traits.preferredContentSizeCategory,
+            interfaceStyle: traits.userInterfaceStyle,
+            themeKey: "\(store.theme?.rawValue ?? ""):\(store.scope.rawValue)"
+        )
+        let buttonID = ObjectIdentifier(button)
+        guard lastButtonKeys[buttonID] != renderKey else { return }
+        lastButtonKeys[buttonID] = renderKey
+
+        let accent = UIColor(store.semanticAccent)
         let foreground: UIColor = appearance.isActive
             ? accent
             : UIColor.label.withAlphaComponent(0.78).resolvedColor(with: traits)

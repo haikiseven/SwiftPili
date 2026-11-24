@@ -19,8 +19,12 @@ struct DanmakuWireCursor {
     var isAtEnd: Bool { index >= raw.count }
 
     mutating func readVarint() throws(DanmakuDecodeError) -> UInt64 {
-        var result: UInt64 = 0
-        var shift: UInt64 = 0
+        guard index < raw.count else { throw .truncated }
+        let first = raw[index]
+        index += 1
+        if first < 0x80 { return UInt64(first) }
+        var result = UInt64(first & 0x7F)
+        var shift: UInt64 = 7
         while true {
             guard index < raw.count else { throw .truncated }
             let byte = raw[index]
@@ -54,6 +58,7 @@ struct DanmakuWireCursor {
 
     mutating func readString() throws(DanmakuDecodeError) -> String {
         let slice = try readLengthDelimited()
+        if slice.isEmpty { return "" }
         // swiftlint:disable:next optional_data_string_conversion
         return String(decoding: slice, as: UTF8.self)
     }

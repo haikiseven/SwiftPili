@@ -52,6 +52,7 @@ final class MomentDetailCollectionViewController: UIViewController,
     private let refreshControl = UIRefreshControl()
     private let prefetchCoordinator = UIKitPrefetchCoordinator()
     private var dataSource: UICollectionViewDiffableDataSource<MomentDetailSectionKey, MomentDetailCellKey>?
+    private var currentSections: [MomentDetailSectionKey] = []
 
     private var currentInput: MomentDetailSnapshotInput?
     private var hostEnvironment = EnvironmentValues()
@@ -168,6 +169,11 @@ final class MomentDetailCollectionViewController: UIViewController,
         likeCount = view.likeCount
         actions = view.actions
 
+        let envChanged = environmentsDiffer(oldEnv, newEnv)
+        if isViewLoaded, hasAppliedInitialSnapshot, !envChanged, oldInput == view.input {
+            return
+        }
+
         let (oldEdges, oldCommentIDs) = syncCaches(oldInput: oldInput, view: view, sectionChanged: sectionChanged)
         guard isViewLoaded else { return }
         if !hasAppliedInitialSnapshot {
@@ -185,7 +191,7 @@ final class MomentDetailCollectionViewController: UIViewController,
         }
         let reconfigures = computeReconfigureKeys(
             oldInput: oldInput, newInput: view.input,
-            oldEnv: oldEnv, newEnv: newEnv, oldEdges: oldEdges
+            envChanged: envChanged, oldEdges: oldEdges
         )
         let resetsCommentViewport = shouldResetCommentsToHeader(
             oldInput: oldInput, newInput: view.input,
@@ -254,22 +260,6 @@ final class MomentDetailCollectionViewController: UIViewController,
         }
     }
 
-    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
-        if ImageDiagnostics.isEnabled { ImageDiagnostics.isScrolling = true }
-    }
-
-    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
-        if ImageDiagnostics.isEnabled, !decelerate { ImageDiagnostics.isScrolling = false }
-    }
-
-    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
-        if ImageDiagnostics.isEnabled { ImageDiagnostics.isScrolling = false }
-    }
-
-    func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
-        if ImageDiagnostics.isEnabled { ImageDiagnostics.isScrolling = false }
-    }
-
     func collectionView(_ collectionView: UICollectionView, prefetchItemsAt indexPaths: [IndexPath]) {
         prefetchCoordinator.prefetch(at: indexPaths) { [weak self] in self?.mediaRequests(for: $0) ?? [] }
     }
@@ -287,7 +277,7 @@ private extension MomentDetailCollectionViewController {
     func makeCollectionLayout() -> UICollectionViewLayout {
         let layout = UICollectionViewCompositionalLayout { [weak self] sectionIndex, env in
             guard let self else { return nil }
-            let sections = dataSource?.snapshot().sectionIdentifiers ?? []
+            let sections = currentSections
             guard sectionIndex < sections.count else { return nil }
             return makeSectionLayout(sections[sectionIndex], effectiveWidth: env.container.effectiveContentSize.width)
         }
@@ -574,6 +564,7 @@ private extension MomentDetailCollectionViewController {
             if shouldAnchorHeader {
                 anchorScrollToInteractionsHeaderIfScrolledPast()
             }
+            currentSections = snapshot.sectionIdentifiers
             dataSource.apply(snapshot, animatingDifferences: false)
             if shouldAnchorHeader {
                 collectionView.layoutIfNeeded()
@@ -616,11 +607,11 @@ private extension MomentDetailCollectionViewController {
 
     func computeReconfigureKeys(
         oldInput: MomentDetailSnapshotInput?, newInput: MomentDetailSnapshotInput,
-        oldEnv: EnvironmentValues, newEnv: EnvironmentValues,
+        envChanged: Bool,
         oldEdges: SectionEdges
     ) -> [MomentDetailCellKey] {
         guard let oldInput else { return [] }
-        if environmentsDiffer(oldEnv, newEnv) {
+        if envChanged {
             return dataSource?.snapshot().itemIdentifiers ?? []
         }
         var keys: [MomentDetailCellKey] = []
@@ -628,11 +619,13 @@ private extension MomentDetailCollectionViewController {
         if let card = newInput.cardFingerprint, oldInput.cardFingerprint != card { keys.append(.card(card.id)) }
         if oldInput.headerFingerprint != newInput.headerFingerprint { keys.append(.header) }
         if oldInput.footerFingerprint != newInput.footerFingerprint { keys.append(.footer) }
-        let oldComments = Dictionary(
-            oldInput.commentFingerprints.map { ($0.rpid, $0) }, uniquingKeysWith: { first, _ in first }
-        )
-        for fingerprint in newInput.commentFingerprints where oldComments[fingerprint.rpid] != fingerprint {
-            keys.append(.comment(fingerprint.rpid))
+        if oldInput.commentFingerprints != newInput.commentFingerprints {
+            let oldComments = Dictionary(
+                oldInput.commentFingerprints.map { ($0.rpid, $0) }, uniquingKeysWith: { first, _ in first }
+            )
+            for fingerprint in newInput.commentFingerprints where oldComments[fingerprint.rpid] != fingerprint {
+                keys.append(.comment(fingerprint.rpid))
+            }
         }
         if oldInput.section == newInput.section {
             keys.append(contentsOf: sectionBoundaryReconfigureKeys(section: newInput.section, oldEdges: oldEdges))

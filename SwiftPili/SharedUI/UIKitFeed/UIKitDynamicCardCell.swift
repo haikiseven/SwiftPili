@@ -76,6 +76,7 @@ final class UIKitDynamicCardCell: UICollectionViewCell, UIGestureRecognizerDeleg
     private let actionBar = UIKitDynamicActionBarView()
 
     private var onOpenPost: (() -> Void)?
+    private var lastPlatterStyleKey: String?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -246,11 +247,11 @@ final class UIKitDynamicCardCell: UICollectionViewCell, UIGestureRecognizerDeleg
 private extension UIKitDynamicCardCell {
     func applyPlatterStyle() {
         let traits = traitCollection
-        platter.layer.borderWidth = 0
-        platter.layer.borderColor = nil
-        quoteContainer.layer.borderWidth = 0
-        quoteContainer.layer.borderColor = nil
-        quoteAccentBar.backgroundColor = UIColor(AccentStore.shared.semanticAccent)
+        let store = AccentStore.shared
+        let key = "\(traits.userInterfaceStyle.rawValue):\(store.theme?.rawValue ?? ""):\(store.scope.rawValue)"
+        guard lastPlatterStyleKey != key else { return }
+        lastPlatterStyleKey = key
+        quoteAccentBar.backgroundColor = UIColor(store.semanticAccent)
             .withAlphaComponent(0.35)
             .resolvedColor(with: traits)
     }

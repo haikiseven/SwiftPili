@@ -12,14 +12,13 @@ extension EnvironmentValues {
 }
 
 extension View {
+    @inline(__always)
     func imageDiagnosticsScreen(_ name: String) -> some View {
-        environment(\.imageDiagnosticsScreen, name)
+        self
     }
 
+    @inline(__always)
     func imageDiagnosticsScrollTracking() -> some View {
-        onScrollPhaseChange { _, newPhase in
-            guard ImageDiagnostics.isEnabled else { return }
-            ImageDiagnostics.isScrolling = newPhase != .idle
-        }
+        self
     }
 }

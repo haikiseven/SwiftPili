@@ -29,7 +29,6 @@ struct CommentRowView: View {
     }
 
     var body: some View {
-        let _ = UIHitchMonitor.countBody("row")
         BlockedCollapsible(mid: comment.mid, uname: comment.member.uname) {
             CommentAIFilterRowContainer(comment: comment, upMid: upMid) { aiAssessment, onInspectAI in
                 commentBody(aiAssessment: aiAssessment, onInspectAI: onInspectAI)

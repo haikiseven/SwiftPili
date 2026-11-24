@@ -319,7 +319,6 @@ final class PlayerContainerView: UIView, PlayerRenderAttachment {
                 }
             }
         }
-        UIHitchMonitor.count("surface")
         PlayerViewModel.shared.noteInlineVideoRect(from: self)
         PlayerViewModel.shared.renderAttachmentDidChange(self)
         logSurfaceIfMoved()

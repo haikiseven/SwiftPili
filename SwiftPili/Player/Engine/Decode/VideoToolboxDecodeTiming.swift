@@ -1,6 +1,7 @@
 import CoreMedia
 import CoreVideo
 import Foundation
+import Synchronization
 
 protocol MediaVideoDecodeTimingReporting: AnyObject, Sendable {
     func setDecodeTimingEnabled(_ enabled: Bool)
@@ -57,6 +58,7 @@ struct MediaVideoDecodeTimingSnapshot: Equatable, Sendable {
 }
 
 final class MediaVideoDecodeTimingStore: @unchecked Sendable {
+    private let enabledAtomic = Atomic<Bool>(false)
     private let lock = NSLock()
     private var enabled = false
     private var value = MediaVideoDecodeTimingSnapshot()
@@ -69,11 +71,13 @@ final class MediaVideoDecodeTimingStore: @unchecked Sendable {
                 let next = value.observationID &+ 1
                 value = MediaVideoDecodeTimingSnapshot(observationID: next)
             }
+            enabledAtomic.store(enabled, ordering: .releasing)
         }
     }
 
     func observationID() -> UInt64? {
-        lock.withLock { enabled ? value.observationID : nil }
+        guard enabledAtomic.load(ordering: .acquiring) else { return nil }
+        return lock.withLock { enabled ? value.observationID : nil }
     }
 
     func snapshot() -> MediaVideoDecodeTimingSnapshot? {

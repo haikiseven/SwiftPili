@@ -12,8 +12,11 @@ final class UIKitDynamicAuthorRowView: UIView {
     private let timeLabel = UILabel()
     private let typeLabel = UILabel()
 
+    private static let avatarPlaceholder = UIImage(systemName: "person.crop.circle.fill")
+
     private var activeAvatarRequest: UIKitCoverPipeline.CoverRequest?
     private var authorMID: Int?
+    private var lastStyledTraitKey: String?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -132,7 +135,7 @@ final class UIKitDynamicAuthorRowView: UIView {
                 to: avatarView,
                 request: request,
                 activeRequest: &activeAvatarRequest,
-                placeholderImage: UIImage(systemName: "person.crop.circle.fill")
+                placeholderImage: Self.avatarPlaceholder
             )
             avatarView.tintColor = .tertiaryLabel
         } else {
@@ -165,6 +168,9 @@ final class UIKitDynamicAuthorRowView: UIView {
 
     private func applyTraitStyling() {
         let traits = traitCollection
+        let key = "\(traits.preferredContentSizeCategory.rawValue):\(traits.userInterfaceStyle.rawValue)"
+        guard lastStyledTraitKey != key else { return }
+        lastStyledTraitKey = key
         avatarView.layer.borderColor = UIColor.quaternaryLabel.resolvedColor(with: traits).cgColor
         nameLabel.font = UIKitFeedFont.systemFont(textStyle: .callout, weight: .semibold, traitCollection: traits)
         let metaFont = UIKitFeedFont.systemFont(textStyle: .caption, traitCollection: traits)

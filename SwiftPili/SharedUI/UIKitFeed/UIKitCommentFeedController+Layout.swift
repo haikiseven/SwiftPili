@@ -110,11 +110,49 @@ extension UIKitCommentFeedViewController {
         }
     }
 
+    private func snapshotStructureMatches(
+        _ currentSnapshot: NSDiffableDataSourceSnapshot<CommentFeedSectionKey, CommentFeedCellKey>
+    ) -> Bool {
+        var expectedSections: [CommentFeedSectionKey] = []
+        expectedSections.reserveCapacity(4)
+        if !orderedHeaderIDs.isEmpty { expectedSections.append(.header) }
+        if !orderedItemIDs.isEmpty {
+            expectedSections.append(.items)
+        } else if config.skeletonCount > 0 {
+            expectedSections.append(.skeletons)
+        }
+        if config.footerContent != nil { expectedSections.append(.footer) }
+        guard currentSnapshot.sectionIdentifiers == expectedSections else { return false }
+
+        if !orderedHeaderIDs.isEmpty {
+            let existingHeaders = currentSnapshot.itemIdentifiers(inSection: .header)
+            guard existingHeaders.count == orderedHeaderIDs.count else { return false }
+            for (existing, id) in zip(existingHeaders, orderedHeaderIDs) where existing != .header(id) {
+                return false
+            }
+        }
+        if !orderedItemIDs.isEmpty {
+            let existingItems = currentSnapshot.itemIdentifiers(inSection: .items)
+            guard existingItems.count == orderedItemIDs.count else { return false }
+            for (existing, id) in zip(existingItems, orderedItemIDs) where existing != .item(id) {
+                return false
+            }
+        } else if config.skeletonCount > 0 {
+            guard currentSnapshot.numberOfItems(inSection: .skeletons) == config.skeletonCount else {
+                return false
+            }
+        }
+        return true
+    }
+
     private func buildSnapshot(
         currentSnapshot: NSDiffableDataSourceSnapshot<CommentFeedSectionKey, CommentFeedCellKey>,
         reconfigureKeys: [CommentFeedCellKey],
         reconfigureAll: Bool
     ) -> NSDiffableDataSourceSnapshot<CommentFeedSectionKey, CommentFeedCellKey>? {
+        if !reconfigureAll, reconfigureKeys.isEmpty, snapshotStructureMatches(currentSnapshot) {
+            return nil
+        }
         var snapshot = NSDiffableDataSourceSnapshot<CommentFeedSectionKey, CommentFeedCellKey>()
         if !orderedHeaderIDs.isEmpty {
             snapshot.appendSections([.header])
@@ -131,15 +169,16 @@ extension UIKitCommentFeedViewController {
             snapshot.appendSections([.footer])
             snapshot.appendItems([.footer], toSection: .footer)
         }
-        let existing = Set(currentSnapshot.itemIdentifiers)
         var hasReconfigureTargets = false
         if reconfigureAll {
+            let existing = Set(currentSnapshot.itemIdentifiers)
             let targets = snapshot.itemIdentifiers.filter { existing.contains($0) }
             if !targets.isEmpty {
                 snapshot.reconfigureItems(targets)
                 hasReconfigureTargets = true
             }
         } else if !reconfigureKeys.isEmpty {
+            let existing = Set(currentSnapshot.itemIdentifiers)
             let valid = Set(snapshot.itemIdentifiers)
             var seen: Set<CommentFeedCellKey> = []
             let targets = reconfigureKeys.filter {
@@ -400,7 +439,6 @@ private struct CommentFeedHostedEnvironmentModifier: ViewModifier {
             .environment(\.layoutDirection, snapshot.layoutDirection)
             .environment(\.displayScale, snapshot.displayScale)
             .environment(\.locale, snapshot.locale)
-            .environment(\.imageDiagnosticsScreen, snapshot.imageDiagnosticsScreen)
             .environment(\.contentLinkDefersToParent, snapshot.contentLinkDefersToParent)
             .environment(\.navigationZoomNamespace, snapshot.navigationZoomNamespace)
             .environment(\.contentLinkContext, contentLinkContext)

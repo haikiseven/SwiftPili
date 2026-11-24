@@ -46,6 +46,8 @@ final class DynamicsFollowingPeopleCatalog {
     private(set) var followingFailure: String?
 
     @ObservationIgnored private var ownerAccountMID: Int?
+    @ObservationIgnored private var recentByMID: [Int: DynamicFollowingPerson] = [:]
+    @ObservationIgnored private var followingByMID: [Int: DynamicFollowingPerson] = [:]
     @ObservationIgnored private var recentOffset: String?
     @ObservationIgnored private var recentVisitedOffsets: Set<String> = []
     @ObservationIgnored private var recentAdmission = FeedLoadAdmission()
@@ -56,8 +58,10 @@ final class DynamicsFollowingPeopleCatalog {
 
     func person(for mid: Int?) -> DynamicFollowingPerson? {
         guard let mid else { return nil }
-        return recentPeople.first(where: { $0.mid == mid })
-            ?? followingPeople.first(where: { $0.mid == mid })
+        _ = recentPeople
+        if let person = recentByMID[mid] { return person }
+        _ = followingPeople
+        return followingByMID[mid]
     }
 
     func loadRecentPeopleIfNeeded() async {
@@ -194,8 +198,13 @@ final class DynamicsFollowingPeopleCatalog {
         let people = items.map(DynamicFollowingPerson.init(updateItem:))
         if loadsPortal {
             recentPeople = FeedCollectionPolicy.replaceDeduplicated(people, id: \.id)
+            recentByMID = Dictionary(uniqueKeysWithValues: recentPeople.map { ($0.mid, $0) })
         } else {
+            let previousCount = recentPeople.count
             FeedCollectionPolicy.appendDeduplicated(to: &recentPeople, incoming: people, id: \.id)
+            for person in recentPeople[previousCount...] {
+                recentByMID[person.mid] = person
+            }
         }
         recentOffset = page.offset
         recentVisitedOffsets = nextVisitedOffsets
@@ -216,11 +225,16 @@ final class DynamicsFollowingPeopleCatalog {
 
         let people = users.map(DynamicFollowingPerson.init(followingItem:))
         if followingHasLoaded {
+            let previousCount = followingPeople.count
             FeedCollectionPolicy.appendDeduplicated(
                 to: &followingPeople, incoming: people, id: \.id
             )
+            for person in followingPeople[previousCount...] {
+                followingByMID[person.mid] = person
+            }
         } else {
             followingPeople = FeedCollectionPolicy.replaceDeduplicated(people, id: \.id)
+            followingByMID = Dictionary(uniqueKeysWithValues: followingPeople.map { ($0.mid, $0) })
         }
         followingHasMore = hasMoreFollowing(result.total, userCount: users.count, page: requestedPage)
         followingPage = requestedPage + 1
@@ -263,6 +277,7 @@ final class DynamicsFollowingPeopleCatalog {
         recentLoadingToken = nil
         isLoadingRecent = false
         recentPeople = []
+        recentByMID = [:]
         recentOffset = nil
         recentVisitedOffsets = []
         recentHasLoaded = false
@@ -272,6 +287,7 @@ final class DynamicsFollowingPeopleCatalog {
         followingLoadingToken = nil
         isLoadingFollowing = false
         followingPeople = []
+        followingByMID = [:]
         followingPage = 1
         followingHasLoaded = false
         followingHasMore = false

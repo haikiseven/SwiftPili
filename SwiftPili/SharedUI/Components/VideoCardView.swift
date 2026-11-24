@@ -36,7 +36,6 @@ struct VideoCardView: View, Equatable {
     }
 
     var body: some View {
-        let _ = UIHitchMonitor.countBody("card")
         HStack(spacing: RowGeometry.coverToTextSpacing) {
             VideoCoverImage(sources: sources, width: coverWidth)
                 .videoCoverFrame(cornerRadius: VideoCardMetrics.cornerRadius)

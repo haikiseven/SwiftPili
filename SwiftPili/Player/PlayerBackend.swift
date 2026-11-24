@@ -208,6 +208,9 @@ protocol PlayerBackend: AnyObject {
     // MARK: - Events
 
     var onStateChanged: (@MainActor @Sendable (PlayerStateEvent) -> Void)? { get set }
+    func setFirstVideoFrameHandler(
+        _ handler: (@MainActor @Sendable (_ generation: UInt64) -> Void)?
+    )
     func setRuntimeFaultHandler(
         _ handler: (@MainActor @Sendable (MediaRuntimeFault) -> Void)?
     )
@@ -249,6 +252,10 @@ extension PlayerBackend {
     func setDemandPresentationCornerRadius(_ radius: CGFloat) {
         _ = radius
     }
+
+    func setFirstVideoFrameHandler(
+        _: (@MainActor @Sendable (UInt64) -> Void)?
+    ) {}
 
     func setRuntimeFaultHandler(
         _: (@MainActor @Sendable (MediaRuntimeFault) -> Void)?

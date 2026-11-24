@@ -95,7 +95,48 @@ enum DanmakuTrackLayout {
         private var scrollLanes: [[Occupant]]
         private var topLanes: [[Occupant]]
         private var bottomLanes: [[Occupant]]
+        private var scrollBounds: [LaneBounds]
+        private var topBounds: [LaneBounds]
+        private var bottomBounds: [LaneBounds]
+        private var earliestScrollExit: TimeInterval = .infinity
         private var nextSerial: UInt64 = 0
+
+        static func == (lhs: Allocator, rhs: Allocator) -> Bool {
+            lhs.metrics == rhs.metrics
+                && lhs.scrollLanes == rhs.scrollLanes
+                && lhs.topLanes == rhs.topLanes
+                && lhs.bottomLanes == rhs.bottomLanes
+                && lhs.nextSerial == rhs.nextSerial
+        }
+
+        private struct LaneBounds: Equatable, Sendable {
+            var minTop: Double = .infinity
+            var maxBottom: Double = -.infinity
+            var hasUnbounded = false
+
+            mutating func include(_ extent: VerticalExtent?) {
+                if let extent {
+                    if extent.top < minTop { minTop = extent.top }
+                    if extent.bottom > maxBottom { maxBottom = extent.bottom }
+                } else {
+                    hasUnbounded = true
+                }
+            }
+
+            func mayOverlap(_ candidate: VerticalExtent) -> Bool {
+                if hasUnbounded { return true }
+                let tolerance = 1e-6
+                return candidate.top < maxBottom - tolerance && candidate.bottom > minTop + tolerance
+            }
+
+            static func compute(for occupants: [Occupant]) -> LaneBounds {
+                var bounds = LaneBounds()
+                for occupant in occupants {
+                    bounds.include(occupant.extent)
+                }
+                return bounds
+            }
+        }
 
         private struct Occupant: Equatable, Sendable {
             let serial: UInt64
@@ -113,12 +154,19 @@ enum DanmakuTrackLayout {
             scrollLanes = Array(repeating: [], count: metrics.laneCount)
             topLanes = Array(repeating: [], count: metrics.laneCount)
             bottomLanes = Array(repeating: [], count: metrics.laneCount)
+            scrollBounds = Array(repeating: LaneBounds(), count: metrics.laneCount)
+            topBounds = Array(repeating: LaneBounds(), count: metrics.laneCount)
+            bottomBounds = Array(repeating: LaneBounds(), count: metrics.laneCount)
         }
 
         mutating func reset() {
             scrollLanes = Array(repeating: [], count: metrics.laneCount)
             topLanes = Array(repeating: [], count: metrics.laneCount)
             bottomLanes = Array(repeating: [], count: metrics.laneCount)
+            scrollBounds = Array(repeating: LaneBounds(), count: metrics.laneCount)
+            topBounds = Array(repeating: LaneBounds(), count: metrics.laneCount)
+            bottomBounds = Array(repeating: LaneBounds(), count: metrics.laneCount)
+            earliestScrollExit = .infinity
         }
 
         mutating func apply(_ newMetrics: Metrics) {
@@ -132,6 +180,10 @@ enum DanmakuTrackLayout {
             scrollLanes = refile(scrollLanes, kind: .scroll)
             topLanes = refile(topLanes, kind: .top)
             bottomLanes = refile(bottomLanes, kind: .bottom)
+            scrollBounds = scrollLanes.map(LaneBounds.compute(for:))
+            topBounds = topLanes.map(LaneBounds.compute(for:))
+            bottomBounds = bottomLanes.map(LaneBounds.compute(for:))
+            recomputeEarliestScrollExit()
         }
 
         private func refile(_ lanes: [[Occupant]], kind: DanmakuRenderKind) -> [[Occupant]] {
@@ -194,26 +246,50 @@ enum DanmakuTrackLayout {
         }
 
         mutating func reclaimFinished(at mediaTime: TimeInterval) {
-            guard mediaTime.isFinite else { return }
+            guard mediaTime.isFinite, mediaTime >= earliestScrollExit else { return }
+            var nextEarliest = TimeInterval.infinity
             for lane in scrollLanes.indices {
+                guard !scrollLanes[lane].isEmpty else { continue }
+                let beforeCount = scrollLanes[lane].count
                 scrollLanes[lane].removeAll { $0.exit <= mediaTime }
+                if scrollLanes[lane].count != beforeCount {
+                    scrollBounds[lane] = LaneBounds.compute(for: scrollLanes[lane])
+                }
+                for occupant in scrollLanes[lane] where occupant.exit < nextEarliest {
+                    nextEarliest = occupant.exit
+                }
             }
+            earliestScrollExit = nextEarliest
         }
 
-        private func scrollDelay(_ request: Request, behind occupant: Occupant) -> TimeInterval {
-            let requestDirection = ScrollDirection(kind: request.kind)
-            let requestLifetime = metrics.scrollLifetime
-            let earlierIsOccupant = occupant.entry <= request.entry
-            let earlierEntry = earlierIsOccupant ? occupant.entry : request.entry
+        private mutating func recomputeEarliestScrollExit() {
+            var nextEarliest = TimeInterval.infinity
+            for lane in scrollLanes {
+                for occupant in lane where occupant.exit < nextEarliest {
+                    nextEarliest = occupant.exit
+                }
+            }
+            earliestScrollExit = nextEarliest
+        }
+
+        private func scrollDelay(
+            requestEntry: TimeInterval,
+            requestWidth: Double,
+            requestDirection: ScrollDirection,
+            requestLifetime: TimeInterval,
+            behind occupant: Occupant
+        ) -> TimeInterval {
+            let earlierIsOccupant = occupant.entry <= requestEntry
+            let earlierEntry = earlierIsOccupant ? occupant.entry : requestEntry
             let earlierLifetime = earlierIsOccupant ? occupant.lifetime : requestLifetime
-            let laterEntry = earlierIsOccupant ? request.entry : occupant.entry
+            let laterEntry = earlierIsOccupant ? requestEntry : occupant.entry
             if laterEntry >= earlierEntry + earlierLifetime { return 0 }
             let required: TimeInterval
             if occupant.direction == requestDirection {
                 required = DanmakuTrackLayout.requiredGap(
-                    leadingWidth: earlierIsOccupant ? occupant.width : request.width,
+                    leadingWidth: earlierIsOccupant ? occupant.width : requestWidth,
                     leadingLifetime: earlierLifetime,
-                    trailingWidth: earlierIsOccupant ? request.width : occupant.width,
+                    trailingWidth: earlierIsOccupant ? requestWidth : occupant.width,
                     trailingLifetime: earlierIsOccupant ? requestLifetime : occupant.lifetime,
                     surfaceWidth: metrics.width
                 )
@@ -233,27 +309,73 @@ enum DanmakuTrackLayout {
         }
 
         private mutating func placeScroll(_ request: Request) -> Placement {
+            let requestDirection = ScrollDirection(kind: request.kind)
+            let requestLifetime = metrics.scrollLifetime
+            let requestEntry = request.entry
+            let requestWidth = request.width
+            let forced = request.forced
             var soonest: (lane: Int, delay: TimeInterval)?
             for lane in scrollLanes.indices {
                 let candidate = candidateExtent(for: request, lane: lane)
                 var delay: TimeInterval = 0
-                for otherLane in scrollLanes.indices {
-                    for occupant in scrollLanes[otherLane]
-                        where isOverlapping(candidate, lane: lane, occupant: occupant, otherLane: otherLane) {
-                        delay = max(delay, scrollDelay(request, behind: occupant))
+                var blocked = false
+
+                // Check own lane first (most common collision site).
+                for occupant in scrollLanes[lane]
+                    where isOverlapping(candidate, lane: lane, occupant: occupant, otherLane: lane) {
+                    let d = scrollDelay(
+                        requestEntry: requestEntry,
+                        requestWidth: requestWidth,
+                        requestDirection: requestDirection,
+                        requestLifetime: requestLifetime,
+                        behind: occupant
+                    )
+                    if d > delay { delay = d }
+                    if !forced, delay > 0 {
+                        blocked = true
+                        break
                     }
                 }
+
+                if !blocked, let candidate {
+                    for otherLane in scrollLanes.indices where otherLane != lane {
+                        guard !scrollLanes[otherLane].isEmpty,
+                              scrollBounds[otherLane].mayOverlap(candidate) else { continue }
+                        for occupant in scrollLanes[otherLane] {
+                            guard let occExtent = occupant.extent, candidate.overlaps(occExtent) else { continue }
+                            let d = scrollDelay(
+                                requestEntry: requestEntry,
+                                requestWidth: requestWidth,
+                                requestDirection: requestDirection,
+                                requestLifetime: requestLifetime,
+                                behind: occupant
+                            )
+                            if d > delay { delay = d }
+                            if !forced, delay > 0 {
+                                blocked = true
+                                break
+                            }
+                        }
+                        if blocked { break }
+                    }
+                }
+
                 if delay == 0 {
-                    scrollLanes[lane].append(occupant(for: request, lane: lane, lifetime: metrics.scrollLifetime))
+                    let entry = occupant(for: request, lane: lane, lifetime: requestLifetime)
+                    scrollLanes[lane].append(entry)
+                    scrollBounds[lane].include(entry.extent)
+                    if entry.exit < earliestScrollExit { earliestScrollExit = entry.exit }
                     return .lane(lane)
                 }
-                if soonest.map({ delay < $0.delay }) ?? true {
+                if forced, soonest.map({ delay < $0.delay }) ?? true {
                     soonest = (lane, delay)
                 }
             }
-            guard request.forced, let pick = soonest else { return .dropped }
-            let entry = occupant(for: request, lane: pick.lane, lifetime: metrics.scrollLifetime)
+            guard forced, let pick = soonest else { return .dropped }
+            let entry = occupant(for: request, lane: pick.lane, lifetime: requestLifetime)
             scrollLanes[pick.lane].append(entry)
+            scrollBounds[pick.lane].include(entry.extent)
+            if entry.exit < earliestScrollExit { earliestScrollExit = entry.exit }
             return .lane(pick.lane)
         }
 
@@ -264,36 +386,65 @@ enum DanmakuTrackLayout {
             band: FixedBand
         ) -> Placement {
             let lanes = band == .top ? topLanes : bottomLanes
+            let bounds = band == .top ? topBounds : bottomBounds
+            let forced = request.forced
+            let requestEntry = request.entry
             var soonest: (lane: Int, busyUntil: TimeInterval)?
             for lane in lanes.indices {
                 let candidate = candidateExtent(for: request, lane: lane)
                 var busyUntil = -TimeInterval.infinity
-                for otherLane in lanes.indices {
-                    for occupant in lanes[otherLane]
-                        where isOverlapping(candidate, lane: lane, occupant: occupant, otherLane: otherLane) {
-                        busyUntil = max(busyUntil, occupant.exit)
+                var blocked = false
+
+                for occupant in lanes[lane]
+                    where isOverlapping(candidate, lane: lane, occupant: occupant, otherLane: lane) {
+                    if occupant.exit > busyUntil { busyUntil = occupant.exit }
+                    if !forced, requestEntry < busyUntil {
+                        blocked = true
+                        break
                     }
                 }
-                if request.entry >= busyUntil {
+
+                if !blocked, let candidate {
+                    for otherLane in lanes.indices where otherLane != lane {
+                        guard !lanes[otherLane].isEmpty,
+                              bounds[otherLane].mayOverlap(candidate) else { continue }
+                        for occupant in lanes[otherLane] {
+                            guard let occExtent = occupant.extent, candidate.overlaps(occExtent) else { continue }
+                            if occupant.exit > busyUntil { busyUntil = occupant.exit }
+                            if !forced, requestEntry < busyUntil {
+                                blocked = true
+                                break
+                            }
+                        }
+                        if blocked { break }
+                    }
+                }
+
+                if requestEntry >= busyUntil {
                     let placed = occupant(for: request, lane: lane, lifetime: metrics.fixedLifetime)
                     store([placed], lane: lane, band: band)
                     return .lane(lane)
                 }
-                if soonest.map({ busyUntil < $0.busyUntil }) ?? true {
+                if forced, soonest.map({ busyUntil < $0.busyUntil }) ?? true {
                     soonest = (lane, busyUntil)
                 }
             }
-            guard request.forced, let pick = soonest else { return .dropped }
+            guard forced, let pick = soonest else { return .dropped }
             let placed = occupant(for: request, lane: pick.lane, lifetime: metrics.fixedLifetime)
-            let kept = lanes[pick.lane].filter { request.entry < $0.exit }
+            let kept = lanes[pick.lane].filter { requestEntry < $0.exit }
             store(kept + [placed], lane: pick.lane, band: band)
             return .lane(pick.lane)
         }
 
         private mutating func store(_ occupants: [Occupant], lane: Int, band: FixedBand) {
+            let computed = LaneBounds.compute(for: occupants)
             switch band {
-            case .top: topLanes[lane] = occupants
-            case .bottom: bottomLanes[lane] = occupants
+            case .top:
+                topLanes[lane] = occupants
+                topBounds[lane] = computed
+            case .bottom:
+                bottomLanes[lane] = occupants
+                bottomBounds[lane] = computed
             }
         }
     }

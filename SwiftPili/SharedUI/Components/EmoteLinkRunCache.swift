@@ -10,18 +10,11 @@ final class EmoteLinkRunCache: Sendable {
     }
 
     private struct Key: Hashable, Sendable {
-        let text: Data
-        let destinations: [Data: Data]
-
-        init(_ text: String, links: [String: URL]) {
-            self.text = Data(text.utf8)
-            destinations = Dictionary(uniqueKeysWithValues: links.lazy.map {
-                (Data($0.key.utf8), Data($0.value.absoluteString.utf8))
-            })
-        }
+        let text: String
+        let links: [String: URL]
 
         var logicalBytes: Int {
-            text.count + destinations.reduce(0) { $0 + $1.key.count + $1.value.count }
+            text.utf8.count + links.reduce(0) { $0 + $1.key.utf8.count + $1.value.absoluteString.utf8.count }
         }
     }
 
@@ -33,7 +26,19 @@ final class EmoteLinkRunCache: Sendable {
     private struct State: Sendable {
         var entries: [Key: Entry] = [:]
         var order: [Key] = []
+        var orderHead = 0
         var logicalBytes = 0
+
+        mutating func popOldest() -> Key? {
+            guard orderHead < order.count else { return nil }
+            let oldest = order[orderHead]
+            orderHead += 1
+            if orderHead >= 64, orderHead * 2 >= order.count {
+                order.removeFirst(orderHead)
+                orderHead = 0
+            }
+            return oldest
+        }
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
@@ -63,7 +68,7 @@ final class EmoteLinkRunCache: Sendable {
     func runs(_ text: String, links: [String: URL]) -> [EmoteText.LinkRun] {
         guard !text.isEmpty else { return [] }
         guard !links.isEmpty else { return [EmoteText.LinkRun(text: text, url: nil)] }
-        let key = Key(text, links: links)
+        let key = Key(text: text, links: links)
         let keyBytes = key.logicalBytes
         guard maxEntries > 0, keyBytes <= maxEntryLogicalBytes,
               keyBytes <= maxLogicalBytes else { return split(text, links) }
@@ -80,7 +85,7 @@ final class EmoteLinkRunCache: Sendable {
             guard resident.entries[key] == nil else { return }
             while resident.entries.count >= maxEntries
                 || resident.logicalBytes > maxLogicalBytes - logicalBytes {
-                let oldest = resident.order.removeFirst()
+                guard let oldest = resident.popOldest() else { break }
                 if let removed = resident.entries.removeValue(forKey: oldest) {
                     resident.logicalBytes -= removed.logicalBytes
                 }

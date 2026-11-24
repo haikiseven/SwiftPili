@@ -33,10 +33,9 @@ final class PlayerRouteOwnershipCoordinator {
 
     var outgoingRouteStills: [String: UIImage] = [:]
     @ObservationIgnored
-    var outgoingRouteStillExpiry = PlayerOutgoingRouteStillExpiry()
+    var outgoingRouteStillTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored
     var departedRouteStillOwners: [String] = []
-    var outgoingRouteStill: OutgoingRouteStill?
 
     var currentOwnerLease: PlayerOwnerLease? {
         guard !ownerKey.isEmpty else { return nil }

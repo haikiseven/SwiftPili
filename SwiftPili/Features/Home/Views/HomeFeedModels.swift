@@ -36,6 +36,7 @@ typealias HomeFeedSectionData = VideoFeedSection<HomeFeedItemData>
 @MainActor
 struct HomeFeedConfiguration {
     let sections: [HomeFeedSectionData]
+    let contentRevision: UInt64?
     let layoutMode: HomeLayoutMode
     let coverPresentation: CoverPresentation
     let placeholderCount: Int

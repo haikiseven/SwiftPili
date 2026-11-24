@@ -33,6 +33,9 @@ final class UIKitDynamicRichTextView: UIView, UITextViewDelegate, UIGestureRecog
     private var attachmentTasks: [Int: Task<Void, Never>] = [:]
     private var attachmentToken = UUID()
     private var lastMeasuredWidth: CGFloat = 0
+    private var lastStyledButtonKey: String?
+    private var hasBuiltContent = false
+    private var lastHadOpenPost = false
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -93,35 +96,65 @@ final class UIKitDynamicRichTextView: UIView, UITextViewDelegate, UIGestureRecog
     }
 
     func configure(_ configuration: Configuration) {
-        let sameContent = self.configuration?.text == configuration.text
-            && self.configuration?.nodes == configuration.nodes
-            && self.configuration?.sourceID == configuration.sourceID
-            && self.configuration?.textStyle == configuration.textStyle
+        let previous = self.configuration
+        let sameContent = hasBuiltContent
+            && previous?.text == configuration.text
+            && previous?.nodes == configuration.nodes
+            && previous?.sourceID == configuration.sourceID
+            && previous?.textStyle == configuration.textStyle
+            && previous?.lineSpacing == configuration.lineSpacing
+            && previous?.detectTimestamps == configuration.detectTimestamps
         self.configuration = configuration
 
         if !sameContent {
             emoteTask?.cancel()
             emoteTask = nil
             emoteToken = UUID()
-            loadedEmotes.removeAll()
+            loadedEmotes.removeAll(keepingCapacity: true)
             cancelAttachmentTasks()
             blocks = DynamicRichContent.blocks(text: configuration.text, nodes: configuration.nodes)
+            rebuildContentViews()
+            hasBuiltContent = true
+            lastHadOpenPost = onOpenPost != nil
+            startEmoteLoadingIfNeeded()
+            updateTruncationState()
+            return
         }
 
-        rebuildContentViews()
+        let openPostPresent = onOpenPost != nil
+        let limitChanged = previous?.lineLimit != configuration.lineLimit
+        if limitChanged {
+            let textCount = textViews.count
+            let limit = textCount == 1 ? configuration.lineLimit : nil
+            for textView in textViews.values {
+                textView.textContainer.maximumNumberOfLines = limit ?? 0
+                textView.textContainer.lineBreakMode = limit == nil ? .byWordWrapping : .byTruncatingTail
+            }
+        }
+        if previous?.availableWidth != configuration.availableWidth {
+            let width = effectiveWidth
+            for gridView in drawGridViews {
+                gridView.updateAvailableWidth(width)
+            }
+        }
         startEmoteLoadingIfNeeded()
-        updateTruncationState()
+        if limitChanged || lastHadOpenPost != openPostPresent || previous?.availableWidth != configuration.availableWidth {
+            lastHadOpenPost = openPostPresent
+            updateTruncationState()
+        }
     }
 
     func prepareForReuse() {
         emoteTask?.cancel()
         emoteTask = nil
         emoteToken = UUID()
-        loadedEmotes.removeAll()
+        loadedEmotes.removeAll(keepingCapacity: true)
         cancelAttachmentTasks()
         configuration = nil
         blocks = []
         lastMeasuredWidth = 0
+        hasBuiltContent = false
+        lastHadOpenPost = false
         onOpenPost = nil
         onOpenURL = nil
         onImageTap = nil
@@ -266,6 +299,10 @@ private extension UIKitDynamicRichTextView {
     }
 
     func styleViewFullTextButton(accent: UIColor) {
+        let store = AccentStore.shared
+        let key = "\(traitCollection.preferredContentSizeCategory.rawValue):\(traitCollection.userInterfaceStyle.rawValue):\(store.theme?.rawValue ?? ""):\(store.scope.rawValue)"
+        guard lastStyledButtonKey != key else { return }
+        lastStyledButtonKey = key
         var config = viewFullTextButton.configuration ?? .plain()
         let font = UIKitFeedFont.systemFont(textStyle: .footnote, weight: .medium, traitCollection: traitCollection)
         config.baseForegroundColor = accent
@@ -367,14 +404,33 @@ private extension UIKitDynamicRichTextView {
         guard !missing.isEmpty else { return }
 
         let token = emoteToken
+        emoteTask?.cancel()
         emoteTask = Task { @MainActor [weak self] in
             var fetched: [String: UIImage] = [:]
-            for source in missing {
-                guard !Task.isCancelled else { return }
+            if missing.count == 1 {
+                let source = missing[0]
                 if let image = await EmoteImageLoader.shared.image(
                     for: source, height: height, scale: scale
                 ) {
                     fetched[source] = image
+                }
+            } else {
+                await withTaskGroup(of: (String, UIImage?).self) { group in
+                    for source in missing {
+                        group.addTask {
+                            let image = await EmoteImageLoader.shared.image(
+                                for: source, height: height, scale: scale
+                            )
+                            return (source, image)
+                        }
+                    }
+                    for await (source, image) in group {
+                        if Task.isCancelled {
+                            group.cancelAll()
+                            break
+                        }
+                        if let image { fetched[source] = image }
+                    }
                 }
             }
             guard let self, !Task.isCancelled, self.emoteToken == token, !fetched.isEmpty else { return }
@@ -425,7 +481,14 @@ private extension UIKitDynamicRichTextView {
     }
 
     func scaledFont(for style: UIFont.TextStyle) -> UIFont {
+        let key = "\(style.rawValue):\(traitCollection.preferredContentSizeCategory.rawValue)"
+        if let cached = Self.scaledFontCache[key] { return cached }
         let base = UIFont.preferredFont(forTextStyle: style, compatibleWith: traitCollection)
-        return UIFontMetrics(forTextStyle: style).scaledFont(for: base, compatibleWith: traitCollection)
+        let scaled = UIFontMetrics(forTextStyle: style).scaledFont(for: base, compatibleWith: traitCollection)
+        if Self.scaledFontCache.count >= 64 { Self.scaledFontCache.removeAll(keepingCapacity: true) }
+        Self.scaledFontCache[key] = scaled
+        return scaled
     }
+
+    private static var scaledFontCache: [String: UIFont] = [:]
 }

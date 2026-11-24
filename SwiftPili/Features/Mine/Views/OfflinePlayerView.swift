@@ -6,7 +6,6 @@ struct OfflinePlayerView: View {
     let pagingContext: OfflinePortraitPagingContext
     @Query private var downloadedItems: [DownloadedVideo]
     @State private var ownerLease: PlayerOwnerLease?
-    @State private var routeActivation = RouteActivationState()
     @State private var presentationScreenID = UUID()
     @State private var routePosition: PlayerRoutePosition?
     @Environment(AppCoordinator.self) private var coordinator
@@ -24,11 +23,8 @@ struct OfflinePlayerView: View {
     private var isActiveOfflineRoute: Bool {
         coordinator.isActivePlayerRoute(.offline(pagingContext), position: routePosition)
     }
-    private var isRouteActivated: Bool {
-        routeActivation.admits(routeIsActive: isActiveOfflineRoute)
-    }
     private var presentationContext: PlayerScreenPresentationContext? {
-        guard isRouteActivated, assetValid, let asset = currentAsset else { return nil }
+        guard isActiveOfflineRoute, assetValid, let asset = currentAsset else { return nil }
         return player.presentationContext(
             screenID: presentationScreenID, lease: ownerLease,
             route: .offline(pagingContext), position: routePosition, source: .offline(asset)
@@ -45,7 +41,7 @@ struct OfflinePlayerView: View {
     }
     private var hasInlineExitChrome: Bool {
         guard let ownerLease, player.isCurrentOwner(ownerLease), player.mode == .offline else { return false }
-        return isRouteActivated && item != nil && assetValid && player.error == nil
+        return isActiveOfflineRoute && item != nil && assetValid && player.error == nil
             && player.surfaceLease(matching: ownerLease, role: .inline) != nil
     }
     private var currentAsset: OfflinePlaybackAsset? {
@@ -101,7 +97,7 @@ struct OfflinePlayerView: View {
     }
     @discardableResult
     private func activateCurrent() -> Bool {
-        guard isRouteActivated, let ownerLease, player.isCurrentOwner(ownerLease) else { return false }
+        guard isActiveOfflineRoute, let ownerLease, player.isCurrentOwner(ownerLease) else { return false }
         guard let item = validatedItem(for: currentRouteItem.downloadID)
         else {
             assetValid = false
@@ -132,16 +128,14 @@ struct OfflinePlayerView: View {
     }
 
     private func startSessionIfNeeded() {
-        guard isRouteActivated else { return }
+        guard isActiveOfflineRoute else { return }
         guard let asset = currentAsset,
               validatedItem(for: currentRouteItem.downloadID) != nil else {
             invalidateCurrentAsset()
             return
         }
         if player.isAlreadyLivePresentation(lease: ownerLease, source: .offline(asset)) { return }
-        if routeActivation.defersActivation {
-            player.endForeignOwnerForRouteActivation(incomingOwner: owner)
-        }
+        player.endForeignOwnerForRouteActivation(incomingOwner: owner)
         if let ownerLease, !player.isCurrentOwner(ownerLease) { self.ownerLease = nil }
         if ownerLease == nil { ownerLease = player.claimOwnerLease(owner: owner) }
         if !activateCurrent() { releaseOwnerLease() }
@@ -155,7 +149,7 @@ struct OfflinePlayerView: View {
 
     private var pagingNeighboursReachable: Bool {
         PortraitPagingPolicy.allowsVerticalPaging(on: .offlinePlayback)
-            && isRouteActivated && pagingEnabled && !player.isFullscreenPresentationActive
+            && isActiveOfflineRoute && pagingEnabled && !player.isFullscreenPresentationActive
     }
 
     private var hostOwnsInlineSurface: Bool {
@@ -208,7 +202,7 @@ struct OfflinePlayerView: View {
                     : nil
             },
             handoff: {
-                guard isRouteActivated, let settlement = pagingReducer.settlement(for: token),
+                guard isActiveOfflineRoute, let settlement = pagingReducer.settlement(for: token),
                       case .switchPage(let targetIndex) = settlement.kind,
                       pagingContext.items.indices.contains(targetIndex),
                       let ownerLease,
@@ -290,7 +284,7 @@ extension OfflinePlayerView {
                     let playerCornerRadius: CGFloat = layout.isSplit ? DetailStageLayout.playerCornerRadius : 0
                     OfflinePlayerPage(layout: layout, viewportHeight: max(0, geometry.size.height)) {
                         ZStack(alignment: .topLeading) {
-                            if isRouteActivated {
+                            if isActiveOfflineRoute {
                                 if hostOwnsInlineSurface {
                                     RoundedRectangle(cornerRadius: playerCornerRadius, style: .continuous)
                                         .fill(Color.black)
@@ -303,7 +297,8 @@ extension OfflinePlayerView {
                                         pageNavigationActions: playerPageNavigation,
                                         inlineViewportSize: layout.playerSize,
                                         inlineCornerRadius: playerCornerRadius,
-                                        screenLease: ownerLease
+                                        screenLease: ownerLease,
+                                        placeholderCoverURL: item.coverURL
                                     )
                                     .frame(width: layout.playerSize.width, height: layout.playerSize.height)
                                     .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { _ in
@@ -323,7 +318,6 @@ extension OfflinePlayerView {
                             PlayerDetailInlineNavigationOverlay(
                                 player: player,
                                 isActiveRoute: isActiveOfflineRoute,
-                                isRouteActivated: isRouteActivated,
                                 hasInlineExitChrome: { hasInlineExitChrome },
                                 scrimWidth: layout.playerSize.width,
                                 scrimHeight: layout.playerSize.height,
@@ -356,7 +350,7 @@ extension OfflinePlayerView {
                         coverURL: item.coverURL,
                         player: player,
                         ownerLease: ownerLease,
-                        isRouteActive: isRouteActivated && isActiveOfflineRoute
+                        isRouteActive: isActiveOfflineRoute
                     )
                 }
             } else {
@@ -414,22 +408,18 @@ extension OfflinePlayerView {
             guardsIPadTopSafeArea: nil,
             presentationContext: presentationContext,
             coordinator: coordinator,
-            watchdogScreen: "OfflinePlayer",
-            onRouteAppearance: { event in
-                _ = routeActivation.handle(event, owner: owner)
-            }
+            watchdogScreen: "OfflinePlayer"
         ) {
             PlayerAmbientPolicy.groundColor
                 .ignoresSafeArea()
         }
-        .onChange(of: isActiveOfflineRoute, initial: true) { _, active in
-            let outcome = routeActivation.handle(.routeActivity(active), owner: owner)
-            if outcome == .deactivated, routeActivation.defersActivation {
+        .onChange(of: isActiveOfflineRoute, initial: true) { oldActive, active in
+            if !active, oldActive {
                 player.pauseForRouteDeparture(lease: ownerLease)
             }
         }
-        .task(id: isRouteActivated) {
-            guard !Task.isCancelled else { return }
+        .task(id: isActiveOfflineRoute) {
+            guard !Task.isCancelled, isActiveOfflineRoute else { return }
             startSessionIfNeeded()
         }
         .onChange(of: currentAsset) { old, new in

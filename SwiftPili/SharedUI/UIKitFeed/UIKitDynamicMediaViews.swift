@@ -54,6 +54,7 @@ final class UIKitDynamicMediaCardView: UIView {
     private var fallbackConstraints: [NSLayoutConstraint] = []
 
     private var model: Model?
+    private var activeMode: DisplayMode?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -122,6 +123,8 @@ final class UIKitDynamicMediaCardView: UIView {
 
 private extension UIKitDynamicMediaCardView {
     func switchMode(_ mode: DisplayMode) {
+        guard activeMode != mode else { return }
+        activeMode = mode
         mainUnitView.isHidden = mode != .main
         quotedRowView.isHidden = mode != .quoted
         fallbackCard.isHidden = mode != .fallback

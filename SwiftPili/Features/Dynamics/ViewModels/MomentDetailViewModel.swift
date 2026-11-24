@@ -39,8 +39,8 @@ final class MomentDetailViewModel {
     var likeCount = 0
     var commentSort: CommentSort = .top
 
-    private var page = 1
-    private var hasMore = true
+    @ObservationIgnored private var page = 1
+    @ObservationIgnored private var hasMore = true
     private(set) var oid: Int?
 
     fileprivate struct CommentSource: Equatable {
@@ -57,14 +57,14 @@ final class MomentDetailViewModel {
     }
 
     let commentUpload = CommentComposerUploadOwner()
-    private let commentComposerID = UUID()
+    @ObservationIgnored private let commentComposerID = UUID()
     private var commentReplacementEpoch: UInt64 = 0
     private(set) var commentSendError: String?
     private var detailGeneration: UInt64 = 0
-    private var loadingDetailID: String?
-    private var settledDetailID: String?
+    @ObservationIgnored private var loadingDetailID: String?
+    @ObservationIgnored private var settledDetailID: String?
     private var readyCommentGeneration: UInt64?
-    private var commentRequestedID: String?
+    @ObservationIgnored private var commentRequestedID: String?
     @ObservationIgnored private var adoptedCommentSource: CommentSource?
     @ObservationIgnored private var commentAdmission = FeedLoadAdmission()
     @ObservationIgnored private var commentLoadingToken: FeedLoadToken?
@@ -75,9 +75,9 @@ final class MomentDetailViewModel {
     private(set) var forwardsLoaded = false
     private(set) var forwardFailure: InteractionLoadFailure?
     private(set) var forwardReportedTotal: Int?
-    private var forwardOffset = ""
+    @ObservationIgnored private var forwardOffset = ""
     private(set) var forwardsHaveMore = true
-    private var forwardContinuationCursors: Set<String> = []
+    @ObservationIgnored private var forwardContinuationCursors: Set<String> = []
 
     var reactions: [ReactionEntry] = []
     var isLoadingReactions = false
@@ -87,7 +87,7 @@ final class MomentDetailViewModel {
     private(set) var reactionsNeedContinuation = false
     private(set) var reactionsHaveUnclassifiedActions = false
     private(set) var reactionReportedTotal: Int?
-    private var reactionOffset = ""
+    @ObservationIgnored private var reactionOffset = ""
 
     @ObservationIgnored private var interactionDynamicID: String?
     @ObservationIgnored private var reactionCursorSourceID: String?

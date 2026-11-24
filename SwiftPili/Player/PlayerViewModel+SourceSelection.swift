@@ -244,6 +244,7 @@ extension PlayerViewModel {
         outgoing.setDemandPresentationProofHandler(nil)
         outgoing.setDemandPresentationFailureHandler(nil)
         outgoing.setRuntimeFaultHandler(nil)
+        outgoing.setFirstVideoFrameHandler(nil)
         outgoing.setStartupTraceToken(nil)
         outgoing.onStateChanged = nil
         outgoing.onTickWithGeneration = nil

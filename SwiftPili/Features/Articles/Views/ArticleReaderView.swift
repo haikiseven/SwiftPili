@@ -1,20 +1,13 @@
+import Observation
 import SwiftUI
 
 struct ArticleReaderView: View {
     let cvid: Int
     @State private var viewModel = ArticleReaderViewModel()
     @State private var previewImages: ImagePreviewItem?
-    @State private var likeInFlight = false
-    @State private var commentText = ""
-    @State private var commentPictures: [ComposedPicture] = []
-    @State private var commentSubmission = CommentComposerSubmission()
-    @State private var acceptedCommentClear: CommentComposerCapture?
-    @State private var replyTarget: CommentResult.CommentItem?
     @State private var showThread: CommentThreadTarget?
-    @State private var commentFocus = CommentComposerFocus()
-    @State private var commentLinkLifetime = ContentLinkLifetime()
+    @State private var composerState = ArticleCommentComposerState()
     @State private var containerSize = WindowMetricsFallback.currentSize
-    @AppMotion private var motion
     @Environment(AppCoordinator.self) private var coordinator
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
@@ -25,11 +18,10 @@ struct ArticleReaderView: View {
         )
     }
 
-    private struct CommentComposerCapture {
+    private struct ArticleSourceCapture {
         let model: ArticleReaderViewModel
         let requestedCvid: Int
         let source: ArticleReaderViewModel.CommentSourceReceipt?
-        let context: CommentComposerUploadOwner.Context
     }
 
     private var articleURL: URL {
@@ -62,22 +54,28 @@ struct ArticleReaderView: View {
     // MARK: - Native reader
 
     private var nativeReader: some View {
-        let composer = commentComposerCapture
-        let model = composer.model
-        let requestedCvid = composer.requestedCvid
+        let capture = sourceCapture
+        let model = capture.model
+        let requestedCvid = capture.requestedCvid
         let showsComments = !model.blocks.isEmpty && !model.commentsClosed
         let composerVisible = AuthManager.shared.isLoggedIn && showsComments
         return Group {
             if usesSplit {
-                articleSplit(composer: composer, composerVisible: composerVisible)
+                articleSplit(capture: capture, composerVisible: composerVisible)
             } else {
                 commentFeed(
-                    composer: composer,
-                    headerItems: articleHeaderItems(composer: composer),
+                    capture: capture,
+                    headerItems: articleHeaderItems(capture: capture),
                     layout: .singleColumn(composerVisible: composerVisible)
                 )
                 .overlay(alignment: .bottom) {
-                    if composerVisible { commentComposer(for: composer) }
+                    if composerVisible {
+                        ArticleCommentComposerOverlay(
+                            viewModel: model,
+                            cvid: requestedCvid,
+                            state: composerState
+                        )
+                    }
                 }
             }
         }
@@ -123,32 +121,8 @@ struct ArticleReaderView: View {
         .dismissingSheetOnBiliLink(coordinator: coordinator) { showThread = nil }
     }
 
-    private func commentComposer(for composer: CommentComposerCapture) -> some View {
-        CollapsibleComposer(
-            text: commentTextBinding(for: composer),
-            pictures: commentPicturesBinding(for: composer),
-            placeholder: replyTarget.map { CommentComposerBar.replyPlaceholder(to: $0.member.uname) }
-                ?? String(localized: "Write a comment..."),
-            replyBanner: replyTarget.map { CommentComposerBar.replyBannerText(for: $0.member.uname) },
-            isSending: commentSubmission.isSending,
-            sendError: composerIsCurrent(composer) ? viewModel.commentSendError : nil,
-            focus: commentFocus,
-            onCancelReply: {
-                guard composerIsCurrent(composer) else { return }
-                withAnimation(motion.animation(normal: CollapsibleComposer.composerCollapseAnimation)) {
-                    setCommentReplyTarget(nil, for: composer)
-                }
-                commentFocus.dismiss()
-            },
-            onSend: { sendComment(from: composer) },
-            allowsCollapseAfterSend: allowsCollapseAfterCommentSend,
-            uploadScope: commentUploadScope(for: composer),
-            isInteractionCurrent: { composerIsCurrent(composer) }
-        )
-    }
-
-    private func articleHeaderItems(composer: CommentComposerCapture) -> [UIKitCommentFeedItem] {
-        let model = composer.model
+    private func articleHeaderItems(capture: ArticleSourceCapture) -> [UIKitCommentFeedItem] {
+        let model = capture.model
         var headerItems: [UIKitCommentFeedItem] = []
         let headerFP = ArticleHeaderFingerprint(
             title: model.info?.title,
@@ -182,11 +156,8 @@ struct ArticleReaderView: View {
             })
         }
         if !model.blocks.isEmpty {
-            let actionsFP = ArticleActionsFingerprint(
-                liked: model.liked, likeInFlight: likeInFlight, likeCount: model.likeCount
-            )
-            headerItems.append(UIKitCommentFeedItem(id: "article-actions", fingerprint: actionsFP) {
-                actionRow
+            headerItems.append(UIKitCommentFeedItem(id: "article-actions", fingerprint: 0) {
+                ArticleActionRow(viewModel: model, articleURL: articleURL)
             })
             let commentsHeaderFP = ArticleCommentsHeaderFingerprint(
                 commentTotal: model.commentTotal
@@ -194,7 +165,7 @@ struct ArticleReaderView: View {
             headerItems.append(UIKitCommentFeedItem(id: "article-comments-header", fingerprint: commentsHeaderFP) {
                 VStack(alignment: .leading, spacing: 14) {
                     Divider()
-                    commentHeader(for: composer)
+                    commentHeader(for: capture)
                 }
             })
         }
@@ -225,17 +196,121 @@ struct ArticleReaderView: View {
     @ViewBuilder
     private func articleFooterView(
         for state: ArticleFooterFingerprint,
-        composer: CommentComposerCapture,
+        capture: ArticleSourceCapture,
         receipt: ArticleReaderViewModel.CommentListReceipt?
     ) -> some View {
         if state.commentsClosed {
             ContentUnavailableView("Comments are turned off", systemImage: "exclamationmark.bubble")
         } else {
-            commentFeedback(for: composer, receipt: receipt)
+            commentFeedback(for: capture, receipt: receipt)
         }
     }
 
-    private var actionRow: some View {
+    // MARK: - Web fallback
+
+    private var webFallback: some View {
+        ArticleWebView(url: articleURL)
+            .ignoresSafeArea(edges: .bottom)
+    }
+}
+
+private extension ArticleReaderView {
+    private var sourceCapture: ArticleSourceCapture {
+        let model = viewModel
+        let requestedCvid = cvid
+        return ArticleSourceCapture(
+            model: model,
+            requestedCvid: requestedCvid,
+            source: model.commentSource(for: requestedCvid)
+        )
+    }
+
+    private func sourceIsCurrent(_ capture: ArticleSourceCapture) -> Bool {
+        guard let source = capture.source else { return false }
+        return viewModel === capture.model
+            && cvid == capture.requestedCvid
+            && capture.model.commentSource(for: capture.requestedCvid) == source
+    }
+
+    private func commentRow(_ comment: CommentResult.CommentItem, capture: ArticleSourceCapture) -> some View {
+        let model = capture.model
+        let requestedCvid = capture.requestedCvid
+        return CommentRowView(
+            comment: comment,
+            upMid: model.info?.mid,
+            onReply: { target in
+                guard sourceIsCurrent(capture) else { return }
+                composerState.beginReply(target, model: model, requestedCvid: requestedCvid)
+            },
+            onViewThread: { root in
+                openCommentThread(root, capture: capture)
+            },
+            onOpenReply: { root, rpid in
+                openCommentThread(root, highlightRpid: rpid, capture: capture)
+            },
+            onImageTap: { item in
+                guard sourceIsCurrent(capture) else { return }
+                previewImages = item
+            },
+            onDelete: {
+                guard sourceIsCurrent(capture) else { return }
+                model.comments.removeAll { $0.rpid == comment.rpid }
+            }
+        )
+    }
+
+    private func commentHeader(for capture: ArticleSourceCapture) -> some View {
+        let model = capture.model
+        return HStack(spacing: AppSpacing.s) {
+            Text("Comments")
+                .appFont(.sectionTitle)
+                .foregroundStyle(.primary)
+            if model.commentTotal > 0 {
+                Text(FormatUtils.viewCount(model.commentTotal))
+                    .appFont(.controlLabel, monospacedDigit: true)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: AppSpacing.s)
+        }
+    }
+
+    private func openCommentThread(
+        _ root: CommentResult.CommentItem, highlightRpid: Int? = nil,
+        capture: ArticleSourceCapture
+    ) {
+        guard sourceIsCurrent(capture) else { return }
+        let target = CommentThreadTarget(
+            oid: capture.requestedCvid, type: 12, root: root, highlightRpid: highlightRpid
+        )
+        coordinator.contentLinks.cancel()
+        showThread = target
+    }
+
+    private func commentFeedback(
+        for capture: ArticleSourceCapture, receipt: ArticleReaderViewModel.CommentListReceipt?
+    ) -> some View {
+        let model = capture.model
+        let requestedCvid = capture.requestedCvid
+        let source = capture.source
+        return CommentLoadFeedbackView(
+            feedback: model.commentFeedback, isLoading: model.isLoadingComments,
+            isEmpty: model.comments.isEmpty, retry: {
+                guard viewModel === model, cvid == requestedCvid,
+                      let source, model.commentSource(for: requestedCvid) == source else { return }
+                let request = model.commentFeedback.failure == .pagination
+                    ? model.prepareMoreComments(from: receipt) : model.prepareCommentRefresh(from: source)
+                if let request { Task { await model.performCommentRequest(request) } }
+            }
+        )
+    }
+}
+
+private struct ArticleActionRow: View {
+    let viewModel: ArticleReaderViewModel
+    let articleURL: URL
+    @State private var likeInFlight = false
+
+    var body: some View {
         HStack(spacing: 10) {
             Button {
                 Task {
@@ -281,171 +356,158 @@ struct ArticleReaderView: View {
         }
         .padding(.top, 8)
     }
+}
 
-    // MARK: - Web fallback
+@MainActor
+@Observable
+private final class ArticleCommentComposerState {
+    struct Capture {
+        let model: ArticleReaderViewModel
+        let requestedCvid: Int
+        let source: ArticleReaderViewModel.CommentSourceReceipt?
+        let context: CommentComposerUploadOwner.Context
+    }
 
-    private var webFallback: some View {
-        ArticleWebView(url: articleURL)
-            .ignoresSafeArea(edges: .bottom)
+    var commentText = ""
+    var commentPictures: [ComposedPicture] = []
+    var commentSubmission = CommentComposerSubmission()
+    @ObservationIgnored var acceptedCommentClear: Capture?
+    var replyTarget: CommentResult.CommentItem?
+    @ObservationIgnored let commentFocus = CommentComposerFocus()
+
+    func draftDidChange() {
+        commentSubmission.draftDidChange()
+        acceptedCommentClear = nil
+    }
+
+    func beginReply(
+        _ target: CommentResult.CommentItem,
+        model: ArticleReaderViewModel,
+        requestedCvid: Int
+    ) {
+        guard model.commentSource(for: requestedCvid) != nil else { return }
+        acceptedCommentClear = nil
+        if replyTarget?.rpid != target.rpid {
+            commentSubmission.draftDidChange()
+            model.clearCommentSendError()
+        }
+        replyTarget = target
+        commentFocus.request()
     }
 }
 
-private extension ArticleReaderView {
-    private func commentRow(_ comment: CommentResult.CommentItem, composer: CommentComposerCapture) -> some View {
-        let model = composer.model
-        let requestedCvid = composer.requestedCvid
-        let source = composer.source
-        return CommentRowView(
-            comment: comment,
-            upMid: model.info?.mid,
-            onReply: { target in
+private struct ArticleCommentComposerOverlay: View {
+    let viewModel: ArticleReaderViewModel
+    let cvid: Int
+    let state: ArticleCommentComposerState
+    @AppMotion private var motion
+
+    var body: some View {
+        let composer = currentCapture
+        CollapsibleComposer(
+            text: commentTextBinding(for: composer),
+            pictures: commentPicturesBinding(for: composer),
+            placeholder: state.replyTarget.map { CommentComposerBar.replyPlaceholder(to: $0.member.uname) }
+                ?? String(localized: "Write a comment..."),
+            replyBanner: state.replyTarget.map { CommentComposerBar.replyBannerText(for: $0.member.uname) },
+            isSending: state.commentSubmission.isSending,
+            sendError: composerIsCurrent(composer) ? viewModel.commentSendError : nil,
+            focus: state.commentFocus,
+            onCancelReply: {
                 guard composerIsCurrent(composer) else { return }
-                setCommentReplyTarget(target, for: composer)
-                commentFocus.request()
+                withAnimation(motion.animation(normal: CollapsibleComposer.composerCollapseAnimation)) {
+                    setCommentReplyTarget(nil, for: composer)
+                }
+                state.commentFocus.dismiss()
             },
-            onViewThread: { root in
-                openCommentThread(root, composer: composer)
-            },
-            onOpenReply: { root, rpid in
-                openCommentThread(root, highlightRpid: rpid, composer: composer)
-            },
-            onImageTap: { item in
-                guard composerIsCurrent(composer) else { return }
-                previewImages = item
-            },
-            onDelete: {
-                guard let source, viewModel === model, cvid == requestedCvid,
-                      model.commentSource(for: requestedCvid) == source else { return }
-                model.comments.removeAll { $0.rpid == comment.rpid }
-            }
+            onSend: { sendComment(from: composer) },
+            allowsCollapseAfterSend: allowsCollapseAfterCommentSend,
+            uploadScope: commentUploadScope(for: composer),
+            isInteractionCurrent: { composerIsCurrent(composer) }
         )
     }
 
-    private func commentHeader(for composer: CommentComposerCapture) -> some View {
-        let model = composer.model
-        return HStack(spacing: AppSpacing.s) {
-            Text("Comments")
-                .appFont(.sectionTitle)
-                .foregroundStyle(.primary)
-            if model.commentTotal > 0 {
-                Text(FormatUtils.viewCount(model.commentTotal))
-                    .appFont(.controlLabel, monospacedDigit: true)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer(minLength: AppSpacing.s)
-        }
-    }
-
-    private func openCommentThread(
-        _ root: CommentResult.CommentItem, highlightRpid: Int? = nil,
-        composer: CommentComposerCapture
-    ) {
-        guard composerIsCurrent(composer) else { return }
-        let target = CommentThreadTarget(
-            oid: composer.requestedCvid, type: 12, root: root, highlightRpid: highlightRpid
-        )
-        commentLinkLifetime.invalidate()
-        coordinator.contentLinks.cancel()
-        showThread = target
-    }
-
-    private func commentFeedback(
-        for composer: CommentComposerCapture, receipt: ArticleReaderViewModel.CommentListReceipt?
-    ) -> some View {
-        let model = composer.model
-        let requestedCvid = composer.requestedCvid
-        let source = composer.source
-        return CommentLoadFeedbackView(
-            feedback: model.commentFeedback, isLoading: model.isLoadingComments,
-            isEmpty: model.comments.isEmpty, retry: {
-                guard viewModel === model, cvid == requestedCvid,
-                      let source, model.commentSource(for: requestedCvid) == source else { return }
-                let request = model.commentFeedback.failure == .pagination
-                    ? model.prepareMoreComments(from: receipt) : model.prepareCommentRefresh(from: source)
-                if let request { Task { await model.performCommentRequest(request) } }
-            }
+    private var currentCapture: ArticleCommentComposerState.Capture {
+        ArticleCommentComposerState.Capture(
+            model: viewModel,
+            requestedCvid: cvid,
+            source: viewModel.commentSource(for: cvid),
+            context: viewModel.commentComposerContext
         )
     }
 
-    private var commentComposerCapture: CommentComposerCapture {
-        let model = viewModel
-        let requestedCvid = cvid
-        return CommentComposerCapture(
-            model: model, requestedCvid: requestedCvid,
-            source: model.commentSource(for: requestedCvid), context: model.commentComposerContext
-        )
-    }
-
-    private func composerIsCurrent(_ captured: CommentComposerCapture) -> Bool {
+    private func composerIsCurrent(_ captured: ArticleCommentComposerState.Capture) -> Bool {
         guard let source = captured.source else { return false }
         return viewModel === captured.model && cvid == captured.requestedCvid
             && captured.model.commentSource(for: captured.requestedCvid) == source
             && captured.model.commentComposerContext == captured.context
     }
 
-    private func commentDraftDidChange() {
-        commentSubmission.draftDidChange()
-        acceptedCommentClear = nil
-    }
-
-    private func commentUploadScope(for captured: CommentComposerCapture) -> CommentComposerUploadScope {
+    private func commentUploadScope(
+        for captured: ArticleCommentComposerState.Capture
+    ) -> CommentComposerUploadScope {
         CommentComposerUploadScope(
             owner: captured.model.commentUpload,
             context: captured.context,
             isCurrent: { composerIsCurrent(captured) },
             onAdmission: {
                 captured.model.clearCommentSendError()
-                commentDraftDidChange()
+                state.draftDidChange()
             }
         )
     }
 
-    private func commentTextBinding(for captured: CommentComposerCapture) -> Binding<String> {
-        Binding(get: { commentText }, set: { text in
+    private func commentTextBinding(for captured: ArticleCommentComposerState.Capture) -> Binding<String> {
+        Binding(get: { state.commentText }, set: { text in
             guard composerIsCurrent(captured) else { return }
             captured.model.clearCommentSendError()
-            commentDraftDidChange()
-            commentText = text
+            state.draftDidChange()
+            state.commentText = text
         })
     }
 
-    private func commentPicturesBinding(for captured: CommentComposerCapture) -> Binding<[ComposedPicture]> {
-        Binding(get: { commentPictures }, set: { pictures in
-            guard composerIsCurrent(captured), pictures != commentPictures else { return }
+    private func commentPicturesBinding(
+        for captured: ArticleCommentComposerState.Capture
+    ) -> Binding<[ComposedPicture]> {
+        Binding(get: { state.commentPictures }, set: { pictures in
+            guard composerIsCurrent(captured), pictures != state.commentPictures else { return }
             captured.model.clearCommentSendError()
-            commentDraftDidChange()
-            commentPictures = pictures
+            state.draftDidChange()
+            state.commentPictures = pictures
         })
     }
 
-    private func setCommentReplyTarget(_ target: CommentResult.CommentItem?, for captured: CommentComposerCapture) {
+    private func setCommentReplyTarget(
+        _ target: CommentResult.CommentItem?,
+        for captured: ArticleCommentComposerState.Capture
+    ) {
         guard composerIsCurrent(captured) else { return }
-        acceptedCommentClear = nil
-        if replyTarget?.rpid != target?.rpid {
-            commentSubmission.draftDidChange()
+        state.acceptedCommentClear = nil
+        if state.replyTarget?.rpid != target?.rpid {
+            state.commentSubmission.draftDidChange()
             captured.model.clearCommentSendError()
         }
-        replyTarget = target
+        state.replyTarget = target
     }
 
     private func allowsCollapseAfterCommentSend() -> Bool {
-        guard let acceptedCommentClear else { return false }
-        return composerIsCurrent(acceptedCommentClear)
+        guard let accepted = state.acceptedCommentClear else { return false }
+        return composerIsCurrent(accepted)
     }
 
-    private func sendComment(from captured: CommentComposerCapture) {
+    private func sendComment(from captured: ArticleCommentComposerState.Capture) {
         guard !Task.isCancelled, composerIsCurrent(captured),
               !captured.model.commentUpload.isUploading, let source = captured.source else { return }
-        let msg = commentText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !msg.isEmpty || !commentPictures.isEmpty,
-              let attempt = commentSubmission.begin() else { return }
+        let msg = state.commentText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !msg.isEmpty || !state.commentPictures.isEmpty,
+              let attempt = state.commentSubmission.begin() else { return }
         captured.model.clearCommentSendError()
-        acceptedCommentClear = nil
-        let target = replyTarget
-        let pictures = commentPictures
+        state.acceptedCommentClear = nil
+        let target = state.replyTarget
+        let pictures = state.commentPictures
         let model = captured.model
         Task {
-            defer { commentSubmission.finish(attempt) }
+            defer { state.commentSubmission.finish(attempt) }
             guard !Task.isCancelled, composerIsCurrent(captured) else { return }
             let accepted = await model.postComment(
                 message: msg,
@@ -455,13 +517,13 @@ private extension ArticleReaderView {
                 expectedSource: source
             )
             guard accepted, !Task.isCancelled, composerIsCurrent(captured),
-                  commentSubmission.canApply(attempt) else { return }
+                  state.commentSubmission.canApply(attempt) else { return }
             commentTextBinding(for: captured).wrappedValue = ""
             commentPicturesBinding(for: captured).wrappedValue = []
             setCommentReplyTarget(nil, for: captured)
             model.commentDraftWasReplaced()
-            commentFocus.dismiss()
-            acceptedCommentClear = commentComposerCapture
+            state.commentFocus.dismiss()
+            state.acceptedCommentClear = currentCapture
         }
     }
 }
@@ -474,11 +536,6 @@ private struct ArticleHeaderFingerprint: Hashable, Sendable {
 private struct ArticleBlockFingerprint: Hashable, Sendable {
     let block: ArticleBlock
     let imageIndex: Int?
-}
-
-private struct ArticleActionsFingerprint: Hashable, Sendable {
-    let liked, likeInFlight: Bool
-    let likeCount: Int
 }
 
 private struct ArticleCommentsHeaderFingerprint: Hashable, Sendable {
@@ -532,14 +589,14 @@ private struct ArticleFeedLayout {
 
 private extension ArticleReaderView {
     private func commentFeed(
-        composer: CommentComposerCapture,
+        capture: ArticleSourceCapture,
         headerItems: [UIKitCommentFeedItem],
         layout: ArticleFeedLayout
     ) -> some View {
-        let model = composer.model
+        let model = capture.model
         let receipt = model.commentListReceipt
-        let source = composer.source
-        let requestedCvid = composer.requestedCvid
+        let source = capture.source
+        let requestedCvid = capture.requestedCvid
         let showsComments = !model.blocks.isEmpty && !model.commentsClosed
         let showsInitialSkeletons = showsComments && model.isLoadingComments && model.comments.isEmpty
         let visibleComments = CommentAIFilterEngine.shared.visibleComments(
@@ -552,13 +609,13 @@ private extension ArticleReaderView {
                     comment: comment,
                     extraFingerprint: AnyHashableSendable(model.info?.mid)
                 ) {
-                    commentRow(comment, composer: composer)
+                    commentRow(comment, capture: capture)
                 }
             }
             : []
         let footerState = articleFooterState(model: model, showsInitialSkeletons: showsInitialSkeletons)
         let footerView = footerState.map {
-            AnyView(articleFooterView(for: $0, composer: composer, receipt: receipt))
+            AnyView(articleFooterView(for: $0, capture: capture, receipt: receipt))
         }
         return UIKitCommentFeedCollectionView(
             headerItems: headerItems,
@@ -593,8 +650,8 @@ private extension ArticleReaderView {
         )
     }
 
-    private func articleSplit(composer: CommentComposerCapture, composerVisible: Bool) -> some View {
-        let model = composer.model
+    private func articleSplit(capture: ArticleSourceCapture, composerVisible: Bool) -> some View {
+        let model = capture.model
         let showsCompanion = !model.blocks.isEmpty
         let contentWidth = DetailCompanionSplitLayout<EmptyView, EmptyView>
             .primaryContentWidth(containerWidth: containerSize.width, showsCompanion: showsCompanion)
@@ -615,13 +672,15 @@ private extension ArticleReaderView {
                     HStack { Spacer(); ProgressView(); Spacer() }
                         .padding(.vertical, 60)
                 }
-                if !model.blocks.isEmpty { actionRow }
+                if !model.blocks.isEmpty {
+                    ArticleActionRow(viewModel: model, articleURL: articleURL)
+                }
             }
         } companion: {
             if showsCompanion {
                 VStack(spacing: 0) {
                     VStack(spacing: 0) {
-                        commentHeader(for: composer)
+                        commentHeader(for: capture)
                             .padding(.horizontal, 20)
                             .padding(.top, AppSpacing.l)
                             .padding(.bottom, AppSpacing.m)
@@ -629,13 +688,19 @@ private extension ArticleReaderView {
                             .opacity(0.35)
                     }
                     commentFeed(
-                        composer: composer,
+                        capture: capture,
                         headerItems: [],
                         layout: .companion(composerVisible: composerVisible)
                     )
                 }
                 .overlay(alignment: .bottom) {
-                    if composerVisible { commentComposer(for: composer) }
+                    if composerVisible {
+                        ArticleCommentComposerOverlay(
+                            viewModel: model,
+                            cvid: capture.requestedCvid,
+                            state: composerState
+                        )
+                    }
                 }
             }
         }

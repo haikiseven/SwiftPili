@@ -679,6 +679,18 @@ enum PathAFMP4 {
         }
     }
 
+    private static let videoCodecFourCCs: Set<String> = [
+        "avc1", "avc3", "hvc1", "hev1", "dvh1", "dvhe", "av01", "vp09"
+    ]
+    private static let configFourCCs: Set<String> = [
+        "avcC", "hvcC", "av1C", "vpcC", "esds", "dec3", "dfLa", "dOps"
+    ]
+    private static let containerFourCCs: Set<String> = [
+        "sinf", "schi", "wave", "wavl", "enca", "encv",
+        "avc1", "avc3", "hvc1", "hev1", "dvh1", "dvhe",
+        "av01", "vp09", "mp4a"
+    ]
+
     private static func parseStsdResult(
         _ data: Data,
         range: Range<Int>,
@@ -741,8 +753,7 @@ enum PathAFMP4 {
             ))
         }
 
-        let videoCodecs: Set<String> = ["avc1", "avc3", "hvc1", "hev1", "dvh1", "dvhe", "av01", "vp09"]
-        let isVideo = videoCodecs.contains(format)
+        let isVideo = videoCodecFourCCs.contains(format)
         var track = TrackInfo(
             trackID: trackID, kind: isVideo ? .video : .audio,
             timescale: timescale, codec: format, config: Data()
@@ -795,14 +806,6 @@ enum PathAFMP4 {
         case .malformed(let failure): return .malformed(failure)
         case .unsupported(let unsupported): return .unsupported(unsupported)
         case .success(let boxes):
-            let configFourCCs: Set<String> = [
-                "avcC", "hvcC", "av1C", "vpcC", "esds", "dec3", "dfLa", "dOps"
-            ]
-            let containerFourCCs: Set<String> = [
-                "sinf", "schi", "wave", "wavl", "enca", "encv",
-                "avc1", "avc3", "hvc1", "hev1", "dvh1", "dvhe",
-                "av01", "vp09", "mp4a"
-            ]
             for box in boxes {
                 if configFourCCs.contains(box.type) {
                     return .success(data.subdata(in: box.payload))
@@ -874,8 +877,10 @@ enum PathAFMP4 {
             ))
         }
 
+        let singleTrack: TrackInfo?
         var byTrack: [UInt32: TrackInfo] = [:]
-        for track in tracks {
+        if tracks.count == 1 {
+            let track = tracks[0]
             guard track.trackID > 0 else {
                 return .malformed(ParseFailure(
                     phase: .fragment, trackID: track.trackID,
@@ -888,11 +893,29 @@ enum PathAFMP4 {
                     field: "timescale", reason: "zero"
                 ))
             }
-            guard byTrack.updateValue(track, forKey: track.trackID) == nil else {
-                return .malformed(ParseFailure(
-                    phase: .fragment, trackID: track.trackID,
-                    field: "trackID", reason: "duplicate"
-                ))
+            singleTrack = track
+        } else {
+            singleTrack = nil
+            byTrack.reserveCapacity(tracks.count)
+            for track in tracks {
+                guard track.trackID > 0 else {
+                    return .malformed(ParseFailure(
+                        phase: .fragment, trackID: track.trackID,
+                        field: "trackID", reason: "zero"
+                    ))
+                }
+                guard track.timescale > 0 else {
+                    return .malformed(ParseFailure(
+                        phase: .fragment, trackID: track.trackID,
+                        field: "timescale", reason: "zero"
+                    ))
+                }
+                guard byTrack.updateValue(track, forKey: track.trackID) == nil else {
+                    return .malformed(ParseFailure(
+                        phase: .fragment, trackID: track.trackID,
+                        field: "trackID", reason: "duplicate"
+                    ))
+                }
             }
         }
 
@@ -907,7 +930,8 @@ enum PathAFMP4 {
         let fragmentSequence = parseFragmentSequence(data, children: moofChildren)
         var samples: [Sample] = []
         samples.reserveCapacity(min(maxSamplesPerMoof, 128))
-        var seenTrafIDs = Set<UInt32>()
+        var firstTrafID: UInt32?
+        var seenTrafIDs: Set<UInt32>?
         var totalSampleBytes = 0
 
         for traf in moofChildren where traf.type == "traf" {
@@ -931,11 +955,18 @@ enum PathAFMP4 {
             case .malformed(let failure): return .malformed(failure)
             case .unsupported(let unsupported): return .unsupported(unsupported)
             }
-            guard seenTrafIDs.insert(tfhd.trackID).inserted else {
-                return .malformed(ParseFailure(
-                    phase: .fragment, boxType: "traf", trackID: tfhd.trackID,
-                    field: "trackID", reason: "duplicate", offset: traf.range.lowerBound
-                ))
+            if let existing = firstTrafID {
+                if seenTrafIDs == nil {
+                    seenTrafIDs = [existing]
+                }
+                guard seenTrafIDs!.insert(tfhd.trackID).inserted else {
+                    return .malformed(ParseFailure(
+                        phase: .fragment, boxType: "traf", trackID: tfhd.trackID,
+                        field: "trackID", reason: "duplicate", offset: traf.range.lowerBound
+                    ))
+                }
+            } else {
+                firstTrafID = tfhd.trackID
             }
             if let explicit = tfhd.baseOffset,
                explicit > UInt64(Int64.max) {
@@ -945,7 +976,12 @@ enum PathAFMP4 {
                 ))
             }
 
-            let track = byTrack[tfhd.trackID]
+            let track: TrackInfo?
+            if let singleTrack {
+                track = singleTrack.trackID == tfhd.trackID ? singleTrack : nil
+            } else {
+                track = byTrack[tfhd.trackID]
+            }
             let defaultDuration = tfhd.sampleDuration ?? track?.defaultSampleDuration ?? 0
             let defaultDurationExplicit = tfhd.sampleDurationWasDeclared
                 || track?.defaultSampleDurationWasDeclared == true
@@ -968,8 +1004,7 @@ enum PathAFMP4 {
             var previousRunEnd: Int64?
             var trackSampleIndex = 0
             var trafSampleCount = 0
-            let trunBoxes = trafChildren.filter { $0.type == "trun" }
-            for trunBox in trunBoxes {
+            for trunBox in trafChildren where trunBox.type == "trun" {
                 let run: TrunInfo
                 switch parseTrunResult(data, range: trunBox.payload) {
                 case .success(let value): run = value
@@ -1188,16 +1223,21 @@ enum PathAFMP4 {
         case .malformed(let failure): return .malformed(failure)
         case .unsupported(let unsupported): return .unsupported(unsupported)
         case .success(let parsed):
-            let samples = parsed.filter { $0.trackID == track.trackID }
-            guard !samples.isEmpty else { return .success(nil) }
-
-            let firstDecodeSample = samples.min { lhs, rhs in
-                if lhs.dtsTicks != rhs.dtsTicks { return lhs.dtsTicks < rhs.dtsTicks }
-                return lhs.ptsTicks < rhs.ptsTicks
-            }
-            let start = samples.map(\.ptsTicks).min() ?? 0
-            var end = start
-            for sample in samples {
+            var firstDecodeSample: Sample?
+            var start = Int64.max
+            var end = Int64.min
+            var matchedAny = false
+            for sample in parsed where sample.trackID == track.trackID {
+                matchedAny = true
+                if let currentFirst = firstDecodeSample {
+                    if sample.dtsTicks < currentFirst.dtsTicks
+                        || (sample.dtsTicks == currentFirst.dtsTicks && sample.ptsTicks < currentFirst.ptsTicks) {
+                        firstDecodeSample = sample
+                    }
+                } else {
+                    firstDecodeSample = sample
+                }
+                if sample.ptsTicks < start { start = sample.ptsTicks }
                 guard let sampleEnd = checkedAdd(
                     sample.ptsTicks, Int64(sample.durationTicks)
                 ) else {
@@ -1206,11 +1246,12 @@ enum PathAFMP4 {
                         field: "ptsEnd", reason: "overflow"
                     ))
                 }
-                end = max(end, sampleEnd)
+                if sampleEnd > end { end = sampleEnd }
             }
+            guard matchedAny else { return .success(nil) }
             return .success(FragmentTiming(
                 startPTSTicks: start,
-                endPTSTicks: end,
+                endPTSTicks: max(start, end),
                 startsWithKeyframe: firstDecodeSample?.isKeyframe == true
             ))
         }
@@ -1458,44 +1499,49 @@ enum PathAFMP4 {
             }
             info.firstSampleFlags = flags
         }
-        info.samples.reserveCapacity(Int(sampleCount))
-        for _ in 0..<sampleCount {
-            var s = TrunSample(
-                duration: nil, size: nil, flags: nil, compositionOffset: nil
-            )
-            if hasDur {
-                guard let value = c.u32() else {
-                    return .malformed(truncatedFailure(phase: .trun, boxType: "trun", range: range))
-                }
-                s.duration = value
-            }
-            if hasSize {
-                guard let value = c.u32() else {
-                    return .malformed(truncatedFailure(phase: .trun, boxType: "trun", range: range))
-                }
-                s.size = value
-            }
-            if hasFlags {
-                guard let value = c.u32() else {
-                    return .malformed(truncatedFailure(phase: .trun, boxType: "trun", range: range))
-                }
-                s.flags = value
-            }
-            if hasCTO {
-                guard let raw = c.u32() else {
-                    return .malformed(truncatedFailure(phase: .trun, boxType: "trun", range: range))
-                }
-                s.compositionOffset = version == 0
-                    ? Int64(raw)
-                    : Int64(Int32(bitPattern: raw))
-            }
-            info.samples.append(s)
+        let expectedSampleBytes = Int(sampleCount) * rowWidth
+        guard c.remaining >= expectedSampleBytes else {
+            return .malformed(truncatedFailure(phase: .trun, boxType: "trun", range: range))
         }
-        guard c.remaining == 0 else {
+        guard c.remaining == expectedSampleBytes else {
             return .malformed(ParseFailure(
                 phase: .trun, boxType: "trun", field: "payload", reason: "trailing",
-                availableBytes: c.remaining
+                availableBytes: c.remaining - expectedSampleBytes
             ))
+        }
+        info.samples.reserveCapacity(Int(sampleCount))
+        let rowsStart = c.position
+        data.withUnsafeBytes { raw in
+            var pos = rowsStart
+            for _ in 0..<sampleCount {
+                var duration: UInt32?
+                var size: UInt32?
+                var sampleFlags: UInt32?
+                var cto: Int64?
+                if hasDur {
+                    duration = raw.loadUnaligned(fromByteOffset: pos, as: UInt32.self).bigEndian
+                    pos += 4
+                }
+                if hasSize {
+                    size = raw.loadUnaligned(fromByteOffset: pos, as: UInt32.self).bigEndian
+                    pos += 4
+                }
+                if hasFlags {
+                    sampleFlags = raw.loadUnaligned(fromByteOffset: pos, as: UInt32.self).bigEndian
+                    pos += 4
+                }
+                if hasCTO {
+                    let rawValue = raw.loadUnaligned(fromByteOffset: pos, as: UInt32.self).bigEndian
+                    pos += 4
+                    cto = version == 0 ? Int64(rawValue) : Int64(Int32(bitPattern: rawValue))
+                }
+                info.samples.append(TrunSample(
+                    duration: duration,
+                    size: size,
+                    flags: sampleFlags,
+                    compositionOffset: cto
+                ))
+            }
         }
         return .success(info)
     }
@@ -1713,58 +1759,69 @@ enum PathAFMP4 {
                 phase: .sidx, boxType: "sidx", field: "first_offset", reason: "overflow"
             ))
         }
+        let expectedEntryBytes = Int(refCount) * 12
+        guard c.remaining >= expectedEntryBytes else {
+            return .malformed(truncatedFailure(phase: .sidx, boxType: "sidx", range: box.payload))
+        }
+        let entriesStart = c.position
+        let trailingBytes = c.remaining - expectedEntryBytes
         let timescaleDouble = Double(timescale)
         var cursorOffset = absoluteBase
         var elapsedTicks = earliestPresentationTime
         var entries: [SidxEntry] = []
         entries.reserveCapacity(Int(refCount))
-        for _ in 0..<refCount {
-            guard let word = c.u32(), let duration = c.u32(),
-                  let sapWord = c.u32() else {
-                return .malformed(truncatedFailure(phase: .sidx, boxType: "sidx", range: box.payload))
-            }
-            let referenceType = (word & 0x8000_0000) != 0
-            guard !referenceType else {
-                return .unsupported(ParseUnsupported(
-                    phase: .sidx, boxType: "sidx", field: "reference_type",
-                    reason: "hierarchical"
+        let failure: ParseResult<[SidxEntry]>? = data.withUnsafeBytes { raw in
+            var pos = entriesStart
+            for _ in 0..<refCount {
+                let word = raw.loadUnaligned(fromByteOffset: pos, as: UInt32.self).bigEndian
+                let duration = raw.loadUnaligned(fromByteOffset: pos + 4, as: UInt32.self).bigEndian
+                let sapWord = raw.loadUnaligned(fromByteOffset: pos + 8, as: UInt32.self).bigEndian
+                pos += 12
+                let referenceType = (word & 0x8000_0000) != 0
+                guard !referenceType else {
+                    return .unsupported(ParseUnsupported(
+                        phase: .sidx, boxType: "sidx", field: "reference_type",
+                        reason: "hierarchical"
+                    ))
+                }
+                let size = Int(word & 0x7FFF_FFFF)
+                guard size > 0 else {
+                    return .malformed(ParseFailure(
+                        phase: .sidx, boxType: "sidx", field: "reference_size", reason: "zero"
+                    ))
+                }
+                let durationStart = Double(elapsedTicks) / timescaleDouble
+                let durationSeconds = Double(duration) / timescaleDouble
+                let tickResult = elapsedTicks.addingReportingOverflow(UInt64(duration))
+                guard durationStart.isFinite, durationSeconds.isFinite,
+                      !tickResult.overflow,
+                      let nextOffset = checkedAdd(cursorOffset, size) else {
+                    return .malformed(ParseFailure(
+                        phase: .sidx, boxType: "sidx", field: "range_or_time", reason: "overflow"
+                    ))
+                }
+                entries.append(SidxEntry(
+                    offset: cursorOffset,
+                    size: size,
+                    durationSeconds: durationSeconds,
+                    presentationStartSeconds: durationStart,
+                    referenceType: 0,
+                    startsWithSAP: (sapWord & 0x8000_0000) != 0,
+                    sapType: Int((sapWord >> 28) & 0x7),
+                    sapDeltaTimeTicks: sapWord & 0x0FFF_FFFF,
+                    timescale: timescale,
+                    earliestPresentationTimeTicks: earliestPresentationTime
                 ))
+                cursorOffset = nextOffset
+                elapsedTicks = tickResult.partialValue
             }
-            let size = Int(word & 0x7FFF_FFFF)
-            guard size > 0 else {
-                return .malformed(ParseFailure(
-                    phase: .sidx, boxType: "sidx", field: "reference_size", reason: "zero"
-                ))
-            }
-            let durationStart = Double(elapsedTicks) / timescaleDouble
-            let durationSeconds = Double(duration) / timescaleDouble
-            let tickResult = elapsedTicks.addingReportingOverflow(UInt64(duration))
-            guard durationStart.isFinite, durationSeconds.isFinite,
-                  !tickResult.overflow,
-                  let nextOffset = checkedAdd(cursorOffset, size) else {
-                return .malformed(ParseFailure(
-                    phase: .sidx, boxType: "sidx", field: "range_or_time", reason: "overflow"
-                ))
-            }
-            entries.append(SidxEntry(
-                offset: cursorOffset,
-                size: size,
-                durationSeconds: durationSeconds,
-                presentationStartSeconds: durationStart,
-                referenceType: 0,
-                startsWithSAP: (sapWord & 0x8000_0000) != 0,
-                sapType: Int((sapWord >> 28) & 0x7),
-                sapDeltaTimeTicks: sapWord & 0x0FFF_FFFF,
-                timescale: timescale,
-                earliestPresentationTimeTicks: earliestPresentationTime
-            ))
-            cursorOffset = nextOffset
-            elapsedTicks = tickResult.partialValue
+            return nil
         }
-        guard c.remaining == 0 else {
+        if let failure { return failure }
+        guard trailingBytes == 0 else {
             return .malformed(ParseFailure(
                 phase: .sidx, boxType: "sidx", field: "payload", reason: "trailing",
-                availableBytes: c.remaining
+                availableBytes: trailingBytes
             ))
         }
         return .success(entries)
@@ -1949,31 +2006,52 @@ enum PathAFMP4 {
             end = min(range.upperBound, d.count)
         }
         var remaining: Int { end - position }
-        private func byte(_ i: Int) -> UInt8 { data[data.startIndex + i] }
 
         mutating func u16() -> UInt16? {
             guard remaining >= 2 else { return nil }
-            let v = (UInt16(byte(position)) << 8) | UInt16(byte(position + 1))
-            position += 2; return v
+            let base = data.startIndex + position
+            let v = (UInt16(data[base]) << 8) | UInt16(data[base + 1])
+            position += 2
+            return v
         }
         mutating func u32() -> UInt32? {
             guard remaining >= 4 else { return nil }
-            var v: UInt32 = 0
-            for i in 0..<4 { v = (v << 8) | UInt32(byte(position + i)) }
-            position += 4; return v
+            let base = data.startIndex + position
+            let v = (UInt32(data[base]) << 24)
+                | (UInt32(data[base + 1]) << 16)
+                | (UInt32(data[base + 2]) << 8)
+                | UInt32(data[base + 3])
+            position += 4
+            return v
         }
         mutating func i32() -> Int32? { u32().map { Int32(bitPattern: $0) } }
         mutating func u64() -> UInt64? {
             guard remaining >= 8 else { return nil }
-            var v: UInt64 = 0
-            for i in 0..<8 { v = (v << 8) | UInt64(byte(position + i)) }
-            position += 8; return v
+            let base = data.startIndex + position
+            let high = (UInt32(data[base]) << 24)
+                | (UInt32(data[base + 1]) << 16)
+                | (UInt32(data[base + 2]) << 8)
+                | UInt32(data[base + 3])
+            let low = (UInt32(data[base + 4]) << 24)
+                | (UInt32(data[base + 5]) << 16)
+                | (UInt32(data[base + 6]) << 8)
+                | UInt32(data[base + 7])
+            position += 8
+            return (UInt64(high) << 32) | UInt64(low)
         }
         mutating func fourCC() -> String? {
             guard remaining >= 4 else { return nil }
-            let bytes = (0..<4).map { byte(position + $0) }
+            let base = data.startIndex + position
+            let b0 = data[base]
+            let b1 = data[base + 1]
+            let b2 = data[base + 2]
+            let b3 = data[base + 3]
             position += 4
-            return String(bytes: bytes, encoding: .ascii)
+            guard (b0 | b1 | b2 | b3) < 0x80 else { return nil }
+            var bytes = (b0, b1, b2, b3)
+            return withUnsafeBytes(of: &bytes) { raw in
+                String(decoding: raw, as: UTF8.self)
+            }
         }
         @discardableResult mutating func skip(_ n: Int) -> Bool {
             guard remaining >= n else { return false }

@@ -14,8 +14,25 @@ struct DanmakuElem: Sendable, Equatable, Hashable {
     var renderKind: DanmakuRenderKind { DanmakuRenderKind(wireMode: mode) }
 
     var identityKey: String? {
-        if !idStr.isEmpty { return Int64(idStr).map(String.init) ?? idStr }
+        if !idStr.isEmpty {
+            if Self.isCanonicalPositiveInt64Decimal(idStr) { return idStr }
+            return Int64(idStr).map(String.init) ?? idStr
+        }
         return id == 0 ? nil : String(id)
+    }
+
+    private static func isCanonicalPositiveInt64Decimal(_ value: String) -> Bool {
+        let utf8 = value.utf8
+        let count = utf8.count
+        guard count >= 1, count <= 18 else { return false }
+        var iterator = utf8.makeIterator()
+        guard let first = iterator.next(), first >= UInt8(ascii: "1"), first <= UInt8(ascii: "9") else {
+            return false
+        }
+        while let byte = iterator.next() {
+            if byte < UInt8(ascii: "0") || byte > UInt8(ascii: "9") { return false }
+        }
+        return true
     }
 }
 
@@ -89,7 +106,7 @@ enum DanmakuWireDecoder {
     ) throws(DanmakuDecodeError) -> [DanmakuElem] {
         var cursor = DanmakuWireCursor(raw)
         var elems: [DanmakuElem] = []
-        elems.reserveCapacity(raw.count / 192)
+        elems.reserveCapacity(max(16, raw.count / 96))
 
         while !cursor.isAtEnd {
             let (field, wire) = try cursor.readTag()

@@ -9,7 +9,14 @@ final class MessageCenterViewModel {
     var atItems: [AtMessageResult.AtMsgItem] = []
     var likeItems: [LikeMessageResult.LikeMsgItem] = []
     var systemItems: [SystemNotifyResult.SystemNotifyItem] = []
-    var sessions: [SessionListResult.SessionItem] = []
+    var sessions: [SessionListResult.SessionItem] = [] {
+        didSet {
+            chatSessions = sessions.filter {
+                ($0.systemMsgType ?? 0) == 0 && $0.talkerId < (1 << 40)
+            }
+        }
+    }
+    private(set) var chatSessions: [SessionListResult.SessionItem] = []
     private(set) var isLoadingSessions = false
     private(set) var sessionsLoaded = false
     private(set) var sessionLoadError: String?
@@ -24,10 +31,10 @@ final class MessageCenterViewModel {
     private(set) var likeLoadError: String?
     private(set) var systemLoadError: String?
 
-    private var replyCursor: ReplyMessageResult.MsgCursor?
-    private var atCursor: ReplyMessageResult.MsgCursor?
-    private var likeCursor: ReplyMessageResult.MsgCursor?
-    private var systemCursorId: Int?
+    @ObservationIgnored private var replyCursor: ReplyMessageResult.MsgCursor?
+    @ObservationIgnored private var atCursor: ReplyMessageResult.MsgCursor?
+    @ObservationIgnored private var likeCursor: ReplyMessageResult.MsgCursor?
+    @ObservationIgnored private var systemCursorId: Int?
     private(set) var repliesLoaded = false
     private(set) var atLoaded = false
     private(set) var likesLoaded = false

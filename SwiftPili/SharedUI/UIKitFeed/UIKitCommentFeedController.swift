@@ -218,22 +218,6 @@ final class UIKitCommentFeedViewController: UIViewController,
         config.onScrollOffsetChange?(offset)
     }
 
-    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
-        if ImageDiagnostics.isEnabled { ImageDiagnostics.isScrolling = true }
-    }
-
-    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
-        if ImageDiagnostics.isEnabled, !decelerate { ImageDiagnostics.isScrolling = false }
-    }
-
-    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
-        if ImageDiagnostics.isEnabled { ImageDiagnostics.isScrolling = false }
-    }
-
-    func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
-        if ImageDiagnostics.isEnabled { ImageDiagnostics.isScrolling = false }
-    }
-
     func collectionView(_ collectionView: UICollectionView, prefetchItemsAt indexPaths: [IndexPath]) {
         prefetchCoordinator.prefetch(at: indexPaths) { [weak self] indexPath in
             self?.prefetchRequests(for: indexPath) ?? []
@@ -248,7 +232,9 @@ final class UIKitCommentFeedViewController: UIViewController,
 private extension UIKitCommentFeedViewController {
     func rebuildCaches(from newConfig: UIKitCommentFeedConfiguration) {
         var headers: [AnyHashableSendable] = []
+        headers.reserveCapacity(newConfig.headerItems.count)
         var headerMap: [AnyHashableSendable: UIKitCommentFeedItem] = [:]
+        headerMap.reserveCapacity(newConfig.headerItems.count)
         for item in newConfig.headerItems where headerMap[item.id] == nil {
             headers.append(item.id)
             headerMap[item.id] = item
@@ -257,8 +243,11 @@ private extension UIKitCommentFeedViewController {
         headerByID = headerMap
 
         var ids: [AnyHashableSendable] = []
+        ids.reserveCapacity(newConfig.items.count)
         var itemsMap: [AnyHashableSendable: UIKitCommentFeedItem] = [:]
+        itemsMap.reserveCapacity(newConfig.items.count)
         var indexMap: [AnyHashableSendable: Int] = [:]
+        indexMap.reserveCapacity(newConfig.items.count)
         for item in newConfig.items where itemsMap[item.id] == nil {
             indexMap[item.id] = ids.count
             ids.append(item.id)

@@ -28,6 +28,7 @@ final class DanmakuRenderController: DanmakuTimelineSink {
         "onOrderIn": NSNull(),
         "onOrderOut": NSNull(),
     ]
+    private static let linearTiming = CAMediaTimingFunction(name: .linear)
 
     nonisolated static func animationIsLive(
         progress: TimeInterval, lifetime: TimeInterval, at mediaTime: TimeInterval
@@ -45,6 +46,7 @@ final class DanmakuRenderController: DanmakuTimelineSink {
     )
     private var pool: [CALayer] = []
     private var live: [Int64: LiveBullet] = [:]
+    private var earliestLiveEnd: TimeInterval = .infinity
     private struct PendingBullet {
         let ticket: UInt64
         let isSelfSent: Bool
@@ -52,6 +54,7 @@ final class DanmakuRenderController: DanmakuTimelineSink {
     private var pending: [Int64: PendingBullet] = [:]
     private var nextAdmissionTicket: UInt64 = 0
     private var clockMediaTime: TimeInterval = 0
+    private var lastPushedClock: (generation: UInt64, mediaTime: TimeInterval, scrollLifetime: TimeInterval, fixedLifetime: TimeInterval)?
     private var allocator: DanmakuTrackLayout.Allocator
     typealias Rasterize = (
         DanmakuTextRasterizer.Key,
@@ -99,12 +102,16 @@ final class DanmakuRenderController: DanmakuTimelineSink {
         container.masksToBounds = true
         container.contentsScale = resolvedScale
         container.actions = Self.disabledLayerActions
-        for _ in 0..<Self.poolCapacity {
-            let layer = CALayer()
-            layer.contentsScale = resolvedScale
-            layer.actions = Self.disabledLayerActions
-            pool.append(layer)
-        }
+        pool.reserveCapacity(min(64, Self.poolCapacity))
+    }
+
+    private func acquireLayer() -> CALayer? {
+        if let layer = pool.popLast() { return layer }
+        guard live.count < Self.poolCapacity else { return nil }
+        let layer = CALayer()
+        layer.contentsScale = displayScale
+        layer.actions = Self.disabledLayerActions
+        return layer
     }
 
     func setDisplayScale(_ scale: CGFloat) {
@@ -205,10 +212,14 @@ final class DanmakuRenderController: DanmakuTimelineSink {
 
     func setContainerOpacity(_ opacity: Double) {
         let unit = opacity.isFinite ? min(1, max(0, opacity)) : 1
-        container.opacity = Float(unit)
+        let next = Float(unit)
+        if container.opacity != next {
+            container.opacity = next
+        }
     }
 
     func admit(_ items: [DanmakuElem], laneHeight _: CGFloat) {
+        guard !items.isEmpty else { return }
         let viewport = container.bounds.size
         guard viewport.width.isFinite, viewport.height.isFinite,
               viewport.width > 0, viewport.height > 0 else {
@@ -219,7 +230,19 @@ final class DanmakuRenderController: DanmakuTimelineSink {
         let pictureHeight = appliedPicture.height
         let advancedGate = CGFloat(preferences.laneHeight(presentation: presentation))
         let fontScale = preferences.fontScale(for: presentation)
-        let ordered = items.sorted { $0.progress < $1.progress }
+        var alreadySorted = true
+        if items.count > 1 {
+            var prev = items[0].progress
+            for index in 1 ..< items.count {
+                let next = items[index].progress
+                if next < prev {
+                    alreadySorted = false
+                    break
+                }
+                prev = next
+            }
+        }
+        let ordered = alreadySorted ? items : items.sorted { $0.progress < $1.progress }
         for item in ordered {
             if let existing = live[item.id], !item.isSelfSent || existing.isSelfSent {
                 continue
@@ -233,7 +256,8 @@ final class DanmakuRenderController: DanmakuTimelineSink {
                     item,
                     laneHeight: advancedGate,
                     fontScale: fontScale,
-                    pictureHeight: pictureHeight
+                    pictureHeight: pictureHeight,
+                    preferences: preferences
                 )
             case .scroll, .top, .bottom, .reverse:
                 admitLaned(item, fontScale: fontScale)
@@ -301,7 +325,8 @@ final class DanmakuRenderController: DanmakuTimelineSink {
         _ item: DanmakuElem,
         laneHeight: CGFloat,
         fontScale: Double,
-        pictureHeight: CGFloat
+        pictureHeight: CGFloat,
+        preferences: DanmakuRenderPreferences
     ) {
         guard let admissionTicket = claimRaster(for: item) else { return }
         let itemID = item.id
@@ -312,7 +337,6 @@ final class DanmakuRenderController: DanmakuTimelineSink {
         let scale = displayScale
         let ticket = generation
         let work = rasterWork
-        let preferences = DanmakuRenderPreferences.load()
         let viewport = DanmakuAdvancedPlacement.Viewport(
             width: Double(appliedPicture.width), height: Double(appliedPicture.height)
         )
@@ -406,11 +430,17 @@ final class DanmakuRenderController: DanmakuTimelineSink {
 
     func reclaimFinished(at mediaTime: TimeInterval) {
         updateRasterClock(mediaTime)
-        guard !live.isEmpty else { return }
+        guard !live.isEmpty, mediaTime >= earliestLiveEnd else { return }
         var finished: [Int64] = []
-        for (id, bullet) in live where bullet.endsAt <= mediaTime {
-            finished.append(id)
+        var nextEarliest = TimeInterval.infinity
+        for (id, bullet) in live {
+            if bullet.endsAt <= mediaTime {
+                finished.append(id)
+            } else if bullet.endsAt < nextEarliest {
+                nextEarliest = bullet.endsAt
+            }
         }
+        earliestLiveEnd = nextEarliest
         for id in finished {
             guard let bullet = live.removeValue(forKey: id) else { continue }
             recycle(bullet.layer)
@@ -431,15 +461,26 @@ final class DanmakuRenderController: DanmakuTimelineSink {
     private func updateRasterClock(_ mediaTime: TimeInterval) {
         clockMediaTime = mediaTime
         allocator.reclaimFinished(at: mediaTime)
+        let scrollLifetime = metrics.scrollLifetime
+        let fixedLifetime = metrics.fixedLifetime
+        if let pushed = lastPushedClock,
+           pushed.generation == generation,
+           pushed.mediaTime == mediaTime,
+           pushed.scrollLifetime == scrollLifetime,
+           pushed.fixedLifetime == fixedLifetime {
+            return
+        }
+        lastPushedClock = (generation, mediaTime, scrollLifetime, fixedLifetime)
         rasterWork.update(
             generation: generation, mediaTime: mediaTime,
-            scrollLifetime: metrics.scrollLifetime, fixedLifetime: metrics.fixedLifetime
+            scrollLifetime: scrollLifetime, fixedLifetime: fixedLifetime
         )
     }
 
     private func invalidateRasterWork() {
         generation &+= 1
         pending.removeAll()
+        lastPushedClock = (generation, clockMediaTime, metrics.scrollLifetime, metrics.fixedLifetime)
         rasterWork.update(
             generation: generation, mediaTime: clockMediaTime,
             scrollLifetime: metrics.scrollLifetime, fixedLifetime: metrics.fixedLifetime
@@ -490,7 +531,7 @@ extension DanmakuRenderController {
         let endsAt = entry + lifetime
         guard endsAt > clockMediaTime else { return }
         guard replaceOrdinaryLiveCopy(id: id, withSelfSent: selfSent),
-              let layer = pool.popLast() else { return }
+              let layer = acquireLayer() else { return }
         let placement = allocator.place(
             DanmakuTrackLayout.Request(
                 kind: kind,
@@ -521,6 +562,7 @@ extension DanmakuRenderController {
             lane: lane,
             bulletWidth: image.width
         )
+        if endsAt < earliestLiveEnd { earliestLiveEnd = endsAt }
         attachMotion(layer, kind: kind, beginTime: entry, width: image.width, lifetime: lifetime)
     }
 
@@ -614,7 +656,7 @@ extension DanmakuRenderController {
         animation.beginTime = beginTime
         animation.isRemovedOnCompletion = false
         animation.fillMode = .forwards
-        animation.timingFunction = CAMediaTimingFunction(name: .linear)
+        animation.timingFunction = Self.linearTiming
         layer.add(animation, forKey: "danmaku")
     }
 
@@ -623,6 +665,7 @@ extension DanmakuRenderController {
             recycle(bullet.layer)
         }
         live.removeAll()
+        earliestLiveEnd = .infinity
     }
 
     private func placeAdvanced(
@@ -645,7 +688,7 @@ extension DanmakuRenderController {
         let endsAt = progress + placed.lifetimeSeconds
         guard endsAt > clockMediaTime else { return }
         guard replaceOrdinaryLiveCopy(id: id, withSelfSent: selfSent),
-              let layer = pool.popLast() else { return }
+              let layer = acquireLayer() else { return }
         let origin = appliedPicture.origin
         let start = DanmakuAdvancedMotion.center(placed.start, image: image).offset(by: origin)
         let end = DanmakuAdvancedMotion.center(placed.end, image: image).offset(by: origin)
@@ -674,6 +717,7 @@ extension DanmakuRenderController {
             lane: nil,
             bulletWidth: image.width
         )
+        if endsAt < earliestLiveEnd { earliestLiveEnd = endsAt }
     }
 
     private func replaceOrdinaryLiveCopy(id: Int64, withSelfSent selfSent: Bool) -> Bool {
@@ -694,8 +738,10 @@ extension DanmakuRenderController {
     }
 }
 
+@MainActor
 private enum DanmakuAdvancedMotion {
     static let perspectiveM34: CGFloat = CGFloat(-1) / CGFloat(500)
+    private static let linearTiming = CAMediaTimingFunction(name: .linear)
 
     static func center(
         _ point: DanmakuAdvancedPlacement.Point,
@@ -761,7 +807,7 @@ private enum DanmakuAdvancedMotion {
         animation.beginTime = beginTime
         animation.isRemovedOnCompletion = false
         animation.fillMode = .forwards
-        animation.timingFunction = CAMediaTimingFunction(name: .linear)
+        animation.timingFunction = linearTiming
         return animation
     }
 }

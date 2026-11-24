@@ -68,6 +68,11 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         }
     }
 
+    var hasRenderedFirstFrame: Bool {
+        get { session.hasRenderedFirstFrame }
+        set { session.hasRenderedFirstFrame = newValue }
+    }
+
     // MARK: - Playback Clock State Facade
 
     var mediaTime: TimeInterval {
@@ -563,17 +568,17 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
             session.currentLiveQuality = newValue
         }
     }
-    var historyReportTask: Task<Void, Never>?
-    var offlineProgressTask: Task<Void, Never>?
-    var playbackWatchdogTask: Task<Void, Never>?
-    var lastWatchdogTime: TimeInterval = -1
-    var currentFault: PlaybackFault?
-    var faultTicks = 0
-    var healthOutcome: (reason: String, ticks: Int)?
+    @ObservationIgnored var historyReportTask: Task<Void, Never>?
+    @ObservationIgnored var offlineProgressTask: Task<Void, Never>?
+    @ObservationIgnored var playbackWatchdogTask: Task<Void, Never>?
+    @ObservationIgnored var lastWatchdogTime: TimeInterval = -1
+    @ObservationIgnored var currentFault: PlaybackFault?
+    @ObservationIgnored var faultTicks = 0
+    @ObservationIgnored var healthOutcome: (reason: String, ticks: Int)?
     static let healthOutcomeHeartbeatTicks = 12
     @ObservationIgnored var coalescedRecoveryWatchdog: (token: UInt64, ticks: Int)?
     static let maxCoalescedWatchdogTicks = 3
-    var budget = RecoveryBudget()
+    @ObservationIgnored var budget = RecoveryBudget()
     @ObservationIgnored var streamRecovery: StreamRecoveryCycle?
     @ObservationIgnored var streamSourceRequestAdmission: (@MainActor @Sendable () -> Bool)?
 
@@ -702,23 +707,16 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     var cdnSwitchIntentGeneration: UInt64 = 0
     var cdnFrameCover: CDNFrameCoverPolicy?
     var freezeFrame: UIImage?
-    var freezeFrameSetAt: CFTimeInterval = 0
-    var freezeFrameAwaitingFreshProof = false
-    var freezeFrameExpectedSessionGeneration: UInt64?
-    var freezeFrameIdentity: UInt64 = 0
+    @ObservationIgnored var freezeFrameAwaitingFreshProof = false
+    @ObservationIgnored var freezeFrameExpectedSessionGeneration: UInt64?
+    @ObservationIgnored var freezeFrameIdentity: UInt64 = 0
     var currentFreezeFrameIdentity: UInt64 { freezeFrameIdentity }
     var recoveryCover: PlayerRecoveryCover?
-    static let freezeFrameSafetyTimeout: CFTimeInterval = 8
-    @ObservationIgnored
-    var transitionCoverExpiry = PlayerTransitionCoverExpiry()
+    @ObservationIgnored var freezeFrameExpiryTask: Task<Void, Never>?
 
     var outgoingRouteStills: [String: UIImage] {
         get { routeOwnership.outgoingRouteStills }
         set { routeOwnership.outgoingRouteStills = newValue }
-    }
-
-    var outgoingRouteStillExpiry: PlayerOutgoingRouteStillExpiry {
-        routeOwnership.outgoingRouteStillExpiry
     }
 
     var departedRouteStillOwners: [String] {
@@ -726,19 +724,14 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         set { routeOwnership.departedRouteStillOwners = newValue }
     }
 
-    var outgoingRouteStill: OutgoingRouteStill? {
-        get { routeOwnership.outgoingRouteStill }
-        set { routeOwnership.outgoingRouteStill = newValue }
-    }
+    @ObservationIgnored var lastSeekRequest: TimeInterval?
 
-    var lastSeekRequest: TimeInterval?
+    @ObservationIgnored var fpsEverLive = false
 
-    var fpsEverLive = false
-
-    var clockEverAdvancedThisStream = false
+    @ObservationIgnored var clockEverAdvancedThisStream = false
     static let primingCeiling: TimeInterval = 15
 
-    var lastBytesAdvanceAt: TimeInterval = 0
+    @ObservationIgnored var lastBytesAdvanceAt: TimeInterval = 0
     static let dataFlowWindow: TimeInterval = 3
     static let bufferedRunwayFloor: TimeInterval = 1.5
 
@@ -758,23 +751,23 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         set { clock.pendingSeekTarget = newValue }
     }
 
-    var pendingSeekTask: Task<Void, Never>?
-    var reopenSeekTask: Task<Void, Never>?
+    @ObservationIgnored var pendingSeekTask: Task<Void, Never>?
+    @ObservationIgnored var reopenSeekTask: Task<Void, Never>?
     @ObservationIgnored var activeSeekToken: SeekSettlementToken?
-    var resumeAtTime: TimeInterval?
+    @ObservationIgnored var resumeAtTime: TimeInterval?
 
-    var lastLoadStartPosition: TimeInterval = 0
+    @ObservationIgnored var lastLoadStartPosition: TimeInterval = 0
 
-    var resumeIsFromHistory = false
-    var pendingRestartNotice = false
+    @ObservationIgnored var resumeIsFromHistory = false
+    @ObservationIgnored var pendingRestartNotice = false
 
     var recoveryPosition: TimeInterval {
         pendingSeekTarget ?? durableResumeTarget ?? resumeAtTime ?? mediaTime
     }
 
-    var durableResumeTarget: TimeInterval?
-    var durableResumeArmedFrom: TimeInterval = 0
-    var durableResumeArmedAtWall: CFTimeInterval = 0
+    @ObservationIgnored var durableResumeTarget: TimeInterval?
+    @ObservationIgnored var durableResumeArmedFrom: TimeInterval = 0
+    @ObservationIgnored var durableResumeArmedAtWall: CFTimeInterval = 0
     static let durableResumeStaleness: CFTimeInterval = 90
 
     var resumeTargetTime: TimeInterval {
@@ -782,18 +775,18 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     }
 
     static let nearEndFreezeThreshold: TimeInterval = NearEndClockPolicy.freezeThreshold
-    var nearEndStallWallStart: CFTimeInterval?
-    var nearEndStallMediaStart: TimeInterval?
+    @ObservationIgnored var nearEndStallWallStart: CFTimeInterval?
+    @ObservationIgnored var nearEndStallMediaStart: TimeInterval?
 
     var nearEndDisplayTime: TimeInterval? {
         get { clock.nearEndDisplayTime }
         set { clock.nearEndDisplayTime = newValue }
     }
 
-    var nearEndStallDriveTask: Task<Void, Never>?
-    var nearEndFreezeArmTask: Task<Void, Never>?
-    var nearEndFreezeCandidateMedia: TimeInterval?
-    var nearEndStallLogged = false
+    @ObservationIgnored var nearEndStallDriveTask: Task<Void, Never>?
+    @ObservationIgnored var nearEndFreezeArmTask: Task<Void, Never>?
+    @ObservationIgnored var nearEndFreezeCandidateMedia: TimeInterval?
+    @ObservationIgnored var nearEndStallLogged = false
 
     struct SettledSeekDisplaySample: Equatable {
         let position: TimeInterval
@@ -1183,7 +1176,7 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
 
     // MARK: - Now Playing (PiP / Lock Screen / Control Center)
 
-    var lastNowPlayingPushAt: CFTimeInterval = 0
+    @ObservationIgnored var lastNowPlayingPushAt: CFTimeInterval = 0
     @ObservationIgnored
     lazy var nowPlayingStateEdgeAdapter: NowPlayingStateEdgeAdapter = {
         NowPlayingStateEdgeAdapter(
@@ -1442,13 +1435,13 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     var skipSegments: [(label: String, start: Double, end: Double)] = []
     var skipNotice: String?
     var skipNoticeTask: Task<Void, Never>?
-    var lastAutoSkipAt: CFTimeInterval = 0
-    var autoSkippedSegmentKeys: Set<String> = []
+    @ObservationIgnored var lastAutoSkipAt: CFTimeInterval = 0
+    @ObservationIgnored var autoSkippedSegmentKeys: Set<String> = []
 
     // MARK: - SponsorBlock auto-skip
 
-    var sponsorSkippedUUIDs: Set<String> = []
-    var lastSponsorSkipAt: CFTimeInterval = 0
+    @ObservationIgnored var sponsorSkippedUUIDs: Set<String> = []
+    @ObservationIgnored var lastSponsorSkipAt: CFTimeInterval = 0
 
     var pendingSponsorManualSegment: SponsorSegment?
 
@@ -1747,6 +1740,7 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
 
         advanceGeneration("stop:\(reason)")
         if !reason.preservesPresentation {
+            hasRenderedFirstFrame = false
             fullscreenTransition = FullscreenTransitionCoalescer()
             if isFullscreen { exitFullscreen() }
         }
@@ -1895,19 +1889,19 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
 
     // MARK: - Smart CDN & delivery state
 
-    var lastStreamStartAt: TimeInterval = 0
+    @ObservationIgnored var lastStreamStartAt: TimeInterval = 0
 
-    var speedSampleTask: Task<Void, Never>?
+    @ObservationIgnored var speedSampleTask: Task<Void, Never>?
     @ObservationIgnored var byteRateSampler = PlaybackByteRateSampler()
     @ObservationIgnored var pipelineGoodput: Double = 0
 
-    var streamNominalBitrate = 0
+    @ObservationIgnored var streamNominalBitrate = 0
 
-    var unhealthySamples = 0
-    var lastRunway: TimeInterval = 0
+    @ObservationIgnored var unhealthySamples = 0
+    @ObservationIgnored var lastRunway: TimeInterval = 0
 
     var videoHostProbes: [String: VideoHostProbe] = [:]
-    var videoProbeTask: Task<Void, Never>?
+    @ObservationIgnored var videoProbeTask: Task<Void, Never>?
     @ObservationIgnored var videoProbeExperimentalAccess: ExperimentalAccessReceipt?
 
     @ObservationIgnored
@@ -1915,22 +1909,22 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
 
     // MARK: - Stress diagnostics
 
-    var stressLogTick = 0
+    @ObservationIgnored var stressLogTick = 0
 
-    var lastDropSample: (count: Int, at: CFTimeInterval)?
+    @ObservationIgnored var lastDropSample: (count: Int, at: CFTimeInterval)?
     @ObservationIgnored var lastEnhancementTelemetryRefresh: CFTimeInterval = 0
-    var pendingBufferHealth: TimeInterval?
-    var cachedResolutionSize: CGSize = .zero
+    @ObservationIgnored var pendingBufferHealth: TimeInterval?
+    @ObservationIgnored var cachedResolutionSize: CGSize = .zero
 
-    var lastReportedProgress = -1
-    var historyPassIsOpen = false
-    var historyStartTs = 0
-    var lastReportClock: CFTimeInterval = 0
-    var completionMarkerReported = false
+    @ObservationIgnored var lastReportedProgress = -1
+    @ObservationIgnored var historyPassIsOpen = false
+    @ObservationIgnored var historyStartTs = 0
+    @ObservationIgnored var lastReportClock: CFTimeInterval = 0
+    @ObservationIgnored var completionMarkerReported = false
 
-    var historyReportMid: String?
+    @ObservationIgnored var historyReportMid: String?
 
-    var lastPersistedOfflineSecond = -1
+    @ObservationIgnored var lastPersistedOfflineSecond = -1
     static let qualityMap: [Int: String] = [
         127: "8K", 126: String(localized: "Dolby Vision"), 125: "HDR",
         120: "4K", 116: "1080P60", 112: "1080P+",

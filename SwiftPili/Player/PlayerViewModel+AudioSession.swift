@@ -110,6 +110,7 @@ extension PlayerViewModel {
         instance.setDemandPresentationProofHandler(nil)
         instance.setDemandPresentationFailureHandler(nil)
         instance.setRuntimeFaultHandler(nil)
+        instance.setFirstVideoFrameHandler(nil)
         instance.setStartupTraceToken(nil)
         instance.onStateChanged = nil
         instance.onTickWithGeneration = nil

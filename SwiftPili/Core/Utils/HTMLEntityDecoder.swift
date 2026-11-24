@@ -1,75 +1,116 @@
 import Foundation
 
 enum HTMLEntityDecoder {
-    private static let namedEntities: [String: Unicode.Scalar] = [
-        "amp": "&",
-        "lt": "<",
-        "gt": ">",
-        "quot": "\"",
-        "apos": "'",
-        "nbsp": "\u{00A0}"
-    ]
-
-    private static let maxNamedEntityLength = namedEntities.keys.map(\.count).max() ?? 0
-
     static func decode(_ raw: String) -> String {
-        guard raw.contains("&") else { return raw }
-        let scalars = raw.unicodeScalars
-        var output = String.UnicodeScalarView()
-        output.reserveCapacity(scalars.count)
-        var index = scalars.startIndex
-        while index < scalars.endIndex {
-            let scalar = scalars[index]
-            guard scalar == "&" else {
-                output.append(scalar)
-                index = scalars.index(after: index)
+        guard raw.utf8.contains(0x26) else { return raw } // '&'
+        let bytes = Array(raw.utf8)
+        let count = bytes.count
+        var output: [UInt8]?
+        var copyStart = 0
+        var index = 0
+
+        while index < count {
+            guard bytes[index] == 0x26 else {
+                index += 1
                 continue
             }
-            if let (decoded, next) = decodeEntity(scalars, from: index) {
-                output.append(decoded)
+            if let (scalar, next) = decodeEntity(bytes, from: index) {
+                if output == nil {
+                    var buffer: [UInt8] = []
+                    buffer.reserveCapacity(count)
+                    output = buffer
+                }
+                if copyStart < index {
+                    output!.append(contentsOf: bytes[copyStart ..< index])
+                }
+                output!.append(contentsOf: scalar.utf8)
                 index = next
+                copyStart = next
             } else {
-                output.append(scalar)
-                index = scalars.index(after: index)
+                index += 1
             }
         }
-        return String(output)
+
+        guard var decoded = output else { return raw }
+        if copyStart < count {
+            decoded.append(contentsOf: bytes[copyStart ..< count])
+        }
+        return String(decoding: decoded, as: UTF8.self)
     }
 
-    private static func decodeEntity(
-        _ scalars: String.UnicodeScalarView,
-        from start: String.UnicodeScalarView.Index
-    ) -> (Unicode.Scalar, String.UnicodeScalarView.Index)? {
-        var index = scalars.index(after: start)
-        guard index < scalars.endIndex else { return nil }
+    private static func decodeEntity(_ bytes: [UInt8], from start: Int) -> (Unicode.Scalar, Int)? {
+        let count = bytes.count
+        var index = start + 1
+        guard index < count else { return nil }
 
-        if scalars[index] == "#" {
-            index = scalars.index(after: index)
-            guard index < scalars.endIndex else { return nil }
-            let isHex = scalars[index] == "x" || scalars[index] == "X"
-            if isHex {
-                index = scalars.index(after: index)
+        if bytes[index] == 0x23 { // '#'
+            index += 1
+            guard index < count else { return nil }
+            let isHex = bytes[index] == 0x78 || bytes[index] == 0x58 // 'x' / 'X'
+            if isHex { index += 1 }
+            let digitsStart = index
+            var value: UInt32 = 0
+            while index < count, bytes[index] != 0x3B { // ';'
+                guard index - digitsStart < 8 else { return nil }
+                let byte = bytes[index]
+                let digit: UInt32
+                if byte >= 0x30, byte <= 0x39 {
+                    digit = UInt32(byte - 0x30)
+                } else if isHex, byte >= 0x61, byte <= 0x66 {
+                    digit = UInt32(byte - 0x61 + 10)
+                } else if isHex, byte >= 0x41, byte <= 0x46 {
+                    digit = UInt32(byte - 0x41 + 10)
+                } else {
+                    return nil
+                }
+                value = value &* (isHex ? 16 : 10) &+ digit
+                index += 1
             }
-            var digits = ""
-            while index < scalars.endIndex, scalars[index] != ";" {
-                guard digits.count < 8 else { return nil }
-                digits.unicodeScalars.append(scalars[index])
-                index = scalars.index(after: index)
+            guard index < count, index > digitsStart, let scalar = Unicode.Scalar(value) else {
+                return nil
             }
-            guard index < scalars.endIndex, !digits.isEmpty else { return nil }
-            let value = isHex ? UInt32(digits, radix: 16) : UInt32(digits, radix: 10)
-            guard let value, let scalar = Unicode.Scalar(value) else { return nil }
-            return (scalar, scalars.index(after: index))
+            return (scalar, index + 1)
         }
 
-        var name = ""
-        while index < scalars.endIndex, scalars[index] != ";", name.count <= maxNamedEntityLength {
-            name.unicodeScalars.append(scalars[index])
-            index = scalars.index(after: index)
+        let nameStart = index
+        let maxEnd = min(count, nameStart + 5)
+        while index < maxEnd, bytes[index] != 0x3B { // ';'
+            index += 1
         }
-        guard index < scalars.endIndex, scalars[index] == ";", let scalar = namedEntities[name] else {
-            return nil
+        guard index < count, bytes[index] == 0x3B else { return nil }
+        let length = index - nameStart
+        let scalar: Unicode.Scalar? = switch length {
+        case 2:
+            if bytes[nameStart] == 0x6C, bytes[nameStart + 1] == 0x74 { // lt
+                "<"
+            } else if bytes[nameStart] == 0x67, bytes[nameStart + 1] == 0x74 { // gt
+                ">"
+            } else {
+                nil
+            }
+        case 3:
+            if bytes[nameStart] == 0x61, bytes[nameStart + 1] == 0x6D, bytes[nameStart + 2] == 0x70 { // amp
+                "&"
+            } else {
+                nil
+            }
+        case 4:
+            if bytes[nameStart] == 0x71, bytes[nameStart + 1] == 0x75,
+               bytes[nameStart + 2] == 0x6F, bytes[nameStart + 3] == 0x74 { // quot
+                "\""
+            } else if bytes[nameStart] == 0x61, bytes[nameStart + 1] == 0x70,
+                      bytes[nameStart + 2] == 0x6F, bytes[nameStart + 3] == 0x73 { // apos
+                "'"
+            } else if bytes[nameStart] == 0x6E, bytes[nameStart + 1] == 0x62,
+                      bytes[nameStart + 2] == 0x73, bytes[nameStart + 3] == 0x70 { // nbsp
+                "\u{00A0}"
+            } else {
+                nil
+            }
+        default:
+            nil
         }
-        return (scalar, scalars.index(after: index))
+        guard let scalar else { return nil }
+        return (scalar, index + 1)
     }
 }

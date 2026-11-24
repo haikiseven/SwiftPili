@@ -15,6 +15,7 @@ extension PlayerViewModel {
         resetRecoveryBudget()
         cdnFallbackActive = false
         if ownerKey != owner {
+            hasRenderedFirstFrame = false
             suspendDanmakuVisibleWork()
             clearFreezeFrame()
             if let outgoingOwner = currentOwnerLease {
@@ -54,6 +55,7 @@ extension PlayerViewModel {
             && outgoingOwner != nil
             && (sceneID == nil || routeOwnership.activeSceneID == nil || routeOwnership.activeSceneID == sceneID)
         if !retainsRunningSession {
+            hasRenderedFirstFrame = false
             invalidateSurfaceSlot(reason: "owner-lease-replacement")
         }
         mediaResetRecovery.invalidate()

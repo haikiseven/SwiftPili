@@ -185,7 +185,7 @@ extension HomeFeedCollectionViewController {
     func makeHomeLayout() -> UICollectionViewCompositionalLayout {
         UICollectionViewCompositionalLayout { [weak self] sectionIndex, environment in
             guard let self else { return nil }
-            let sections = dataSource?.snapshot().sectionIdentifiers ?? []
+            let sections = currentSections
             guard sectionIndex < sections.count else { return nil }
             let sectionKey = sections[sectionIndex]
             let isLast = sectionIndex == sections.count - 1
@@ -339,6 +339,7 @@ extension HomeFeedCollectionViewController {
                 }
             }
             lastReconfiguredWidth = currentContentWidth
+            currentSections = snapshot.sectionIdentifiers
             dataSource.apply(snapshot, animatingDifferences: false)
             return
         }
@@ -364,6 +365,7 @@ extension HomeFeedCollectionViewController {
 
         reconfigureItems(reconfigureItemIDs, in: &snapshot)
         lastReconfiguredWidth = currentContentWidth
+        currentSections = snapshot.sectionIdentifiers
         dataSource.apply(snapshot, animatingDifferences: false)
     }
 

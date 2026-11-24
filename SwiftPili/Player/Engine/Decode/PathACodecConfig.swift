@@ -61,18 +61,25 @@ enum PathACodecConfig {
     ) -> [Data]? {
         guard (1...4).contains(nalLengthSize), data.count > nalLengthSize else { return nil }
         return data.withUnsafeBytes { raw -> [Data]? in
+            let total = raw.count
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return nil }
             var offset = 0
-            var sets: [Data] = []
+            var sets: [Data]?
             var hasSPS = false
             var hasPPS = false
-            while offset + nalLengthSize <= raw.count {
-                var nalLength = 0
-                for i in 0..<nalLengthSize {
-                    nalLength = (nalLength << 8) | Int(base[offset + i])
+            while offset + nalLengthSize <= total {
+                let nalLength: Int
+                if nalLengthSize == 4 {
+                    nalLength = Int(raw.loadUnaligned(fromByteOffset: offset, as: UInt32.self).bigEndian)
+                } else {
+                    var length = 0
+                    for i in 0..<nalLengthSize {
+                        length = (length << 8) | Int(base[offset + i])
+                    }
+                    nalLength = length
                 }
                 offset += nalLengthSize
-                guard nalLength > 0, offset + nalLength <= raw.count else { break }
+                guard nalLength > 0, offset + nalLength <= total else { break }
                 let header = base[offset]
                 let isParameterSet: Bool
                 switch codec {
@@ -89,7 +96,8 @@ enum PathACodecConfig {
                     else { isParameterSet = false }
                 }
                 if isParameterSet {
-                    sets.append(Data(bytes: base + offset, count: nalLength))
+                    if sets == nil { sets = [] }
+                    sets!.append(Data(bytes: base + offset, count: nalLength))
                 }
                 offset += nalLength
             }

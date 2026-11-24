@@ -29,7 +29,15 @@ final class ChatViewModel {
     @ObservationIgnored private let authManager: AuthManager
     @ObservationIgnored private let accountManager: AccountManager
 
+    struct DisplayRow: Identifiable, Sendable {
+        let message: SessionMsgsResult.ChatMessage
+        let previousTimestamp: Int?
+
+        var id: Int { message.id }
+    }
+
     private(set) var messages: [SessionMsgsResult.ChatMessage] = []
+    private(set) var displayRows: [DisplayRow] = []
     private(set) var scrollTargetID: Int?
     private(set) var hasMore = false
     private(set) var loadedOnce = false
@@ -37,10 +45,10 @@ final class ChatViewModel {
     private(set) var initialFailure: String?
     private(set) var historyFailure: String?
 
-    private var minSeqno: Int?
-    private var latestSeqno: Int?
-    private var acknowledgedSeqno: Int?
-    private var runID: UUID?
+    @ObservationIgnored private var minSeqno: Int?
+    @ObservationIgnored private var latestSeqno: Int?
+    @ObservationIgnored private var acknowledgedSeqno: Int?
+    @ObservationIgnored private var runID: UUID?
     private var read: Read?
     @ObservationIgnored private var readWork: Task<Void, Never>?
     @ObservationIgnored private var catchUp: CatchUp?
@@ -171,11 +179,12 @@ final class ChatViewModel {
                 )
                 guard isCurrent(request) else { return }
                 let incoming = try validMessages(result)
-                messages = mergingChatHistory(
+                let merged = mergingChatHistory(
                     uniqueChatMessages(Array(incoming.reversed())), retaining: messages,
                     preservingCurrentPayload: request.kind == .older,
                     olderBoundary: request.kind == .older ? request.olderBoundary : nil
                 )
+                publishMessagesIfChanged(merged)
                 minSeqno = result.minSeqno
                 hasMore = result.hasMore == 1 && result.minSeqno != nil
                     && (request.kind == .initial || result.minSeqno != request.olderBoundary)
@@ -210,10 +219,17 @@ final class ChatViewModel {
     }
 
     private func fetchLatest(_ request: Read) async throws {
-        var pending = catchUp ?? CatchUp(
-            boundary: latestSeqno,
-            knownIDs: Set(messages.filter { $0.msgKey != nil || $0.msgSeqno != nil }.map(\.id))
-        )
+        var pending: CatchUp
+        if let existingCatchUp = catchUp {
+            pending = existingCatchUp
+        } else {
+            var knownIDs = Set<Int>()
+            knownIDs.reserveCapacity(messages.count)
+            for message in messages where message.msgKey != nil || message.msgSeqno != nil {
+                knownIDs.insert(message.id)
+            }
+            pending = CatchUp(boundary: latestSeqno, knownIDs: knownIDs)
+        }
         for _ in 0 ..< 4 {
             guard isCurrent(request) else { return }
             let result = try await MessageAPI.getSessionMessages(
@@ -230,10 +246,12 @@ final class ChatViewModel {
             }
             if reachedBoundary || result.hasMore == 0 {
                 let newestFirst = uniqueChatMessages(pending.newestFirst)
-                messages = mergingChatHistory(
+                let merged = mergingChatHistory(
                     Array(newestFirst.reversed()), retaining: messages, preservingCurrentPayload: false
                 )
-                latestSeqno = max(latestSeqno ?? 0, newestFirst.compactMap(\.msgSeqno).max() ?? 0)
+                publishMessagesIfChanged(merged)
+                let nextLatest = max(latestSeqno ?? 0, newestFirst.compactMap(\.msgSeqno).max() ?? 0)
+                if latestSeqno != nextLatest { latestSeqno = nextLatest }
                 catchUp = nil
                 await acknowledgeLatest(request)
                 return
@@ -273,10 +291,46 @@ final class ChatViewModel {
             msgKey: result.msgKey ?? Int(Date().timeIntervalSince1970 * 1000), msgStatus: 0
         )
         if !messages.contains(where: { $0.id == message.id }) {
+            let previousTimestamp = messages.last?.timestamp
             messages.append(message)
+            displayRows.append(DisplayRow(message: message, previousTimestamp: previousTimestamp))
             scrollTargetID = message.id
         }
     }
+
+    private func publishMessagesIfChanged(_ next: [SessionMsgsResult.ChatMessage]) {
+        guard !chatMessagesEqual(messages, next) else { return }
+        messages = next
+        var rows: [DisplayRow] = []
+        rows.reserveCapacity(next.count)
+        var previousTimestamp: Int?
+        for message in next {
+            rows.append(DisplayRow(message: message, previousTimestamp: previousTimestamp))
+            previousTimestamp = message.timestamp
+        }
+        displayRows = rows
+    }
+}
+
+private func chatMessagesEqual(
+    _ lhs: [SessionMsgsResult.ChatMessage],
+    _ rhs: [SessionMsgsResult.ChatMessage]
+) -> Bool {
+    guard lhs.count == rhs.count else { return false }
+    for index in lhs.indices {
+        let left = lhs[index]
+        let right = rhs[index]
+        guard left.id == right.id,
+              left.msgSeqno == right.msgSeqno,
+              left.msgStatus == right.msgStatus,
+              left.msgType == right.msgType,
+              left.timestamp == right.timestamp,
+              left.senderUid == right.senderUid,
+              left.content == right.content else {
+            return false
+        }
+    }
+    return true
 }
 
 private func uniqueChatMessages(_ messages: [SessionMsgsResult.ChatMessage]) -> [SessionMsgsResult.ChatMessage] {

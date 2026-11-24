@@ -15,6 +15,12 @@ struct IndexedArticleBlock: Identifiable, Sendable, Equatable {
     let imageIndex: Int?
 }
 
+struct ParsedArticleContent: Sendable {
+    let blocks: [ArticleBlock]
+    let indexedBlocks: [IndexedArticleBlock]
+    let imageURLs: [URL]
+}
+
 enum ArticleContentParser {
     private static let blockRegex: NSRegularExpression? = try? NSRegularExpression(
         pattern: "<(p|h1|h2|h3|h4|h5|h6|figure|blockquote|ul|ol)[^>]*>(.*?)</\\1>",
@@ -41,21 +47,20 @@ enum ArticleContentParser {
     )
 
     static func parse(pageHTML: String) -> [ArticleBlock] {
-        var content = pageHTML
-        if let start = content.range(of: "id=\"read-article-holder\"") {
-            content = String(content[start.upperBound...])
-        }
+        let startIndex = pageHTML.range(of: "id=\"read-article-holder\"")?.upperBound ?? pageHTML.startIndex
+        var endIndex = pageHTML.endIndex
         for endMarker in ["id=\"read-interaction-holder\"", "class=\"read-more\"", "id=\"comment-holder\""] {
-            if let end = content.range(of: endMarker) {
-                content = String(content[..<end.lowerBound])
+            if let end = pageHTML.range(of: endMarker, range: startIndex..<endIndex) {
+                endIndex = end.lowerBound
                 break
             }
         }
 
-        guard let regex = blockRegex else { return [] }
+        guard let regex = blockRegex, startIndex < endIndex else { return [] }
         var blocks: [ArticleBlock] = []
-        let nsText = content as NSString
-        regex.enumerateMatches(in: content, range: NSRange(location: 0, length: nsText.length)) { match, _, _ in
+        let nsText = pageHTML as NSString
+        let searchRange = NSRange(startIndex..<endIndex, in: pageHTML)
+        regex.enumerateMatches(in: pageHTML, range: searchRange) { match, _, _ in
             guard let match else { return }
             let tag = nsText.substring(with: match.range(at: 1)).lowercased()
             let inner = nsText.substring(with: match.range(at: 2))
@@ -64,33 +69,69 @@ enum ArticleContentParser {
         return blocks
     }
 
+    static func parseIndexed(pageHTML: String) -> ParsedArticleContent {
+        let blocks = parse(pageHTML: pageHTML)
+        let (indexed, imageURLs) = indexBlocksWithImages(blocks)
+        return ParsedArticleContent(blocks: blocks, indexedBlocks: indexed, imageURLs: imageURLs)
+    }
+
     static func indexBlocks(_ blocks: [ArticleBlock]) -> [IndexedArticleBlock] {
-        var counts: [ArticleBlock: Int] = [:]
-        var nextImageIndex = 0
-        return blocks.map { block in
-            let occurrence = counts[block, default: 0]
-            counts[block] = occurrence + 1
+        indexBlocksWithImages(blocks).indexed
+    }
+
+    static func indexBlocksWithImages(
+        _ blocks: [ArticleBlock]
+    ) -> (indexed: [IndexedArticleBlock], imageURLs: [URL]) {
+        var counts: [String: Int] = [:]
+        counts.reserveCapacity(blocks.count)
+        var indexed: [IndexedArticleBlock] = []
+        indexed.reserveCapacity(blocks.count)
+        var imageURLs: [URL] = []
+
+        for block in blocks {
             let imageIndex: Int?
-            if case .image = block {
-                imageIndex = nextImageIndex
-                nextImageIndex += 1
-            } else {
+            let baseID: String
+            switch block {
+            case .heading(let text):
                 imageIndex = nil
+                baseID = "h:\(stableHash(text))"
+            case .paragraph(let text):
+                imageIndex = nil
+                baseID = "p:\(stableHash(text))"
+            case .quote(let text):
+                imageIndex = nil
+                baseID = "q:\(stableHash(text))"
+            case .listItem(let text):
+                imageIndex = nil
+                baseID = "li:\(stableHash(text))"
+            case .caption(let text):
+                imageIndex = nil
+                baseID = "cap:\(stableHash(text))"
+            case .image(let url):
+                imageIndex = imageURLs.count
+                imageURLs.append(url)
+                baseID = "img:\(url.absoluteString)"
             }
-            let baseID: String = switch block {
-            case .heading(let text): "h:\(String(text.characters))"
-            case .paragraph(let text): "p:\(String(text.characters))"
-            case .quote(let text): "q:\(String(text.characters))"
-            case .listItem(let text): "li:\(String(text.characters))"
-            case .caption(let text): "cap:\(String(text.characters))"
-            case .image(let url): "img:\(url.absoluteString)"
-            }
-            return IndexedArticleBlock(
+            let occurrence = counts[baseID, default: 0]
+            counts[baseID] = occurrence + 1
+            indexed.append(IndexedArticleBlock(
                 id: "\(baseID)#\(occurrence)",
                 block: block,
                 imageIndex: imageIndex
-            )
+            ))
         }
+        return (indexed, imageURLs)
+    }
+
+    private static func stableHash(_ text: AttributedString) -> UInt64 {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for character in text.characters {
+            for byte in character.utf8 {
+                hash ^= UInt64(byte)
+                hash &*= 0x100000001b3
+            }
+        }
+        return hash
     }
 
     private static func parseBlock(tag: String, inner: String) -> [ArticleBlock] {
@@ -249,7 +290,7 @@ enum ArticleContentParser {
     private static func cleanRawFragment(_ html: String) -> String {
         var working = html
         if working.contains("<") {
-            if let lineBreakRegex {
+            if let lineBreakRegex, working.range(of: "<br", options: .caseInsensitive) != nil {
                 working = lineBreakRegex.stringByReplacingMatches(
                     in: working,
                     range: NSRange(working.startIndex..., in: working),

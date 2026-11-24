@@ -80,7 +80,10 @@ final class DynamicsViewModel {
         }
     }
 
-    var items: [DynamicFeedResult.DynamicItem] = []
+    var items: [DynamicFeedResult.DynamicItem] = [] {
+        didSet { itemsRevision &+= 1 }
+    }
+    @ObservationIgnored private(set) var itemsRevision: UInt64 = 0
     var isLoading = false
     var selection: DynamicFeedSelection = .category(.all)
     var filter: FeedFilter {
@@ -101,10 +104,10 @@ final class DynamicsViewModel {
         var hasLoaded: Bool
     }
 
-    private var offset: String?
-    private var hasMore = true
-    private var admission = FeedLoadAdmission()
-    private var cachedFeeds: [DynamicFeedSelection: CachedFeed] = [:]
+    @ObservationIgnored private var offset: String?
+    @ObservationIgnored private var hasMore = true
+    @ObservationIgnored private var admission = FeedLoadAdmission()
+    @ObservationIgnored private var cachedFeeds: [DynamicFeedSelection: CachedFeed] = [:]
 
     func load() async {
         guard let requestedAccountMID = activeFeedAccountMID() else { return }

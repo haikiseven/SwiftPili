@@ -101,28 +101,44 @@ struct SearchFilterBar: View {
 
 private extension SearchVideoOrder {
     var label: LocalizedStringKey {
-        LocalizedStringKey([.totalrank: "SearchSortComprehensive", .click: "Most Played", .pubdate: "Newest",
-                            .danmaku: "Most Danmaku"][self] ?? "SearchSortComprehensive")
+        switch self {
+        case .totalrank: "SearchSortComprehensive"
+        case .click: "Most Played"
+        case .pubdate: "Newest"
+        case .danmaku: "Most Danmaku"
+        }
     }
 }
 
 private extension SearchDuration {
     var label: LocalizedStringKey {
-        LocalizedStringKey([.all: "All Durations", .under10: "Under 10 min", .tenTo30: "10-30 min",
-                            .thirtyTo60: "30-60 min", .over60: "Over 60 min"][self] ?? "All Durations")
+        switch self {
+        case .all: "All Durations"
+        case .under10: "Under 10 min"
+        case .tenTo30: "10-30 min"
+        case .thirtyTo60: "30-60 min"
+        case .over60: "Over 60 min"
+        }
     }
 }
 
 private extension SearchUserOrder {
     var label: LocalizedStringKey {
-        LocalizedStringKey([.defaultOrder: "SearchSortDefault", .fans: "SearchSortFans",
-                            .level: "Level"][self] ?? "SearchSortDefault")
+        switch self {
+        case .defaultOrder: "SearchSortDefault"
+        case .fans: "SearchSortFans"
+        case .level: "Level"
+        }
     }
 }
 
 private extension SearchArticleOrder {
     var label: LocalizedStringKey {
-        LocalizedStringKey([.totalrank: "SearchSortComprehensive", .click: "Most Read", .pubdate: "Newest",
-                            .attention: "Most Liked"][self] ?? "SearchSortComprehensive")
+        switch self {
+        case .totalrank: "SearchSortComprehensive"
+        case .click: "Most Read"
+        case .pubdate: "Newest"
+        case .attention: "Most Liked"
+        }
     }
 }

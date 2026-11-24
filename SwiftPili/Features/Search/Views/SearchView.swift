@@ -5,9 +5,7 @@ struct SearchView: View {
     @State private var viewModel: SearchViewModel
     @Environment(AppCoordinator.self) private var coordinator
     @Environment(\.modelContext) private var modelContext
-    @Query(sort: \SearchHistoryItem.searchedAt, order: .reverse) private var searchHistory: [SearchHistoryItem]
     @FocusState private var isSearchFocused: Bool
-    @State private var contentWidth: CGFloat = FeedWidth.seed
     @State private var isScreenVisible = false
 
     private let initialKeyword: String?
@@ -19,40 +17,39 @@ struct SearchView: View {
         self.initialKeyword = initialKeyword
     }
 
-    private var showsSuggestions: Bool {
-        guard isSearchFocused, !viewModel.suggestions.isEmpty else { return false }
-        let trimmed = viewModel.keyword.trimmingCharacters(in: .whitespaces)
-        return !trimmed.isEmpty && (!viewModel.hasSearched || trimmed != viewModel.submittedQuery?.term)
-    }
-
-    private var showsFilterBar: Bool {
-        viewModel.selectedType != .bangumi && viewModel.selectedType != .liveRoom
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             SearchHeaderBar(viewModel: viewModel, isSearchFocused: $isSearchFocused, onSubmit: runSearch)
                 .searchReadableColumn()
             ZStack(alignment: .topLeading) {
-                VStack(spacing: 0) {
+                Group {
                     if viewModel.hasSearched {
-                        typePicker
-                        if showsFilterBar { SearchFilterBar(viewModel: viewModel, onRunRequest: performRequest) }
-                        resultsList
+                        SearchResultsContainer(
+                            viewModel: viewModel,
+                            coordinator: coordinator,
+                            isScreenVisible: isScreenVisible,
+                            isSearchFocused: isSearchFocused,
+                            onSwitchType: switchSearchType,
+                            onRunRequest: performRequest
+                        )
                     } else {
-                        idleContent
+                        SearchIdleContentView(
+                            viewModel: viewModel,
+                            onSelectKeyword: { keyword in
+                                viewModel.keyword = keyword
+                                runSearch()
+                            }
+                        )
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
-                if showsSuggestions {
-                    SearchSuggestionsOverlay(
-                        suggestions: viewModel.suggestions,
-                        onSelectSuggestion: { viewModel.keyword = $0.value; runSearch() },
-                        onFillSuggestion: { viewModel.updateKeyword($0.value); isSearchFocused = true }
-                    )
-                    .searchReadableColumn()
-                }
+                SearchSuggestionsHost(
+                    viewModel: viewModel,
+                    isSearchFocused: isSearchFocused,
+                    onSelectSuggestion: { viewModel.keyword = $0.value; runSearch() },
+                    onFillSuggestion: { viewModel.updateKeyword($0.value); isSearchFocused = true }
+                )
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
@@ -77,9 +74,35 @@ struct SearchView: View {
         .onChange(of: isSearchFocused) { _, focused in if !focused { viewModel.clearSuggestions() } }
     }
 
-    // MARK: - Idle: history + trending
+    // MARK: - Actions
 
-    private var idleContent: some View {
+    private func runSearch() { performRequest(viewModel.prepareSearch(modelContext: modelContext)) }
+    private func switchSearchType(to type: SearchType) { performRequest(viewModel.prepareTypeChange(to: type)) }
+    private func performRequest(_ request: SearchViewModel.PreparedRequest?) {
+        isSearchFocused = false
+        guard let request else { return }
+        let model = viewModel
+        Task { await model.perform(request) }
+    }
+
+    static func fixScheme(_ pic: String?) -> String {
+        guard let pic else { return "" }
+        if pic.hasPrefix("//") { return "https:" + pic }
+        return pic.replacingOccurrences(of: "http://", with: "https://")
+    }
+}
+
+// MARK: - Idle: history + trending
+
+private struct SearchIdleContentView: View {
+    let viewModel: SearchViewModel
+    let onSelectKeyword: (String) -> Void
+
+    @Environment(\.modelContext) private var modelContext
+    @Query(sort: \SearchHistoryItem.searchedAt, order: .reverse) private var searchHistory: [SearchHistoryItem]
+    @State private var contentWidth: CGFloat = FeedWidth.seed
+
+    var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 if !searchHistory.isEmpty { historySection }
@@ -105,7 +128,7 @@ struct SearchView: View {
             }
             FlowLayout(spacing: 8) {
                 ForEach(searchHistory.prefix(20)) { item in
-                    Button { viewModel.keyword = item.keyword; runSearch() } label: {
+                    Button { onSelectKeyword(item.keyword) } label: {
                         Text(item.keyword).appFont(.messageTitle).foregroundStyle(.primary).lineLimit(1)
                             .padding(.horizontal, 12).padding(.vertical, 7)
                             .background(Capsule().fill(Color(.quaternarySystemFill)))
@@ -131,7 +154,7 @@ struct SearchView: View {
                 alignment: .leading, spacing: 4
             ) {
                 ForEach(Array(viewModel.hotWords.prefix(20).enumerated()), id: \.element.id) { index, word in
-                    Button { viewModel.keyword = word.keyword; runSearch() } label: {
+                    Button { onSelectKeyword(word.keyword) } label: {
                         HStack(spacing: 8) {
                             Text("\(index + 1)")
                                 .appFont(.messageMeta, monospacedDigit: true).fontWeight(.bold).monospacedDigit()
@@ -148,153 +171,95 @@ struct SearchView: View {
             }
         }
     }
+}
 
-    // MARK: - Result Type Tabs & Results
+// MARK: - Results Container
+
+private struct SearchResultsContainer: View {
+    let viewModel: SearchViewModel
+    let coordinator: AppCoordinator
+    let isScreenVisible: Bool
+    let isSearchFocused: Bool
+    let onSwitchType: (SearchType) -> Void
+    let onRunRequest: (SearchViewModel.PreparedRequest?) -> Void
 
     private static let tabKeys: [SearchType: String] = [
         .all: "SearchTabAll", .video: "Videos", .bangumi: "Bangumi",
         .liveRoom: "Live", .user: "Users", .article: "Articles",
     ]
 
-    private var typePicker: some View {
-        SectionTabBar(
-            values: [SearchType.all, .video, .bangumi, .liveRoom, .user, .article],
-            selection: viewModel.selectedType,
-            isScrollable: true,
-            enablesSelectionHaptic: true,
-            label: { Text(LocalizedStringKey(Self.tabKeys[$0] ?? "SearchTabAll")) },
-            onSelect: switchSearchType
-        )
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 12).padding(.bottom, showsFilterBar ? 0 : 8)
+    private var showsFilterBar: Bool {
+        viewModel.selectedType != .bangumi && viewModel.selectedType != .liveRoom
     }
 
-    @ViewBuilder
-    private var resultsList: some View {
-        let model = viewModel
-        if let query = model.submittedQuery {
-            let showsEmpty = !model.hasResults && !model.isSearching
-            ZStack {
-                SearchResultsCollectionView(
-                    searchType: query.type, generation: model.resultGeneration,
-                    buckets: model.allBuckets.map(makeBucketData),
-                    items: model.results.map { makeResultData($0, type: query.type) },
-                    isSearching: model.isSearching,
-                    isActive: isScreenVisible && !showsEmpty && !showsSuggestions,
-                    isTabSelected: isScreenVisible, scrollToTopTick: coordinator.scrollToTopTick,
-                    actions: SearchResultsActions(
-                        isCurrentResult: { model.isCurrentResult(generation: $0) },
-                        onLoadMore: { performRequest(model.prepareLoadMore(generation: $0)) },
-                        onSelectVideo: { coordinator.navigateToVideo($0) },
-                        onSelectLiveRoom: { coordinator.navigate(to: .liveRoom($0, zoom: .none)) },
-                        onSelectUser: { coordinator.navigate(to: .userSpace($0)) },
-                        onSelectBangumi: { coordinator.navigate(to: .bangumiDetail($0, zoom: .none)) },
-                        onSelectArticle: { coordinator.navigate(to: .articleReader($0)) },
-                        onSwitchToType: switchSearchType
+    var body: some View {
+        VStack(spacing: 0) {
+            SectionTabBar(
+                values: [SearchType.all, .video, .bangumi, .liveRoom, .user, .article],
+                selection: viewModel.selectedType,
+                isScrollable: true,
+                enablesSelectionHaptic: true,
+                label: { Text(LocalizedStringKey(Self.tabKeys[$0] ?? "SearchTabAll")) },
+                onSelect: onSwitchType
+            )
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12).padding(.bottom, showsFilterBar ? 0 : 8)
+
+            if showsFilterBar {
+                SearchFilterBar(viewModel: viewModel, onRunRequest: { onRunRequest($0) })
+            }
+
+            if let query = viewModel.submittedQuery {
+                let showsEmpty = !viewModel.hasResults && !viewModel.isSearching
+                let showsSuggestions = isSearchFocused && viewModel.hasEligibleSuggestions
+                ZStack {
+                    SearchResultsCollectionView(
+                        searchType: query.type,
+                        generation: viewModel.resultGeneration,
+                        buckets: viewModel.preparedBuckets,
+                        items: viewModel.preparedItems,
+                        snapshotRevision: viewModel.snapshotRevision,
+                        isSearching: viewModel.isSearching,
+                        isActive: isScreenVisible && !showsEmpty && !showsSuggestions,
+                        isTabSelected: isScreenVisible,
+                        scrollToTopTick: coordinator.scrollToTopTick,
+                        actions: SearchResultsActions(
+                            isCurrentResult: { viewModel.isCurrentResult(generation: $0) },
+                            onLoadMore: { onRunRequest(viewModel.prepareLoadMore(generation: $0)) },
+                            onSelectVideo: { coordinator.navigateToVideo($0) },
+                            onSelectLiveRoom: { coordinator.navigate(to: .liveRoom($0, zoom: .none)) },
+                            onSelectUser: { coordinator.navigate(to: .userSpace($0)) },
+                            onSelectBangumi: { coordinator.navigate(to: .bangumiDetail($0, zoom: .none)) },
+                            onSelectArticle: { coordinator.navigate(to: .articleReader($0)) },
+                            onSwitchToType: onSwitchType
+                        )
                     )
-                )
-                .opacity(showsEmpty ? 0 : 1).allowsHitTesting(!showsEmpty).accessibilityHidden(showsEmpty)
-                if showsEmpty {
-                    ContentUnavailableView.search(text: query.term).frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .opacity(showsEmpty ? 0 : 1).allowsHitTesting(!showsEmpty).accessibilityHidden(showsEmpty)
+                    if showsEmpty {
+                        ContentUnavailableView.search(text: query.term)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
                 }
             }
         }
     }
-
-    // MARK: - Actions
-
-    private func runSearch() { performRequest(viewModel.prepareSearch(modelContext: modelContext)) }
-    private func switchSearchType(to type: SearchType) { performRequest(viewModel.prepareTypeChange(to: type)) }
-    private func performRequest(_ request: SearchViewModel.PreparedRequest?) {
-        isSearchFocused = false
-        guard let request else { return }
-        let model = viewModel
-        Task { await model.perform(request) }
-    }
 }
 
-// MARK: - Snapshot Mapping
+private struct SearchSuggestionsHost: View {
+    let viewModel: SearchViewModel
+    let isSearchFocused: Bool
+    let onSelectSuggestion: (SearchSuggestion) -> Void
+    let onFillSuggestion: (SearchSuggestion) -> Void
 
-extension SearchView {
-    private func makeBucketData(_ bucket: SearchViewModel.AllSearchBucket) -> SearchAllBucketData {
-        .init(
-            targetType: bucket.targetType,
-            items: bucket.items.map { makeResultData($0, type: bucket.targetType) },
-            totalCount: bucket.totalCount, hasMore: bucket.hasMore
-        )
-    }
-
-    private func makeResultData(_ result: SearchViewModel.PreparedResult, type: SearchType) -> SearchResultItemData {
-        let item = result.item
-        let kind: SearchResultItemData.Kind
-        switch type {
-        case .all, .video:
-            kind = .video(.init(
-                title: result.displayTitle, sources: VideoCoverSources(widescreen: Self.fixScheme(item.pic)),
-                durationSeconds: result.durationSeconds, author: item.author ?? "",
-                playCount: item.play ?? 0, routeTarget: Self.routeTarget(result)
-            ))
-        case .bangumi:
-            kind = .bangumi(.init(
-                seasonID: item.seasonId, title: result.displayTitle,
-                coverURL: Self.fixScheme(item.cover ?? item.pic), seasonTypeName: item.seasonTypeName,
-                score: item.mediaScore?.score, userCount: item.mediaScore?.userCount,
-                areas: item.areas, styles: item.styles, indexShow: item.indexShow, desc: result.displayDesc
-            ))
-        case .user: kind = .user(makeUserPayload(result))
-        case .liveRoom:
-            kind = .liveRoom(.init(
-                roomID: item.roomid, title: result.displayTitle, uname: item.uname ?? item.author ?? "",
-                areaName: item.areaName ?? item.cateName,
-                coverURL: Self.fixScheme(item.liveArtwork ?? item.pic),
-                online: item.online ?? item.play ?? 0, liveStatus: item.liveStatus
-            ))
-        case .article:
-            let cover = Self.fixScheme(item.imageUrls?.first ?? item.pic)
-            kind = .article(.init(
-                articleID: item.articleId ?? item.aid, title: result.displayTitle,
-                coverURL: cover.isEmpty ? nil : cover, author: item.author ?? item.uname ?? "",
-                categoryName: item.categoryName, viewCount: item.view ?? item.play ?? 0,
-                likeCount: item.like ?? 0, desc: result.displayDesc
-            ))
-        }
-        return SearchResultItemData(id: result.id, kind: kind)
-    }
-
-    private func makeUserPayload(_ result: SearchViewModel.PreparedResult) -> SearchResultItemData.UserPayload {
-        let item = result.item, ownerName = item.uname ?? item.author ?? ""
-        let repVideos: [SearchRepresentativeVideoData] = (item.res ?? []).map { rep in
-            let cover = Self.fixScheme(rep.pic)
-            return .init(
-                id: rep.id, title: rep.cleanTitle, sources: VideoCoverSources(widescreen: cover),
-                durationSeconds: rep.durationSeconds, playCount: rep.play ?? 0,
-                routeTarget: .make(
-                    bvid: rep.bvid, aid: rep.aid, title: rep.cleanTitle, coverURL: cover,
-                    ownerName: ownerName, durationSeconds: rep.durationSeconds
-                )
+    var body: some View {
+        if isSearchFocused && viewModel.hasEligibleSuggestions {
+            SearchSuggestionsOverlay(
+                suggestions: viewModel.suggestions,
+                onSelectSuggestion: onSelectSuggestion,
+                onFillSuggestion: onFillSuggestion
             )
+            .searchReadableColumn()
         }
-        return .init(
-            mid: item.mid, uname: item.uname ?? result.displayTitle,
-            avatarURL: Self.fixScheme(item.upic ?? item.pic),
-            officialVerifyType: item.officialVerify?.type, officialVerifyDesc: item.officialVerify?.desc,
-            fans: item.fans ?? 0, videos: item.videos ?? 0, usign: item.usign ?? result.displayDesc,
-            isLive: item.isLive ?? false, representativeVideos: repVideos
-        )
-    }
-
-    static func fixScheme(_ pic: String?) -> String {
-        guard let pic else { return "" }
-        if pic.hasPrefix("//") { return "https:" + pic }
-        return pic.replacingOccurrences(of: "http://", with: "https://")
-    }
-
-    private static func routeTarget(_ result: SearchViewModel.PreparedResult) -> VideoRouteTarget? {
-        let item = result.item
-        return .make(
-            bvid: item.bvid, aid: item.aid, title: result.displayTitle,
-            coverURL: fixScheme(item.pic), ownerName: item.author ?? "", durationSeconds: result.durationSeconds
-        )
     }
 }
 

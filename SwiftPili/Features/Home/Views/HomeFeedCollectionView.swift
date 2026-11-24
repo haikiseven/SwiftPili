@@ -4,6 +4,8 @@ import UIKit
 struct HomeFeedCollectionView<Item: Identifiable>: View {
     let items: [Item]
     var sections: [VideoFeedSection<Item>]?
+    var preconvertedSections: [HomeFeedSectionData]? = nil
+    var contentRevision: UInt64? = nil
     let title: (Item) -> String
     let sources: (Item) -> VideoCoverSources
     let duration: (Item) -> Int
@@ -31,7 +33,8 @@ struct HomeFeedCollectionView<Item: Identifiable>: View {
     var body: some View {
         let coverPresentation = CoverPresentationStore.shared.presentation
         let config = HomeFeedConfiguration(
-            sections: convertedSections,
+            sections: preconvertedSections ?? convertedSections,
+            contentRevision: contentRevision,
             layoutMode: effectiveLayoutMode,
             coverPresentation: coverPresentation,
             placeholderCount: placeholderCount,
@@ -80,6 +83,45 @@ struct HomeFeedCollectionView<Item: Identifiable>: View {
     }
 }
 
+extension HomeFeedCollectionView where Item == HomeFeedItemData {
+    init(
+        preconvertedSections: [HomeFeedSectionData],
+        contentRevision: UInt64,
+        fixedLayoutMode: HomeLayoutMode? = nil,
+        placeholderCount: Int = 0,
+        placeholderLabel: String = "",
+        heroBadge: String = String(localized: "Recommend"),
+        isActive: Bool = true,
+        isHomeTabSelected: Bool = true,
+        scrollToTopTick: Int = 0,
+        onRefresh: @escaping @MainActor () async -> Bool = { false },
+        onLastAppear: @escaping () -> Void,
+        onSelectVideo: @escaping (VideoRouteTarget) -> Void
+    ) {
+        items = []
+        sections = nil
+        self.preconvertedSections = preconvertedSections
+        self.contentRevision = contentRevision
+        title = \.title
+        sources = \.sources
+        duration = \.duration
+        ownerName = \.ownerName
+        viewCount = \.viewCount
+        rank = \.rank
+        routeTarget = \.routeTarget
+        self.fixedLayoutMode = fixedLayoutMode
+        self.placeholderCount = placeholderCount
+        self.placeholderLabel = placeholderLabel
+        self.heroBadge = heroBadge
+        self.isActive = isActive
+        self.isHomeTabSelected = isHomeTabSelected
+        self.scrollToTopTick = scrollToTopTick
+        self.onRefresh = onRefresh
+        self.onLastAppear = onLastAppear
+        self.onSelectVideo = onSelectVideo
+    }
+}
+
 @MainActor
 final class HomeFeedCollectionViewController: UIKitBaseCollectionViewController {
     struct PaginationTriggerKey: Hashable {
@@ -88,8 +130,10 @@ final class HomeFeedCollectionViewController: UIKitBaseCollectionViewController 
     }
 
     var dataSource: UICollectionViewDiffableDataSource<HomeFeedSectionKey, HomeFeedCellKey>?
+    var currentSections: [HomeFeedSectionKey] = []
 
     var rawSections: [HomeFeedSectionData] = []
+    private var lastContentRevision: UInt64?
     var balancedSections: [HomeFeedSectionData] = []
     var itemByID: [HomeFeedItemIdentifier: HomeFeedItemData] = [:]
     var itemIndexByID: [HomeFeedItemIdentifier: Int] = [:]
@@ -160,7 +204,13 @@ final class HomeFeedCollectionViewController: UIKitBaseCollectionViewController 
         onLastAppear = config.onLastAppear
         onSelectVideo = config.onSelectVideo
 
-        let sectionsChanged = config.sections != rawSections
+        let sectionsChanged: Bool
+        if let incomingRev = config.contentRevision, let currentRev = lastContentRevision,
+           incomingRev == currentRev {
+            sectionsChanged = false
+        } else {
+            sectionsChanged = config.sections != rawSections
+        }
         let layoutChanged = config.layoutMode != layoutMode
         let presentationChanged = config.coverPresentation != coverPresentation
         let placeholderChanged = config.placeholderCount != placeholderCount
@@ -175,7 +225,10 @@ final class HomeFeedCollectionViewController: UIKitBaseCollectionViewController 
         let previousItems = itemByID
         let previousOrderedCount = orderedItemIDs.count
 
-        rawSections = config.sections
+        if sectionsChanged {
+            rawSections = config.sections
+        }
+        lastContentRevision = config.contentRevision
         layoutMode = config.layoutMode
         coverPresentation = config.coverPresentation
         placeholderCount = config.placeholderCount
@@ -187,13 +240,16 @@ final class HomeFeedCollectionViewController: UIKitBaseCollectionViewController 
             collectionView.collectionViewLayout.invalidateLayout()
         }
 
-        rebuildIndexCaches()
+        if sectionsChanged || layoutChanged {
+            rebuildIndexCaches()
+        }
         if orderedItemIDs.count != previousOrderedCount {
             resetPaginationGate()
         }
 
         let toReconfigure = changedReconfigureIDs(
             previousItems: previousItems,
+            sectionsChanged: sectionsChanged,
             layoutChanged: layoutChanged,
             presentationChanged: presentationChanged,
             badgeChanged: badgeChanged
@@ -215,16 +271,26 @@ final class HomeFeedCollectionViewController: UIKitBaseCollectionViewController 
 
     private func changedReconfigureIDs(
         previousItems: [HomeFeedItemIdentifier: HomeFeedItemData],
+        sectionsChanged: Bool,
         layoutChanged: Bool,
         presentationChanged: Bool,
         badgeChanged: Bool
     ) -> Set<HomeFeedItemIdentifier> {
         guard !layoutChanged else { return [] }
+        if presentationChanged {
+            return Set(orderedItemIDs)
+        }
+        if !sectionsChanged {
+            if badgeChanged, let first = orderedItemIDs.first {
+                return [first]
+            }
+            return []
+        }
         var toReconfigure = Set<HomeFeedItemIdentifier>()
         for id in orderedItemIDs {
             let changed = previousItems[id] != itemByID[id]
             let isHero = id == orderedItemIDs.first
-            if changed || presentationChanged || (badgeChanged && isHero) {
+            if changed || (badgeChanged && isHero) {
                 toReconfigure.insert(id)
             }
         }

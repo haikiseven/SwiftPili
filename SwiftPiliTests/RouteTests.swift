@@ -252,10 +252,14 @@ struct BiliLinkParsingTests {
 
     @Test("ArticleContentParser preserves anchor links and UIKitDynamicRichTextBuilder strips CJK punctuation")
     func richTextAndArticleLinkExtraction() {
-        let html = #"<div id="read-article-holder"><p>See <a href="https://www.bilibili.com/video/BV1xx411c7mD">this video</a> now.</p></div>"#
-        let blocks = ArticleContentParser.parse(pageHTML: html)
-        #expect(blocks.count == 1)
-        if case .paragraph(let attributed) = blocks.first {
+        let html = #"<div id="read-article-holder"><p>See <a href="https://www.bilibili.com/video/BV1xx411c7mD">this video</a> now.</p><figure><img src="https://i0.hdslb.com/bfs/article/sample.jpg"></figure></div>"#
+        let parsed = ArticleContentParser.parseIndexed(pageHTML: html)
+        #expect(parsed.blocks.count == 2)
+        #expect(parsed.indexedBlocks.count == 2)
+        #expect(parsed.imageURLs == [URL(string: "https://i0.hdslb.com/bfs/article/sample.jpg")!])
+        #expect(parsed.indexedBlocks.first?.imageIndex == nil)
+        #expect(parsed.indexedBlocks.last?.imageIndex == 0)
+        if case .paragraph(let attributed) = parsed.blocks.first {
             #expect(String(attributed.characters) == "See this video now.")
             let links = attributed.runs.compactMap { $0.link }
             #expect(links == [URL(string: "https://www.bilibili.com/video/BV1xx411c7mD")!])

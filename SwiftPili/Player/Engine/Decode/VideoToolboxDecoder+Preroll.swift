@@ -78,8 +78,21 @@ extension VideoToolboxDecoder {
         events: [VideoToolboxTimingOutputEvent],
         truncated: Bool
     ) {
+        let submissionFault = Self.classification(for: submissionStatus) != nil
+        var hasEventAnomaly = false
+        for event in events {
+            let status = OSStatus(event.status)
+            if event.status == VideoDecodeAnomalyCounters.referenceMissingStatus
+                || Self.classification(for: status) != nil
+                || (event.infoFlags & VideoDecodeAnomalyCounters.frameDroppedInfoFlag) != 0
+                || (event.status == 0 && !event.imagePresent && !truncated) {
+                hasEventAnomaly = true
+                break
+            }
+        }
+        guard submissionFault || hasEventAnomaly else { return }
         anomalyLock.withLock {
-            if Self.classification(for: submissionStatus) != nil {
+            if submissionFault {
                 anomalyValue.noteSubmissionFault()
             }
             for event in events {

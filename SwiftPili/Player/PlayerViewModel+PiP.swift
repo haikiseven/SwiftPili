@@ -146,6 +146,9 @@ extension PlayerViewModel {
               sample.sessionGeneration == backend.demandPresentationSessionGeneration else {
             return
         }
+        if sample.rendererReady {
+            markFirstVideoFrameRendered()
+        }
         if recoveryCover != nil {
             _ = consumeRecoveryCoverPresentationSample(sample)
         } else if freezeFrameAwaitingFreshProof,

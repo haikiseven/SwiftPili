@@ -30,7 +30,6 @@ struct VideoDetailView: View {
     @AppMotion private var motion
     let target: VideoRouteTarget
     @State private var screenOwner: String
-    @State private var activationCoordinator = VideoDetailActivationCoordinator()
     @State private var viewModel = VideoDetailViewModel()
     private enum DetailSheet: Identifiable {
         enum ID: Hashable {
@@ -163,7 +162,7 @@ struct VideoDetailView: View {
         PlayerDetailSurfacePolicy.hostOwnsInlineSurface(player: player, lease: viewModel.playerLease)
     }
     private var hasUsableInlinePlayerChrome: Bool {
-        guard isRouteActivated, viewModel.error == nil, viewModel.unavailability == nil,
+        guard isActiveVideoRoute, viewModel.error == nil, viewModel.unavailability == nil,
               player.error == nil, player.unavailability == nil,
               player.videoPresentationFailureMessage == nil, player.currentURL != nil,
               let lease = viewModel.playerLease else { return false }
@@ -189,7 +188,7 @@ struct VideoDetailView: View {
     @State private var presentationScreenID = UUID()
     private var player: PlayerViewModel { PlayerViewModel.shared }
     private var presentationContext: PlayerScreenPresentationContext? {
-        guard isRouteActivated else { return nil }
+        guard isActiveVideoRoute else { return nil }
         let source: PlayerPresentationSource? = if let aid = viewModel.videoInfo?.aid,
             let cid = viewModel.currentCid {
             .vod(aid: aid, cid: cid, source: .ugc)
@@ -206,10 +205,6 @@ struct VideoDetailView: View {
 
     private var isActiveVideoRoute: Bool {
         coordinator.isActivePlayerRoute(.video(videoID), position: routePosition)
-    }
-
-    private var isRouteActivated: Bool {
-        activationCoordinator.admits(routeIsActive: isActiveVideoRoute)
     }
 
     private var placeholderCoverURL: String? {
@@ -247,7 +242,6 @@ struct VideoDetailView: View {
     }
 
     var body: some View {
-        let _ = UIHitchMonitor.countBody("detail")
         let inlineCornerRadius = showsWideChrome ? DetailStageLayout.playerCornerRadius : 0
         ZStack(alignment: .bottom) {
             PlayerDetailGeometryProbes(
@@ -255,7 +249,6 @@ struct VideoDetailView: View {
                 restingHeight: containerMetrics.restingHeight,
                 isFullscreenPresentationActive: player.isFullscreenPresentationActive,
                 onSizeChange: { size in
-                    UIHitchMonitor.count("geom")
                     containerMetrics.update(size: size, isRegularWidth: sizeClass == .regular)
                 },
                 onKeyboardDockedChange: { docked in
@@ -271,7 +264,7 @@ struct VideoDetailView: View {
                 }
 
                 VStack(spacing: 0) {
-                    if isRouteActivated {
+                    if isActiveVideoRoute {
                         if hostOwnsInlineSurface {
                             RoundedRectangle(cornerRadius: inlineCornerRadius, style: .continuous)
                                 .fill(Color.black)
@@ -290,7 +283,9 @@ struct VideoDetailView: View {
                                     height: playerVideoHeight
                                 ),
                                 inlineCornerRadius: inlineCornerRadius,
-                                screenLease: viewModel.playerLease
+                                screenLease: viewModel.playerLease,
+                                placeholderCoverURL: placeholderCoverURL,
+                                showsLoadingIndicator: viewModel.error == nil && viewModel.unavailability == nil
                             )
                         }
                     } else {
@@ -312,7 +307,6 @@ struct VideoDetailView: View {
                     PlayerDetailInlineNavigationOverlay(
                         player: player,
                         isActiveRoute: isActiveVideoRoute,
-                        isRouteActivated: isRouteActivated,
                         hasInlineExitChrome: { hasUsableInlinePlayerChrome },
                         cornerRadius: inlineCornerRadius,
                         actions: playerPageNavigation
@@ -352,29 +346,30 @@ struct VideoDetailView: View {
             preventsContentDismissal: isActiveVideoRoute,
             presentationContext: presentationContext,
             coordinator: coordinator,
-            watchdogScreen: "VideoDetail",
-            onRouteAppearance: { event in
-                activationCoordinator.handleAppearance(event, owner: screenOwner)
-            }
+            watchdogScreen: "VideoDetail"
         ) {
             CinematicBackdrop(
                 coverURL: placeholderCoverURL,
                 player: player,
                 ownerLease: viewModel.playerLease,
-                isRouteActive: isRouteActivated && isActiveVideoRoute
+                isRouteActive: isActiveVideoRoute
             )
         }
-        .onChange(of: isActiveVideoRoute, initial: true) { _, active in
-            if !active {
+        .onChange(of: isActiveVideoRoute, initial: true) { oldActive, active in
+            if active {
+                _ = claimPlayerLeaseIfNeeded()
+            } else {
                 cancelSharePreparation()
                 downloadRequestSerial &+= 1
+                if oldActive {
+                    viewModel.revokeLoadForRouteDeparture()
+                    player.pauseForRouteDeparture(lease: viewModel.playerLease)
+                }
+                coordinator.cancelVideoNavigation(videoID)
             }
-            activationCoordinator.handleRouteActivity(
-                active, owner: screenOwner, route: activationRouteRead, ports: activationPorts
-            )
         }
         .tint(Color.primary)
-        .task(id: isRouteActivated) { await activateIfNeeded() }
+        .task(id: isActiveVideoRoute) { await activateIfNeeded(settlesNavigationAdmission: true) }
         .onChange(of: coordinator.pendingCommentNavigation?.sequence) { _, _ in
             Task { await handlePendingCommentNavigationIfNeeded() }
         }
@@ -823,7 +818,7 @@ struct VideoDetailView: View {
     }
 
     private func prepareShareCard(_ info: VideoInfo) {
-        guard shareState.requestID == nil, !shareState.isPresenting, isRouteActivated else { return }
+        guard shareState.requestID == nil, !shareState.isPresenting, isActiveVideoRoute else { return }
         let id = UUID()
         let model = viewModel
         let request = ShareCardRenderer.Request(
@@ -842,7 +837,7 @@ struct VideoDetailView: View {
             }
             guard let image = try? await ShareCardRenderer.prepare(request),
                   !Task.isCancelled, shareState.requestID == id,
-                  isRouteActivated, viewModel === model, model.videoInfo?.bvid == info.bvid else { return }
+                  isActiveVideoRoute, viewModel === model, model.videoInfo?.bvid == info.bvid else { return }
             shareState.image = image
             shareState.isPresenting = true
             ActivitySharePresenter.present(items: shareItems(for: info)) { completed in
@@ -994,22 +989,35 @@ struct VideoDetailView: View {
         }
     }
 
-    private var activationRouteRead: VideoDetailActivationCoordinator.RouteRead {
-        .init(isActive: { isActiveVideoRoute }, currentVideoID: { videoID })
+    private func claimPlayerLeaseIfNeeded() -> PlayerOwnerLease? {
+        guard isActiveVideoRoute else { return nil }
+        if let existing = viewModel.playerLease, player.isCurrentOwner(existing) {
+            return existing
+        }
+        player.endForeignOwnerForRouteActivation(incomingOwner: screenOwner)
+        let lease = player.claimOwnerLease(owner: screenOwner)
+        viewModel.adoptPlayerLease(lease)
+        return lease
     }
 
-    private var activationPorts: VideoDetailActivationCoordinator.Ports {
-        .init(model: viewModel, player: player, navigation: coordinator)
-    }
-
-    private func activateIfNeeded() async {
-        guard activationCoordinator.beginRoute(
-            owner: screenOwner, route: activationRouteRead, ports: activationPorts
-        ) else { return }
-        await activationCoordinator.activate(
-            owner: screenOwner, route: activationRouteRead, ports: activationPorts,
-            settlesNavigationAdmission: true
-        )
+    private func activateIfNeeded(settlesNavigationAdmission: Bool) async {
+        let targetID = videoID
+        defer {
+            if settlesNavigationAdmission {
+                if isActiveVideoRoute {
+                    coordinator.settleVideoNavigation(targetID)
+                } else {
+                    coordinator.cancelVideoNavigation(targetID)
+                }
+            }
+        }
+        guard isActiveVideoRoute, let lease = claimPlayerLeaseIfNeeded() else {
+            if !isActiveVideoRoute {
+                PlayerLog.log("[Navigation] historical VOD route activation ignored")
+            }
+            return
+        }
+        _ = await viewModel.load(id: targetID, owner: screenOwner, lease: lease)
         await handlePendingCommentNavigationIfNeeded()
     }
 
@@ -1112,9 +1120,7 @@ struct VideoDetailView: View {
             if viewModel.unavailability?.isRetryable ?? true {
                 Button("Retry") {
                     Task {
-                        await activationCoordinator.activate(
-                            owner: screenOwner, route: activationRouteRead, ports: activationPorts
-                        )
+                        await activateIfNeeded(settlesNavigationAdmission: false)
                     }
                 }
                 .buttonStyle(.borderedProminent)

@@ -15,21 +15,10 @@ struct CoverImage: View {
     var fillsOfferedBox: Bool = false
     var onLoadedImage: ((UIImage) -> Void)?
 
-    private struct Measurement: Equatable {
-        var box: CGSize = .zero
-        var url: String = ""
-    }
+    @State private var measuredBox: CGSize = .zero
 
-    @State private var measurement = Measurement()
-
-    private var measuredBox: CGSize { measurement.url == urlString ? measurement.box : .zero }
-
-    @Environment(\.imageDiagnosticsScreen) private var diagnosticsScreen
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.displayScale) private var displayScale
-
-    private let componentFile: String
-    private let componentLine: Int
 
     init(
         urlString: String,
@@ -59,37 +48,17 @@ struct CoverImage: View {
         self.sourceRelation = sourceRelation
         self.fillsOfferedBox = fillsOfferedBox
         self.onLoadedImage = onLoadedImage
-        componentFile = file
-        componentLine = line
-    }
-
-    private var site: ImageSite {
-        guard ImageDiagnostics.isRecordingImageEvents || PlayerLog.isCapturing else {
-            return ImageSite(screen: "", component: "")
-        }
-        return ImageSite(
-            screen: diagnosticsScreen,
-            component: "\((componentFile as NSString).lastPathComponent):\(componentLine)"
-        )
+        _ = (file, line)
     }
 
     var body: some View {
-        UIHitchMonitor.count("img.body")
-        ImageDiagnostics.noteBody()
         let drawn = displayBox
         let box = requestBox(drawnBox: drawn)
-        return inOfferedBox(image(box: box, drawn: drawn)
-            .onAppear {
-                UIHitchMonitor.count("img.appear")
-                ImageDiagnostics.noteAppear(url: urlString, rendered: box, at: site)
-            }
-            .onDisappear {
-                UIHitchMonitor.count("img.gone")
-                ImageDiagnostics.noteDisappear(url: urlString, at: site)
-            }
-            .background(groundColor)
+        inOfferedBox(
+            image(box: box, drawn: drawn)
+                .background(groundColor)
         )
-            .frame(width: fixedSide(drawn.width), height: fixedSide(drawn.height))
+        .frame(width: fixedSide(drawn.width), height: fixedSide(drawn.height))
     }
 
     private var displayBox: CGSize {
@@ -130,60 +99,6 @@ struct CoverImage: View {
         )
     }
 
-    private func requestBoxDriftNote(drawn: CGSize, requested: CGSize) -> String {
-        guard contentMode == .fill, drawn.width > 0, drawn.height > 0,
-              requested.width > 0, requested.height > 0
-        else { return "" }
-        let intended = cropsOnServer(drawnBox: drawn)
-            ? drawn
-            : headroomBox(drawn, drawnBox: drawn)
-        guard intended.width > 0, intended.height > 0 else { return "" }
-        let intendedRatio = intended.height / intended.width
-        let requestedRatio = requested.height / requested.width
-        let drift = abs(requestedRatio - intendedRatio) / intendedRatio
-        guard drift > 0.01 else { return "" }
-        return String(format: " ⚠️ REQUEST-BOX-DRIFT %.0f%%", drift * 100)
-    }
-
-    private func claimVersusBitmapNote(
-        agreement: CoverFrameAgreement,
-        bitmap: CGSize,
-        frame: CGSize
-    ) -> String {
-        guard sourceRelation == .authored, agreement == .mismatch,
-              bitmap.height > 0, frame.height > 0
-        else { return "" }
-        return String(
-            format: " ⚠️ AUTHORED-CLAIM-UNMET bitmap %.2f vs frame %.2f",
-            bitmap.width / bitmap.height,
-            frame.width / frame.height
-        )
-    }
-
-    private func fillCropNote(bitmap: CGSize, frame: CGSize) -> String {
-        guard contentMode == .fill, bitmap.width > 0, bitmap.height > 0,
-              frame.width > 0, frame.height > 0
-        else { return "" }
-        let bitmapRatio = bitmap.width / bitmap.height
-        let frameRatio = frame.width / frame.height
-        let (axis, kept) = bitmapRatio > frameRatio
-            ? ("w", frameRatio / bitmapRatio)
-            : ("h", bitmapRatio / frameRatio)
-        guard kept < 0.99 else { return "" }
-        return String(format: " crop=%@%.0f%%", axis, kept * 100)
-    }
-
-    private func contentScaleNote(bitmapPoints: CGSize, frame: CGSize) -> String {
-        guard bitmapPoints.width > 0, bitmapPoints.height > 0,
-              frame.width > 0, frame.height > 0
-        else { return "" }
-        let byWidth = frame.width / bitmapPoints.width
-        let byHeight = frame.height / bitmapPoints.height
-        let scale = contentMode == .fill ? max(byWidth, byHeight) : min(byWidth, byHeight)
-        return String(format: " scale=x%.2f", scale)
-            + (scale > 1.01 ? " ⚠️ CONTENT-UPSCALE" : "")
-    }
-
     @ViewBuilder
     private func image(box: CGSize, drawn: CGSize) -> some View {
         if box.width > 1, box.height > 1 {
@@ -200,140 +115,23 @@ struct CoverImage: View {
                 reduceMotion: reduceMotion,
                 isDecorative: isDecorative,
                 chromeSide: chromeSide,
-                site: site,
-                onSuccess: { result in
-                    let source: ImageDiagnosticsSource
-                    switch result.cacheType {
-                    case .memory:
-                        UIHitchMonitor.count("img.hit.mem")
-                        source = .memory
-                    case .disk:
-                        UIHitchMonitor.count("img.hit.disk")
-                        source = .disk
-                    case .none:
-                        UIHitchMonitor.count("img.miss")
-                        source = .network
-                    }
-                    let image = result.image
-                    onLoadedImage?(image)
-                    let px = CGSize(
-                        width: image.size.width * image.scale,
-                        height: image.size.height * image.scale
-                    )
-                    if PlayerLog.isCapturing, ImagePipelinePolicy.emitsImageDiagnostics {
-                        let ratio = { (s: CGSize) in
-                            s.width > 0 ? String(format: "%.2f", s.height / s.width) : "-"
-                        }
-                        let shown = drawn
-                        let agreement = CoverFrameAgreement.measured(
-                            bitmap: px, frame: shown, serverCropped: serverCrops
-                        )
-                        PlayerLog.log(
-                            "[cover] \(site.component) display=\(Int(shown.width))x\(Int(shown.height))"
-                            + "(\(ratio(shown))) request=\(Int(box.width))x\(Int(box.height))"
-                            + "(\(ratio(box))) returned=\(Int(px.width))x\(Int(px.height))"
-                            + "(\(ratio(px))) mode=\(contentMode == .fill ? "fill" : "fit")"
-                            + " serverCrop=\(serverCrops ? "1c" : "none")"
-                            + " src=\(source)"
-                            + (sourceRelation.map { " rel=\($0.rawValue)" } ?? "")
-                            + " measured=\(agreement.rawValue)"
-                            + (isDecorative ? " role=decorative" : "")
-                            + requestBoxDriftNote(drawn: shown, requested: box)
-                            + fillCropNote(bitmap: px, frame: shown)
-                            + contentScaleNote(bitmapPoints: image.size, frame: shown)
-                            + claimVersusBitmapNote(agreement: agreement, bitmap: px, frame: shown)
-                        )
-                    }
-                    ImageDiagnostics.noteCompletion(
-                        url: urlString,
-                        source: source,
-                        pixels: px,
-                        rendered: box,
-                        at: site
-                    )
-                },
-                onFailure: { _ in
-                    UIHitchMonitor.count("img.fail")
-                    ImageDiagnostics.noteFailure(url: urlString, rendered: box, at: site)
-                }
+                onLoadedImage: onLoadedImage
             )
             .equatable()
 
             if contentMode == .fill {
-                geometryProbed(
-                    geometryProbed(
-                        kf.scaledToFill(),
-                        layer: "art",
-                        drawn: drawn
-                    )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: fillAlignment),
-                    layer: "clip",
-                    drawn: drawn
-                )
-                .clipped()
+                kf.scaledToFill()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: fillAlignment)
+                    .clipped()
             } else {
-                geometryProbed(
-                    geometryProbed(
-                        kf.scaledToFit(),
-                        layer: "art",
-                        drawn: drawn
-                    )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity),
-                    layer: "clip",
-                    drawn: drawn
-                )
+                kf.scaledToFit()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+        } else if isDecorative {
+            Color.clear
         } else {
-            if isDecorative {
-                Color.clear
-            } else {
-                LoadingCover(shape: .rect, ground: .clear, showsIndicator: false)
-            }
+            LoadingCover(shape: .rect, ground: .clear, showsIndicator: false)
         }
-    }
-
-    @ViewBuilder
-    private func geometryProbed<V: View>(_ view: V, layer: String, drawn: CGSize) -> some View {
-        if ImagePipelinePolicy.installsCoverGeometryProbes {
-            view.background {
-                GeometryReader { geo in
-                    Color.clear
-                        .onAppear { noteGeometry(layer: layer, laidOut: geo.size, drawn: drawn) }
-                        .onChange(of: geo.size) { _, size in
-                            noteGeometry(layer: layer, laidOut: size, drawn: drawn)
-                        }
-                }
-            }
-        } else {
-            view
-        }
-    }
-
-    private func noteGeometry(layer: String, laidOut: CGSize, drawn: CGSize) {
-        guard PlayerLog.isCapturing, laidOut.width > 1, laidOut.height > 1 else { return }
-        var verdict = ""
-        if layer == "clip" {
-            if drawn.width > 1, drawn.height > 1,
-               laidOut.width > drawn.width + 1 || laidOut.height > drawn.height + 1 {
-                verdict = " ⚠️ CLIP-EXCEEDS-FRAME"
-            }
-        } else if drawn.width > 1, drawn.height > 1 {
-            let overWidth = laidOut.width > drawn.width + 1
-            let overHeight = laidOut.height > drawn.height + 1
-            if contentMode == .fit, overWidth || overHeight {
-                verdict = " ⚠️ FIT-OVERFLOWS-FRAME"
-            } else if contentMode == .fill, overWidth, overHeight {
-                verdict = " ⚠️ FILL-OVERFLOWS-BOTH-AXES"
-            }
-        }
-        PlayerLog.log(
-            "[cover-geo] \(site.component) layer=\(layer)"
-            + " laidOut=\(Int(laidOut.width))x\(Int(laidOut.height))"
-            + " drawn=\(Int(drawn.width))x\(Int(drawn.height))"
-            + " mode=\(contentMode == .fill ? "fill" : "fit")"
-            + (isDecorative ? " role=decorative" : "")
-            + verdict
-        )
     }
 
     @ViewBuilder
@@ -350,16 +148,17 @@ struct CoverImage: View {
     private var sizeProbe: some View {
         GeometryReader { geo in
             Color.clear
-                .onAppear { if geo.size != measuredBox { noteMeasured(geo.size) } }
-                .onChange(of: geo.size) { _, s in if s != measuredBox { noteMeasured(s) } }
+                .onAppear { updateMeasured(geo.size) }
+                .onChange(of: geo.size) { _, size in updateMeasured(size) }
         }
-        .id(urlString)
     }
 
-    private func noteMeasured(_ size: CGSize) {
-        UIHitchMonitor.count("img.probe")
-        ImageDiagnostics.noteProbe(url: urlString, rendered: size, at: site)
-        measurement = Measurement(box: size, url: urlString)
+    private func updateMeasured(_ size: CGSize) {
+        guard size.width.isFinite, size.height.isFinite, size.width > 1, size.height > 1 else { return }
+        guard abs(size.width - measuredBox.width) > 0.5 || abs(size.height - measuredBox.height) > 0.5 else {
+            return
+        }
+        measuredBox = size
     }
 
     private func fixedSide(_ side: CGFloat) -> CGFloat? {
@@ -368,16 +167,14 @@ struct CoverImage: View {
 }
 
 private struct RequestedCoverImage: View, Equatable {
-    let sourceURL: String
     let requestedURL: String
     let requestBox: CGSize
     let scale: CGFloat
     let reduceMotion: Bool
     let isDecorative: Bool
     let chromeSide: CGFloat
-    let site: ImageSite
-    let onSuccess: (RetrieveImageResult) -> Void
-    let onFailure: (KingfisherError) -> Void
+    let hasLoadedCallback: Bool
+    let onLoadedImage: ((UIImage) -> Void)?
 
     init(
         sourceURL: String,
@@ -387,19 +184,15 @@ private struct RequestedCoverImage: View, Equatable {
         reduceMotion: Bool,
         isDecorative: Bool,
         chromeSide: CGFloat,
-        site: ImageSite,
-        onSuccess: @escaping (RetrieveImageResult) -> Void,
-        onFailure: @escaping (KingfisherError) -> Void
+        onLoadedImage: ((UIImage) -> Void)?
     ) {
-        self.sourceURL = sourceURL
         self.requestBox = requestBox
         self.scale = scale
         self.reduceMotion = reduceMotion
         self.isDecorative = isDecorative
         self.chromeSide = chromeSide
-        self.site = site
-        self.onSuccess = onSuccess
-        self.onFailure = onFailure
+        self.hasLoadedCallback = onLoadedImage != nil
+        self.onLoadedImage = onLoadedImage
         requestedURL = sourceURL.biliResized(
             toPixel: CGSize(width: requestBox.width * scale, height: requestBox.height * scale),
             crop: serverCrops
@@ -413,23 +206,20 @@ private struct RequestedCoverImage: View, Equatable {
             && lhs.reduceMotion == rhs.reduceMotion
             && lhs.isDecorative == rhs.isDecorative
             && lhs.chromeSide == rhs.chromeSide
+            && lhs.hasLoadedCallback == rhs.hasLoadedCallback
     }
 
     var body: some View {
-        let processor = DownsamplingImageProcessor(size: requestBox)
-        let kf = ImageDiagnostics.measuringSetup(url: sourceURL, rendered: requestBox, at: site) {
-            UIHitchMonitor.measure("img.kf") {
-                KFImage(URL(string: requestedURL))
-                    .setProcessor(processor)
-                    .scaleFactor(scale)
-                    .cancelOnDisappear(true)
-                    .onSuccess(onSuccess)
-                    .onFailure(onFailure)
-                    .imageFadePolicy(reduceMotion: reduceMotion)
-                    .resizable()
-            }
+        var kf = KFImage(URL(string: requestedURL))
+            .setProcessor(DownsamplingImageProcessor(size: requestBox))
+            .backgroundDecode()
+            .scaleFactor(scale)
+            .cancelOnDisappear(true)
+            .imageFadePolicy(reduceMotion: reduceMotion)
+        if let onLoadedImage {
+            kf = kf.onSuccess { onLoadedImage($0.image) }
         }
-        covered(kf, shorterSide: chromeSide)
+        return covered(kf.resizable(), shorterSide: chromeSide)
     }
 
     @ViewBuilder

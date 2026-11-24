@@ -165,7 +165,9 @@ final class DanmakuMaskRenderer {
         let begin = max(segment.start, earliestBeginTime)
         let duration = segment.end - begin
         guard duration > 0, !segment.frames.isEmpty else { return nil }
-        var keyTimes: [Double] = [0]
+        var keyTimes: [Double] = []
+        keyTimes.reserveCapacity(segment.frames.count + 1)
+        keyTimes.append(0)
         var previous = 0.0
         for frame in segment.frames.dropFirst() {
             let fraction = min(1, max(previous, (frame.time - begin) / duration))

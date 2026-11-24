@@ -89,12 +89,6 @@ extension RootView {
             root()
                 .keepsInteractivePopGesture()
                 .toolbar(path.wrappedValue.isEmpty ? .visible : .automatic, for: .tabBar)
-                .background {
-                    RootTabBarDiagnostics(tab: tab, coordinator: coordinator)
-                        .frame(width: 0, height: 0)
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
-                }
                 .imageDiagnosticsScreen(screen)
                 .imageDiagnosticsScrollTracking()
                 .navigationDestination(for: Route.self) { route in

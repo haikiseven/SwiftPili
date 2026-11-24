@@ -31,14 +31,38 @@ struct EmoteTextFont: Equatable {
 
     static let inlineAttachment: Font = Font(UIFont.systemFont(ofSize: 0.1))
 
+    private struct FontCacheKey: Hashable, Sendable {
+        let size: CGFloat
+        let weightRaw: CGFloat
+        let textStyleRaw: String
+        let categoryRaw: String
+    }
+
+    private static let scaledFontCache = OSAllocatedUnfairLock(
+        uncheckedState: [FontCacheKey: UIFont]()
+    )
+
     var uiFont: UIFont {
         scaledFont(compatibleWith: nil)
     }
 
     func uiFont(for dynamicTypeSize: DynamicTypeSize) -> UIFont {
-        scaledFont(compatibleWith: UITraitCollection(
-            preferredContentSizeCategory: dynamicTypeSize.uiContentSizeCategory
-        ))
+        let category = dynamicTypeSize.uiContentSizeCategory
+        let key = FontCacheKey(
+            size: size,
+            weightRaw: weight.rawValue,
+            textStyleRaw: textStyle.rawValue,
+            categoryRaw: category.rawValue
+        )
+        if let cached = Self.scaledFontCache.withLockUnchecked({ $0[key] }) {
+            return cached
+        }
+        let font = scaledFont(compatibleWith: UITraitCollection(preferredContentSizeCategory: category))
+        Self.scaledFontCache.withLockUnchecked { cache in
+            if cache.count >= 128 { cache.removeAll(keepingCapacity: true) }
+            cache[key] = font
+        }
+        return font
     }
 
     private func scaledFont(compatibleWith traits: UITraitCollection?) -> UIFont {
@@ -105,19 +129,31 @@ actor EmoteImageLoader {
 
     private static let maxEntries = 256
 
+    private struct CacheKey: Hashable, Sendable {
+        let url: String
+        let heightTenths: Int
+        let baselineHundredths: Int
+
+        init(_ urlString: String, height: CGFloat, baselineFromBottom: CGFloat) {
+            url = urlString
+            heightTenths = Int((height * 10).rounded())
+            baselineHundredths = Int((baselineFromBottom * 100).rounded())
+        }
+    }
+
     private struct ResidentState: Sendable {
-        var map: [String: UIImage] = [:]
-        var accessGen: [String: UInt64] = [:]
+        var map: [CacheKey: UIImage] = [:]
+        var accessGen: [CacheKey: UInt64] = [:]
         var nextGen: UInt64 = 0
 
-        mutating func get(_ key: String) -> UIImage? {
+        mutating func get(_ key: CacheKey) -> UIImage? {
             guard let image = map[key] else { return nil }
             nextGen &+= 1
             accessGen[key] = nextGen
             return image
         }
 
-        mutating func store(_ key: String, image: UIImage, maxEntries: Int) {
+        mutating func store(_ key: CacheKey, image: UIImage, maxEntries: Int) {
             map[key] = image
             nextGen &+= 1
             accessGen[key] = nextGen
@@ -130,12 +166,12 @@ actor EmoteImageLoader {
     }
 
     private let resident = OSAllocatedUnfairLock(initialState: ResidentState())
-    private var inflight: [String: Task<UIImage?, Never>] = [:]
+    private var inflight: [CacheKey: Task<UIImage?, Never>] = [:]
 
     func image(
         for urlString: String, height: CGFloat, baselineFromBottom: CGFloat = 0, scale: CGFloat = 3.0
     ) async -> UIImage? {
-        let key = Self.key(urlString, height: height, baselineFromBottom: baselineFromBottom)
+        let key = CacheKey(urlString, height: height, baselineFromBottom: baselineFromBottom)
         if let hit = resident.withLock({ $0.get(key) }) { return hit }
         if let task = inflight[key] { return await task.value }
 
@@ -154,14 +190,8 @@ actor EmoteImageLoader {
     nonisolated func residentImage(
         for urlString: String, height: CGFloat, baselineFromBottom: CGFloat = 0
     ) -> UIImage? {
-        let key = Self.key(urlString, height: height, baselineFromBottom: baselineFromBottom)
+        let key = CacheKey(urlString, height: height, baselineFromBottom: baselineFromBottom)
         return resident.withLock { $0.get(key) }
-    }
-
-    private nonisolated static func key(
-        _ urlString: String, height: CGFloat, baselineFromBottom: CGFloat
-    ) -> String {
-        "\(urlString)@\(String(format: "%.1f", height))@\(String(format: "%.2f", baselineFromBottom))"
     }
 
     private nonisolated static func loadAndDecode(
@@ -275,17 +305,10 @@ private struct EmoteTextContentIdentity: Equatable {
     }
 
     private static func literallyEqual(_ lhs: String, _ rhs: String) -> Bool {
-        var lhs = lhs
-        var rhs = rhs
-        return lhs.withUTF8 { left in
-            rhs.withUTF8 { right in
-                left.count == right.count && (
-                    left.baseAddress.flatMap { leftBase in
-                        right.baseAddress.map { memcmp(leftBase, $0, left.count) == 0 }
-                    } ?? true
-                )
-            }
-        }
+        let left = lhs.utf8
+        let right = rhs.utf8
+        guard left.count == right.count else { return false }
+        return left.elementsEqual(right)
     }
 
     private static func literallyEqual<Value>(
@@ -691,7 +714,6 @@ struct EmoteText: View {
     private var resolvedFont: UIFont { font.uiFont(for: dynamicTypeSize) }
 
     var body: some View {
-        let _ = UIHitchMonitor.countBody("emote")
         let metrics = resolvedFont
         let inputs = RenderInputs(
             content: preparedContent,
@@ -771,6 +793,7 @@ struct EmoteText: View {
     private static func referencedEmotes(
         in message: String, emotes: [String: String]
     ) -> [(token: String, url: String)] {
+        guard !emotes.isEmpty, message.utf8.contains(0x5B) else { return [] }
         var matches: [(token: String, url: String)] = []
         var seen: Set<String> = []
         var remaining = Substring(message)
@@ -879,8 +902,20 @@ struct EmoteText: View {
         initialState: [String: [String: URL]]()
     )
 
+    nonisolated private static func hasDigitColonDigit(_ text: String) -> Bool {
+        var prevIsDigit = false
+        var sawDigitColon = false
+        for byte in text.utf8 {
+            let isDigit = byte >= 0x30 && byte <= 0x39
+            if sawDigitColon, isDigit { return true }
+            sawDigitColon = prevIsDigit && byte == 0x3A // ':'
+            prevIsDigit = isDigit
+        }
+        return false
+    }
+
     nonisolated static func timestampLinks(in text: String) -> [String: URL] {
-        guard text.contains(":") || text.contains("：") else { return [:] }
+        guard hasDigitColonDigit(text) else { return [:] }
         if let cached = timestampCache.withLock({ $0[text] }) { return cached }
         guard let regex = timestampRegex else { return [:] }
         var found: [String: URL] = [:]
@@ -914,6 +949,28 @@ struct EmoteText: View {
     nonisolated static func linkRuns(_ text: String, links: [String: URL]) -> [LinkRun] {
         guard !text.isEmpty else { return [] }
         guard !links.isEmpty else { return [LinkRun(text: text, url: nil)] }
+
+        if links.count == 1, let (key, url) = links.first, !key.isEmpty {
+            if text == key {
+                return [LinkRun(text: text, url: url)]
+            }
+            var runs: [LinkRun] = []
+            var searchStart = text.startIndex
+            while let range = text.range(of: key, options: .literal, range: searchStart ..< text.endIndex) {
+                if searchStart < range.lowerBound {
+                    runs.append(LinkRun(text: String(text[searchStart ..< range.lowerBound]), url: nil))
+                }
+                runs.append(LinkRun(text: key, url: url))
+                searchStart = range.upperBound
+            }
+            if runs.isEmpty {
+                return [LinkRun(text: text, url: nil)]
+            }
+            if searchStart < text.endIndex {
+                runs.append(LinkRun(text: String(text[searchStart...]), url: nil))
+            }
+            return runs
+        }
 
         var buckets: [Character: [(key: String, url: URL)]] = [:]
         for (key, url) in links {
@@ -958,7 +1015,13 @@ struct EmoteText: View {
         cache: EmoteLinkRunCache = .shared
     ) -> Text {
         guard !links.isEmpty, !text.isEmpty else { return Text(verbatim: text) }
-        let runs = UIHitchMonitor.measure("linkify") { cache.runs(text, links: links) }
+        if links.count == 1, let url = links[text] {
+            var attributed = AttributedString(text)
+            attributed.link = url
+            attributed.foregroundColor = accent
+            return Text(attributed)
+        }
+        let runs = cache.runs(text, links: links)
         guard runs.contains(where: { $0.url != nil }) else { return Text(verbatim: text) }
         var result = Text(verbatim: "")
         for run in runs {

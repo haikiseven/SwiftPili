@@ -114,7 +114,10 @@ struct PathAMdatStreamAssembler: Sendable {
                     partial = Data()
                     return []
                 }
-                partial.append(chunk.subdata(in: position..<nextPosition.partialValue))
+                if partial.isEmpty {
+                    partial.reserveCapacity(spanLengthResult.partialValue)
+                }
+                partial.append(chunk[position..<nextPosition.partialValue])
                 if take == needed {
                     emitted.append(Emitted(
                         sampleIndex: span.index, data: partial

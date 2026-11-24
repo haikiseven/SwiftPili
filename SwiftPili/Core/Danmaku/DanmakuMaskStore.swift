@@ -65,6 +65,7 @@ final class DanmakuMaskStore {
             return
         }
         let current = index.segment(containing: mediaTime) ?? 0
+        if windowIsQuiet(current: current, segmentCount: index.count, now: now) { return }
         let plan = DanmakuMaskWindow.plan(
             current: current,
             segmentCount: index.count,
@@ -103,6 +104,26 @@ final class DanmakuMaskStore {
 
     private func isEligible(_ key: Int, at now: TimeInterval) -> Bool {
         failures[key].map { $0.isEligible(at: now) } ?? true
+    }
+
+    private func windowIsQuiet(current: Int, segmentCount: Int, now: TimeInterval) -> Bool {
+        let count = max(0, segmentCount)
+        func isSettled(_ key: Int) -> Bool {
+            if segments[key] != nil || inFlight[key] != nil { return true }
+            if let failure = failures[key], !failure.isEligible(at: now) { return true }
+            return false
+        }
+        if current >= 0, current < count, !isSettled(current) { return false }
+        let next = current + 1
+        if next >= 0, next < count, !isSettled(next) { return false }
+        let prev = current - 1
+        for key in segments.keys {
+            if key < 0 || key >= count || key < prev || key > next { return false }
+        }
+        for key in inFlight.keys where key != Self.indexKey {
+            if key < 0 || key >= count || (key != current && key != next) { return false }
+        }
+        return true
     }
 
     private func start(

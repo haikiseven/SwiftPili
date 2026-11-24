@@ -1,3 +1,4 @@
+import os
 import SwiftUI
 import UIKit
 
@@ -45,6 +46,16 @@ enum UIKitFeedFont {
         )
     }
 
+    private struct FontKey: Hashable, Sendable {
+        let textStyleRaw: String
+        let nominalSize: CGFloat
+        let weightRaw: CGFloat
+        let monospacedDigit: Bool
+        let categoryRaw: String
+    }
+
+    private static let fontCache = OSAllocatedUnfairLock(uncheckedState: [FontKey: UIFont]())
+
     private static func scaledFont(
         textStyle: UIFont.TextStyle,
         nominalSize: CGFloat,
@@ -52,11 +63,26 @@ enum UIKitFeedFont {
         monospacedDigit: Bool,
         traitCollection: UITraitCollection
     ) -> UIFont {
+        let key = FontKey(
+            textStyleRaw: textStyle.rawValue,
+            nominalSize: nominalSize,
+            weightRaw: weight.rawValue,
+            monospacedDigit: monospacedDigit,
+            categoryRaw: traitCollection.preferredContentSizeCategory.rawValue
+        )
+        if let cached = fontCache.withLockUnchecked({ $0[key] }) {
+            return cached
+        }
         let base: UIFont = monospacedDigit
             ? .monospacedDigitSystemFont(ofSize: nominalSize, weight: weight)
             : .systemFont(ofSize: nominalSize, weight: weight)
-        return UIFontMetrics(forTextStyle: textStyle)
+        let scaled = UIFontMetrics(forTextStyle: textStyle)
             .scaledFont(for: base, compatibleWith: traitCollection)
+        fontCache.withLockUnchecked { cache in
+            if cache.count >= 256 { cache.removeAll(keepingCapacity: true) }
+            cache[key] = scaled
+        }
+        return scaled
     }
 }
 

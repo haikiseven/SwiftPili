@@ -32,6 +32,11 @@ enum BiliIMMessageParser {
     private static let cardLikeTypes: Set<Int> = [10, 16, 19]
     private static let bareURLRegex = try? NSRegularExpression(pattern: "(?:https?://|bilibili://)[^\\s<>\"'\\)\\]}]+")
     private static let truncatedJSONRegex = try? NSRegularExpression(pattern: "^(?:\\{\\s*\"|\\[\\s*\\{\\s*\")")
+    private static let truncatedFieldRegexes: [NSRegularExpression] = [
+        "title", "headline", "text", "content", "desc", "summary",
+    ].compactMap { key in
+        try? NSRegularExpression(pattern: "\"\(key)\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])+)\"")
+    }
 
     static func parse(msgType: Int?, rawContent: String?) -> ChatMessagePayload {
         if msgType == 5 { return .recalled }
@@ -293,24 +298,41 @@ extension BiliIMMessageParser {
 
     private static func extractConfigURL(_ raw: Any?) -> String? {
         guard let config = raw as? [String: Any] else { return nil }
-        let candidates = ["all_uri", "web_uri", "ios_uri", "uri", "url"]
-            .compactMap { stringValue(config[$0]).flatMap(normalizeURL) }
-        return candidates.first(where: isHTTPURL) ?? candidates.first
+        var fallback: String?
+        for key in ["all_uri", "web_uri", "ios_uri", "uri", "url"] {
+            guard let url = stringValue(config[key]).flatMap(normalizeURL) else { continue }
+            if isHTTPURL(url) { return url }
+            if fallback == nil { fallback = url }
+        }
+        return fallback
     }
 
     private static func extractJumpText(from dict: [String: Any]) -> String? {
-        let direct = sanitizeOptionalText(firstString(in: dict, keys: ["jump_text", "jump_text_2"]))
-        return direct ?? ["jump_uri_config", "jump_uri_2_config"].compactMap { key in
-            (dict[key] as? [String: Any]).flatMap { sanitizeOptionalText(firstString(in: $0, keys: ["text", "title"])) }
-        }.first
+        if let direct = sanitizeOptionalText(firstString(in: dict, keys: ["jump_text", "jump_text_2"])) {
+            return direct
+        }
+        for key in ["jump_uri_config", "jump_uri_2_config"] {
+            if let config = dict[key] as? [String: Any],
+               let text = sanitizeOptionalText(firstString(in: config, keys: ["text", "title"])) {
+                return text
+            }
+        }
+        return nil
     }
 
     private static func extractImageURL(
         from dict: [String: Any], extraKeys: [String] = [], includePlainURL: Bool = false
     ) -> String? {
-        let keys = ["thumb", "cover", "pic", "pic_url", "image_url", "img_url"]
-            + extraKeys + (includePlainURL ? ["url"] : [])
-        return keys.compactMap { stringValue(dict[$0]).flatMap(normalizeURL) }.first(where: isHTTPURL)
+        for key in ["thumb", "cover", "pic", "pic_url", "image_url", "img_url"] {
+            if let url = stringValue(dict[key]).flatMap(normalizeURL), isHTTPURL(url) { return url }
+        }
+        for key in extraKeys {
+            if let url = stringValue(dict[key]).flatMap(normalizeURL), isHTTPURL(url) { return url }
+        }
+        if includePlainURL, let url = stringValue(dict["url"]).flatMap(normalizeURL), isHTTPURL(url) {
+            return url
+        }
+        return nil
     }
 
     private static func synthesizeContentURL(from dict: [String: Any], msgType: Int) -> String? {
@@ -371,19 +393,26 @@ extension BiliIMMessageParser {
         guard depth < 3 else { return nil }
         let nsRaw = raw as NSString
         let range = NSRange(location: 0, length: nsRaw.length)
-        for key in ["title", "headline", "text", "content", "desc", "summary"] {
-            let pattern = "\"\(key)\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])+)\""
-            guard let regex = try? NSRegularExpression(pattern: pattern),
-                  let match = regex.firstMatch(in: raw, range: range), match.numberOfRanges > 1 else { continue }
+        for regex in truncatedFieldRegexes {
+            guard let match = regex.firstMatch(in: raw, range: range), match.numberOfRanges > 1 else { continue }
             let captured = nsRaw.substring(with: match.range(at: 1))
-            let decoded = (try? JSONDecoder().decode(String.self, from: Data("\"\(captured)\"".utf8))) ?? captured
+            let decoded: String
+            if captured.contains("\\"),
+               let parsed = try? JSONSerialization.jsonObject(
+                   with: Data("\"\(captured)\"".utf8),
+                   options: .fragmentsAllowed
+               ) as? String {
+                decoded = parsed
+            } else {
+                decoded = captured
+            }
             let trimmed = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
-            if let nested = parseJSONObject(from: trimmed),
-               let text = extractReadableText(from: nested, depth: depth + 1) { return text }
-            if looksLikeTruncatedJSON(trimmed) {
+            if let nested = parseJSONObject(from: trimmed) {
+                if let text = extractReadableText(from: nested, depth: depth + 1) { return text }
+            } else if looksLikeTruncatedJSON(trimmed) {
                 if let text = extractFirstTruncatedField(from: trimmed, depth: depth + 1) { return text }
-            } else if parseJSONObject(from: trimmed) == nil {
+            } else {
                 return trimmed
             }
         }
@@ -427,11 +456,14 @@ extension BiliIMMessageParser {
     }
 
     static func firstString(in dict: [String: Any], keys: [String]) -> String? {
-        keys.compactMap { stringValue(dict[$0]) }.first
+        for key in keys {
+            if let value = stringValue(dict[key]) { return value }
+        }
+        return nil
     }
 
     static func extractFirstURL(in text: String) -> String? {
-        guard let regex = bareURLRegex else { return nil }
+        guard text.contains("://"), let regex = bareURLRegex else { return nil }
         let nsText = text as NSString
         guard let match = regex.firstMatch(in: text, range: NSRange(location: 0, length: nsText.length)) else {
             return nil
@@ -442,7 +474,8 @@ extension BiliIMMessageParser {
     }
 
     static func looksLikeTruncatedJSON(_ text: String) -> Bool {
-        guard let regex = truncatedJSONRegex else { return false }
+        guard let first = text.first, first == "{" || first == "[",
+              let regex = truncatedJSONRegex else { return false }
         let nsText = text as NSString
         return regex.firstMatch(in: text, range: NSRange(location: 0, length: nsText.length)) != nil
     }
@@ -450,8 +483,13 @@ extension BiliIMMessageParser {
     private static func sanitizeNoRawJSON(_ text: String, msgType: Int?) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
-        if parseJSONObject(from: trimmed) == nil, !looksLikeTruncatedJSON(trimmed) { return text }
-        return sanitizeOptionalText(trimmed) ?? fallbackLabel(for: msgType)
+        if let nested = parseJSONObject(from: trimmed) {
+            return extractReadableText(from: nested, depth: 0) ?? fallbackLabel(for: msgType)
+        }
+        if looksLikeTruncatedJSON(trimmed) {
+            return extractFirstTruncatedField(from: trimmed) ?? fallbackLabel(for: msgType)
+        }
+        return text
     }
 
     private static func sanitizeOptionalText(_ raw: String?) -> String? {
@@ -479,7 +517,10 @@ extension BiliIMMessageParser {
     }
 
     private static func positiveInt(_ dict: [String: Any], _ keys: [String]) -> Int? {
-        keys.compactMap { intValue(dict[$0]) }.first { $0 > 0 }
+        for key in keys {
+            if let value = intValue(dict[key]), value > 0 { return value }
+        }
+        return nil
     }
 
     private static func intValue(_ raw: Any?) -> Int? {
@@ -492,6 +533,6 @@ extension BiliIMMessageParser {
     private static func isHTTPURL(_ url: String) -> Bool { url.hasPrefix("https://") || url.hasPrefix("http://") }
 
     private static func collapseWhitespace(_ text: String) -> String {
-        text.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
+        text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
 }

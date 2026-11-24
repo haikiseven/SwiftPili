@@ -1,10 +1,26 @@
 import Foundation
+import os
 
 struct PCMLinearResampler: Sendable {
     private final class PolyphaseKernel: Sendable {
         static let taps = 32
         static let halfTaps = taps / 2
         static let phaseCount = 512
+
+        private static let cache = OSAllocatedUnfairLock<[UInt64: PolyphaseKernel]>(initialState: [:])
+
+        static func cached(for step: Double) -> PolyphaseKernel {
+            let key = step.bitPattern
+            if let hit = cache.withLock({ $0[key] }) {
+                return hit
+            }
+            let kernel = PolyphaseKernel(step: step)
+            cache.withLock { store in
+                if store.count >= 8 { store.removeAll(keepingCapacity: true) }
+                store[key] = kernel
+            }
+            return kernel
+        }
 
         // (phaseCount + 1) rows of `taps` floats for linear phase interpolation
         let weights: [Float]
@@ -73,7 +89,7 @@ struct PCMLinearResampler: Sendable {
            abs(inputSampleRate - outputSampleRate) > 0.5 {
             let step = inputSampleRate / outputSampleRate
             let pad = PolyphaseKernel.halfTaps - 1
-            self.kernel = PolyphaseKernel(step: step)
+            self.kernel = PolyphaseKernel.cached(for: step)
             self.initialPadFrames = pad
             self.initialPadRemaining = pad
             self.buffer = [Float](repeating: 0, count: pad * channelCount)
@@ -123,69 +139,103 @@ struct PCMLinearResampler: Sendable {
         let firstCenter = Int(position.rounded(.towardZero))
         guard firstCenter + halfTaps < availableFrames else { return [] }
 
-        let estimatedFrames = Int(ceil((Double(availableFrames - halfTaps) - position) / step)) + 1
-        var output: [Float] = []
-        output.reserveCapacity(max(1, estimatedFrames) * channelCount)
-
+        let estimatedFrames = max(1, Int(ceil((Double(availableFrames - halfTaps) - position) / step)) + 2)
         let phaseScale = Double(PolyphaseKernel.phaseCount)
         let channels = channelCount
+        let maxCapacity = estimatedFrames * channels
 
-        buffer.withUnsafeBufferPointer { srcBuf in
-            kernel.weights.withUnsafeBufferPointer { tablePtr in
-                guard let srcBase = srcBuf.baseAddress,
-                      let weightsBase = tablePtr.baseAddress else { return }
+        var currentPosition = position
+        let output = [Float](unsafeUninitializedCapacity: maxCapacity) { outBuf, initializedCount in
+            var written = 0
+            buffer.withUnsafeBufferPointer { srcBuf in
+                kernel.weights.withUnsafeBufferPointer { tablePtr in
+                    guard let srcBase = srcBuf.baseAddress,
+                          let weightsBase = tablePtr.baseAddress,
+                          let outBase = outBuf.baseAddress else { return }
 
-                while true {
-                    let center = Int(position.rounded(.towardZero))
-                    let lastTapFrame = center + halfTaps
-                    guard lastTapFrame < availableFrames else { break }
+                    while written + channels <= maxCapacity {
+                        let center = Int(currentPosition.rounded(.towardZero))
+                        let lastTapFrame = center + halfTaps
+                        guard lastTapFrame < availableFrames else { break }
 
-                    let frac = position - Double(center)
-                    let scaledPhase = frac * phaseScale
-                    let phaseIndex = min(PolyphaseKernel.phaseCount - 1, max(0, Int(scaledPhase)))
-                    let alpha = Float(scaledPhase - Double(phaseIndex))
+                        let frac = currentPosition - Double(center)
+                        let scaledPhase = frac * phaseScale
+                        let phaseIndex = min(PolyphaseKernel.phaseCount - 1, max(0, Int(scaledPhase)))
+                        let alpha = Float(scaledPhase - Double(phaseIndex))
 
-                    let w0Ptr = weightsBase.advanced(by: phaseIndex * taps)
-                    let w1Ptr = w0Ptr.advanced(by: taps)
-                    let startInputFrame = center - (halfTaps - 1)
-                    let srcFrameBase = srcBase.advanced(by: startInputFrame * channels)
+                        let w0Ptr = weightsBase.advanced(by: phaseIndex * taps)
+                        let w1Ptr = w0Ptr.advanced(by: taps)
+                        let startInputFrame = center - (halfTaps - 1)
+                        let srcFrameBase = srcBase.advanced(by: startInputFrame * channels)
 
-                    if channels == 2 {
-                        var acc0: Float = 0
-                        var acc1: Float = 0
-                        for tap in 0..<taps {
-                            let w0 = w0Ptr[tap]
-                            let w = w0 + (w1Ptr[tap] - w0) * alpha
-                            let s = srcFrameBase.advanced(by: tap * 2)
-                            acc0 += w * s[0]
-                            acc1 += w * s[1]
-                        }
-                        output.append(acc0)
-                        output.append(acc1)
-                    } else if channels == 1 {
-                        var acc: Float = 0
-                        for tap in 0..<taps {
-                            let w0 = w0Ptr[tap]
-                            let w = w0 + (w1Ptr[tap] - w0) * alpha
-                            acc += w * srcFrameBase[tap]
-                        }
-                        output.append(acc)
-                    } else {
-                        for channel in 0..<channels {
-                            var acc: Float = 0
-                            for tap in 0..<taps {
-                                let w0 = w0Ptr[tap]
-                                let w = w0 + (w1Ptr[tap] - w0) * alpha
-                                acc += w * srcFrameBase[tap * channels + channel]
+                        if channels == 2 {
+                            var vAcc0 = SIMD4<Float>.zero
+                            var vAcc1 = SIMD4<Float>.zero
+                            var tap = 0
+                            while tap < taps {
+                                let w0 = SIMD4<Float>(
+                                    w0Ptr[tap], w0Ptr[tap + 1], w0Ptr[tap + 2], w0Ptr[tap + 3]
+                                )
+                                let w1 = SIMD4<Float>(
+                                    w1Ptr[tap], w1Ptr[tap + 1], w1Ptr[tap + 2], w1Ptr[tap + 3]
+                                )
+                                let w = w0 + (w1 - w0) * alpha
+                                let base = tap * 2
+                                let s0 = SIMD4<Float>(
+                                    srcFrameBase[base], srcFrameBase[base + 2],
+                                    srcFrameBase[base + 4], srcFrameBase[base + 6]
+                                )
+                                let s1 = SIMD4<Float>(
+                                    srcFrameBase[base + 1], srcFrameBase[base + 3],
+                                    srcFrameBase[base + 5], srcFrameBase[base + 7]
+                                )
+                                vAcc0.addProduct(w, s0)
+                                vAcc1.addProduct(w, s1)
+                                tap += 4
                             }
-                            output.append(acc)
+                            outBase[written] = vAcc0.sum()
+                            outBase[written + 1] = vAcc1.sum()
+                            written += 2
+                        } else if channels == 1 {
+                            var vAcc = SIMD4<Float>.zero
+                            var tap = 0
+                            while tap < taps {
+                                let w0 = SIMD4<Float>(
+                                    w0Ptr[tap], w0Ptr[tap + 1], w0Ptr[tap + 2], w0Ptr[tap + 3]
+                                )
+                                let w1 = SIMD4<Float>(
+                                    w1Ptr[tap], w1Ptr[tap + 1], w1Ptr[tap + 2], w1Ptr[tap + 3]
+                                )
+                                let w = w0 + (w1 - w0) * alpha
+                                let s = SIMD4<Float>(
+                                    srcFrameBase[tap], srcFrameBase[tap + 1],
+                                    srcFrameBase[tap + 2], srcFrameBase[tap + 3]
+                                )
+                                vAcc.addProduct(w, s)
+                                tap += 4
+                            }
+                            outBase[written] = vAcc.sum()
+                            written += 1
+                        } else {
+                            for channel in 0..<channels {
+                                var acc: Float = 0
+                                for tap in 0..<taps {
+                                    let w0 = w0Ptr[tap]
+                                    let w = w0 + (w1Ptr[tap] - w0) * alpha
+                                    acc += w * srcFrameBase[tap * channels + channel]
+                                }
+                                outBase[written] = acc
+                                written += 1
+                            }
                         }
-                    }
 
-                    position += step
+                        currentPosition += step
+                    }
                 }
             }
+            initializedCount = written
         }
+        position = currentPosition
 
         discardConsumedInput(availableFrames: availableFrames)
         return output

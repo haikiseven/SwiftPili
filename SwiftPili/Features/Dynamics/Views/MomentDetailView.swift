@@ -1,3 +1,4 @@
+import Observation
 import SwiftUI
 
 struct MomentDetailView: View {
@@ -5,28 +6,14 @@ struct MomentDetailView: View {
     @State private var viewModel = MomentDetailViewModel()
     @State private var previewImages: ImagePreviewItem?
     @State private var showRepost = false
-    @State private var commentText = ""
-    @State private var commentPictures: [ComposedPicture] = []
-    @State private var commentSubmission = CommentComposerSubmission()
-    @State private var commentSessionGeneration = AuthManager.shared.sessionGeneration
-    @State private var acceptedCommentClear: CommentComposerCapture?
-    @State private var replyTarget: CommentResult.CommentItem?
+    @State private var composerState = MomentCommentComposerState()
     @State private var replyState = InlineCommentReplyState()
     @State private var section: InteractionSection = .comments
-    @State private var commentFocus = CommentComposerFocus()
 
     enum InteractionSection: CaseIterable, Hashable {
         case comments, forwards, likes
     }
 
-    private struct CommentComposerCapture {
-        let model: MomentDetailViewModel
-        let requestedID: String
-        let source: MomentDetailViewModel.CommentSourceReceipt?
-        let context: CommentComposerUploadOwner.Context
-    }
-
-    @AppMotion private var motion
     @Environment(AppCoordinator.self) private var coordinator
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
@@ -43,25 +30,31 @@ struct MomentDetailView: View {
     var body: some View {
         let model = viewModel
         let requestedID = dynamicId
-        let composer = commentComposerCapture
         let source = viewModel.readyCommentSource
         let showsComposer = AuthManager.shared.isLoggedIn && viewModel.oid != nil && !viewModel.commentsClosed
+        let comments = section == .comments ? visibleComments : []
         Group {
             if usesSplit {
-                splitContent(composer: composer, source: source, showsComposer: showsComposer)
+                splitContent(source: source, showsComposer: showsComposer, visibleComments: comments)
             } else {
                 MomentDetailCollectionView(
-                    input: snapshotInput,
+                    input: makeSnapshotInput(visibleComments: comments, showsComposer: showsComposer),
                     item: viewModel.item,
-                    comments: visibleComments,
+                    comments: comments,
                     forwards: viewModel.forwards,
                     reactions: viewModel.reactions,
                     liked: viewModel.liked,
                     likeCount: viewModel.likeCount,
-                    actions: makeCollectionActions(composer: composer, source: source)
+                    actions: makeCollectionActions(source: source)
                 )
                 .overlay(alignment: .bottom) {
-                    if showsComposer { commentComposer }
+                    if showsComposer {
+                        MomentCommentComposerOverlay(
+                            viewModel: model,
+                            dynamicId: requestedID,
+                            state: composerState
+                        )
+                    }
                 }
             }
         }
@@ -162,7 +155,16 @@ struct MomentDetailView: View {
         )
     }
 
-    private var snapshotInput: MomentDetailSnapshotInput {
+    private var isInitialCommentsLoading: Bool {
+        section == .comments
+            && !viewModel.commentsClosed && viewModel.oid != nil
+            && viewModel.isLoadingComments && viewModel.comments.isEmpty
+    }
+
+    private func makeSnapshotInput(
+        visibleComments: [CommentResult.CommentItem],
+        showsComposer: Bool
+    ) -> MomentDetailSnapshotInput {
         let cardFP = viewModel.item.map { item in
             let stat = item.modules?.moduleStat
             return MomentDetailSnapshotInput.CardFingerprint(
@@ -182,10 +184,6 @@ struct MomentDetailView: View {
             likeCount: viewModel.likeCount,
             isAccessibilitySize: dynamicTypeSize.isAccessibilitySize
         )
-        let isEmptyInitialComments = section == .comments
-            && !viewModel.commentsClosed && viewModel.oid != nil
-            && viewModel.isLoadingComments && viewModel.comments.isEmpty
-        let showsComposer = AuthManager.shared.isLoggedIn && viewModel.oid != nil && !viewModel.commentsClosed
         return MomentDetailSnapshotInput(
             dynamicID: dynamicId,
             section: section,
@@ -200,7 +198,7 @@ struct MomentDetailView: View {
             footerFingerprint: currentFooterFingerprint,
             showsReactionBanner: section == .likes && AuthManager.shared.isLoggedIn
                 && viewModel.reactionsHaveUnclassifiedActions,
-            skeletonCount: isEmptyInitialComments ? 6 : 0,
+            skeletonCount: isInitialCommentsLoading ? 6 : 0,
             composerClearance: showsComposer ? 88 : 0
         )
     }
@@ -261,9 +259,10 @@ struct MomentDetailView: View {
     }
 
     private func makeCollectionActions(
-        composer: CommentComposerCapture,
         source: MomentDetailViewModel.CommentSourceReceipt?
     ) -> MomentDetailCollectionActions {
+        let model = viewModel
+        let requestedID = dynamicId
         let lineage = viewModel.commentListLineage
         let thread = (viewModel.oid ?? 0, viewModel.commentType)
         return MomentDetailCollectionActions(
@@ -290,14 +289,14 @@ struct MomentDetailView: View {
             onImageTap: { previewItem in previewImages = previewItem },
             onRepost: { showRepost = true },
             onFocusComment: {
-                guard composerIsCurrent(composer) else { return }
-                commentFocus.request()
+                guard isComposerSourceActive(model: model, requestedID: requestedID, source: source) else { return }
+                composerState.commentFocus.request()
             },
             onToggleLike: { Task { await viewModel.toggleLike() } },
             makeStateView: { AnyView(momentStateView) },
             makeHeaderView: { AnyView(interactionsHeader) },
             makeCommentRow: { comment in
-                AnyView(commentRow(comment, source: source, thread: thread))
+                AnyView(commentRow(comment, model: model, requestedID: requestedID, source: source, thread: thread))
             },
             makeForwardRow: { forward in
                 AnyView(MomentForwardRow(
@@ -405,45 +404,34 @@ struct MomentDetailView: View {
         )
     }
 
-    private var commentComposer: some View {
-        let composer = commentComposerCapture
-        return CollapsibleComposer(
-            text: commentTextBinding(for: composer),
-            pictures: commentPicturesBinding(for: composer),
-            placeholder: replyTarget.map { CommentComposerBar.replyPlaceholder(to: $0.member.uname) }
-                ?? String(localized: "Write a comment..."),
-            replyBanner: replyTarget.map { CommentComposerBar.replyBannerText(for: $0.member.uname) },
-            isSending: commentSubmission.isSending,
-            sendError: composerIsCurrent(composer) ? viewModel.commentSendError : nil,
-            focus: commentFocus,
-            onCancelReply: {
-                guard composerIsCurrent(composer) else { return }
-                withAnimation(motion.animation(normal: CollapsibleComposer.composerCollapseAnimation)) {
-                    setCommentReplyTarget(nil, for: composer)
-                }
-                commentFocus.dismiss()
-            },
-            onSend: { sendComment(from: composer) },
-            allowsCollapseAfterSend: allowsCollapseAfterCommentSend,
-            uploadScope: commentUploadScope(for: composer),
-            isInteractionCurrent: { composerIsCurrent(composer) }
-        )
+    private func isComposerSourceActive(
+        model: MomentDetailViewModel,
+        requestedID: String,
+        source: MomentDetailViewModel.CommentSourceReceipt?
+    ) -> Bool {
+        guard let source else { return false }
+        return viewModel === model
+            && dynamicId == requestedID
+            && model.commentSource(for: requestedID) == source
+            && !model.commentsClosed
+            && AuthManager.shared.isLoggedIn
+            && AuthManager.shared.sessionGeneration == composerState.commentSessionGeneration
     }
 
     private func commentRow(
         _ comment: CommentResult.CommentItem,
+        model: MomentDetailViewModel,
+        requestedID: String,
         source: MomentDetailViewModel.CommentSourceReceipt?,
         thread: (oid: Int, type: Int)
     ) -> some View {
-        let composer = commentComposerCapture
-        return CommentRowView(
+        CommentRowView(
             comment: comment,
-            upMid: viewModel.authorMid,
+            upMid: model.authorMid,
             onReply: { target in
-                guard source != nil, viewModel.readyCommentSource == source,
-                      composer.source == source, composerIsCurrent(composer) else { return }
-                setCommentReplyTarget(target, for: composer)
-                commentFocus.request()
+                guard source != nil, model.readyCommentSource == source,
+                      isComposerSourceActive(model: model, requestedID: requestedID, source: source) else { return }
+                composerState.beginReply(target, model: model)
             },
             onViewThread: { root in
                 openCommentThread(root, source: source, thread: thread)
@@ -474,7 +462,7 @@ struct MomentDetailView: View {
             oid: thread.oid, type: thread.type, root: root, highlightRpid: highlightRpid
         )
         coordinator.contentLinks.cancel()
-        commentFocus.dismiss()
+        composerState.commentFocus.dismiss()
         replyState.open(target, presentInline: usesSplit)
     }
 
@@ -505,83 +493,151 @@ struct MomentDetailView: View {
     }
 }
 
-private extension MomentDetailView {
-    private var commentComposerCapture: CommentComposerCapture {
-        CommentComposerCapture(
-            model: viewModel, requestedID: dynamicId,
-            source: viewModel.commentSource(for: dynamicId), context: viewModel.commentComposerContext
+@MainActor
+@Observable
+private final class MomentCommentComposerState {
+    struct Capture {
+        let model: MomentDetailViewModel
+        let requestedID: String
+        let source: MomentDetailViewModel.CommentSourceReceipt?
+        let context: CommentComposerUploadOwner.Context
+    }
+
+    var commentText = ""
+    var commentPictures: [ComposedPicture] = []
+    var commentSubmission = CommentComposerSubmission()
+    @ObservationIgnored let commentSessionGeneration = AuthManager.shared.sessionGeneration
+    @ObservationIgnored var acceptedCommentClear: Capture?
+    var replyTarget: CommentResult.CommentItem?
+    @ObservationIgnored let commentFocus = CommentComposerFocus()
+
+    func draftDidChange() {
+        commentSubmission.draftDidChange()
+        acceptedCommentClear = nil
+    }
+
+    func beginReply(_ target: CommentResult.CommentItem, model: MomentDetailViewModel) {
+        acceptedCommentClear = nil
+        if replyTarget?.rpid != target.rpid {
+            commentSubmission.draftDidChange()
+            model.clearCommentSendError()
+        }
+        replyTarget = target
+        commentFocus.request()
+    }
+}
+
+private struct MomentCommentComposerOverlay: View {
+    let viewModel: MomentDetailViewModel
+    let dynamicId: String
+    let state: MomentCommentComposerState
+    @AppMotion private var motion
+
+    var body: some View {
+        let composer = currentCapture
+        CollapsibleComposer(
+            text: commentTextBinding(for: composer),
+            pictures: commentPicturesBinding(for: composer),
+            placeholder: state.replyTarget.map { CommentComposerBar.replyPlaceholder(to: $0.member.uname) }
+                ?? String(localized: "Write a comment..."),
+            replyBanner: state.replyTarget.map { CommentComposerBar.replyBannerText(for: $0.member.uname) },
+            isSending: state.commentSubmission.isSending,
+            sendError: composerIsCurrent(composer) ? viewModel.commentSendError : nil,
+            focus: state.commentFocus,
+            onCancelReply: {
+                guard composerIsCurrent(composer) else { return }
+                withAnimation(motion.animation(normal: CollapsibleComposer.composerCollapseAnimation)) {
+                    setCommentReplyTarget(nil, for: composer)
+                }
+                state.commentFocus.dismiss()
+            },
+            onSend: { sendComment(from: composer) },
+            allowsCollapseAfterSend: allowsCollapseAfterCommentSend,
+            uploadScope: commentUploadScope(for: composer),
+            isInteractionCurrent: { composerIsCurrent(composer) }
         )
     }
 
-    private func composerIsCurrent(_ captured: CommentComposerCapture) -> Bool {
+    private var currentCapture: MomentCommentComposerState.Capture {
+        MomentCommentComposerState.Capture(
+            model: viewModel,
+            requestedID: dynamicId,
+            source: viewModel.commentSource(for: dynamicId),
+            context: viewModel.commentComposerContext
+        )
+    }
+
+    private func composerIsCurrent(_ captured: MomentCommentComposerState.Capture) -> Bool {
         guard let source = captured.source else { return false }
         return viewModel === captured.model && dynamicId == captured.requestedID
             && captured.model.commentSource(for: captured.requestedID) == source
             && captured.model.commentComposerContext == captured.context
             && !captured.model.commentsClosed && AuthManager.shared.isLoggedIn
-            && AuthManager.shared.sessionGeneration == commentSessionGeneration
+            && AuthManager.shared.sessionGeneration == state.commentSessionGeneration
     }
 
-    private func commentUploadScope(for captured: CommentComposerCapture) -> CommentComposerUploadScope {
+    private func commentUploadScope(
+        for captured: MomentCommentComposerState.Capture
+    ) -> CommentComposerUploadScope {
         CommentComposerUploadScope(
             owner: captured.model.commentUpload, context: captured.context,
             isCurrent: { composerIsCurrent(captured) },
             onAdmission: {
                 captured.model.clearCommentSendError()
-                commentDraftDidChange()
+                state.draftDidChange()
             }
         )
     }
 
-    func commentDraftDidChange() {
-        commentSubmission.draftDidChange()
-        acceptedCommentClear = nil
-    }
-
-    private func commentTextBinding(for captured: CommentComposerCapture) -> Binding<String> {
-        Binding(get: { commentText }, set: { text in
+    private func commentTextBinding(for captured: MomentCommentComposerState.Capture) -> Binding<String> {
+        Binding(get: { state.commentText }, set: { text in
             guard composerIsCurrent(captured) else { return }
             captured.model.clearCommentSendError()
-            commentDraftDidChange()
-            commentText = text
+            state.draftDidChange()
+            state.commentText = text
         })
     }
 
-    private func commentPicturesBinding(for captured: CommentComposerCapture) -> Binding<[ComposedPicture]> {
-        Binding(get: { commentPictures }, set: { pictures in
-            guard composerIsCurrent(captured), pictures != commentPictures else { return }
+    private func commentPicturesBinding(
+        for captured: MomentCommentComposerState.Capture
+    ) -> Binding<[ComposedPicture]> {
+        Binding(get: { state.commentPictures }, set: { pictures in
+            guard composerIsCurrent(captured), pictures != state.commentPictures else { return }
             captured.model.clearCommentSendError()
-            commentDraftDidChange()
-            commentPictures = pictures
+            state.draftDidChange()
+            state.commentPictures = pictures
         })
     }
 
-    private func setCommentReplyTarget(_ target: CommentResult.CommentItem?, for captured: CommentComposerCapture) {
+    private func setCommentReplyTarget(
+        _ target: CommentResult.CommentItem?,
+        for captured: MomentCommentComposerState.Capture
+    ) {
         guard composerIsCurrent(captured) else { return }
-        acceptedCommentClear = nil
-        if replyTarget?.rpid != target?.rpid {
-            commentSubmission.draftDidChange()
+        state.acceptedCommentClear = nil
+        if state.replyTarget?.rpid != target?.rpid {
+            state.commentSubmission.draftDidChange()
             captured.model.clearCommentSendError()
         }
-        replyTarget = target
+        state.replyTarget = target
     }
 
     private func allowsCollapseAfterCommentSend() -> Bool {
-        guard let acceptedCommentClear else { return false }
-        return composerIsCurrent(acceptedCommentClear)
+        guard let accepted = state.acceptedCommentClear else { return false }
+        return composerIsCurrent(accepted)
     }
 
-    private func sendComment(from captured: CommentComposerCapture) {
+    private func sendComment(from captured: MomentCommentComposerState.Capture) {
         guard !Task.isCancelled, composerIsCurrent(captured),
               !captured.model.commentUpload.isUploading, let source = captured.source else { return }
-        let msg = commentText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !msg.isEmpty || !commentPictures.isEmpty, let attempt = commentSubmission.begin() else { return }
+        let msg = state.commentText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !msg.isEmpty || !state.commentPictures.isEmpty, let attempt = state.commentSubmission.begin() else { return }
         captured.model.clearCommentSendError()
-        acceptedCommentClear = nil
-        let target = replyTarget
-        let pictures = commentPictures
+        state.acceptedCommentClear = nil
+        let target = state.replyTarget
+        let pictures = state.commentPictures
         Task {
-            defer { commentSubmission.finish(attempt) }
+            defer { state.commentSubmission.finish(attempt) }
             guard !Task.isCancelled, composerIsCurrent(captured) else { return }
             let accepted = await captured.model.postComment(
                 message: msg,
@@ -591,15 +647,18 @@ private extension MomentDetailView {
                 expectedSource: source
             )
             guard accepted, !Task.isCancelled, composerIsCurrent(captured),
-                  commentSubmission.canApply(attempt) else { return }
+                  state.commentSubmission.canApply(attempt) else { return }
             commentTextBinding(for: captured).wrappedValue = ""
             commentPicturesBinding(for: captured).wrappedValue = []
             setCommentReplyTarget(nil, for: captured)
             captured.model.commentDraftWasReplaced()
-            commentFocus.dismiss()
-            acceptedCommentClear = commentComposerCapture
+            state.commentFocus.dismiss()
+            state.acceptedCommentClear = currentCapture
         }
     }
+}
+
+private extension MomentDetailView {
     @ViewBuilder
     private var forwardsFooter: some View {
         if viewModel.isLoadingForwards {
@@ -745,11 +804,11 @@ private extension MomentDetailView {
 
 private extension MomentDetailView {
     private func splitContent(
-        composer: CommentComposerCapture,
         source: MomentDetailViewModel.CommentSourceReceipt?,
-        showsComposer: Bool
+        showsComposer: Bool,
+        visibleComments: [CommentResult.CommentItem]
     ) -> some View {
-        let actions = makeCollectionActions(composer: composer, source: source)
+        let actions = makeCollectionActions(source: source)
         return DetailCompanionSplitLayout(
             containerWidth: containerSize.width,
             showsCompanion: viewModel.item != nil
@@ -757,7 +816,7 @@ private extension MomentDetailView {
             splitPrimary(actions: actions)
         } companion: {
             if viewModel.item != nil {
-                splitCompanion(actions: actions, showsComposer: showsComposer)
+                splitCompanion(actions: actions, showsComposer: showsComposer, visibleComments: visibleComments)
             }
         }
     }
@@ -836,17 +895,22 @@ private extension MomentDetailView {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
-    func splitCompanion(actions: MomentDetailCollectionActions, showsComposer: Bool) -> some View {
+    func splitCompanion(
+        actions: MomentDetailCollectionActions,
+        showsComposer: Bool,
+        visibleComments: [CommentResult.CommentItem]
+    ) -> some View {
         let target = replyState.target
+        let footerFingerprint = currentFooterFingerprint
         return CommentReplyZoomContainer(
             presentation: replyState.presentation,
             root: VStack(spacing: 0) {
                 splitCompanionHeader
                 UIKitCommentFeedCollectionView(
-                    items: splitItems(actions: actions),
-                    footerContent: currentFooterFingerprint == nil ? nil : actions.makeFooterView(),
-                    footerFingerprint: currentFooterFingerprint.map(AnyHashableSendable.init),
-                    skeletonCount: snapshotInput.skeletonCount,
+                    items: splitItems(actions: actions, visibleComments: visibleComments),
+                    footerContent: footerFingerprint == nil ? nil : actions.makeFooterView(),
+                    footerFingerprint: footerFingerprint.map(AnyHashableSendable.init),
+                    skeletonCount: isInitialCommentsLoading ? 6 : 0,
                     showsItemDividers: true,
                     dividerLeadingInset: 48,
                     itemSpacing: AppSpacing.l,
@@ -868,7 +932,13 @@ private extension MomentDetailView {
             .allowsHitTesting(replyState.target == nil)
             .accessibilityHidden(replyState.target != nil)
             .overlay(alignment: .bottom) {
-                if showsComposer, replyState.target == nil { commentComposer }
+                if showsComposer, replyState.target == nil {
+                    MomentCommentComposerOverlay(
+                        viewModel: viewModel,
+                        dynamicId: dynamicId,
+                        state: composerState
+                    )
+                }
             },
             destination: Group {
                 if let target { splitCommentThreadInline(target) }
@@ -878,7 +948,10 @@ private extension MomentDetailView {
         )
     }
 
-    func splitItems(actions: MomentDetailCollectionActions) -> [UIKitCommentFeedItem] {
+    func splitItems(
+        actions: MomentDetailCollectionActions,
+        visibleComments: [CommentResult.CommentItem]
+    ) -> [UIKitCommentFeedItem] {
         switch section {
         case .comments:
             return visibleComments.map { comment in

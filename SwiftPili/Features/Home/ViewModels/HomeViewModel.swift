@@ -4,8 +4,11 @@ import Observation
 @MainActor
 @Observable
 final class HomeViewModel {
-    private(set) var recommendationFeed = RecommendationFeed()
+    private(set) var recommendationFeed = RecommendationFeed() {
+        didSet { recommendedRevision &+= 1 }
+    }
     var recommendedItems: [RecommendResult.RecommendItem] { recommendationFeed.items }
+    @ObservationIgnored private(set) var recommendedRevision: UInt64 = 0
 
     enum RecommendationRefreshResult: Equatable {
         case published(UInt64)
@@ -28,12 +31,31 @@ final class HomeViewModel {
     ) {
         self.fetchRecommendations = fetchRecommendations
     }
-    var popularItems: [VideoCard] = []
-    var rankingItems: [RankingResult.RankItem] = []
-    var animeItems: [PGCIndexResult.PGCItem] = []
-    var movieItems: [PGCIndexResult.PGCItem] = []
-    var followedAnime: [BangumiFollowResult.FollowedBangumi] = []
-    var followedShows: [BangumiFollowResult.FollowedBangumi] = []
+    var popularItems: [VideoCard] = [] {
+        didSet { popularRevision &+= 1 }
+    }
+    var rankingItems: [RankingResult.RankItem] = [] {
+        didSet { rankingRevision &+= 1 }
+    }
+    var animeItems: [PGCIndexResult.PGCItem] = [] {
+        didSet { animeRevision &+= 1 }
+    }
+    var movieItems: [PGCIndexResult.PGCItem] = [] {
+        didSet { movieRevision &+= 1 }
+    }
+    var followedAnime: [BangumiFollowResult.FollowedBangumi] = [] {
+        didSet { followedAnimeRevision &+= 1 }
+    }
+    var followedShows: [BangumiFollowResult.FollowedBangumi] = [] {
+        didSet { followedShowsRevision &+= 1 }
+    }
+
+    @ObservationIgnored private(set) var popularRevision: UInt64 = 0
+    @ObservationIgnored private(set) var rankingRevision: UInt64 = 0
+    @ObservationIgnored private(set) var animeRevision: UInt64 = 0
+    @ObservationIgnored private(set) var movieRevision: UInt64 = 0
+    @ObservationIgnored private(set) var followedAnimeRevision: UInt64 = 0
+    @ObservationIgnored private(set) var followedShowsRevision: UInt64 = 0
 
     @ObservationIgnored private var freshIdx = 1
     @ObservationIgnored private var popularPage = 1
@@ -48,10 +70,24 @@ final class HomeViewModel {
     @ObservationIgnored private var pendingPGCLoads: Set<Int> = []
 
     @ObservationIgnored private var admissions: [HomeFeedKey: FeedLoadAdmission] = [:]
-    private var feedbackStates: [HomeFeedKey: HomeFeedFeedback] = [:]
+    private var recommendedFeedback = HomeFeedFeedback()
+    private var popularFeedback = HomeFeedFeedback()
+    private var rankingFeedback = HomeFeedFeedback()
+    private var animeFeedback = HomeFeedFeedback()
+    private var movieFeedback = HomeFeedFeedback()
+    private var followedAnimeFeedback = HomeFeedFeedback()
+    private var followedShowsFeedback = HomeFeedFeedback()
 
     func feedback(for key: HomeFeedKey) -> HomeFeedFeedback {
-        feedbackStates[key, default: HomeFeedFeedback()]
+        switch key {
+        case .recommended: recommendedFeedback
+        case .popular: popularFeedback
+        case .ranking: rankingFeedback
+        case .pgc(1): animeFeedback
+        case .pgc: movieFeedback
+        case .followed(1): followedAnimeFeedback
+        case .followed: followedShowsFeedback
+        }
     }
 
     func retry(_ failure: HomeFeedFailure) async {
@@ -652,11 +688,28 @@ final class HomeViewModel {
         for key: HomeFeedKey,
         mutate: (inout HomeFeedFeedback) -> Void
     ) {
-        var next = feedbackStates[key, default: HomeFeedFeedback()]
+        var next = feedback(for: key)
         mutate(&next)
         next.isLoading = !hasContent(for: key) && (admissions[key]?.hasInFlight ?? false)
-        if feedbackStates[key] != next {
-            feedbackStates[key] = next
+        setFeedback(next, for: key)
+    }
+
+    private func setFeedback(_ next: HomeFeedFeedback, for key: HomeFeedKey) {
+        switch key {
+        case .recommended:
+            if recommendedFeedback != next { recommendedFeedback = next }
+        case .popular:
+            if popularFeedback != next { popularFeedback = next }
+        case .ranking:
+            if rankingFeedback != next { rankingFeedback = next }
+        case .pgc(1):
+            if animeFeedback != next { animeFeedback = next }
+        case .pgc:
+            if movieFeedback != next { movieFeedback = next }
+        case .followed(1):
+            if followedAnimeFeedback != next { followedAnimeFeedback = next }
+        case .followed:
+            if followedShowsFeedback != next { followedShowsFeedback = next }
         }
     }
 
@@ -698,7 +751,7 @@ final class HomeViewModel {
     ) -> Bool {
         guard let failure else { return true }
         return failure.key == key && failure.token.kind == kind && failure.token.cursor == cursor
-            && feedbackStates[key]?.failure == failure && isCurrent(key, token: failure.token)
+            && feedback(for: key).failure == failure && isCurrent(key, token: failure.token)
     }
 
     private func publishFailure(_ key: HomeFeedKey, token: FeedLoadToken, error: any Error) {

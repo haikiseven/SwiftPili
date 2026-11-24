@@ -6,6 +6,7 @@ import Observation
 @Observable
 final class PlayerSessionState {
     var isPlaying = false
+    var hasRenderedFirstFrame = false
     var playbackRate: Float = 1.0
     var currentQuality: Int = 116
     var mode: PlayerMode = .vod

@@ -42,6 +42,8 @@ final class UIKitUserRowCell: UICollectionViewCell {
     private var topConstraint: NSLayoutConstraint?
     private var bottomConstraint: NSLayoutConstraint?
     private var separatorLeadingConstraint: NSLayoutConstraint?
+    private static let avatarPlaceholder = UIImage(systemName: "person.crop.circle.fill")
+
     private var activeAvatarRequest: UIKitCoverPipeline.CoverRequest?
     private var onGroupTap: (() -> Void)?
     private var onFollowTap: (() -> Void)?
@@ -182,12 +184,11 @@ final class UIKitUserRowCell: UICollectionViewCell {
             pointSize: model.avatarSize,
             scale: traits.displayScale
         )
-        let placeholder = UIImage(systemName: "person.crop.circle.fill")
         UIKitCoverPipeline.apply(
             to: avatarView,
             request: request,
             activeRequest: &activeAvatarRequest,
-            placeholderImage: placeholder
+            placeholderImage: Self.avatarPlaceholder
         )
         avatarView.tintColor = .tertiaryLabel
 

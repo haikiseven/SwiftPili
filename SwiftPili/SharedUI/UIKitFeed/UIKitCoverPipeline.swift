@@ -90,6 +90,7 @@ enum UIKitCoverPipeline {
         var items = KingfisherManager.shared.defaultOptions
         items.append(contentsOf: [
             .processor(processor),
+            .backgroundDecode,
             .scaleFactor(request.scale),
             .transition(.none),
         ])

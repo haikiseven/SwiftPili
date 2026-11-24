@@ -143,7 +143,6 @@ struct PlayerDetailGeometryProbes: View {
 struct PlayerDetailInlineNavigationOverlay: View {
     let player: PlayerViewModel
     let isActiveRoute: Bool
-    let isRouteActivated: Bool
     let hasInlineExitChrome: @MainActor () -> Bool
     var scrimWidth: CGFloat?
     var scrimHeight: CGFloat?
@@ -154,7 +153,7 @@ struct PlayerDetailInlineNavigationOverlay: View {
         if !player.isFullscreenPresentationActive, isActiveRoute {
             let showsNavigation = !hasInlineExitChrome() || player.showControls
             ZStack(alignment: .topLeading) {
-                if showsNavigation && (!isRouteActivated || !player.showControls) {
+                if showsNavigation && !player.showControls {
                     PlayerControlsScrim()
                         .frame(width: scrimWidth, height: scrimHeight)
                         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
@@ -179,7 +178,6 @@ struct PlayerDetailChromeModifier<Backdrop: View>: ViewModifier {
     let coordinator: AppCoordinator
     let liveRoom: LiveRoomViewModel?
     let watchdogScreen: String?
-    let onRouteAppearance: @MainActor (RouteActivationGate.Event) -> Void
     let backdrop: Backdrop
 
     func body(content: Content) -> some View {
@@ -199,7 +197,6 @@ struct PlayerDetailChromeModifier<Backdrop: View>: ViewModifier {
                 .toolbarBackground(.hidden, for: .navigationBar)
                 .keepsInteractivePopGesture()
             )
-            .routeAppearanceProbe(onRouteAppearance)
             .background(alignment: .topLeading) {
                 if let presentationContext {
                     PlayerFullscreenHost(
@@ -290,7 +287,6 @@ extension View {
         coordinator: AppCoordinator,
         liveRoom: LiveRoomViewModel? = nil,
         watchdogScreen: String? = nil,
-        onRouteAppearance: @escaping @MainActor (RouteActivationGate.Event) -> Void,
         @ViewBuilder backdrop: () -> Backdrop
     ) -> some View {
         modifier(
@@ -303,7 +299,6 @@ extension View {
                 coordinator: coordinator,
                 liveRoom: liveRoom,
                 watchdogScreen: watchdogScreen,
-                onRouteAppearance: onRouteAppearance,
                 backdrop: backdrop()
             )
         )
@@ -317,8 +312,7 @@ extension View {
         presentationContext: PlayerScreenPresentationContext?,
         coordinator: AppCoordinator,
         liveRoom: LiveRoomViewModel? = nil,
-        watchdogScreen: String? = nil,
-        onRouteAppearance: @escaping @MainActor (RouteActivationGate.Event) -> Void
+        watchdogScreen: String? = nil
     ) -> some View {
         modifier(
             PlayerDetailChromeModifier(
@@ -330,7 +324,6 @@ extension View {
                 coordinator: coordinator,
                 liveRoom: liveRoom,
                 watchdogScreen: watchdogScreen,
-                onRouteAppearance: onRouteAppearance,
                 backdrop: EmptyView()
             )
         )

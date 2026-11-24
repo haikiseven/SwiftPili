@@ -28,9 +28,15 @@ final class ArticleReaderViewModel {
 
     var info: ArticleViewInfo?
     var blocks: [ArticleBlock] = [] {
-        didSet { indexedBlocks = ArticleContentParser.indexBlocks(blocks) }
+        didSet {
+            guard !suppressBlocksDidSet else { return }
+            let result = ArticleContentParser.indexBlocksWithImages(blocks)
+            indexedBlocks = result.indexed
+            imageURLs = result.imageURLs
+        }
     }
     private(set) var indexedBlocks: [IndexedArticleBlock] = []
+    private(set) var imageURLs: [URL] = []
     var isLoading = false
     var parseFailed = false
     var liked = false
@@ -40,23 +46,24 @@ final class ArticleReaderViewModel {
         didSet { commentRowsRevision &+= 1 }
     }
     @ObservationIgnored private var commentRowsRevision: UInt64 = 0
+    @ObservationIgnored private var suppressBlocksDidSet = false
     var commentTotal = 0
     private(set) var commentFeedback = CommentLoadFeedback()
     private(set) var commentsClosed = false
     var isLoadingComments: Bool { commentLoadingToken != nil }
     private(set) var commentListReceipt: CommentListReceipt?
 
-    private var page = 1
-    private var hasMore = true
-    private var commentAdmission = FeedLoadAdmission()
+    @ObservationIgnored private var page = 1
+    @ObservationIgnored private var hasMore = true
+    @ObservationIgnored private var commentAdmission = FeedLoadAdmission()
     private var commentLoadingToken: FeedLoadToken?
     private(set) var cvid = 0
     private var commentSourceRevision: UInt64 = 0
-    private var loadingCVID: Int?
-    private var settledCVID: Int?
-    private var loadGeneration: UInt64 = 0
+    @ObservationIgnored private var loadingCVID: Int?
+    @ObservationIgnored private var settledCVID: Int?
+    @ObservationIgnored private var loadGeneration: UInt64 = 0
     let commentUpload = CommentComposerUploadOwner()
-    private let commentComposerIdentifier = UUID()
+    @ObservationIgnored private let commentComposerIdentifier = UUID()
     private var commentReplacementEpoch: UInt64 = 0
     private(set) var commentSendError: String?
 
@@ -81,13 +88,6 @@ final class ArticleReaderViewModel {
     func commentSource(for requestedCvid: Int) -> CommentSourceReceipt? {
         guard requestedCvid > 0, cvid == requestedCvid else { return nil }
         return CommentSourceReceipt(cvid: cvid, revision: commentSourceRevision)
-    }
-
-    var imageURLs: [URL] {
-        blocks.compactMap { block in
-            if case .image(let url) = block { return url }
-            return nil
-        }
     }
 
     func load(cvid: Int) async {
@@ -127,10 +127,15 @@ final class ArticleReaderViewModel {
             parseFailed = true
             return
         }
-        blocks = await Task.detached(priority: .userInitiated) {
-            ArticleContentParser.parse(pageHTML: html)
+        let parsed = await Task.detached(priority: .userInitiated) {
+            ArticleContentParser.parseIndexed(pageHTML: html)
         }.value
         guard generation == loadGeneration, self.cvid == cvid, !Task.isCancelled else { return }
+        suppressBlocksDidSet = true
+        blocks = parsed.blocks
+        indexedBlocks = parsed.indexedBlocks
+        imageURLs = parsed.imageURLs
+        suppressBlocksDidSet = false
         parseFailed = blocks.isEmpty
 
         guard let loadedInfo = await infoFetch,

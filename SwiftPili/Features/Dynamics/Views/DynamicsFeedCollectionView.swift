@@ -50,6 +50,8 @@ struct DynamicsFeedCollectionActions {
 
 struct DynamicsFeedCollectionView: View {
     let items: [DynamicFeedResult.DynamicItem]
+    var fingerprints: [DynamicsItemFingerprint]? = nil
+    var itemsRevision: UInt64? = nil
     let interactionStore: MomentInteractionStore
     let peopleHeader: DynamicsPeopleHeaderState?
     let inlineFeedback: DynamicsEmptyFeedbackState
@@ -63,7 +65,7 @@ struct DynamicsFeedCollectionView: View {
     @Environment(\.openURL) private var openURL
 
     var body: some View {
-        let fingerprints = items.map(DynamicsItemFingerprint.init)
+        let resolvedFingerprints = fingerprints ?? items.map(DynamicsItemFingerprint.init)
         UIKitCollectionHost(
             isActive: isActive,
             isTabSelected: isDynamicsTabSelected,
@@ -71,7 +73,7 @@ struct DynamicsFeedCollectionView: View {
             onRefresh: actions.onRefresh,
             makeController: { DynamicsFeedCollectionViewController() },
             updateController: { controller in
-                controller.update(view: self, fingerprints: fingerprints, onOpenURL: { openURL($0) })
+                controller.update(view: self, fingerprints: resolvedFingerprints, onOpenURL: { openURL($0) })
             }
         )
     }
@@ -121,8 +123,10 @@ private final class DynamicsFeedCollectionViewController: UIKitBaseCollectionVie
     }
 
     private var dataSource: UICollectionViewDiffableDataSource<DynamicsSectionKey, DynamicsCellKey>?
+    private var currentSections: [DynamicsSectionKey] = []
     private var items: [DynamicFeedResult.DynamicItem] = []
     private var fingerprints: [DynamicsItemFingerprint] = []
+    private var lastItemsRevision: UInt64?
     private var fingerprintByID: [String: DynamicsItemFingerprint] = [:]
     private var itemByID: [String: DynamicFeedResult.DynamicItem] = [:]
     private var itemIndexByID: [String: Int] = [:]
@@ -146,7 +150,7 @@ private final class DynamicsFeedCollectionViewController: UIKitBaseCollectionVie
     override func makeCollectionLayout() -> UICollectionViewLayout {
         UICollectionViewCompositionalLayout { [weak self] sectionIndex, environment in
             guard let self else { return nil }
-            let sections = dataSource?.snapshot().sectionIdentifiers ?? []
+            let sections = currentSections
             guard sectionIndex < sections.count else { return nil }
             let next: DynamicsSectionKey? = sectionIndex + 1 < sections.count ? sections[sectionIndex + 1] : nil
             return makeSectionLayout(
@@ -201,7 +205,13 @@ private final class DynamicsFeedCollectionViewController: UIKitBaseCollectionVie
         onOpenURL = newOpenURL
         interactionStore = view.interactionStore
 
-        let itemsChanged = newFingerprints != fingerprints
+        let itemsChanged: Bool
+        if let incomingRev = view.itemsRevision, let currentRev = lastItemsRevision,
+           incomingRev == currentRev {
+            itemsChanged = false
+        } else {
+            itemsChanged = newFingerprints != fingerprints
+        }
         let peopleChanged = view.peopleHeader != peopleHeader
         let feedbackChanged = view.inlineFeedback != inlineFeedback
         let placeholderChanged = view.placeholderCount != placeholderCount
@@ -212,8 +222,11 @@ private final class DynamicsFeedCollectionViewController: UIKitBaseCollectionVie
         let previousLastID = orderedItemIDs.last
         let previousFingerprints = fingerprintByID
 
-        items = view.items
-        fingerprints = newFingerprints
+        lastItemsRevision = view.itemsRevision
+        if itemsChanged {
+            items = view.items
+            fingerprints = newFingerprints
+        }
         peopleHeader = view.peopleHeader
         inlineFeedback = view.inlineFeedback
         placeholderCount = view.placeholderCount
@@ -417,6 +430,7 @@ private extension DynamicsFeedCollectionViewController {
             if !targets.isEmpty { snapshot.reconfigureItems(targets) }
         }
         lastReconfiguredWidth = currentContentWidth
+        currentSections = snapshot.sectionIdentifiers
         dataSource.apply(snapshot, animatingDifferences: false)
     }
 

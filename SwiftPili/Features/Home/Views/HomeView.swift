@@ -196,9 +196,7 @@ private struct HomeSectionTabContainer: View, Equatable {
 }
 
 private struct HomeFeedRenderKey: Equatable {
-    let itemIDs: [Int]
-    let generationIDs: [UInt64]
-    let generationCounts: [Int]
+    let contentRevision: UInt64
     let placeholderCount: Int
     let isActive: Bool
     let isHomeTabSelected: Bool
@@ -227,34 +225,59 @@ enum HomeFeedPlaceholder {
 @MainActor
 private final class RecommendedTabCache {
     struct Snapshot {
-        let items: [RecommendResult.RecommendItem]
-        let generations: [RecommendationFeed.Generation]
-        let itemIDs: [Int]
-        let generationIDs: [UInt64]
-        let generationCounts: [Int]
+        let sections: [HomeFeedSectionData]
+        let hasContent: Bool
+        let revision: UInt64
         let feedback: HomeFeedFeedback
     }
 
+    private var hasSynced = false
     var snapshot = Snapshot(
-        items: [], generations: [], itemIDs: [], generationIDs: [],
-        generationCounts: [], feedback: HomeFeedFeedback()
+        sections: [], hasContent: false, revision: 0, feedback: HomeFeedFeedback()
     )
 
     func sync(from viewModel: HomeViewModel) -> Snapshot {
-        let items = viewModel.recommendedItems
-        let generations = viewModel.recommendationFeed.generations
+        let feed = viewModel.recommendationFeed
         let feedback = viewModel.feedback(for: .recommended)
-        let genIDs = generations.map(\.id)
-        let genCounts = generations.map(\.items.count)
-        let itemsUnchanged = items.count == snapshot.items.count
-            && genIDs == snapshot.generationIDs
-            && genCounts == snapshot.generationCounts
-            && items.first?.id == snapshot.items.first?.id
-            && items.last?.id == snapshot.items.last?.id
-        let itemIDs = itemsUnchanged ? snapshot.itemIDs : items.map(\.id)
+        let rev = viewModel.recommendedRevision
+        if hasSynced, rev == snapshot.revision {
+            snapshot = Snapshot(
+                sections: snapshot.sections,
+                hasContent: snapshot.hasContent,
+                revision: rev,
+                feedback: feedback
+            )
+            return snapshot
+        }
+        hasSynced = true
+        let sections: [HomeFeedSectionData] = feed.generations.compactMap { gen in
+            guard !gen.items.isEmpty else { return nil }
+            let mapped = gen.items.map { item in
+                HomeFeedItemData(
+                    id: HomeFeedItemIdentifier(item.id),
+                    title: item.title,
+                    sources: VideoCoverSources(widescreen: item.pic, fourByThree: item.mobileCoverURL),
+                    duration: item.duration ?? 0,
+                    ownerName: item.owner?.name ?? "",
+                    viewCount: item.stat?.view ?? 0,
+                    routeTarget: .make(
+                        bvid: item.bvid,
+                        aid: nil,
+                        title: item.title,
+                        coverURL: item.pic,
+                        mobileCoverURL: item.mobileCoverURL,
+                        ownerName: item.owner?.name ?? "",
+                        durationSeconds: item.duration ?? 0
+                    )
+                )
+            }
+            return HomeFeedSectionData(id: gen.id, items: mapped)
+        }
         snapshot = Snapshot(
-            items: items, generations: generations, itemIDs: itemIDs,
-            generationIDs: genIDs, generationCounts: genCounts, feedback: feedback
+            sections: sections,
+            hasContent: !feed.items.isEmpty,
+            revision: rev,
+            feedback: feedback
         )
         return snapshot
     }
@@ -270,14 +293,12 @@ private struct RecommendedListView: View {
 
     var body: some View {
         let snap = isSelected ? cache.sync(from: viewModel) : cache.snapshot
-        let hasContent = !snap.items.isEmpty
+        let hasContent = snap.hasContent
         let title = String(localized: "Recommend")
         let placeholderCount = snap.feedback.showsPlaceholder(hasContent: hasContent)
             ? HomeFeedPlaceholder.count : 0
         let renderKey = HomeFeedRenderKey(
-            itemIDs: snap.itemIDs,
-            generationIDs: snap.generationIDs,
-            generationCounts: snap.generationCounts,
+            contentRevision: snap.revision,
             placeholderCount: placeholderCount,
             isActive: isSelected,
             isHomeTabSelected: coordinator.selectedTab == .home,
@@ -295,14 +316,8 @@ private struct RecommendedListView: View {
             content: {
                 EquatableHomeFeedHost(key: renderKey) {
                     HomeFeedCollectionView(
-                        items: snap.items,
-                        sections: snap.generations,
-                        title: \.title,
-                        sources: { VideoCoverSources(widescreen: $0.pic, fourByThree: $0.mobileCoverURL) },
-                        duration: { $0.duration ?? 0 },
-                        ownerName: { $0.owner?.name ?? "" },
-                        viewCount: { $0.stat?.view ?? 0 },
-                        routeTarget: Self.routeTarget,
+                        preconvertedSections: snap.sections,
+                        contentRevision: snap.revision,
                         placeholderCount: placeholderCount,
                         placeholderLabel: String(format: String(localized: "Loading %@"), title),
                         heroBadge: title,
@@ -331,38 +346,60 @@ private struct RecommendedListView: View {
             }
         }
     }
-
-    private static func routeTarget(_ item: RecommendResult.RecommendItem) -> VideoRouteTarget? {
-        .make(
-            bvid: item.bvid,
-            aid: nil,
-            title: item.title,
-            coverURL: item.pic,
-            mobileCoverURL: item.mobileCoverURL,
-            ownerName: item.owner?.name ?? "",
-            durationSeconds: item.duration ?? 0
-        )
-    }
 }
 
 @MainActor
 private final class PopularTabCache {
     struct Snapshot {
-        let items: [VideoCard]
-        let itemIDs: [Int]
+        let sections: [HomeFeedSectionData]
+        let hasContent: Bool
+        let revision: UInt64
         let feedback: HomeFeedFeedback
     }
 
-    var snapshot = Snapshot(items: [], itemIDs: [], feedback: HomeFeedFeedback())
+    private var hasSynced = false
+    var snapshot = Snapshot(sections: [], hasContent: false, revision: 0, feedback: HomeFeedFeedback())
 
     func sync(from viewModel: HomeViewModel) -> Snapshot {
         let items = viewModel.popularItems
         let feedback = viewModel.feedback(for: .popular)
-        let unchanged = items.count == snapshot.items.count
-            && items.first?.id == snapshot.items.first?.id
-            && items.last?.id == snapshot.items.last?.id
-        let itemIDs = unchanged ? snapshot.itemIDs : items.map(\.id)
-        snapshot = Snapshot(items: items, itemIDs: itemIDs, feedback: feedback)
+        let rev = viewModel.popularRevision
+        if hasSynced, rev == snapshot.revision {
+            snapshot = Snapshot(
+                sections: snapshot.sections,
+                hasContent: snapshot.hasContent,
+                revision: rev,
+                feedback: feedback
+            )
+            return snapshot
+        }
+        hasSynced = true
+        let sections: [HomeFeedSectionData]
+        if items.isEmpty {
+            sections = []
+        } else {
+            let mapped = items.map { item in
+                HomeFeedItemData(
+                    id: HomeFeedItemIdentifier(item.id),
+                    title: item.title,
+                    sources: VideoCoverSources(widescreen: item.pic, fourByThree: item.mobileCoverURL),
+                    duration: item.duration,
+                    ownerName: item.owner.name,
+                    viewCount: item.stat.view,
+                    routeTarget: .make(
+                        bvid: item.bvid,
+                        aid: nil,
+                        title: item.title,
+                        coverURL: item.pic,
+                        mobileCoverURL: item.mobileCoverURL,
+                        ownerName: item.owner.name,
+                        durationSeconds: item.duration
+                    )
+                )
+            }
+            sections = [HomeFeedSectionData(id: 0, items: mapped)]
+        }
+        snapshot = Snapshot(sections: sections, hasContent: !items.isEmpty, revision: rev, feedback: feedback)
         return snapshot
     }
 }
@@ -377,14 +414,12 @@ private struct PopularListView: View {
 
     var body: some View {
         let snap = isSelected ? cache.sync(from: viewModel) : cache.snapshot
-        let hasContent = !snap.items.isEmpty
+        let hasContent = snap.hasContent
         let title = String(localized: "Popular")
         let placeholderCount = snap.feedback.showsPlaceholder(hasContent: hasContent)
             ? HomeFeedPlaceholder.count : 0
         let renderKey = HomeFeedRenderKey(
-            itemIDs: snap.itemIDs,
-            generationIDs: [],
-            generationCounts: [],
+            contentRevision: snap.revision,
             placeholderCount: placeholderCount,
             isActive: isSelected,
             isHomeTabSelected: coordinator.selectedTab == .home,
@@ -402,13 +437,8 @@ private struct PopularListView: View {
             content: {
                 EquatableHomeFeedHost(key: renderKey) {
                     HomeFeedCollectionView(
-                        items: snap.items,
-                        title: \.title,
-                        sources: { VideoCoverSources(widescreen: $0.pic, fourByThree: $0.mobileCoverURL) },
-                        duration: \.duration,
-                        ownerName: { $0.owner.name },
-                        viewCount: { $0.stat.view },
-                        routeTarget: Self.routeTarget,
+                        preconvertedSections: snap.sections,
+                        contentRevision: snap.revision,
                         placeholderCount: placeholderCount,
                         placeholderLabel: String(format: String(localized: "Loading %@"), title),
                         heroBadge: title,
@@ -435,18 +465,6 @@ private struct PopularListView: View {
                 await viewModel.loadPopular()
             }
         }
-    }
-
-    private static func routeTarget(_ item: VideoCard) -> VideoRouteTarget? {
-        .make(
-            bvid: item.bvid,
-            aid: nil,
-            title: item.title,
-            coverURL: item.pic,
-            mobileCoverURL: item.mobileCoverURL,
-            ownerName: item.owner.name,
-            durationSeconds: item.duration
-        )
     }
 }
 
@@ -516,32 +534,59 @@ private struct HomeFeedSurfaceContainer<Content: View>: View {
     }
 }
 
-private struct RankedFeedItem: Identifiable {
-    let rank: Int
-    let item: RankingResult.RankItem
-    var id: Int { item.id }
-}
-
 @MainActor
 private final class RankingTabCache {
     struct Snapshot {
-        let rankedItems: [RankedFeedItem]
-        let itemIDs: [Int]
+        let sections: [HomeFeedSectionData]
+        let hasContent: Bool
+        let revision: UInt64
         let feedback: HomeFeedFeedback
     }
 
-    var snapshot = Snapshot(rankedItems: [], itemIDs: [], feedback: HomeFeedFeedback())
+    private var hasSynced = false
+    var snapshot = Snapshot(sections: [], hasContent: false, revision: 0, feedback: HomeFeedFeedback())
 
     func sync(from viewModel: HomeViewModel) -> Snapshot {
         let rawItems = viewModel.rankingItems
         let feedback = viewModel.feedback(for: .ranking)
-        let newIDs = rawItems.map(\.id)
-        if newIDs == snapshot.itemIDs {
-            snapshot = Snapshot(rankedItems: snapshot.rankedItems, itemIDs: snapshot.itemIDs, feedback: feedback)
-        } else {
-            let mapped = rawItems.enumerated().map { RankedFeedItem(rank: $0.offset + 1, item: $0.element) }
-            snapshot = Snapshot(rankedItems: mapped, itemIDs: newIDs, feedback: feedback)
+        let rev = viewModel.rankingRevision
+        if hasSynced, rev == snapshot.revision {
+            snapshot = Snapshot(
+                sections: snapshot.sections,
+                hasContent: snapshot.hasContent,
+                revision: rev,
+                feedback: feedback
+            )
+            return snapshot
         }
+        hasSynced = true
+        let sections: [HomeFeedSectionData]
+        if rawItems.isEmpty {
+            sections = []
+        } else {
+            let mapped = rawItems.enumerated().map { offset, item in
+                HomeFeedItemData(
+                    id: HomeFeedItemIdentifier(item.id),
+                    title: item.title,
+                    sources: VideoCoverSources(widescreen: item.pic, fourByThree: item.mobileCoverURL),
+                    duration: item.duration ?? 0,
+                    ownerName: item.owner?.name ?? "",
+                    viewCount: item.stat?.view ?? 0,
+                    rank: offset + 1,
+                    routeTarget: .make(
+                        bvid: item.bvid,
+                        aid: item.aid,
+                        title: item.title,
+                        coverURL: item.pic,
+                        mobileCoverURL: item.mobileCoverURL,
+                        ownerName: item.owner?.name ?? "",
+                        durationSeconds: item.duration ?? 0
+                    )
+                )
+            }
+            sections = [HomeFeedSectionData(id: 0, items: mapped)]
+        }
+        snapshot = Snapshot(sections: sections, hasContent: !rawItems.isEmpty, revision: rev, feedback: feedback)
         return snapshot
     }
 }
@@ -555,13 +600,11 @@ private struct RankingListView: View {
 
     var body: some View {
         let snap = isSelected ? cache.sync(from: viewModel) : cache.snapshot
-        let hasContent = !snap.rankedItems.isEmpty
+        let hasContent = snap.hasContent
         let title = String(localized: "Ranking")
         let placeholderCount = snap.feedback.showsPlaceholder(hasContent: hasContent) ? 7 : 0
         let renderKey = HomeFeedRenderKey(
-            itemIDs: snap.itemIDs,
-            generationIDs: [],
-            generationCounts: [],
+            contentRevision: snap.revision,
             placeholderCount: placeholderCount,
             isActive: isSelected,
             isHomeTabSelected: coordinator.selectedTab == .home,
@@ -579,16 +622,8 @@ private struct RankingListView: View {
             content: {
                 EquatableHomeFeedHost(key: renderKey) {
                     HomeFeedCollectionView(
-                        items: snap.rankedItems,
-                        title: \.item.title,
-                        sources: {
-                            VideoCoverSources(widescreen: $0.item.pic, fourByThree: $0.item.mobileCoverURL)
-                        },
-                        duration: { $0.item.duration ?? 0 },
-                        ownerName: { $0.item.owner?.name ?? "" },
-                        viewCount: { $0.item.stat?.view ?? 0 },
-                        rank: \.rank,
-                        routeTarget: { Self.routeTarget($0.item) },
+                        preconvertedSections: snap.sections,
+                        contentRevision: snap.revision,
                         fixedLayoutMode: .list,
                         placeholderCount: placeholderCount,
                         placeholderLabel: String(format: String(localized: "Loading %@"), title),
@@ -615,23 +650,11 @@ private struct RankingListView: View {
             }
         }
     }
-
-    private static func routeTarget(_ item: RankingResult.RankItem) -> VideoRouteTarget? {
-        .make(
-            bvid: item.bvid,
-            aid: item.aid,
-            title: item.title,
-            coverURL: item.pic,
-            mobileCoverURL: item.mobileCoverURL,
-            ownerName: item.owner?.name ?? "",
-            durationSeconds: item.duration ?? 0
-        )
-    }
 }
 
 private struct PGCFeedRenderKey: Equatable {
-    let followedItems: [PGCFollowedPosterData]
-    let itemIDs: [Int]
+    let followedRevision: UInt64
+    let itemsRevision: UInt64
     let placeholderCount: Int
     let isActive: Bool
     let isHomeTabSelected: Bool
@@ -655,17 +678,20 @@ private struct EquatablePGCFeedHost<Content: View>: View, Equatable {
 private final class PGCTabCache {
     struct Snapshot {
         let followedItems: [PGCFollowedPosterData]
+        let followedRevision: UInt64
         let items: [PGCPosterItemData]
-        let itemIDs: [Int]
+        let itemsRevision: UInt64
         let followedFeedback: HomeFeedFeedback
         let pgcFeedback: HomeFeedFeedback
         let canLoadFollowed: Bool
     }
 
+    private var hasSynced = false
     var snapshot = Snapshot(
         followedItems: [],
+        followedRevision: 0,
         items: [],
-        itemIDs: [],
+        itemsRevision: 0,
         followedFeedback: HomeFeedFeedback(),
         pgcFeedback: HomeFeedFeedback(),
         canLoadFollowed: false
@@ -673,22 +699,28 @@ private final class PGCTabCache {
 
     func sync(
         rawFollowed: [BangumiFollowResult.FollowedBangumi],
+        followedRevision: UInt64,
         rawItems: [PGCIndexResult.PGCItem],
+        itemsRevision: UInt64,
         followedFeedback: HomeFeedFeedback,
         pgcFeedback: HomeFeedFeedback,
         canLoadFollowed: Bool
     ) -> Snapshot {
-        let mappedFollowed = rawFollowed.map {
-            PGCFollowedPosterData(
-                id: $0.seasonId,
-                title: $0.title ?? "",
-                cover: $0.cover ?? "",
-                meta: $0.progressText ?? $0.newEpShow ?? " "
-            )
+        let mappedFollowed: [PGCFollowedPosterData]
+        if hasSynced, followedRevision == snapshot.followedRevision {
+            mappedFollowed = snapshot.followedItems
+        } else {
+            mappedFollowed = rawFollowed.map {
+                PGCFollowedPosterData(
+                    id: $0.seasonId,
+                    title: $0.title ?? "",
+                    cover: $0.cover ?? "",
+                    meta: $0.progressText ?? $0.newEpShow ?? " "
+                )
+            }
         }
-        let newIDs = rawItems.map(\.id)
         let mappedItems: [PGCPosterItemData]
-        if newIDs == snapshot.itemIDs {
+        if hasSynced, itemsRevision == snapshot.itemsRevision {
             mappedItems = snapshot.items
         } else {
             mappedItems = rawItems.map {
@@ -701,10 +733,12 @@ private final class PGCTabCache {
                 )
             }
         }
+        hasSynced = true
         snapshot = Snapshot(
             followedItems: mappedFollowed,
+            followedRevision: followedRevision,
             items: mappedItems,
-            itemIDs: newIDs,
+            itemsRevision: itemsRevision,
             followedFeedback: followedFeedback,
             pgcFeedback: pgcFeedback,
             canLoadFollowed: canLoadFollowed
@@ -729,6 +763,14 @@ private struct PGCListView: View {
         indexType == 1 ? viewModel.followedAnime : viewModel.followedShows
     }
 
+    private var itemsRevision: UInt64 {
+        indexType == 1 ? viewModel.animeRevision : viewModel.movieRevision
+    }
+
+    private var followedRevision: UInt64 {
+        indexType == 1 ? viewModel.followedAnimeRevision : viewModel.followedShowsRevision
+    }
+
     private var canLoadFollowed: Bool {
         guard let midString = AuthManager.shared.dedeUserID else { return false }
         return Int(midString) != nil
@@ -740,7 +782,9 @@ private struct PGCListView: View {
         let snap = isSelected
             ? cache.sync(
                 rawFollowed: followed,
+                followedRevision: followedRevision,
                 rawItems: items,
+                itemsRevision: itemsRevision,
                 followedFeedback: viewModel.feedback(for: .followed(indexType)),
                 pgcFeedback: viewModel.feedback(for: .pgc(indexType)),
                 canLoadFollowed: canLoadFollowed
@@ -749,8 +793,8 @@ private struct PGCListView: View {
         let hasItems = !snap.items.isEmpty
         let placeholderCount = snap.pgcFeedback.showsPlaceholder(hasContent: hasItems) ? 6 : 0
         let renderKey = PGCFeedRenderKey(
-            followedItems: snap.followedItems,
-            itemIDs: snap.itemIDs,
+            followedRevision: snap.followedRevision,
+            itemsRevision: snap.itemsRevision,
             placeholderCount: placeholderCount,
             isActive: isSelected,
             isHomeTabSelected: coordinator.selectedTab == .home,
@@ -771,7 +815,9 @@ private struct PGCListView: View {
                     PGCFeedCollectionView(
                         followedTitle: followedTitle,
                         followedItems: snap.followedItems,
+                        followedRevision: snap.followedRevision,
                         items: snap.items,
+                        itemsRevision: snap.itemsRevision,
                         placeholderCount: placeholderCount,
                         placeholderLabel: String(format: String(localized: "Loading %@"), pgcTitle),
                         isActive: renderKey.isActive,

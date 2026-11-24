@@ -3,7 +3,7 @@ import SwiftUI
 
 struct ChatMessageRow: View {
     let message: SessionMsgsResult.ChatMessage
-    let previous: SessionMsgsResult.ChatMessage?
+    let previousTimestamp: Int?
     let talkerID: Int
     let face: String?
     let myUID: Int?
@@ -13,11 +13,45 @@ struct ChatMessageRow: View {
     @Environment(\.contentLinkContext) private var linkContext
     @Environment(\.displayScale) private var displayScale
 
+    init(
+        message: SessionMsgsResult.ChatMessage,
+        previousTimestamp: Int?,
+        talkerID: Int,
+        face: String?,
+        myUID: Int?,
+        bubbleMaxWidth: CGFloat = 260
+    ) {
+        self.message = message
+        self.previousTimestamp = previousTimestamp
+        self.talkerID = talkerID
+        self.face = face
+        self.myUID = myUID
+        self.bubbleMaxWidth = bubbleMaxWidth
+    }
+
+    init(
+        message: SessionMsgsResult.ChatMessage,
+        previous: SessionMsgsResult.ChatMessage?,
+        talkerID: Int,
+        face: String?,
+        myUID: Int?,
+        bubbleMaxWidth: CGFloat = 260
+    ) {
+        self.init(
+            message: message,
+            previousTimestamp: previous?.timestamp,
+            talkerID: talkerID,
+            face: face,
+            myUID: myUID,
+            bubbleMaxWidth: bubbleMaxWidth
+        )
+    }
+
     @ViewBuilder
     var body: some View {
         if let timestamp = message.timestamp,
-           timestamp - (previous?.timestamp ?? 0) > 300 {
-            Text(Self.chipFormatter.string(from: Date(timeIntervalSince1970: TimeInterval(timestamp))))
+           timestamp - (previousTimestamp ?? 0) > 300 {
+            Text(payload.timestampText(for: timestamp, formatter: Self.chipFormatter))
                 .appFont(.messageMeta)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 10)
@@ -89,7 +123,8 @@ struct ChatMessageRow: View {
             .overlay {
                 KFImage(URL(string: resizedURL))
                     .setProcessor(DownsamplingImageProcessor(size: CGSize(width: 200, height: 150)))
-                    .scaleFactor(displayScale)
+                    .backgroundDecode()
+                    .scaleFactor(displayScale > 0 ? displayScale : 1)
                     .cancelOnDisappear(true)
                     .resizable()
                     .imageLoadingCover(ground: .clear, shorterSide: 150)
@@ -107,7 +142,8 @@ struct ChatMessageRow: View {
             .overlay {
                 KFImage(URL(string: resizedURL))
                     .setProcessor(DownsamplingImageProcessor(size: CGSize(width: 120, height: 120)))
-                    .scaleFactor(displayScale)
+                    .backgroundDecode()
+                    .scaleFactor(displayScale > 0 ? displayScale : 1)
                     .cancelOnDisappear(true)
                     .resizable()
                     .imageLoadingCover(ground: .clear, shorterSide: 120)
@@ -142,28 +178,7 @@ struct ChatMessageRow: View {
     }
 
     private func linkifiedBubbleText(_ text: String, isMine: Bool) -> Text {
-        guard !text.isEmpty else {
-            return Text(verbatim: String(localized: "[Unsupported message]"))
-        }
-        let links = UIKitDynamicRichTextBuilder.inlineLinks(in: text)
-        guard !links.isEmpty else { return Text(verbatim: text) }
-        let runs = EmoteText.linkRuns(text, links: links)
-        guard runs.contains(where: { $0.url != nil }) else { return Text(verbatim: text) }
-        var result = Text(verbatim: "")
-        for run in runs {
-            guard let url = run.url else {
-                result = result + Text(verbatim: run.text)
-                continue
-            }
-            var attributed = AttributedString(run.text)
-            attributed.link = url
-            attributed.foregroundColor = isMine ? Color.white : Color.biliAccent
-            if isMine {
-                attributed.underlineStyle = Text.LineStyle.single
-            }
-            result = result + Text(attributed)
-        }
-        return result
+        payload.bubbleText(for: text, isMine: isMine)
     }
 
     private func systemNoticeRow(text: String, url: String?) -> some View {
@@ -350,8 +365,17 @@ private final class ChatMessagePayloadCache {
         let content: String?
     }
 
+    private struct TextKey: Equatable {
+        let text: String
+        let isMine: Bool
+    }
+
     private var key: Key?
     private var prepared: ChatMessagePayload?
+    private var cachedTimestamp: Int?
+    private var cachedTimestampText: String?
+    private var cachedTextKey: TextKey?
+    private var cachedBubbleText: Text?
 
     func value(for message: SessionMsgsResult.ChatMessage) -> ChatMessagePayload {
         let requested = Key(type: message.msgType, content: message.content)
@@ -360,5 +384,47 @@ private final class ChatMessagePayloadCache {
         key = requested
         prepared = payload
         return payload
+    }
+
+    func timestampText(for timestamp: Int, formatter: DateFormatter) -> String {
+        if cachedTimestamp == timestamp, let cachedTimestampText { return cachedTimestampText }
+        let formatted = formatter.string(from: Date(timeIntervalSince1970: TimeInterval(timestamp)))
+        cachedTimestamp = timestamp
+        cachedTimestampText = formatted
+        return formatted
+    }
+
+    func bubbleText(for text: String, isMine: Bool) -> Text {
+        let requested = TextKey(text: text, isMine: isMine)
+        if cachedTextKey == requested, let cachedBubbleText { return cachedBubbleText }
+        let built = buildBubbleText(text, isMine: isMine)
+        cachedTextKey = requested
+        cachedBubbleText = built
+        return built
+    }
+
+    private func buildBubbleText(_ text: String, isMine: Bool) -> Text {
+        guard !text.isEmpty else {
+            return Text(verbatim: String(localized: "[Unsupported message]"))
+        }
+        let links = UIKitDynamicRichTextBuilder.inlineLinks(in: text)
+        guard !links.isEmpty else { return Text(verbatim: text) }
+        let runs = EmoteText.linkRuns(text, links: links)
+        guard runs.contains(where: { $0.url != nil }) else { return Text(verbatim: text) }
+        var result = Text(verbatim: "")
+        for run in runs {
+            guard let url = run.url else {
+                result = result + Text(verbatim: run.text)
+                continue
+            }
+            var attributed = AttributedString(run.text)
+            attributed.link = url
+            attributed.foregroundColor = isMine ? Color.white : Color.biliAccent
+            if isMine {
+                attributed.underlineStyle = Text.LineStyle.single
+            }
+            result = result + Text(attributed)
+        }
+        return result
     }
 }

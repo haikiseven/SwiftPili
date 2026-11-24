@@ -129,20 +129,19 @@ struct AudioTimelineBuffer: Sendable {
               channels == self.channels
         else { return AudioSupplyPull(frames: 0) }
 
-        var framesWritten = 0
-        while framesWritten < frameCount {
-            let samplesLeft = samples.count - readIndex
-            guard samplesLeft >= channels else { break }
-            let destination = framesWritten * channels
-            let source = readIndex
-            for channel in 0..<channels {
-                output[destination + channel] = samples[source + channel]
-            }
-            readIndex += channels
-            framesWritten += 1
+        let samplesLeft = samples.count - readIndex
+        let availableFrames = samplesLeft / channels
+        let framesToCopy = min(frameCount, availableFrames)
+        guard framesToCopy > 0 else { return AudioSupplyPull(frames: 0) }
+
+        let sampleCount = framesToCopy * channels
+        samples.withUnsafeBufferPointer { source in
+            guard let base = source.baseAddress else { return }
+            output.update(from: base.advanced(by: readIndex), count: sampleCount)
         }
+        readIndex += sampleCount
         compactIfNeeded()
-        return AudioSupplyPull(frames: framesWritten)
+        return AudioSupplyPull(frames: framesToCopy)
     }
 
     private func rejected(_ rejection: Rejection) -> AppendResult {
@@ -224,6 +223,13 @@ struct AudioTimelineBuffer: Sendable {
     }
 
     private mutating func compactIfNeeded() {
+        if readIndex >= samples.count {
+            if !samples.isEmpty {
+                samples.removeAll(keepingCapacity: true)
+            }
+            readIndex = 0
+            return
+        }
         let ch = max(1, channels)
         let discardCandidates = readIndex
         guard discardCandidates >= 16_384, discardCandidates * 2 >= samples.count else { return }

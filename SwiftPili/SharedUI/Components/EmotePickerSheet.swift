@@ -228,6 +228,7 @@ private extension EmotePickerSheet {
             toPixel: CGSize(width: size * displayScale, height: size * displayScale)
         )))
         .setProcessor(DownsamplingImageProcessor(size: CGSize(width: size, height: size)))
+        .backgroundDecode()
         .scaleFactor(displayScale)
         .cancelOnDisappear(true)
         .resizable()

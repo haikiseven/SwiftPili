@@ -286,42 +286,6 @@ private struct LiveStatusBadge: View {
     }
 }
 
-private struct LivePortraitInputEdgeProbe: ViewModifier {
-    let tree: String
-    let screenHeight: CGFloat
-    let screenSource: String
-    let containerHeight: CGFloat
-    let physicalBottomInset: CGFloat
-    let effectiveBottomInset: CGFloat
-    let bottomOverlayPadding: CGFloat
-    let keyboardFrame: CGRect?
-
-    func body(content: Content) -> some View {
-        content.onGeometryChange(for: CGRect.self) {
-            $0.frame(in: .global)
-        } action: { frame in
-            guard PlayerLog.isCapturing else { return }
-            let allowed = screenHeight - max(0, max(physicalBottomInset, effectiveBottomInset))
-            let keyboard = keyboardFrame.map {
-                "\(Int($0.minY.rounded()))..\(Int($0.maxY.rounded()))"
-            } ?? "none"
-            PlayerLog.log(
-                "[LivePortrait] inputEdge tree=\(tree) "
-                    + "screen=\(Int(screenHeight.rounded()))/\(screenSource) "
-                    + "container=\(Int(containerHeight.rounded())) "
-                    + "rect=\(Int(frame.minY.rounded()))..\(Int(frame.maxY.rounded())) "
-                    + "h=\(Int(frame.height.rounded())) "
-                    + "allowed=\(Int(allowed.rounded())) "
-                    + "below=\(Int(max(0, frame.maxY - allowed).rounded())) "
-                    + "physBottom=\(Int(physicalBottomInset.rounded())) "
-                    + "effBottom=\(Int(effectiveBottomInset.rounded())) "
-                    + "overlayBottom=\(Int(bottomOverlayPadding.rounded())) "
-                    + "kbd=\(keyboard)"
-            )
-        }
-    }
-}
-
 private struct LivePortraitInputBarHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
 
@@ -435,7 +399,6 @@ struct LiveRoomView: View {
         _routePosition = State(initialValue: routePosition)
     }
     @State private var viewModel = LiveRoomViewModel()
-    @State private var routeActivation = RouteActivationState()
     @State private var danmakuDraft = LiveDanmakuDraftModel()
     @FocusState private var isDanmakuFocused: Bool
     @Environment(AppCoordinator.self) private var coordinator
@@ -445,18 +408,11 @@ struct LiveRoomView: View {
     @Environment(\.accentStore) private var accentStore
     @State private var scaleModeBeforeImmersivePortrait: VideoScaleMode?
     @State private var inlineContainerSize: CGSize = .zero
-    @State private var standardChatAutoScroll = LiveChatAutoScrollPolicy<UUID>()
-    @State private var immersiveChatAutoScroll = LiveChatAutoScrollPolicy<UUID>()
     @State private var portraitKeyboardFrame: CGRect?
     @State private var portraitInputBarHeight = LivePortraitOverlayMetrics.minimumInputHeight
     @State private var immersiveTransportHeight = LivePortraitOverlayMetrics.minimumInputHeight
-    @State private var lastBandRect: CGRect = .zero
     @State private var immersiveHeaderHeight = LivePortraitOverlayMetrics.minimumHeaderHeight
     @State private var standardHeaderHeight = LivePortraitOverlayMetrics.minimumHeaderHeight
-
-    private var portraitHeaderHeight: CGFloat {
-        usesImmersivePortraitLayout ? immersiveHeaderHeight : standardHeaderHeight
-    }
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -466,11 +422,8 @@ struct LiveRoomView: View {
     private var isActiveLiveRoute: Bool {
         coordinator.isActivePlayerRoute(.live(roomID), position: routePosition)
     }
-    private var isRouteActivated: Bool {
-        routeActivation.admits(routeIsActive: isActiveLiveRoute)
-    }
     private var presentationContext: PlayerScreenPresentationContext? {
-        guard isRouteActivated else { return nil }
+        guard isActiveLiveRoute else { return nil }
         return player.presentationContext(
             screenID: presentationScreenID, lease: viewModel.playerOwnerLease,
             route: .live(roomID), position: routePosition, source: .live(roomID: roomID)
@@ -541,7 +494,7 @@ struct LiveRoomView: View {
     }
 
     private var hasInlineExitChrome: Bool {
-        guard isRouteActivated, !isRoomOffline, viewModel.streamUnavailable == nil,
+        guard isActiveLiveRoute, !isRoomOffline, viewModel.streamUnavailable == nil,
               viewModel.error == nil, player.error == nil,
               let lease = viewModel.playerOwnerLease else { return false }
         return player.isCurrentOwner(lease) && player.mode == .live
@@ -549,7 +502,7 @@ struct LiveRoomView: View {
     }
 
     private var inlineQualityControl: LiveQualityControl? {
-        guard !usesImmersivePortraitLayout, isRouteActivated, !player.isFullscreenPresentationActive,
+        guard !usesImmersivePortraitLayout, isActiveLiveRoute, !player.isFullscreenPresentationActive,
               canChooseQuality, let lease = viewModel.playerOwnerLease,
               player.isCurrentOwner(lease), player.mode == .live else { return nil }
         let room = viewModel
@@ -618,10 +571,7 @@ struct LiveRoomView: View {
             presentationContext: presentationContext,
             coordinator: coordinator,
             liveRoom: viewModel,
-            watchdogScreen: "LiveRoom",
-            onRouteAppearance: { event in
-                _ = routeActivation.handle(event, owner: PlayerViewModel.liveOwner(roomID))
-            }
+            watchdogScreen: "LiveRoom"
         ) {
             if usesImmersivePortraitLayout {
                 Color.black.ignoresSafeArea()
@@ -630,7 +580,7 @@ struct LiveRoomView: View {
                     coverURL: viewModel.roomInfo?.coverURL(for: .roomPoster),
                     player: player,
                     ownerLease: viewModel.playerOwnerLease,
-                    isRouteActive: isRouteActivated
+                    isRouteActive: isActiveLiveRoute
                 )
             }
         }
@@ -639,22 +589,16 @@ struct LiveRoomView: View {
         ) { size in
             if inlineContainerSize != size { inlineContainerSize = size }
         }
-        .onChange(of: isActiveLiveRoute, initial: true) { _, active in
-            let outcome = routeActivation.handle(
-                .routeActivity(active), owner: PlayerViewModel.liveOwner(roomID)
-            )
-            if outcome == .deactivated, routeActivation.defersActivation {
+        .onChange(of: isActiveLiveRoute, initial: true) { oldActive, active in
+            if !active, oldActive {
                 viewModel.revokeLoadForRouteDeparture()
                 player.pauseForRouteDeparture(lease: viewModel.playerOwnerLease)
             }
         }
         .task(id: isActiveLiveRoute) {
             guard isActiveLiveRoute else { return }
-            await viewModel.prefetchMetadata(roomID: roomID, requestAdmission: { isActiveLiveRoute })
-        }
-        .task(id: isRouteActivated) {
-            guard isRouteActivated else { return }
-            await viewModel.load(roomID: roomID, requestAdmission: { isRouteActivated })
+            player.endForeignOwnerForRouteActivation(incomingOwner: PlayerViewModel.liveOwner(roomID))
+            await viewModel.load(roomID: roomID, requestAdmission: { isActiveLiveRoute })
         }
         .task(id: viewModel.roomInfo?.uid) {
             await viewModel.loadBroadcaster(uid: viewModel.roomInfo?.uid, authManager: authManager)
@@ -665,8 +609,6 @@ struct LiveRoomView: View {
             guard scenePhase == .active else { return }
             let departingLease = viewModel.playerOwnerLease
             guard viewModel.endPlayback() == .ownershipEnded else { return }
-            standardChatAutoScroll.reset()
-            immersiveChatAutoScroll.reset()
             danmakuDraft.cancelSend()
             viewModel.disconnect()
             if player.currentOwnerLease == nil || player.currentOwnerLease == departingLease {
@@ -722,7 +664,6 @@ struct LiveRoomView: View {
                 ?? (geometry.size.height
                     + geometry.safeAreaInsets.top
                     + geometry.safeAreaInsets.bottom)
-            let screenSource = keyWindowFrameInScreen == nil ? "geo" : "win"
             let safeAreaLayout = LivePortraitSafeAreaLayout.resolve(
                 isImmersivePortrait: usesImmersivePortraitLayout,
                 topSafeAreaInset: physicalTopInset,
@@ -774,8 +715,6 @@ struct LiveRoomView: View {
                 boxHeight: overlayBoxHeight,
                 chromeBoxHeight: geometry.size.height,
                 chromeReservation: chromeReservation,
-                layout: safeAreaLayout,
-                screenSource: screenSource,
                 hostChrome: hostChrome
             )
             ZStack {
@@ -790,8 +729,7 @@ struct LiveRoomView: View {
                         layout: safeAreaLayout,
                         containerSize: geometry.size,
                         metrics: overlayMetrics,
-                        boxHeight: overlayBoxHeight,
-                        screenSource: screenSource
+                        boxHeight: overlayBoxHeight
                     )
                 }
             }
@@ -814,100 +752,6 @@ struct LiveRoomView: View {
                 }
                 immersiveTransportHeight = measuredHeight
             }
-            .onChange(of: portraitKeyboardFrame) { _, _ in
-                guard PlayerLog.isCapturing else { return }
-                logBandEdge("kbd", rect: lastBandRect)
-            }
-            .onChange(of: portraitInputBarHeight) { _, _ in
-                logPortraitSafeAreaLayout(
-                    safeAreaLayout,
-                    containerSize: geometry.size,
-                    boxHeight: overlayBoxHeight,
-                    playerBand: playerInlineHeight(
-                        containerWidth: geometry.size.width,
-                        boxHeight: overlayBoxHeight
-                    ),
-                    headerHeight: portraitHeaderHeight,
-                    chromeReservation: chromeReservation,
-                    hostChrome: hostChrome,
-                    metrics: usesImmersivePortraitLayout ? overlayMetrics : nil
-                )
-            }
-            .onChange(of: immersiveTransportHeight) { _, _ in
-                logPortraitSafeAreaLayout(
-                    safeAreaLayout,
-                    containerSize: geometry.size,
-                    boxHeight: overlayBoxHeight,
-                    playerBand: playerInlineHeight(
-                        containerWidth: geometry.size.width,
-                        boxHeight: overlayBoxHeight
-                    ),
-                    headerHeight: portraitHeaderHeight,
-                    chromeReservation: chromeReservation,
-                    hostChrome: hostChrome,
-                    metrics: usesImmersivePortraitLayout ? overlayMetrics : nil
-                )
-            }
-            .onAppear {
-                logPortraitSafeAreaLayout(
-                    safeAreaLayout,
-                    containerSize: geometry.size,
-                    boxHeight: overlayBoxHeight,
-                    playerBand: playerInlineHeight(
-                        containerWidth: geometry.size.width,
-                        boxHeight: overlayBoxHeight
-                    ),
-                    headerHeight: portraitHeaderHeight,
-                    chromeReservation: chromeReservation,
-                    hostChrome: hostChrome,
-                    metrics: usesImmersivePortraitLayout ? overlayMetrics : nil
-                )
-            }
-            .onChange(of: portraitHeaderHeight) { _, _ in
-                logPortraitSafeAreaLayout(
-                    safeAreaLayout,
-                    containerSize: geometry.size,
-                    boxHeight: overlayBoxHeight,
-                    playerBand: playerInlineHeight(
-                        containerWidth: geometry.size.width,
-                        boxHeight: overlayBoxHeight
-                    ),
-                    headerHeight: portraitHeaderHeight,
-                    chromeReservation: chromeReservation,
-                    hostChrome: hostChrome,
-                    metrics: usesImmersivePortraitLayout ? overlayMetrics : nil
-                )
-            }
-            .onChange(of: geometry.size) { _, _ in
-                logPortraitSafeAreaLayout(
-                    safeAreaLayout,
-                    containerSize: geometry.size,
-                    boxHeight: overlayBoxHeight,
-                    playerBand: playerInlineHeight(
-                        containerWidth: geometry.size.width,
-                        boxHeight: overlayBoxHeight
-                    ),
-                    headerHeight: portraitHeaderHeight,
-                    chromeReservation: chromeReservation,
-                    hostChrome: hostChrome,
-                    metrics: usesImmersivePortraitLayout ? overlayMetrics : nil
-                )
-            }
-            .onChange(of: safeAreaLayout) { _, layout in
-                logPortraitSafeAreaLayout(
-                    layout,
-                    containerSize: geometry.size,
-                    boxHeight: overlayBoxHeight,
-                    playerBand: playerInlineHeight(
-                        containerWidth: geometry.size.width,
-                        boxHeight: overlayBoxHeight
-                    ),
-                    headerHeight: portraitHeaderHeight,
-                    chromeReservation: chromeReservation,
-                    hostChrome: hostChrome,
-                    metrics: usesImmersivePortraitLayout ? overlayMetrics : nil
-                )
-            }
             .modifier(LiveKeyboardFrameTracker(frame: $portraitKeyboardFrame))
         }
     }
@@ -926,8 +770,6 @@ struct LiveRoomView: View {
         boxHeight: CGFloat,
         chromeBoxHeight: CGFloat,
         chromeReservation: CGFloat,
-        layout: LivePortraitSafeAreaLayout,
-        screenSource: String,
         hostChrome: LiveHostChromeExtent
     ) -> some View {
         let isImmersive = usesImmersivePortraitLayout
@@ -960,11 +802,8 @@ struct LiveRoomView: View {
 
                 ScrollView([]) {
                     if !isImmersive {
-                        standardRoomCompanion(
-                            boxHeight: boxHeight, chromeBoxHeight: chromeBoxHeight,
-                            chatHeight: chatHeight, layout: layout, screenSource: screenSource
-                        )
-                        .frame(width: companionWidth)
+                        standardRoomCompanion(chatHeight: chatHeight)
+                            .frame(width: companionWidth)
                     }
                 }
                 .frame(
@@ -984,8 +823,11 @@ struct LiveRoomView: View {
         width: CGFloat, height: CGFloat, isImmersive: Bool,
         hostChrome: LiveHostChromeExtent, cornerRadius: CGFloat = 0
     ) -> some View {
+        let showsLoadingIndicator = !isRoomOffline
+            && viewModel.streamUnavailable == nil
+            && viewModel.error == nil
         Group {
-            if isRouteActivated {
+            if isActiveLiveRoute {
                 if hostOwnsInlineSurface {
                     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                         .fill(Color.black)
@@ -1003,18 +845,17 @@ struct LiveRoomView: View {
                         pageNavigationActions: isImmersive ? nil : playerPageNavigation,
                         inlineViewportSize: CGSize(width: width, height: height),
                         inlineCornerRadius: cornerRadius,
-                        screenLease: viewModel.playerOwnerLease
+                        screenLease: viewModel.playerOwnerLease,
+                        placeholderCoverURL: viewModel.roomInfo?.coverURL(for: .roomPoster),
+                        showsLoadingIndicator: showsLoadingIndicator
                     )
                     .frame(width: width, height: height)
-                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { frame in
-                        lastBandRect = frame
-                        if isRouteActivated, !player.isFullscreenPresentationActive,
+                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { _ in
+                        if isActiveLiveRoute, !player.isFullscreenPresentationActive,
                            let lease = viewModel.playerOwnerLease, player.isCurrentOwner(lease),
                            player.surfaceLease(matching: lease, role: .inline) != nil {
                             player.refreshInlineVideoRect()
                         }
-                        guard PlayerLog.isCapturing else { return }
-                        logBandEdge("move", rect: frame)
                     }
                     .overlay {
                         if let refusal = viewModel.streamUnavailable {
@@ -1023,11 +864,6 @@ struct LiveRoomView: View {
                             offlinePlayerOverlay
                         } else if let loadError = viewModel.error, player.error == nil {
                             errorPlayerOverlay(loadError)
-                        } else if viewModel.isLoading, !isPlayerOwner {
-                            ProgressView()
-                                .tint(.white)
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                                .background(.black.opacity(0.6))
                         }
                     }
                     .background {
@@ -1056,7 +892,6 @@ struct LiveRoomView: View {
         PlayerDetailInlineNavigationOverlay(
             player: player,
             isActiveRoute: isActiveLiveRoute,
-            isRouteActivated: isRouteActivated,
             hasInlineExitChrome: { hasInlineExitChrome },
             scrimWidth: width,
             scrimHeight: height,
@@ -1155,7 +990,9 @@ struct LiveRoomView: View {
                 Color.clear
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .overlay(alignment: .topLeading) {
-                        if !isRoomOffline { chatScrollView }
+                        if !isRoomOffline {
+                            LiveStandardChatView(viewModel: viewModel, isWide: true)
+                        }
                     }
                 Color.clear
                     .frame(height: hasInput ? portraitInputBarHeight + AppSpacing.m : 0)
@@ -1204,10 +1041,7 @@ struct LiveRoomView: View {
         .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: isFloating)
     }
 
-    private func standardRoomCompanion(
-        boxHeight: CGFloat, chromeBoxHeight: CGFloat, chatHeight: CGFloat,
-        layout: LivePortraitSafeAreaLayout, screenSource: String
-    ) -> some View {
+    private func standardRoomCompanion(chatHeight: CGFloat) -> some View {
         VStack(spacing: 0) {
             if let info = viewModel.roomInfo {
                 roomInfoBar(info)
@@ -1223,7 +1057,9 @@ struct LiveRoomView: View {
                 Color.clear
                     .frame(height: chatHeight)
                     .overlay(alignment: .topLeading) {
-                        if !isRoomOffline { chatScrollView }
+                        if !isRoomOffline {
+                            LiveStandardChatView(viewModel: viewModel, isWide: false)
+                        }
                     }
 
                 if !isRoomOffline && AuthManager.shared.isLoggedIn {
@@ -1235,14 +1071,6 @@ struct LiveRoomView: View {
                         viewModel: viewModel
                     )
                         .fixedSize(horizontal: false, vertical: true)
-                        .modifier(LivePortraitInputEdgeProbe(
-                            tree: "standard", screenHeight: boxHeight,
-                            screenSource: screenSource, containerHeight: chromeBoxHeight,
-                            physicalBottomInset: keyWindowSafeAreaInsets?.bottom ?? 0,
-                            effectiveBottomInset: layout.effectiveBottomSafeAreaInset,
-                            bottomOverlayPadding: layout.bottomOverlayPadding,
-                            keyboardFrame: portraitKeyboardFrame
-                        ))
                         .background {
                             GeometryReader { proxy in
                                 Color.clear.preference(
@@ -1268,8 +1096,7 @@ struct LiveRoomView: View {
         layout: LivePortraitSafeAreaLayout,
         containerSize: CGSize,
         metrics: LivePortraitOverlayMetrics,
-        boxHeight: CGFloat,
-        screenSource: String
+        boxHeight: CGFloat
     ) -> some View {
         let hasInput = AuthManager.shared.isLoggedIn
         return ZStack(alignment: .bottom) {
@@ -1307,7 +1134,7 @@ struct LiveRoomView: View {
 
                 VStack(spacing: 0) {
                     if metrics.showsChatList {
-                        immersiveChatScrollView
+                        LiveImmersiveChatView(viewModel: viewModel)
                             .frame(height: metrics.chatHeight)
                             .opacity(isImmersiveChromeActive ? 1.0 : 0.60)
                             .animation(immersiveChromeAnimation, value: isImmersiveChromeActive)
@@ -1334,16 +1161,11 @@ struct LiveRoomView: View {
                     }
 
                     if hasInput {
-                        immersiveDanmakuInputBar(
-                            layout: layout,
-                            containerSize: containerSize,
-                            boxHeight: boxHeight,
-                            screenSource: screenSource
-                        )
-                        .modifier(ImmersiveChromeFade(
-                            isActive: isImmersiveChromeActive,
-                            animation: immersiveChromeAnimation
-                        ))
+                        immersiveDanmakuInputBar()
+                            .modifier(ImmersiveChromeFade(
+                                isActive: isImmersiveChromeActive,
+                                animation: immersiveChromeAnimation
+                            ))
                     }
                 }
                 .padding(.bottom, layout.bottomOverlayPadding)
@@ -1352,12 +1174,7 @@ struct LiveRoomView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func immersiveDanmakuInputBar(
-        layout: LivePortraitSafeAreaLayout,
-        containerSize: CGSize,
-        boxHeight: CGFloat,
-        screenSource: String
-    ) -> some View {
+    private func immersiveDanmakuInputBar() -> some View {
         LiveDanmakuInputBar(
             style: .immersive,
             draft: danmakuDraft,
@@ -1365,16 +1182,6 @@ struct LiveRoomView: View {
             roomID: roomID,
             viewModel: viewModel
         )
-        .modifier(LivePortraitInputEdgeProbe(
-            tree: "immersive",
-            screenHeight: boxHeight,
-            screenSource: screenSource,
-            containerHeight: containerSize.height,
-            physicalBottomInset: layout.physicalBottomSafeAreaInset,
-            effectiveBottomInset: layout.effectiveBottomSafeAreaInset,
-            bottomOverlayPadding: layout.bottomOverlayPadding,
-            keyboardFrame: portraitKeyboardFrame
-        ))
         .background {
             GeometryReader { proxy in
                 Color.clear.preference(
@@ -1382,23 +1189,6 @@ struct LiveRoomView: View {
                     value: proxy.size.height
                 )
             }
-        }
-        .onGeometryChange(for: CGRect.self) {
-            $0.frame(in: .global)
-        } action: { frame in
-            guard PlayerLog.isCapturing else { return }
-            let allowed = layout.keyboardDisplacement > 0
-                ? boxHeight - layout.effectiveBottomSafeAreaInset
-                : boxHeight - layout.physicalBottomSafeAreaInset
-            PlayerLog.log(
-                "[LivePortrait] input container=\(Int(containerSize.width)) "
-                    + "width=\(Int(frame.width)) "
-                    + "trailing=\(Int(frame.maxX)) "
-                    + "overflow=\(Int(max(0, frame.maxX - containerSize.width))) "
-                    + "bottom=\(Int(frame.maxY)) "
-                    + "allowed=\(Int(allowed)) "
-                    + "below=\(Int(max(0, frame.maxY - allowed)))"
-            )
         }
     }
 
@@ -1456,7 +1246,7 @@ struct LiveRoomView: View {
         } actions: {
             Button("Retry") {
                 Task {
-                    await viewModel.load(roomID: roomID, requestAdmission: { isRouteActivated })
+                    await viewModel.load(roomID: roomID, requestAdmission: { isActiveLiveRoute })
                 }
             }
             .buttonStyle(.borderedProminent)
@@ -1581,10 +1371,6 @@ struct LiveRoomView: View {
                         LivePortraitHeaderBudget.controlSide + LivePortraitHeaderBudget.interitemSpacing
                     )
             }
-        }
-        .onChange(of: budget, initial: true) { _, resolved in
-            guard PlayerLog.isEnabled else { return }
-            PlayerLog.log("[LivePortrait] header \(resolved.diagnosticText)")
         }
     }
 
@@ -1716,111 +1502,11 @@ struct LiveRoomView: View {
         .disabled(viewModel.followRequestInFlight)
     }
 
-    private var immersiveChatScrollView: some View {
-        ScrollViewReader { proxy in
-            let renderedMessages = LiveChatRenderPolicy.immersiveVisibleMessages(
-                from: viewModel.chatMessages
-            )
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 6) {
-                    ForEach(renderedMessages) { message in
-                        immersiveChatBubble(message)
-                            .id(message.id)
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-            }
-            .scrollIndicators(.hidden)
-            .scrollDismissesKeyboard(.interactively)
-            .mask {
-                VStack(spacing: 0) {
-                    LinearGradient(
-                        colors: [.clear, .black],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                    .frame(height: 24)
-                    Color.black
-                }
-            }
-            .onChange(of: renderedMessages.last?.id) { _, latestID in
-                guard let targetID = immersiveChatAutoScroll.nextTarget(for: latestID) else {
-                    return
-                }
-                var transaction = Transaction()
-                transaction.disablesAnimations = true
-                withTransaction(transaction) {
-                    proxy.scrollTo(targetID, anchor: .bottom)
-                }
-            }
-        }
-    }
-
-    private func immersiveChatBubble(_ message: ChatMessage) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 7) {
-            if message.isSystem {
-                Image(systemName: "info.circle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.white.opacity(0.80))
-                Text(message.text)
-                    .font(.footnote)
-                    .foregroundStyle(.white.opacity(0.88))
-                    .italic()
-            } else {
-                if let name = message.medalName, let level = message.medalLevel {
-                    medalChip(name: name, level: level, color: message.medalColor)
-                        .alignmentGuide(.firstTextBaseline) { medalChipFirstTextBaseline($0) }
-                }
-                Button {
-                    guard message.uid > 0 else { return }
-                    coordinator.navigate(to: .userSpace(message.uid))
-                } label: {
-                    Text(message.uname)
-                        .font(.callout.weight(.semibold))
-                        .foregroundStyle(Color.biliAccent.mix(with: .white, by: 0.25))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .frame(maxWidth: chatSenderNameMaxWidth, alignment: .leading)
-                        .fixedSize(horizontal: true, vertical: false)
-                }
-                .buttonStyle(.plain)
-                .disabled(message.uid <= 0)
-                .accessibilityLabel(Text(
-                    message.uid > 0
-                        ? "Open \(message.uname)'s profile"
-                        : message.uname
-                ))
-                Text(message.text)
-                    .font(.callout)
-                    .lineLimit(2)
-                    .layoutPriority(1)
-            }
-        }
-        .foregroundStyle(.white)
-        .shadow(color: .black.opacity(0.82), radius: 1, x: 0, y: 0.5)
-        .shadow(color: .black.opacity(0.55), radius: 3, x: 0, y: 1.5)
-    }
-
     private var keyWindowSafeAreaInsets: UIEdgeInsets? {
         AppWindowMetrics.current?.safeAreaInsets
     }
 
     private var keyWindowFrameInScreen: CGRect? { AppWindowMetrics.frameInScreen }
-
-    private func logBandEdge(_ edge: String, rect: CGRect) {
-        let keyboard = portraitKeyboardFrame.map {
-            "\(Int($0.minY.rounded()))..\(Int($0.maxY.rounded()))"
-        } ?? "none"
-        PlayerLog.log(
-            "[LivePortrait] bandEdge on=\(edge) "
-                + "rect=\(Int(rect.minY.rounded()))..\(Int(rect.maxY.rounded())) "
-                + "h=\(Int(rect.height.rounded())) "
-                + "w=\(Int(rect.width.rounded())) "
-                + "immersive=\(usesImmersivePortraitLayout) "
-                + "kbd=\(keyboard)"
-        )
-    }
 
     private func unsafeAreaContainerFrame(_ geometry: GeometryProxy) -> CGRect {
         let inset = geometry.frame(in: .global)
@@ -1837,58 +1523,6 @@ struct LiveRoomView: View {
         guard let previous = scaleModeBeforeImmersivePortrait else { return }
         scaleModeBeforeImmersivePortrait = nil
         player.scaleMode = previous
-    }
-
-    private func logPortraitSafeAreaLayout(
-        _ layout: LivePortraitSafeAreaLayout,
-        containerSize: CGSize,
-        boxHeight: CGFloat,
-        playerBand: CGFloat,
-        headerHeight: CGFloat,
-        chromeReservation: CGFloat,
-        hostChrome: LiveHostChromeExtent,
-        metrics: LivePortraitOverlayMetrics?
-    ) {
-        guard PlayerLog.isCapturing else { return }
-        let width = Int(max(0, containerSize.width).rounded())
-        let height = Int(max(0, containerSize.height).rounded())
-        let topInset = Int(layout.topSafeAreaInset.rounded())
-        let bottomInset = Int(layout.effectiveBottomSafeAreaInset.rounded())
-        let keyboardDisplacement = Int(layout.keyboardDisplacement.rounded())
-        let topPadding = Int(layout.topOverlayPadding.rounded())
-        let bottomPadding = Int(layout.bottomOverlayPadding.rounded())
-        var line = "[LiveLayout] portraitImmersive=\(usesImmersivePortraitLayout) "
-            + "container=\(width)x\(height) box=\(Int(max(0, boxHeight).rounded())) "
-            + "safeTop=\(topInset) safeBottom=\(bottomInset) "
-            + "keyboardDisplacement=\(keyboardDisplacement) "
-            + "overlayTop=\(topPadding) overlayBottom=\(bottomPadding) "
-            + "player=\(Int(max(0, playerBand).rounded()))"
-        if let metrics {
-            let required = layout.topOverlayPadding
-                + metrics.reservedHeaderHeight
-                + metrics.chatHeight
-                + metrics.reservedBottomHeight
-                + layout.bottomOverlayPadding
-            line += " header=\(Int(metrics.reservedHeaderHeight.rounded()))"
-                + " headerRaw=\(Int(max(0, headerHeight).rounded()))"
-                + " chat=\(Int(metrics.chatHeight.rounded()))"
-                + " input=\(Int(metrics.reservedInputHeight.rounded()))"
-                + " transport=\(Int(metrics.reservedTransportHeight.rounded()))"
-                + " required=\(Int(required.rounded()))"
-                + " over=\(Int(max(0, required - max(0, boxHeight)).rounded()))"
-                + " hostTop=\(Int(max(0, hostChrome.top).rounded()))"
-                + " hostBottom=\(Int(max(0, hostChrome.bottom).rounded()))"
-                + " hostBottomEatsTouches=\(hostChrome.bottomInterceptsTouches ? 1 : 0)"
-                + " cardTop=\(Int((8 + max(max(0, hostChrome.top), layout.topSafeAreaInset)).rounded()))"
-        } else {
-            let floor = max(0, playerBand) + max(0, chromeReservation)
-            line += " header=\(Int(max(0, headerHeight).rounded()))"
-                + " reserved=\(Int(max(0, chromeReservation).rounded()))"
-                + " floor=\(Int(floor.rounded()))"
-                + " chatSlack=\(Int((max(0, containerSize.height) - floor).rounded()))"
-                + " scrollOverflow=\(Int(max(0, floor - max(0, containerSize.height)).rounded()))"
-        }
-        PlayerLog.log(line)
     }
 
     // MARK: - Room Info
@@ -2039,153 +1673,9 @@ struct LiveRoomView: View {
         .disabled(viewModel.followRequestInFlight)
     }
 
-    // MARK: - Chat
-
-    @ScaledMetric(relativeTo: .callout) private var chatSenderNameMaxWidth: CGFloat = 130
-    @ScaledMetric(relativeTo: .footnote) private var headerTextScaleProbe: CGFloat = 100
-
-    private var chatScrollView: some View {
-        ScrollViewReader { proxy in
-            let renderedMessages = LiveChatRenderPolicy.standardVisibleMessages(
-                from: viewModel.chatMessages
-            )
-            let isWide = usesWideCompanionLayout
-            let horizontalInset: CGFloat = isWide ? 18 : 14
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: AppSpacing.s) {
-                    Image(systemName: "bubble.left.and.bubble.right.fill")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.biliAccent)
-                    Text("Live Chat")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.primary.opacity(0.9))
-                    Spacer()
-                }
-                .padding(.horizontal, horizontalInset)
-                .padding(.top, isWide ? AppSpacing.l : AppSpacing.m)
-                .padding(.bottom, isWide ? AppSpacing.m : AppSpacing.s)
-
-                Divider()
-                    .opacity(0.24)
-
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: isWide ? 10 : 8) {
-                        ForEach(renderedMessages) { msg in
-                            chatBubble(msg)
-                                .id(msg.id)
-                        }
-
-                        if renderedMessages.isEmpty {
-                            HStack {
-                                Spacer()
-                                VStack(spacing: AppSpacing.s) {
-                                    Image(systemName: "bubble.left.and.bubble.right")
-                                        .font(.title2)
-                                        .foregroundStyle(.tertiary)
-                                    Text("Chat messages will appear here")
-                                        .font(.footnote)
-                                        .foregroundStyle(.tertiary)
-                                }
-                                .padding(.vertical, 48)
-                                Spacer()
-                            }
-                        }
-                    }
-                    .padding(.horizontal, horizontalInset)
-                    .padding(.vertical, isWide ? AppSpacing.m : AppSpacing.s)
-                }
-                .scrollDismissesKeyboard(.interactively)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .onChange(of: renderedMessages.last?.id) { _, latestID in
-                guard let targetID = standardChatAutoScroll.nextTarget(for: latestID) else {
-                    return
-                }
-                var transaction = Transaction()
-                transaction.disablesAnimations = true
-                withTransaction(transaction) {
-                    proxy.scrollTo(targetID, anchor: .bottom)
-                }
-            }
-        }
-    }
-
-    private func chatBubble(_ msg: ChatMessage) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 7) {
-            if msg.isSystem {
-                Image(systemName: "info.circle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Text(msg.text)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .italic()
-            } else {
-                if let name = msg.medalName, let level = msg.medalLevel {
-                    medalChip(name: name, level: level, color: msg.medalColor)
-                        .alignmentGuide(.firstTextBaseline) { medalChipFirstTextBaseline($0) }
-                }
-                Button {
-                    guard msg.uid > 0 else { return }
-                    coordinator.navigate(to: .userSpace(msg.uid))
-                } label: {
-                    Text(msg.uname)
-                        .font(.callout)
-                        .fontWeight(.semibold)
-                        .foregroundStyle(.biliAccent)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .frame(maxWidth: chatSenderNameMaxWidth, alignment: .leading)
-                        .fixedSize(horizontal: true, vertical: false)
-                }
-                .buttonStyle(.plain)
-                .disabled(msg.uid <= 0)
-                .accessibilityLabel(Text(
-                    msg.uid > 0
-                        ? "Open \(msg.uname)'s profile"
-                        : msg.uname
-                ))
-                Text(msg.text)
-                    .font(.callout)
-                    .foregroundStyle(.primary)
-                    .layoutPriority(1)
-            }
-        }
-    }
-
-    private func medalChip(name: String, level: Int, color: Int?) -> some View {
-        HStack(spacing: 2) {
-            Text(name)
-                .appFont(.overlayBadge)
-                .fontWeight(.medium)
-                .lineLimit(1)
-            Text("\(level)")
-                .appFont(.overlayBadge)
-                .fontWeight(.bold)
-        }
-        .foregroundStyle(.white)
-        .padding(.horizontal, 5)
-        .padding(.vertical, 1)
-        .background(medalColor(color))
-        .clipShape(RoundedRectangle(cornerRadius: AppRadius.badge))
-        .fixedSize()
-    }
-
-    private nonisolated func medalChipFirstTextBaseline(_ dimensions: ViewDimensions) -> CGFloat {
-        let capHeight = UIFont.preferredFont(forTextStyle: .callout).capHeight
-        return dimensions.height / 2 + capHeight / 2
-    }
-
-    private func medalColor(_ value: Int?) -> Color {
-        guard let value else { return .secondary }
-        return Color(
-            red: Double((value >> 16) & 0xFF) / 255.0,
-            green: Double((value >> 8) & 0xFF) / 255.0,
-            blue: Double(value & 0xFF) / 255.0
-        )
-    }
-
     // MARK: - Quality
+
+    @ScaledMetric(relativeTo: .footnote) private var headerTextScaleProbe: CGFloat = 100
 
     private var canChooseQuality: Bool {
         viewModel.streamUnavailable == nil && !viewModel.availableQualities.isEmpty
@@ -2249,5 +1739,266 @@ struct LiveRoomView: View {
         }
         .accessibilityLabel(Text("Video quality \(label)"))
         .accessibilitySortPriority(2)
+    }
+}
+
+// MARK: - Isolated Live Chat Subviews
+
+private struct LiveStandardChatView: View {
+    let viewModel: LiveRoomViewModel
+    let isWide: Bool
+
+    @Environment(AppCoordinator.self) private var coordinator
+    @ScaledMetric(relativeTo: .callout) private var chatSenderNameMaxWidth: CGFloat = 130
+    @State private var autoScroll = LiveChatAutoScrollPolicy<UUID>()
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            let renderedMessages = LiveChatRenderPolicy.standardVisibleMessages(
+                from: viewModel.chatMessages
+            )
+            let horizontalInset: CGFloat = isWide ? 18 : 14
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(spacing: AppSpacing.s) {
+                    Image(systemName: "bubble.left.and.bubble.right.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.biliAccent)
+                    Text("Live Chat")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary.opacity(0.9))
+                    Spacer()
+                }
+                .padding(.horizontal, horizontalInset)
+                .padding(.top, isWide ? AppSpacing.l : AppSpacing.m)
+                .padding(.bottom, isWide ? AppSpacing.m : AppSpacing.s)
+
+                Divider()
+                    .opacity(0.24)
+
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: isWide ? 10 : 8) {
+                        ForEach(renderedMessages) { msg in
+                            chatBubble(msg)
+                                .id(msg.id)
+                        }
+
+                        if renderedMessages.isEmpty {
+                            HStack {
+                                Spacer()
+                                VStack(spacing: AppSpacing.s) {
+                                    Image(systemName: "bubble.left.and.bubble.right")
+                                        .font(.title2)
+                                        .foregroundStyle(.tertiary)
+                                    Text("Chat messages will appear here")
+                                        .font(.footnote)
+                                        .foregroundStyle(.tertiary)
+                                }
+                                .padding(.vertical, 48)
+                                Spacer()
+                            }
+                        }
+                    }
+                    .padding(.horizontal, horizontalInset)
+                    .padding(.vertical, isWide ? AppSpacing.m : AppSpacing.s)
+                }
+                .scrollDismissesKeyboard(.interactively)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .onChange(of: renderedMessages.last?.id) { _, latestID in
+                guard let targetID = autoScroll.nextTarget(for: latestID) else {
+                    return
+                }
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    proxy.scrollTo(targetID, anchor: .bottom)
+                }
+            }
+            .onDisappear {
+                autoScroll.reset()
+            }
+        }
+    }
+
+    private func chatBubble(_ msg: ChatMessage) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 7) {
+            if msg.isSystem {
+                Image(systemName: "info.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(msg.text)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .italic()
+            } else {
+                if let name = msg.medalName, let level = msg.medalLevel {
+                    LiveChatMedalChip(name: name, level: level, color: msg.medalColor)
+                        .alignmentGuide(.firstTextBaseline) {
+                            LiveChatMedalChip.firstTextBaseline($0)
+                        }
+                }
+                Button {
+                    guard msg.uid > 0 else { return }
+                    coordinator.navigate(to: .userSpace(msg.uid))
+                } label: {
+                    Text(msg.uname)
+                        .font(.callout)
+                        .fontWeight(.semibold)
+                        .foregroundStyle(.biliAccent)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: chatSenderNameMaxWidth, alignment: .leading)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                .buttonStyle(.plain)
+                .disabled(msg.uid <= 0)
+                .accessibilityLabel(Text(
+                    msg.uid > 0
+                        ? "Open \(msg.uname)'s profile"
+                        : msg.uname
+                ))
+                Text(msg.text)
+                    .font(.callout)
+                    .foregroundStyle(.primary)
+                    .layoutPriority(1)
+            }
+        }
+    }
+}
+
+private struct LiveImmersiveChatView: View {
+    let viewModel: LiveRoomViewModel
+
+    @Environment(AppCoordinator.self) private var coordinator
+    @ScaledMetric(relativeTo: .callout) private var chatSenderNameMaxWidth: CGFloat = 130
+    @State private var autoScroll = LiveChatAutoScrollPolicy<UUID>()
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            let renderedMessages = LiveChatRenderPolicy.immersiveVisibleMessages(
+                from: viewModel.chatMessages
+            )
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 6) {
+                    ForEach(renderedMessages) { message in
+                        immersiveChatBubble(message)
+                            .id(message.id)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+            }
+            .scrollIndicators(.hidden)
+            .scrollDismissesKeyboard(.interactively)
+            .mask {
+                VStack(spacing: 0) {
+                    LinearGradient(
+                        colors: [.clear, .black],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(height: 24)
+                    Color.black
+                }
+            }
+            .onChange(of: renderedMessages.last?.id) { _, latestID in
+                guard let targetID = autoScroll.nextTarget(for: latestID) else {
+                    return
+                }
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    proxy.scrollTo(targetID, anchor: .bottom)
+                }
+            }
+            .onDisappear {
+                autoScroll.reset()
+            }
+        }
+    }
+
+    private func immersiveChatBubble(_ message: ChatMessage) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 7) {
+            if message.isSystem {
+                Image(systemName: "info.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.80))
+                Text(message.text)
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.88))
+                    .italic()
+            } else {
+                if let name = message.medalName, let level = message.medalLevel {
+                    LiveChatMedalChip(name: name, level: level, color: message.medalColor)
+                        .alignmentGuide(.firstTextBaseline) {
+                            LiveChatMedalChip.firstTextBaseline($0)
+                        }
+                }
+                Button {
+                    guard message.uid > 0 else { return }
+                    coordinator.navigate(to: .userSpace(message.uid))
+                } label: {
+                    Text(message.uname)
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(Color.biliAccent.mix(with: .white, by: 0.25))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: chatSenderNameMaxWidth, alignment: .leading)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                .buttonStyle(.plain)
+                .disabled(message.uid <= 0)
+                .accessibilityLabel(Text(
+                    message.uid > 0
+                        ? "Open \(message.uname)'s profile"
+                        : message.uname
+                ))
+                Text(message.text)
+                    .font(.callout)
+                    .lineLimit(2)
+                    .layoutPriority(1)
+            }
+        }
+        .foregroundStyle(.white)
+        .shadow(color: .black.opacity(0.82), radius: 1, x: 0, y: 0.5)
+        .shadow(color: .black.opacity(0.55), radius: 3, x: 0, y: 1.5)
+    }
+}
+
+private struct LiveChatMedalChip: View {
+    let name: String
+    let level: Int
+    let color: Int?
+
+    var body: some View {
+        HStack(spacing: 2) {
+            Text(name)
+                .appFont(.overlayBadge)
+                .fontWeight(.medium)
+                .lineLimit(1)
+            Text("\(level)")
+                .appFont(.overlayBadge)
+                .fontWeight(.bold)
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 1)
+        .background(medalColor)
+        .clipShape(RoundedRectangle(cornerRadius: AppRadius.badge))
+        .fixedSize()
+    }
+
+    private var medalColor: Color {
+        guard let color else { return .secondary }
+        return Color(
+            red: Double((color >> 16) & 0xFF) / 255.0,
+            green: Double((color >> 8) & 0xFF) / 255.0,
+            blue: Double(color & 0xFF) / 255.0
+        )
+    }
+
+    nonisolated static func firstTextBaseline(_ dimensions: ViewDimensions) -> CGFloat {
+        let capHeight = UIFont.preferredFont(forTextStyle: .callout).capHeight
+        return dimensions.height / 2 + capHeight / 2
     }
 }

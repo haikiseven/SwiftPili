@@ -140,7 +140,12 @@ struct DanmakuRenderPreferences: Equatable, Sendable {
     var showsTop: Bool
     var showsBottom: Bool
     var avoidsOverlap: Bool
-    var blockedKeywords: [String]
+    var blockedKeywords: [String] {
+        didSet {
+            foldedBlockedKeywords = Self.foldKeywords(blockedKeywords)
+        }
+    }
+    private var foldedBlockedKeywords: [String]
 
     init(
         opacity: Double,
@@ -164,6 +169,7 @@ struct DanmakuRenderPreferences: Equatable, Sendable {
         self.showsBottom = showsBottom
         self.avoidsOverlap = avoidsOverlap
         self.blockedKeywords = blockedKeywords
+        self.foldedBlockedKeywords = Self.foldKeywords(blockedKeywords)
     }
 
     static let `default` = DanmakuRenderPreferences(
@@ -326,14 +332,24 @@ struct DanmakuRenderPreferences: Equatable, Sendable {
     }
 
     func blocks(_ text: String) -> Bool {
+        guard !foldedBlockedKeywords.isEmpty else { return false }
         let haystack = text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
-        for keyword in blockedKeywords {
-            let needle = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !needle.isEmpty else { continue }
-            let folded = needle.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+        for folded in foldedBlockedKeywords {
             if haystack.contains(folded) { return true }
         }
         return false
+    }
+
+    private static func foldKeywords(_ keywords: [String]) -> [String] {
+        guard !keywords.isEmpty else { return [] }
+        var folded: [String] = []
+        folded.reserveCapacity(keywords.count)
+        for keyword in keywords {
+            let needle = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !needle.isEmpty else { continue }
+            folded.append(needle.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil))
+        }
+        return folded
     }
 
     func admits(_ kind: DanmakuRenderKind) -> Bool {

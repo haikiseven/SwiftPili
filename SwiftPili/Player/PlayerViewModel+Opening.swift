@@ -47,6 +47,9 @@ extension PlayerViewModel {
             }
         }
         resetStreamDisplayForOpen(videoURL: url, audioURL: audioURL, isSeekReopen: isSeekReopen)
+        if !isSeekReopen, currentURL == nil {
+            hasRenderedFirstFrame = false
+        }
         liveNeedsReconnectOnResume = false
         terminalOpenFailure = false
         admitDanmakuSession(openingAt: startAt)
@@ -257,6 +260,18 @@ extension PlayerViewModel {
 }
 
 extension PlayerViewModel {
+
+    func markFirstVideoFrameRendered() {
+        guard !terminalOpenFailure, error == nil else { return }
+        if !hasRenderedFirstFrame {
+            hasRenderedFirstFrame = true
+            PlayerLog.log("[Player] first video frame rendered owner=\(ownerKey.isEmpty ? "-" : ownerKey)")
+        }
+        if !ownerKey.isEmpty {
+            clearOutgoingRouteStill(owner: ownerKey)
+        }
+        notePresentationStarted()
+    }
 
     func notePresentationStarted() {
         guard !hasStartedPresenting else { return }

@@ -203,7 +203,7 @@ actor MediaByteRangeStore {
         reservationBytes: Int64? = nil,
         onCancel: @escaping @Sendable () -> Void = {}
     ) -> ClaimToken? {
-        guard !segmentRanges(for: key).contains(where: { $0.overlaps(range) }),
+        guard entry(for: key)?.overlaps(range) != true,
               let token = rangeClaims.claim(
                 key, range: range, reservationLimit: caps.totalBytes / 2,
                 reservationBytes: reservationBytes, onCancel: onCancel
@@ -300,6 +300,7 @@ actor MediaByteRangeStore {
 private extension MediaByteRangeStore {
     func evictToTotalCap(protecting protected: String?, heldCap: Int64? = nil) {
         let ceiling = heldCap ?? effectiveHeldCap
+        guard totalBytes > ceiling else { return }
         let activePaths = protectedActivePaths
         while totalBytes > ceiling {
             let victim = entries

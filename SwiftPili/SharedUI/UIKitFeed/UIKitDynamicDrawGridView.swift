@@ -169,7 +169,7 @@ final class UIKitDynamicDrawGridView: UIView {
             availableWidth: width, maxWidth: maxWidth
         )
         heightConstraint?.constant = layout.totalHeight
-        let urls = items.map(\.url)
+        let urls = currentURLs
         let drawn = min(items.count, 9)
         let cornerRadius = drawn == 1 ? AppRadius.control : AppRadius.thumbnail
         let traits = traitCollection
@@ -199,10 +199,23 @@ final class UIKitDynamicDrawGridView: UIView {
     }
 
     private func configureTileImage(_ tile: TileView, item: MediaItem, size: CGSize, isSingle: Bool) {
+        let safeScale = max(1, traitCollection.displayScale)
         if item.isGIF {
-            tile.activeRequest = nil
+            let gifRequest = UIKitCoverPipeline.CoverRequest(
+                url: item.url,
+                requestBox: size,
+                scale: safeScale,
+                displayMode: .fill,
+                sourceURL: item.url.absoluteString
+            )
             tile.imageView.contentMode = .scaleAspectFill
-            tile.imageView.kf.setImage(with: item.url, options: [.transition(.none)])
+            tile.imageView.layer.contentsRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+            guard tile.activeRequest != gifRequest else { return }
+            tile.activeRequest = gifRequest
+            tile.imageView.kf.setImage(
+                with: item.url,
+                options: [.backgroundDecode, .scaleFactor(safeScale), .transition(.none)]
+            )
             return
         }
         let cropped = !isSingle || item.isLongImage || item.pixelSize == nil
@@ -211,7 +224,7 @@ final class UIKitDynamicDrawGridView: UIView {
             drawnBox: size,
             displayMode: cropped ? .fill : .entire,
             requestsServerCrop: !isSingle,
-            scale: traitCollection.displayScale
+            scale: safeScale
         )
         UIKitCoverPipeline.apply(to: tile.imageView, request: request, activeRequest: &tile.activeRequest)
         if item.isLongImage, let pixelSize = item.pixelSize,

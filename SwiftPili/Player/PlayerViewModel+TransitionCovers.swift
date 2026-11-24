@@ -3,33 +3,30 @@ import Foundation
 import UIKit
 
 extension PlayerViewModel {
+    private static let transitionCoverTimeout: Duration = .seconds(8)
 
     @discardableResult
     func parkOutgoingRouteStill() -> String? {
-        let costSpan = UIHitchMonitor.beginSpan("nav.still")
-        defer { UIHitchMonitor.endSpan(costSpan) }
         releaseDepartedRouteStills()
         let owner = ownerKey
         guard !owner.isEmpty else { return nil }
         guard let frame = backend.currentDisplayedFrameForTransition(),
               frame.size.width > 0,
               frame.size.height > 0 else {
-            var stored = outgoingRouteStills
-            stored.removeValue(forKey: owner)
-            outgoingRouteStills = stored
-            outgoingRouteStillExpiry.cancel(owner: owner)
-            if outgoingRouteStill?.owner == owner {
-                outgoingRouteStill = nil
-            }
+            clearOutgoingRouteStill(owner: owner)
             PlayerLog.log("[Player] outgoing route still capture missed owner=\(owner)")
             return owner
         }
         var stored = outgoingRouteStills
         stored[owner] = frame
         outgoingRouteStills = stored
-        outgoingRouteStill = OutgoingRouteStill(owner: owner, image: frame)
-        _ = outgoingRouteStillExpiry.arm(owner: owner) { [weak self] owner, expiryIdentity in
-            self?.expireOutgoingRouteStill(owner: owner, expiryIdentity: expiryIdentity)
+        routeOwnership.outgoingRouteStillTasks[owner]?.cancel()
+        routeOwnership.outgoingRouteStillTasks[owner] = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.transitionCoverTimeout)
+            guard !Task.isCancelled, let self,
+                  self.outgoingRouteStills[owner] != nil else { return }
+            self.clearOutgoingRouteStill(owner: owner)
+            PlayerLog.log("[Player] outgoing route still expired owner=\(owner)")
         }
         PlayerLog.log(
             "[Player] outgoing route still parked owner=\(owner) " +
@@ -46,16 +43,11 @@ extension PlayerViewModel {
     }
 
     func clearOutgoingRouteStill(owner: String) {
-        guard outgoingRouteStills[owner] != nil || outgoingRouteStill?.owner == owner else {
-            return
-        }
-        outgoingRouteStillExpiry.cancel(owner: owner)
+        routeOwnership.outgoingRouteStillTasks.removeValue(forKey: owner)?.cancel()
+        guard outgoingRouteStills[owner] != nil else { return }
         var stored = outgoingRouteStills
         stored.removeValue(forKey: owner)
         outgoingRouteStills = stored
-        if outgoingRouteStill?.owner == owner {
-            outgoingRouteStill = nil
-        }
     }
 
     func retireDepartedRouteStill(owner: String) {
@@ -64,10 +56,10 @@ extension PlayerViewModel {
     }
 
     func clearAllOutgoingRouteStills() {
-        outgoingRouteStillExpiry.cancelAll()
+        for task in routeOwnership.outgoingRouteStillTasks.values { task.cancel() }
+        routeOwnership.outgoingRouteStillTasks.removeAll()
         departedRouteStillOwners.removeAll()
         outgoingRouteStills = [:]
-        outgoingRouteStill = nil
     }
 
     private func releaseDepartedRouteStills() {
@@ -77,15 +69,6 @@ extension PlayerViewModel {
         for owner in owners {
             clearOutgoingRouteStill(owner: owner)
         }
-    }
-
-    private func expireOutgoingRouteStill(owner: String, expiryIdentity: UInt64) {
-        guard outgoingRouteStillExpiry.isCurrent(owner: owner, expiryIdentity),
-              outgoingRouteStills[owner] != nil else {
-            return
-        }
-        clearOutgoingRouteStill(owner: owner)
-        PlayerLog.log("[Player] outgoing route still expired owner=\(owner)")
     }
 
     func ownsRecoveryCoverAuthority(_ cover: PlayerRecoveryCover) -> Bool {
@@ -213,10 +196,10 @@ extension PlayerViewModel {
     func clearFreezeFrame() {
         recoveryCover?.retire()
         recoveryCover = nil
-        transitionCoverExpiry.cancel()
+        freezeFrameExpiryTask?.cancel()
+        freezeFrameExpiryTask = nil
         freezeFrameIdentity &+= 1
         freezeFrame = nil
-        freezeFrameSetAt = 0
         freezeFrameAwaitingFreshProof = false
         freezeFrameExpectedSessionGeneration = nil
         cdnFrameCover = nil
@@ -229,20 +212,22 @@ extension PlayerViewModel {
     ) -> UInt64 {
         recoveryCover?.retire()
         recoveryCover = nil
-        transitionCoverExpiry.cancel()
+        freezeFrameExpiryTask?.cancel()
+        freezeFrameExpiryTask = nil
         freezeFrameIdentity &+= 1
         freezeFrame = frame
-        freezeFrameSetAt = CACurrentMediaTime()
         freezeFrameAwaitingFreshProof = awaitingFreshProof
         freezeFrameExpectedSessionGeneration = nil
         cdnFrameCover = nil
         let coverIdentity = freezeFrameIdentity
         if !awaitingFreshProof {
-            _ = transitionCoverExpiry.arm { [weak self] expiryIdentity in
-                self?.expireInstalledCover(
-                    expiryIdentity: expiryIdentity,
-                    coverIdentity: coverIdentity
-                )
+            freezeFrameExpiryTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: Self.transitionCoverTimeout)
+                guard !Task.isCancelled, let self,
+                      self.isCurrentFreezeFrame(coverIdentity),
+                      self.freezeFrame != nil else { return }
+                self.clearFreezeFrame()
+                PlayerLog.log("[Player] freeze frame expired cover=\(coverIdentity)")
             }
         }
         return coverIdentity
@@ -250,129 +235,5 @@ extension PlayerViewModel {
 
     func isCurrentFreezeFrame(_ identity: UInt64) -> Bool {
         freezeFrameIdentity == identity
-    }
-
-    private func expireInstalledCover(expiryIdentity: UInt64, coverIdentity: UInt64) {
-        guard transitionCoverExpiry.isCurrent(expiryIdentity),
-              isCurrentFreezeFrame(coverIdentity),
-              freezeFrame != nil else {
-            return
-        }
-        clearFreezeFrame()
-        PlayerLog.log("[Player] freeze frame expired cover=\(coverIdentity)")
-    }
-}
-
-struct OutgoingRouteStill {
-    let owner: String
-    let image: UIImage
-}
-
-@MainActor
-final class PlayerTransitionCoverExpiry {
-    typealias Sleeper = @MainActor @Sendable (Duration) async -> Bool
-    typealias Expiration = @MainActor @Sendable (UInt64) -> Void
-
-    private let timeout: Duration
-    private let sleeper: Sleeper
-    private var task: Task<Void, Never>?
-    private(set) var identity: UInt64 = 0
-
-    init(
-        timeout: Duration = .seconds(8),
-        sleeper: @escaping Sleeper = { duration in
-            do {
-                try await Task.sleep(for: duration)
-                return true
-            } catch {
-                return false
-            }
-        }
-    ) {
-        self.timeout = timeout
-        self.sleeper = sleeper
-    }
-
-    @discardableResult
-    func arm(_ onExpire: @escaping Expiration) -> UInt64 {
-        task?.cancel()
-        identity &+= 1
-        let armedIdentity = identity
-        let timeout = self.timeout
-        let sleeper = self.sleeper
-        task = Task { @MainActor in
-            guard await sleeper(timeout), !Task.isCancelled else { return }
-            onExpire(armedIdentity)
-        }
-        return armedIdentity
-    }
-
-    func isCurrent(_ candidate: UInt64) -> Bool {
-        identity == candidate
-    }
-
-    func cancel() {
-        task?.cancel()
-        task = nil
-        identity &+= 1
-    }
-}
-
-@MainActor
-final class PlayerOutgoingRouteStillExpiry {
-    typealias Sleeper = @MainActor @Sendable (Duration) async -> Bool
-    typealias Expiration = @MainActor @Sendable (String, UInt64) -> Void
-
-    private let timeout: Duration
-    private let sleeper: Sleeper
-    private var tasks: [String: Task<Void, Never>] = [:]
-    private var identities: [String: UInt64] = [:]
-    private var nextIdentity: UInt64 = 0
-
-    init(
-        timeout: Duration = .seconds(8),
-        sleeper: @escaping Sleeper = { duration in
-            do {
-                try await Task.sleep(for: duration)
-                return true
-            } catch {
-                return false
-            }
-        }
-    ) {
-        self.timeout = timeout
-        self.sleeper = sleeper
-    }
-
-    @discardableResult
-    func arm(owner: String, _ onExpire: @escaping Expiration) -> UInt64 {
-        tasks[owner]?.cancel()
-        nextIdentity &+= 1
-        let identity = nextIdentity
-        identities[owner] = identity
-        let timeout = self.timeout
-        let sleeper = self.sleeper
-        tasks[owner] = Task { @MainActor in
-            guard await sleeper(timeout), !Task.isCancelled else { return }
-            onExpire(owner, identity)
-        }
-        return identity
-    }
-
-    func isCurrent(owner: String, _ identity: UInt64) -> Bool {
-        identities[owner] == identity
-    }
-
-    func cancel(owner: String) {
-        tasks[owner]?.cancel()
-        tasks.removeValue(forKey: owner)
-        identities.removeValue(forKey: owner)
-    }
-
-    func cancelAll() {
-        for task in tasks.values { task.cancel() }
-        tasks.removeAll()
-        nextIdentity &+= 1
-        identities.removeAll()
     }
 }

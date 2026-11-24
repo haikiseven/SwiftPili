@@ -37,14 +37,16 @@ struct ArticleImage: View {
     }
 
     private func loadedImage(box: CGSize) -> some View {
-        let scale = displayScale
+        let scale = displayScale > 0 ? displayScale : 1
+        let requestBox = ImagePipelinePolicy.quantizedRequestBox(box)
         return KFImage(URL(string: url.absoluteString.biliResized(
             toPixel: CGSize(
-                width: box.width * scale,
-                height: box.height * scale
+                width: requestBox.width * scale,
+                height: requestBox.height * scale
             )
         )) ?? url)
-            .setProcessor(DownsamplingImageProcessor(size: box))
+            .setProcessor(DownsamplingImageProcessor(size: requestBox))
+            .backgroundDecode()
             .scaleFactor(scale)
             .cancelOnDisappear(true)
             .imageFadePolicy(reduceMotion: reduceMotion)

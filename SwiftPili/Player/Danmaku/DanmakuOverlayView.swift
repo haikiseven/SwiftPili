@@ -74,9 +74,18 @@ extension Notification.Name {
 }
 
 final class DanmakuHostView: UIView {
+    private struct SyncSnapshot: Equatable {
+        let bounds: CGRect
+        let picture: CGRect?
+        let scaleMode: VideoScaleMode
+        let presentation: DanmakuPresentation
+        let preferences: DanmakuRenderPreferences
+    }
+
     let controller = DanmakuRenderController()
     private var appliedPreferences = DanmakuRenderPreferences.load()
     private var appliedSmartMask = DanmakuRenderPreferences.smartMaskEnabled()
+    private var lastSync: SyncSnapshot?
     var scaleMode: VideoScaleMode = .fit
     var picture: CGRect?
     nonisolated(unsafe) private var preferenceObserver: DanmakuPreferenceObserver?
@@ -121,16 +130,29 @@ final class DanmakuHostView: UIView {
     }
 
     func syncBounds() {
+        let presentation = Self.presentation()
+        let preferences = DanmakuRenderPreferences.load()
+        let snapshot = SyncSnapshot(
+            bounds: bounds,
+            picture: picture,
+            scaleMode: scaleMode,
+            presentation: presentation,
+            preferences: preferences
+        )
+        guard snapshot != lastSync else { return }
+        lastSync = snapshot
+        appliedPreferences = preferences
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        controller.container.frame = bounds
-        let preferences = DanmakuRenderPreferences.load()
+        if controller.container.frame != bounds {
+            controller.container.frame = bounds
+        }
         controller.setContainerOpacity(preferences.opacity)
         CATransaction.commit()
         if controller.resize(
             viewport: bounds.size,
             picture: picture,
-            presentation: Self.presentation(),
+            presentation: presentation,
             preferences: preferences,
             maskFit: scaleMode
         ) {
@@ -153,6 +175,7 @@ final class DanmakuHostView: UIView {
         guard preferences != appliedPreferences else { return }
         let layout = preferences.layoutChanged(from: appliedPreferences)
         appliedPreferences = preferences
+        lastSync = nil
         controller.setContainerOpacity(preferences.opacity)
         guard layout else { return }
         controller.retargetLayout(preferences: preferences)

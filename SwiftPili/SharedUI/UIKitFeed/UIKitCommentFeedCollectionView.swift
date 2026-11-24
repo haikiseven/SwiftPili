@@ -39,7 +39,6 @@ struct CommentFeedEnvironmentSnapshot: Equatable {
     var locale: Locale = .autoupdatingCurrent
     var accessibilityReduceMotion: Bool = false
     var accessibilityReduceTransparency: Bool = false
-    var imageDiagnosticsScreen: String = "-"
     var contentLinkDefersToParent: Bool = false
     var navigationZoomNamespace: Namespace.ID?
     var contentLinkStateKey: ContentLinkStateKey?
@@ -70,7 +69,6 @@ struct UIKitCommentFeedCollectionView: View {
     @Environment(\.locale) private var locale
     @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
     @Environment(\.accessibilityReduceTransparency) private var accessibilityReduceTransparency
-    @Environment(\.imageDiagnosticsScreen) private var imageDiagnosticsScreen
     @Environment(\.contentLinkDefersToParent) private var contentLinkDefersToParent
     @Environment(\.navigationZoomNamespace) private var navigationZoomNamespace
     @Environment(AppCoordinator.self) private var coordinator: AppCoordinator?
@@ -232,7 +230,6 @@ struct UIKitCommentFeedCollectionView: View {
                 locale: locale,
                 accessibilityReduceMotion: accessibilityReduceMotion,
                 accessibilityReduceTransparency: accessibilityReduceTransparency,
-                imageDiagnosticsScreen: imageDiagnosticsScreen,
                 contentLinkDefersToParent: contentLinkDefersToParent,
                 navigationZoomNamespace: navigationZoomNamespace,
                 contentLinkStateKey: contentLinkContext?.stateKey

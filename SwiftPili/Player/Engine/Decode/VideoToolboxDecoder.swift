@@ -5,9 +5,7 @@ import VideoToolbox
 
 enum VideoToolboxSampleDependencyAttachmentPolicy {
     static func apply(to attachment: NSMutableDictionary, isKeyframe: Bool) {
-        attachment[kCMSampleAttachmentKey_NotSync as NSString] = NSNumber(
-            value: !isKeyframe
-        )
+        attachment[kCMSampleAttachmentKey_NotSync as NSString] = NSNumber(value: !isKeyframe)
     }
 }
 
@@ -123,7 +121,18 @@ final class VideoToolboxOutputRouter: @unchecked Sendable {
 
     func drainReady(forGeneration generation: UInt64) -> [Entry] {
         lock.withLock {
-            guard generation == activeGeneration else { return [] }
+            guard generation == activeGeneration, !submissionOrder.isEmpty else { return [] }
+            if submissionOrder.count == 1 {
+                let id = submissionOrder[0]
+                guard let entry = pendingBySubmission[id] else {
+                    submissionOrder.removeAll(keepingCapacity: true)
+                    return []
+                }
+                guard !entry.records.isEmpty else { return [] }
+                pendingBySubmission.removeValue(forKey: id)
+                submissionOrder.removeAll(keepingCapacity: true)
+                return [entry]
+            }
             var ready: [Entry] = []
             var remainingOrder: [UInt64] = []
             remainingOrder.reserveCapacity(submissionOrder.count)
@@ -873,7 +882,10 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
         }
 
         trace?.advance(to: .postprocess)
-        let drainedEntries = prepared.drainedEntries + router.drainReady(forGeneration: queueSessionID)
+        let newlyReady = router.drainReady(forGeneration: queueSessionID)
+        let drainedEntries = prepared.drainedEntries.isEmpty
+            ? newlyReady
+            : (prepared.drainedEntries + newlyReady)
         let currentEntry = drainedEntries.first { $0.submission.identity == identity }
         trace?.value.firstImageCallOffset = currentEntry?.firstImageOffset
 
@@ -918,9 +930,14 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
                     "keyframe=\(entry.packet.isKeyframe ? 1 : 0) — frame dropped, decoding continues"
                 )
             }
-            let callbackFaultStatus = entry.records
-                .map { OSStatus($0.event.status) }
-                .first { Self.classification(for: $0) != nil } ?? noErr
+            var callbackFaultStatus: OSStatus = noErr
+            for record in entry.records {
+                let status = OSStatus(record.event.status)
+                if Self.classification(for: status) != nil {
+                    callbackFaultStatus = status
+                    break
+                }
+            }
             if let fault = Self.runtimeFault(for: callbackFaultStatus, stage: .decodeCallback) {
                 logFaultIfNeeded(fault, status: callbackFaultStatus)
                 throw fault

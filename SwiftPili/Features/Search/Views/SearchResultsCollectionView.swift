@@ -106,6 +106,7 @@ struct SearchResultsConfiguration {
     let generation: UInt64
     let buckets: [SearchAllBucketData]
     let items: [SearchResultItemData]
+    let snapshotRevision: UInt64?
     let isSearching: Bool
     let coverPresentation: CoverPresentation
     let actions: SearchResultsActions
@@ -132,6 +133,7 @@ struct SearchResultsCollectionView: View {
     let generation: UInt64
     var buckets: [SearchAllBucketData] = []
     let items: [SearchResultItemData]
+    var snapshotRevision: UInt64? = nil
     let isSearching: Bool
     var isActive = true
     var isTabSelected = true
@@ -144,6 +146,7 @@ struct SearchResultsCollectionView: View {
             generation: generation,
             buckets: buckets,
             items: items,
+            snapshotRevision: snapshotRevision,
             isSearching: isSearching,
             coverPresentation: CoverPresentationStore.shared.presentation,
             actions: actions
@@ -169,6 +172,7 @@ final class SearchResultsCollectionViewController: UIKitBaseCollectionViewContro
     }
 
     var dataSource: UICollectionViewDiffableDataSource<SearchSectionKey, SearchCellKey>?
+    var currentSections: [SearchSectionKey] = []
     var searchType: SearchType = .all
     var generation: UInt64 = 0
     var buckets: [SearchAllBucketData] = []
@@ -176,6 +180,7 @@ final class SearchResultsCollectionViewController: UIKitBaseCollectionViewContro
     var items: [SearchResultItemData] = []
     var itemByID: [String: SearchResultItemData] = [:]
     var itemIndexByID: [String: Int] = [:]
+    private var lastSnapshotRevision: UInt64?
     var isSearching = false
     var coverPresentation = CoverPresentationStore.shared.presentation
     var actions: SearchResultsActions?
@@ -208,7 +213,7 @@ final class SearchResultsCollectionViewController: UIKitBaseCollectionViewContro
     override func makeCollectionLayout() -> UICollectionViewLayout {
         UICollectionViewCompositionalLayout { [weak self] sectionIndex, environment in
             guard let self else { return nil }
-            let sections = dataSource?.snapshot().sectionIdentifiers ?? []
+            let sections = currentSections
             guard sectionIndex < sections.count else { return nil }
             let effectiveWidth = environment.container.effectiveContentSize.width
             let contentWidth = max(1, effectiveWidth - UIKitFeedLayoutMetrics.horizontalInset * 2)
@@ -248,19 +253,23 @@ final class SearchResultsCollectionViewController: UIKitBaseCollectionViewContro
         let generationChanged = config.generation != generation
         let typeChanged = config.searchType != searchType
         let presentationChanged = config.coverPresentation != coverPresentation
-        let bucketsChanged = config.buckets != buckets
-        guard hasConfigChanges(
-            config,
-            generationChanged: generationChanged,
-            typeChanged: typeChanged,
-            presentationChanged: presentationChanged,
-            bucketsChanged: bucketsChanged
-        ) else { return }
+        let dataChanged: Bool
+        let bucketsChanged: Bool
+        if let incomingRev = config.snapshotRevision, let currentRev = lastSnapshotRevision,
+           incomingRev == currentRev {
+            dataChanged = false
+            bucketsChanged = false
+        } else {
+            bucketsChanged = config.buckets != buckets
+            dataChanged = bucketsChanged || config.items != items
+        }
+        guard generationChanged || typeChanged || presentationChanged || dataChanged
+            || config.isSearching != isSearching else { return }
 
         let previousCount = items.count
         let previousLastID = items.last?.id
         let previousByID = itemByID
-        applyIncomingConfig(config)
+        applyIncomingConfig(config, dataChanged: dataChanged)
 
         if generationChanged || typeChanged || items.count != previousCount {
             if generationChanged || typeChanged { prefetchCoordinator.cancelAll() }
@@ -275,6 +284,7 @@ final class SearchResultsCollectionViewController: UIKitBaseCollectionViewContro
             generationChanged: generationChanged,
             typeChanged: typeChanged,
             presentationChanged: presentationChanged,
+            dataChanged: dataChanged,
             previousByID: previousByID,
             previousLastID: items.count > previousCount ? previousLastID : nil
         )
@@ -330,17 +340,21 @@ final class SearchResultsCollectionViewController: UIKitBaseCollectionViewContro
     }
 
     func showsUserSeparator(at indexPath: IndexPath) -> Bool {
-        let sections = dataSource?.snapshot().sectionIdentifiers ?? []
-        guard let dataSource, indexPath.section < sections.count else { return false }
-        let sectionItems = dataSource.snapshot().itemIdentifiers(inSection: sections[indexPath.section])
-        guard indexPath.item + 1 < sectionItems.count else { return false }
-        switch sectionItems[indexPath.item + 1] {
-        case .bucketItem(_, _, let nextID), .resultItem(_, _, let nextID):
-            if case .user(let nextPayload) = itemByID[nextID]?.kind,
-               !nextPayload.representativeVideos.isEmpty {
-                return false
-            }
-        default: break
+        guard indexPath.section < currentSections.count else { return false }
+        let sectionItems: [SearchResultItemData]
+        switch currentSections[indexPath.section] {
+        case .bucket(let bucketType):
+            sectionItems = bucketByType[bucketType]?.items ?? []
+        case .results:
+            sectionItems = items
+        case .skeletons, .loadingFooter:
+            return false
+        }
+        let nextIndex = indexPath.item + 1
+        guard nextIndex < sectionItems.count else { return false }
+        if case .user(let nextPayload) = sectionItems[nextIndex].kind,
+           !nextPayload.representativeVideos.isEmpty {
+            return false
         }
         return true
     }
@@ -354,50 +368,44 @@ final class SearchResultsCollectionViewController: UIKitBaseCollectionViewContro
         }
     }
 
-    private func hasConfigChanges(
-        _ config: SearchResultsConfiguration,
-        generationChanged: Bool,
-        typeChanged: Bool,
-        presentationChanged: Bool,
-        bucketsChanged: Bool
-    ) -> Bool {
-        generationChanged || typeChanged || presentationChanged || bucketsChanged
-            || config.items != items || config.isSearching != isSearching
-    }
-
-    private func applyIncomingConfig(_ config: SearchResultsConfiguration) {
+    private func applyIncomingConfig(_ config: SearchResultsConfiguration, dataChanged: Bool) {
         searchType = config.searchType
         generation = config.generation
+        lastSnapshotRevision = config.snapshotRevision
+        isSearching = config.isSearching
+        coverPresentation = config.coverPresentation
+
+        guard dataChanged else { return }
         buckets = config.buckets
         bucketByType = Dictionary(uniqueKeysWithValues: buckets.map { ($0.targetType, $0) })
         items = config.items
 
         var combined: [String: SearchResultItemData] = [:]
+        combined.reserveCapacity(items.count + buckets.reduce(0) { $0 + $1.items.count })
         for bucket in buckets {
             for item in bucket.items { combined[item.id] = item }
         }
         for item in items { combined[item.id] = item }
         itemByID = combined
         itemIndexByID = Dictionary(uniqueKeysWithValues: items.enumerated().map { ($0.element.id, $0.offset) })
-        isSearching = config.isSearching
-        coverPresentation = config.coverPresentation
     }
 
     private func changedCellKeys(
         generationChanged: Bool,
         typeChanged: Bool,
         presentationChanged: Bool,
+        dataChanged: Bool,
         previousByID: [String: SearchResultItemData],
         previousLastID: String?
     ) -> [SearchCellKey] {
-        guard !generationChanged, !typeChanged else { return [] }
+        guard !generationChanged, !typeChanged, (presentationChanged || dataChanged) else { return [] }
         var keys: [SearchCellKey] = []
         for bucket in buckets {
-            for item in bucket.items where previousByID[item.id] != item || presentationChanged {
+            for item in bucket.items where presentationChanged || previousByID[item.id] != item {
                 keys.append(.bucketItem(generation: generation, bucket: bucket.targetType, id: item.id))
             }
         }
-        for item in items where previousByID[item.id] != item || presentationChanged || item.id == previousLastID {
+        for item in items where presentationChanged || item.id == previousLastID || previousByID[item.id] != item {
             keys.append(.resultItem(generation: generation, tab: searchType, id: item.id))
         }
         return keys

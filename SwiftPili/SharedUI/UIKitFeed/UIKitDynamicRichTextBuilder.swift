@@ -1,3 +1,4 @@
+import os
 import SwiftUI
 import UIKit
 
@@ -111,31 +112,106 @@ enum UIKitDynamicRichTextBuilder {
         return result
     }
 
+    private struct TruncationCacheKey: Hashable, Sendable {
+        let text: String
+        let widthHalfPoints: Int
+        let lineLimit: Int
+        let fontName: String
+        let fontSizeTenths: Int
+        let lineSpacingTenths: Int
+        let attachmentSignature: Int
+    }
+
+    private static let truncationCache = OSAllocatedUnfairLock(initialState: [TruncationCacheKey: Bool]())
+    private static let inlineLinkCache = OSAllocatedUnfairLock(initialState: [String: [String: URL]]())
+
     static func isAttributedText(
         _ attributed: NSAttributedString,
         truncatedAtWidth width: CGFloat,
         lineLimit: Int
     ) -> Bool {
-        let fullHeight = measuredHeight(of: attributed, width: width, maximumNumberOfLines: 0)
-        let cappedHeight = measuredHeight(of: attributed, width: width, maximumNumberOfLines: lineLimit)
-        return fullHeight > cappedHeight + 1
+        guard lineLimit > 0, width.isFinite, width > 1, attributed.length > 0 else { return false }
+
+        let rawString = attributed.string
+        var newlineCount = 0
+        var mayHaveAttachment = false
+        for byte in rawString.utf8 {
+            if byte == 0x0A { // '\n'
+                newlineCount += 1
+                if newlineCount > lineLimit { return true }
+            } else if byte == 0xEF { // UTF-8 lead byte of U+FFFC (NSTextAttachment)
+                mayHaveAttachment = true
+            }
+        }
+
+        let firstFont = attributed.attribute(.font, at: 0, effectiveRange: nil) as? UIFont
+        let firstParagraph = attributed.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        var attachmentSignature = 0
+        if mayHaveAttachment {
+            attributed.enumerateAttribute(
+                .attachment,
+                in: NSRange(location: 0, length: attributed.length),
+                options: []
+            ) { value, _, _ in
+                if let attachment = value as? NSTextAttachment {
+                    let w = Int((attachment.bounds.width * 2).rounded())
+                    let h = Int((attachment.bounds.height * 2).rounded())
+                    attachmentSignature = attachmentSignature &* 31 &+ (w &* 997 ^ h)
+                }
+            }
+        }
+
+        let cacheKey = TruncationCacheKey(
+            text: rawString,
+            widthHalfPoints: Int((width * 2).rounded()),
+            lineLimit: lineLimit,
+            fontName: firstFont?.fontName ?? "",
+            fontSizeTenths: Int(((firstFont?.pointSize ?? 0) * 10).rounded()),
+            lineSpacingTenths: Int(((firstParagraph?.lineSpacing ?? 0) * 10).rounded()),
+            attachmentSignature: attachmentSignature
+        )
+        if let cached = truncationCache.withLock({ $0[cacheKey] }) {
+            return cached
+        }
+
+        let truncated = measureTruncation(of: attributed, width: width, lineLimit: lineLimit)
+        truncationCache.withLock { cache in
+            if cache.count >= 512 { cache.removeAll(keepingCapacity: true) }
+            cache[cacheKey] = truncated
+        }
+        return truncated
     }
 
-    private static func measuredHeight(
+    private static func measureTruncation(
         of attributed: NSAttributedString,
         width: CGFloat,
-        maximumNumberOfLines: Int
-    ) -> CGFloat {
+        lineLimit: Int
+    ) -> Bool {
         let storage = NSTextStorage(attributedString: attributed)
         let manager = NSLayoutManager()
         let container = NSTextContainer(size: CGSize(width: width, height: .greatestFiniteMagnitude))
         container.lineFragmentPadding = 0
-        container.maximumNumberOfLines = maximumNumberOfLines
-        container.lineBreakMode = maximumNumberOfLines > 0 ? .byTruncatingTail : .byWordWrapping
+        container.maximumNumberOfLines = lineLimit + 1
+        container.lineBreakMode = .byWordWrapping
         manager.addTextContainer(container)
         storage.addLayoutManager(manager)
         manager.ensureLayout(for: container)
-        return manager.usedRect(for: container).height
+
+        let laidOutGlyphs = manager.glyphRange(for: container)
+        if laidOutGlyphs.upperBound < manager.numberOfGlyphs {
+            return true
+        }
+        var lineCount = 0
+        manager.enumerateLineFragments(forGlyphRange: laidOutGlyphs) { _, _, _, _, stop in
+            lineCount += 1
+            if lineCount > lineLimit {
+                stop.pointee = true
+            }
+        }
+        if lineCount <= lineLimit, manager.extraLineFragmentRect.height > 0 {
+            lineCount += 1
+        }
+        return lineCount > lineLimit
     }
 
     static func linkTarget(_ node: DynamicRichContent.Node) -> URL? {
@@ -163,19 +239,50 @@ enum UIKitDynamicRichTextBuilder {
         return URL(string: normalized) ?? URL(string: normalized, encodingInvalidCharacters: true)
     }
 
+    private static func scanInlineLinkHints(in text: String) -> (hasURL: Bool, hasBV: Bool, hasAV: Bool) {
+        var hasURL = false
+        var hasBV = false
+        var hasAV = false
+        var prev2: UInt8 = 0
+        var prev1: UInt8 = 0
+        for byte in text.utf8 {
+            if !hasURL, prev2 == 0x3A, prev1 == 0x2F, byte == 0x2F { // "://"
+                hasURL = true
+            }
+            if !hasBV, (prev1 == 0x42 || prev1 == 0x62), (byte == 0x56 || byte == 0x76) { // "BV"/"bv"
+                hasBV = true
+            }
+            if !hasAV,
+               (prev2 == 0x41 || prev2 == 0x61),
+               (prev1 == 0x56 || prev1 == 0x76),
+               byte >= 0x30, byte <= 0x39 { // "av" + digit
+                hasAV = true
+            }
+            if hasURL, hasBV, hasAV { break }
+            prev2 = prev1
+            prev1 = byte
+        }
+        return (hasURL, hasBV, hasAV)
+    }
+
     static func inlineLinks(in text: String) -> [String: URL] {
+        guard text.utf8.count >= 3 else { return [:] }
+        let hints = scanInlineLinkHints(in: text)
+        guard hints.hasURL || hints.hasBV || hints.hasAV else { return [:] }
+        if let cached = inlineLinkCache.withLock({ $0[text] }) { return cached }
+
         var found: [String: URL] = [:]
         let nsText = text as NSString
         let fullRange = NSRange(location: 0, length: nsText.length)
 
-        if let urlRegex {
+        if hints.hasURL, let urlRegex {
             for match in urlRegex.matches(in: text, range: fullRange) {
                 var raw = nsText.substring(with: match.range)
                 while let last = raw.last, ".,;:!?)]}。，！？；：】」》）".contains(last) { raw.removeLast() }
                 if let url = URL(string: raw) { found[raw] = url }
             }
         }
-        if let bvRegex {
+        if hints.hasBV, let bvRegex {
             for match in bvRegex.matches(in: text, range: fullRange) {
                 let token = nsText.substring(with: match.range(at: 1))
                 if let bvid = BiliLinkResolver.normalizedBVID(token),
@@ -184,7 +291,7 @@ enum UIKitDynamicRichTextBuilder {
                 }
             }
         }
-        if let avRegex {
+        if hints.hasAV, let avRegex {
             for match in avRegex.matches(in: text, range: fullRange) {
                 let token = nsText.substring(with: match.range(at: 1))
                 if let aid = BiliLinkResolver.parsedAID(token, allowBareNumeric: false),
@@ -193,7 +300,12 @@ enum UIKitDynamicRichTextBuilder {
                 }
             }
         }
-        return found
+        let result = found
+        inlineLinkCache.withLock { cache in
+            if cache.count >= 512 { cache.removeAll(keepingCapacity: true) }
+            cache[text] = result
+        }
+        return result
     }
 
     static func mediaItems(

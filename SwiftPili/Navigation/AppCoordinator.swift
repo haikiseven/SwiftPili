@@ -350,8 +350,6 @@ final class AppCoordinator {
     }
 
     func goBack() {
-        let costSpan = UIHitchMonitor.beginSpan("nav.back")
-        defer { UIHitchMonitor.endSpan(costSpan) }
         videoNavigationAdmission.cancel()
         pendingCommentNavigation = nil
         if let row = selectedSidebarRow {
@@ -413,8 +411,6 @@ final class AppCoordinator {
     }
 
     private func append(_ route: Route) {
-        let costSpan = UIHitchMonitor.beginSpan("nav.push")
-        defer { UIHitchMonitor.endSpan(costSpan) }
         if activePlayerDestination != nil {
             routePlayer?.parkOutgoingRouteStill()
         }

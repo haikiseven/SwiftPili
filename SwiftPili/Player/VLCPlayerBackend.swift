@@ -154,6 +154,15 @@ final class VLCPlayerBackend: PlayerBackend {
     var onStateChanged: (@MainActor @Sendable (PlayerStateEvent) -> Void)?
     var onTickWithGeneration: (@MainActor @Sendable (_ currentTime: TimeInterval, _ totalTime: TimeInterval, _ generation: UInt64, _ startupTraceToken: StartupTrace.Token?) -> Void)?
     var onBufferChanged: (@MainActor @Sendable (_ consumeTime: TimeInterval) -> Void)?
+    private var firstVideoFrameHandler: (@MainActor @Sendable (UInt64) -> Void)?
+    private var firstFrameDisplayedBaseline: UInt64 = 0
+    private var reportedFirstFrameGeneration: UInt64?
+
+    func setFirstVideoFrameHandler(
+        _ handler: (@MainActor @Sendable (UInt64) -> Void)?
+    ) {
+        firstVideoFrameHandler = handler
+    }
 
     // MARK: - Init
 
@@ -415,6 +424,8 @@ final class VLCPlayerBackend: PlayerBackend {
         seekVisibleBaseline = (isSeekReopen && PlayerLog.isEnabled) ? 0 : nil
         startupVisibleBaseline = (startupTraceToken != nil && PlayerLog.isEnabled) ? 0 : nil
         startupVisibleArmedAt = CACurrentMediaTime()
+        firstFrameDisplayedBaseline = 0
+        reportedFirstFrameGeneration = nil
 
         startEventLoop(traceToken: startupTraceToken)
 
@@ -454,6 +465,7 @@ final class VLCPlayerBackend: PlayerBackend {
         settlePendingSeek(false, reason: "stop()")
         seekVisibleBaseline = nil
         startupVisibleBaseline = nil
+        reportedFirstFrameGeneration = nil
         retainedLivenessObservation.cancel(reason: .stop)
         player.stop()
     }
@@ -888,6 +900,7 @@ final class VLCPlayerBackend: PlayerBackend {
                 if pendingSeekTarget == nil {
                     onStateChanged?(.bufferFinished)
                 }
+                notifyFirstVideoFrameIfRendered(runtimeGeneration: runtimeGeneration)
             case .paused:
                 onStateChanged?(.paused)
             case .stopped, .stopping, .idle:
@@ -917,6 +930,7 @@ final class VLCPlayerBackend: PlayerBackend {
             } else {
                 PlayerLog.log("[VLC] event: bufferingProgress(\(String(format: "%.0f%%", fill * 100)))")
             }
+            notifyFirstVideoFrameIfRendered(runtimeGeneration: runtimeGeneration)
 
         case .timeChanged(let time):
             checkSeekVisibleFrame()
@@ -935,6 +949,7 @@ final class VLCPlayerBackend: PlayerBackend {
                     onStateChanged?(.bufferFinished)
                 }
             }
+            notifyFirstVideoFrameIfRendered(runtimeGeneration: runtimeGeneration)
             updateFPS()
             onTickWithGeneration?(t, duration, runtimeGeneration, traceToken)
 
@@ -965,7 +980,9 @@ final class VLCPlayerBackend: PlayerBackend {
             let previous = activeVoutCount
             activeVoutCount = count
             PlayerLog.log("[VLC] event: voutChanged(\(count)), previous=\(previous)")
-            if count == 0, previous > 0 {
+            if count > 0 {
+                notifyFirstVideoFrameIfRendered(runtimeGeneration: runtimeGeneration)
+            } else if previous > 0 {
                 PlayerLog.log("[VLC] WARNING: video output lost (vout dropped to 0)")
             }
 
@@ -1043,6 +1060,18 @@ final class VLCPlayerBackend: PlayerBackend {
         startPositionChecked = true
         guard t < loadStartOffset - 5 else { return }
         PlayerLog.log("[VLC] ⚠️ opened at \(String(format: "%.1f", t))s but asked for \(String(format: "%.1f", loadStartOffset))s — :start-time may have been refused (F15; 0005 should prevent this)")
+    }
+
+    private func notifyFirstVideoFrameIfRendered(runtimeGeneration: UInt64) {
+        guard runtimeGeneration == self.runtimeGeneration,
+              reportedFirstFrameGeneration != runtimeGeneration,
+              pendingSeekTarget == nil else { return }
+        let displayed = player.statistics?.displayedPictures ?? 0
+        let hasDisplayedPicture = displayed > firstFrameDisplayedBaseline
+        let hasActiveVoutAndClock = activeVoutCount > 0 && hasFiredReady && lastTickTime > 0.05
+        guard hasDisplayedPicture || hasActiveVoutAndClock else { return }
+        reportedFirstFrameGeneration = runtimeGeneration
+        firstVideoFrameHandler?(runtimeGeneration)
     }
 
     private func checkStartupVisibleFrame() {

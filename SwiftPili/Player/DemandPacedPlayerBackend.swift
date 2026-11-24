@@ -64,6 +64,9 @@ final class DemandPacedPlayerBackend: PlayerBackend {
     private var observedPiPLeaseChangeHandler: (@MainActor @Sendable (Bool) -> Void)?
     private var pipTransportEdgeHandler:
         (@MainActor @Sendable (PlayerBackendPiPTransportEdge) -> Void)?
+    private var firstVideoFrameHandler: (@MainActor @Sendable (UInt64) -> Void)?
+    private var firstFrameBaselinePresentedCount = 0
+    private var reportedFirstFrameGeneration: UInt64?
     private var runtimeFaultHandler: (@MainActor @Sendable (MediaRuntimeFault) -> Void)?
     private var deliveredRuntimeFault: RuntimeFaultDeliveryKey?
     private var openTask: Task<Void, Never>?
@@ -362,6 +365,8 @@ final class DemandPacedPlayerBackend: PlayerBackend {
 
         runtimeGeneration &+= 1
         deliveredRuntimeFault = nil
+        firstFrameBaselinePresentedCount = 0
+        reportedFirstFrameGeneration = nil
 
         session.forceRetirePiP()
         invalidateSeekCoordinator()
@@ -440,6 +445,8 @@ final class DemandPacedPlayerBackend: PlayerBackend {
         }
         runtimeGeneration &+= 1
         deliveredRuntimeFault = nil
+        firstFrameBaselinePresentedCount = 0
+        reportedFirstFrameGeneration = nil
         openTask?.cancel()
         openTask = nil
         session.forceRetirePiP()
@@ -506,6 +513,8 @@ final class DemandPacedPlayerBackend: PlayerBackend {
     ) {
         runtimeGeneration &+= 1
         deliveredRuntimeFault = nil
+        firstFrameBaselinePresentedCount = session.stats.presentedVideoFrames
+        reportedFirstFrameGeneration = nil
         terminalFailure = false
         debugReportWasBuffering = false
         openTask?.cancel()
@@ -567,6 +576,8 @@ final class DemandPacedPlayerBackend: PlayerBackend {
         parkTTLTask = nil
         runtimeGeneration &+= 1
         deliveredRuntimeFault = nil
+        firstFrameBaselinePresentedCount = 0
+        reportedFirstFrameGeneration = nil
         openTask?.cancel()
         openTask = nil
         session.forceRetirePiP()
@@ -1046,10 +1057,41 @@ final class DemandPacedPlayerBackend: PlayerBackend {
         session.forceRetirePiP()
     }
 
+    func setFirstVideoFrameHandler(
+        _ handler: (@MainActor @Sendable (UInt64) -> Void)?
+    ) {
+        firstVideoFrameHandler = handler
+    }
+
     func setRuntimeFaultHandler(
         _ handler: (@MainActor @Sendable (MediaRuntimeFault) -> Void)?
     ) {
         runtimeFaultHandler = handler
+    }
+
+    private func notifyFirstVideoFrameIfRendered() {
+        guard reportedFirstFrameGeneration != runtimeGeneration,
+              parkedTicket == nil,
+              !terminalFailure,
+              isReadyToPlay,
+              pendingSeekTarget == nil else { return }
+        let presented = session.stats.presentedVideoFrames
+        guard presented > firstFrameBaselinePresentedCount else { return }
+        #if !targetEnvironment(simulator)
+        let readyForReveal: Bool = switch session.demandPresentationHealth {
+        case .visible:
+            true
+        case .attachedButUnproven, .needsFlush:
+            hasObservedPiPLease || presented >= firstFrameBaselinePresentedCount + 3
+        case .missingSurface, .warmSuspended:
+            hasObservedPiPLease
+        case .rendererFailed, .decoderInvalid:
+            false
+        }
+        guard readyForReveal else { return }
+        #endif
+        reportedFirstFrameGeneration = runtimeGeneration
+        firstVideoFrameHandler?(runtimeGeneration)
     }
 
     private func updateObservedPiPLease(_ active: Bool) {
@@ -1237,6 +1279,7 @@ final class DemandPacedPlayerBackend: PlayerBackend {
                 PlayerLog.log("[playback] buffering-exit mt=\(String(format: "%.2f", session.mediaTime))")
             }
             onStateChanged?(.bufferFinished)
+            notifyFirstVideoFrameIfRendered()
         case .paused:
             isPlaying = false
             onStateChanged?(.paused)
@@ -1292,6 +1335,7 @@ final class DemandPacedPlayerBackend: PlayerBackend {
             }
             runtimeFaultHandler?(fault)
         case .tick(let t, let d, _):
+            notifyFirstVideoFrameIfRendered()
             onTickWithGeneration?(t, d, runtimeGeneration, startupTraceToken)
             publishDeliveryRunway()
         case .buffered:

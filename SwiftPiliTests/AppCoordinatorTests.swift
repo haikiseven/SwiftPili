@@ -236,4 +236,43 @@ struct AppCoordinatorTests {
         #expect(coordinator.stack(for: .home) == [.videoDetail(v1)])
         #expect(hook.routeChanges.last == .init(from: dest2, to: dest1))
     }
+
+    @Test("Direct route activation queries reflect active player routes immediately without appearance gating")
+    func directRouteActivationAndAdmissionCancel() {
+        let (coordinator, _) = makeCoordinator()
+        let v1 = VideoRouteTarget(videoID: .bvid("BV1direct001"))
+        let v2 = VideoRouteTarget(videoID: .bvid("BV1direct002"))
+
+        // Pushing a video activates its player route immediately; pending admission blocks duplicates until settled/cancelled.
+        #expect(coordinator.navigateToVideo(v1))
+        let pos1 = coordinator.playerRoutePosition(for: .videoDetail(v1))
+        #expect(pos1 == PlayerRoutePosition(tab: .home, sidebarID: nil, depth: 0))
+        #expect(coordinator.isActivePlayerRoute(.video(v1.videoID)))
+        #expect(coordinator.isActivePlayerRoute(.video(v1.videoID), position: pos1))
+        #expect(!coordinator.isActivePlayerRoute(.video(v1.videoID), position: nil))
+        #expect(!coordinator.navigateToVideo(v2))
+
+        // Cancelling the pending video admission allows a subsequent video push immediately.
+        coordinator.cancelVideoNavigation(v1.videoID)
+        #expect(coordinator.navigateToVideo(v2))
+        let pos2 = coordinator.playerRoutePosition(for: .videoDetail(v2))
+        #expect(pos2 == PlayerRoutePosition(tab: .home, sidebarID: nil, depth: 1))
+        #expect(coordinator.isActivePlayerRoute(.video(v2.videoID), position: pos2))
+        #expect(!coordinator.isActivePlayerRoute(.video(v1.videoID), position: pos1))
+        coordinator.settleVideoNavigation(v2.videoID)
+
+        // Bangumi, Live, and Offline routes become active immediately upon push.
+        coordinator.navigate(to: .bangumiDetail(34430))
+        #expect(coordinator.isActiveBangumiRoute(34430))
+        #expect(!coordinator.isActiveBangumiRoute(99999))
+        #expect(coordinator.isActivePlayerRoute(.bangumi(34430)))
+
+        coordinator.navigate(to: .liveRoom(21452505))
+        #expect(!coordinator.isActiveBangumiRoute(34430))
+        #expect(coordinator.isActivePlayerRoute(.live(21452505)))
+
+        coordinator.navigate(to: .offlinePlayer("dl-offline-1"))
+        #expect(coordinator.isActivePlayerRoute(.offline(.single("dl-offline-1"))))
+        #expect(!coordinator.isActivePlayerRoute(.live(21452505)))
+    }
 }

@@ -11,7 +11,6 @@ struct BangumiDetailView: View {
         _routePosition = State(initialValue: routePosition)
     }
     @State private var viewModel = BangumiViewModel()
-    @State private var routeActivation = RouteActivationState()
     @State private var isDescExpanded = false
     @State private var showThread: CommentThreadTarget?
     @State private var commentPresentation = CommentZoomPresentation()
@@ -36,7 +35,7 @@ struct BangumiDetailView: View {
     @State private var presentationScreenID = UUID()
     private var player: PlayerViewModel { PlayerViewModel.shared }
     private var presentationContext: PlayerScreenPresentationContext? {
-        guard isRouteActivated else { return nil }
+        guard isActiveBangumiRoute else { return nil }
         let source: PlayerPresentationSource? = if let aid = viewModel.currentEpisodeAid,
             let episode = viewModel.season?.episodes?.first(where: { $0.id == viewModel.selectedEpisodeId }),
             let cid = episode.cid {
@@ -74,12 +73,8 @@ struct BangumiDetailView: View {
         coordinator.isActivePlayerRoute(.bangumi(seasonId), position: routePosition)
     }
 
-    private var isRouteActivated: Bool {
-        routeActivation.admits(routeIsActive: isActiveBangumiRoute)
-    }
-
     private var hasInlineExitChrome: Bool {
-        guard isRouteActivated, viewModel.error == nil,
+        guard isActiveBangumiRoute, viewModel.error == nil,
               player.error == nil, player.unavailability == nil,
               let lease = viewModel.playerLease else { return false }
         return player.isCurrentOwner(lease) && player.mode == .vod
@@ -124,10 +119,8 @@ struct BangumiDetailView: View {
     }
 
     private func activateIfNeeded() async {
-        guard isRouteActivated else { return }
-        if routeActivation.defersActivation {
-            player.endForeignOwnerForRouteActivation(incomingOwner: pgcOwner)
-        }
+        guard isActiveBangumiRoute else { return }
+        player.endForeignOwnerForRouteActivation(incomingOwner: pgcOwner)
         await viewModel.load(seasonId: seasonId)
     }
 
@@ -180,7 +173,7 @@ struct BangumiDetailView: View {
                 }
 
                 VStack(spacing: 0) {
-                    if isRouteActivated {
+                    if isActiveBangumiRoute {
                         if hostOwnsInlineSurface {
                             RoundedRectangle(cornerRadius: inlineCornerRadius, style: .continuous)
                                 .fill(Color.black)
@@ -200,7 +193,9 @@ struct BangumiDetailView: View {
                                     height: playerVideoHeight
                                 ),
                                 inlineCornerRadius: inlineCornerRadius,
-                                screenLease: viewModel.playerLease
+                                screenLease: viewModel.playerLease,
+                                placeholderCoverURL: placeholderCoverURL,
+                                showsLoadingIndicator: viewModel.error == nil
                             )
                         }
                     } else {
@@ -222,7 +217,6 @@ struct BangumiDetailView: View {
                     PlayerDetailInlineNavigationOverlay(
                         player: player,
                         isActiveRoute: isActiveBangumiRoute,
-                        isRouteActivated: isRouteActivated,
                         hasInlineExitChrome: { hasInlineExitChrome },
                         scrimHeight: playerVideoHeight,
                         cornerRadius: inlineCornerRadius,
@@ -283,26 +277,22 @@ struct BangumiDetailView: View {
             preventsContentDismissal: isActiveBangumiRoute,
             presentationContext: presentationContext,
             coordinator: coordinator,
-            watchdogScreen: "BangumiDetail",
-            onRouteAppearance: { event in
-                _ = routeActivation.handle(event, owner: pgcOwner)
-            }
+            watchdogScreen: "BangumiDetail"
         ) {
             CinematicBackdrop(
                 coverURL: placeholderCoverURL,
                 player: player,
                 ownerLease: viewModel.playerLease,
-                isRouteActive: isRouteActivated && isActiveBangumiRoute
+                isRouteActive: isActiveBangumiRoute
             )
         }
-        .onChange(of: isActiveBangumiRoute, initial: true) { _, active in
-            let outcome = routeActivation.handle(.routeActivity(active), owner: pgcOwner)
-            if outcome == .deactivated, routeActivation.defersActivation {
+        .onChange(of: isActiveBangumiRoute, initial: true) { oldActive, active in
+            if !active, oldActive {
                 viewModel.revokeLoadForRouteDeparture()
                 player.pauseForRouteDeparture(lease: viewModel.playerLease)
             }
         }
-        .task(id: isRouteActivated) { await activateIfNeeded() }
+        .task(id: isActiveBangumiRoute) { await activateIfNeeded() }
         .onDisappear {
             guard scenePhase == .active else {
                 PlayerLog.log("[BangumiDetail] playback release deferred scenePhase=\(scenePhase)")

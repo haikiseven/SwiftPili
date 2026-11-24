@@ -1,5 +1,6 @@
 import CoreText
 import Foundation
+import os
 import UIKit
 
 final class DanmakuTextRasterizer: @unchecked Sendable {
@@ -60,21 +61,68 @@ final class DanmakuTextRasterizer: @unchecked Sendable {
     private static let minimumEffectiveScale: CGFloat = 0.5
     private static let maxCacheEntries = 256
     private static let maxCacheByteCost = 16 * 1024 * 1024
+    private static let maxFontCacheEntries = 32
+    private static let deviceRGB = CGColorSpaceCreateDeviceRGB()
+    private static let strokeColor = CGColor(gray: 0, alpha: 0.72)
+    private static let shadowColor = CGColor(gray: 0, alpha: 0.50)
+    private static let foregroundKey = NSAttributedString.Key(rawValue: kCTForegroundColorAttributeName as String)
+
+    private struct FontCacheKey: Hashable, Sendable {
+        let name: String
+        let sizeBits: UInt64
+    }
+
+    private struct CachedFont: @unchecked Sendable {
+        let font: CTFont
+        let ascent: CGFloat
+        let descent: CGFloat
+    }
+
+    private static let fontCache = OSAllocatedUnfairLock<[FontCacheKey: CachedFont]>(initialState: [:])
+
+    private static func cachedFont(named name: String, size: CGFloat) -> CachedFont {
+        let key = FontCacheKey(name: name, sizeBits: Double(size).bitPattern)
+        if let hit = fontCache.withLock({ $0[key] }) {
+            return hit
+        }
+        let font = CTFontCreateWithName(name as CFString, size, nil)
+        let entry = CachedFont(
+            font: font,
+            ascent: CTFontGetAscent(font),
+            descent: CTFontGetDescent(font)
+        )
+        fontCache.withLock { cache in
+            if cache.count >= maxFontCacheEntries {
+                cache.removeAll(keepingCapacity: true)
+            }
+            cache[key] = entry
+        }
+        return entry
+    }
 
     typealias Render = @Sendable (Key, @Sendable (CGFloat) -> Bool) -> Image?
     private let render: Render
 
-    private struct CacheEntry {
-        let image: Image
-        let byteCost: Int
-        var lastUsedStamp: UInt64
+    private final class CacheNode {
+        let key: Key
+        var image: Image
+        var byteCost: Int
+        var prev: CacheNode?
+        var next: CacheNode?
+
+        init(key: Key, image: Image, byteCost: Int) {
+            self.key = key
+            self.image = image
+            self.byteCost = byteCost
+        }
     }
 
     private let queue = DispatchQueue(label: "danmaku.raster", qos: .userInitiated)
     private let lock = NSLock()
-    private var cache: [Key: CacheEntry] = [:]
+    private var cache: [Key: CacheNode] = [:]
+    private var lruHead: CacheNode?
+    private var lruTail: CacheNode?
     private var totalCacheBytes = 0
-    private var nextUseStamp: UInt64 = 0
     private nonisolated(unsafe) var memoryWarningToken: NSObjectProtocol?
 
     init(render: Render? = nil) {
@@ -92,13 +140,47 @@ final class DanmakuTextRasterizer: @unchecked Sendable {
         if let memoryWarningToken {
             NotificationCenter.default.removeObserver(memoryWarningToken)
         }
+        clearCache()
     }
 
     func clearCache() {
         lock.lock()
+        var node = lruHead
+        while let current = node {
+            let next = current.next
+            current.prev = nil
+            current.next = nil
+            node = next
+        }
+        lruHead = nil
+        lruTail = nil
         cache.removeAll()
         totalCacheBytes = 0
         lock.unlock()
+        Self.fontCache.withLock { $0.removeAll() }
+    }
+
+    private func moveToFront(_ node: CacheNode) {
+        guard lruHead !== node else { return }
+        detach(node)
+        prepend(node)
+    }
+
+    private func prepend(_ node: CacheNode) {
+        node.prev = nil
+        node.next = lruHead
+        lruHead?.prev = node
+        lruHead = node
+        if lruTail == nil { lruTail = node }
+    }
+
+    private func detach(_ node: CacheNode) {
+        let prev = node.prev
+        let next = node.next
+        if let prev { prev.next = next } else { lruHead = next }
+        if let next { next.prev = prev } else { lruTail = prev }
+        node.prev = nil
+        node.next = nil
     }
 
     func image(
@@ -118,30 +200,34 @@ final class DanmakuTextRasterizer: @unchecked Sendable {
 
     private func cachedImage(for key: Key, canRender: @Sendable (CGFloat) -> Bool) -> Image? {
         lock.lock()
-        if var hit = cache[key] {
-            nextUseStamp &+= 1
-            hit.lastUsedStamp = nextUseStamp
-            cache[key] = hit
+        if let hit = cache[key] {
+            moveToFront(hit)
+            let image = hit.image
             lock.unlock()
-            return canRender(hit.image.width) ? hit.image : nil
+            return canRender(image.width) ? image : nil
         }
         lock.unlock()
         guard let made = render(key, canRender) else { return nil }
         let cost = made.contents.bytesPerRow * made.contents.height
         if cost <= Self.maxCacheByteCost / 2 {
             lock.lock()
-            nextUseStamp &+= 1
-            if let existing = cache.removeValue(forKey: key) {
+            if let existing = cache[key] {
                 totalCacheBytes -= existing.byteCost
+                existing.image = made
+                existing.byteCost = cost
+                totalCacheBytes += cost
+                moveToFront(existing)
+            } else {
+                let node = CacheNode(key: key, image: made, byteCost: cost)
+                cache[key] = node
+                prepend(node)
+                totalCacheBytes += cost
             }
-            cache[key] = CacheEntry(image: made, byteCost: cost, lastUsedStamp: nextUseStamp)
-            totalCacheBytes += cost
             while cache.count > Self.maxCacheEntries || totalCacheBytes > Self.maxCacheByteCost {
-                guard let victim = cache.min(by: { $0.value.lastUsedStamp < $1.value.lastUsedStamp })?.key,
-                      victim != key else { break }
-                if let removed = cache.removeValue(forKey: victim) {
-                    totalCacheBytes -= removed.byteCost
-                }
+                guard let victim = lruTail, victim.key != key else { break }
+                detach(victim)
+                cache.removeValue(forKey: victim.key)
+                totalCacheBytes -= victim.byteCost
             }
             lock.unlock()
         }
@@ -155,6 +241,40 @@ final class DanmakuTextRasterizer: @unchecked Sendable {
         let ascent: CGFloat
         let descent: CGFloat
         var height: CGFloat { ascent + descent }
+    }
+
+    private static func makeLineMetrics(
+        text: String,
+        font: CTFont,
+        fontAscent: CGFloat,
+        fontDescent: CGFloat,
+        color: CGColor,
+        hasStroke: Bool
+    ) -> LineMetrics {
+        let colorLine = CTLineCreateWithAttributedString(
+            NSAttributedString(string: text, attributes: [
+                .font: font,
+                foregroundKey: color,
+            ])
+        )
+        let blackLine: CTLine? = hasStroke
+            ? CTLineCreateWithAttributedString(
+                NSAttributedString(string: text, attributes: [
+                    .font: font,
+                    foregroundKey: strokeColor,
+                ])
+            )
+            : nil
+        var ascent: CGFloat = 0
+        var descent: CGFloat = 0
+        let lineWidth = CGFloat(CTLineGetTypographicBounds(colorLine, &ascent, &descent, nil))
+        return LineMetrics(
+            colorLine: colorLine,
+            blackLine: blackLine,
+            width: lineWidth,
+            ascent: ascent > 0 ? ascent : fontAscent,
+            descent: descent > 0 ? descent : fontDescent
+        )
     }
 
     private static func render(_ key: Key, canRender: @Sendable (CGFloat) -> Bool) -> Image? {
@@ -174,57 +294,61 @@ final class DanmakuTextRasterizer: @unchecked Sendable {
                 fontScale: Double(key.fontScale)
             ))
         }
-        let font = CTFontCreateWithName(key.fontPostScriptName as CFString, fontSize, nil)
+        let cached = cachedFont(named: key.fontPostScriptName, size: fontSize)
+        let font = cached.font
+        let fontAscent = cached.ascent
+        let fontDescent = cached.descent
         let color = CGColor(
             red: CGFloat((key.colorRGB >> 16) & 0xFF) / 255,
             green: CGFloat((key.colorRGB >> 8) & 0xFF) / 255,
             blue: CGFloat(key.colorRGB & 0xFF) / 255,
             alpha: 1
         )
-        let foreground = NSAttributedString.Key(rawValue: kCTForegroundColorAttributeName as String)
-        let strokeColor = CGColor(gray: 0, alpha: 0.72)
-        let fontAscent = CTFontGetAscent(font)
-        let fontDescent = CTFontGetDescent(font)
-        let rawLines = key.text
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map(String.init)
+        let isMultiline = key.text.utf8.contains { $0 == 0x0A || $0 == 0x0D }
+        let singleLine: LineMetrics?
         var measuredLines: [LineMetrics] = []
-        measuredLines.reserveCapacity(rawLines.count)
-        var maxLineWidth: CGFloat = 0
-        for lineText in rawLines {
-            let colorLine = CTLineCreateWithAttributedString(
-                NSAttributedString(string: lineText, attributes: [
-                    .font: font,
-                    foreground: color,
-                ])
+        let maxLineWidth: CGFloat
+        let lineGap: CGFloat
+        let totalLineHeight: CGFloat
+        if !isMultiline {
+            let line = makeLineMetrics(
+                text: key.text,
+                font: font,
+                fontAscent: fontAscent,
+                fontDescent: fontDescent,
+                color: color,
+                hasStroke: key.hasStroke
             )
-            let blackLine: CTLine? = key.hasStroke
-                ? CTLineCreateWithAttributedString(
-                    NSAttributedString(string: lineText, attributes: [
-                        .font: font,
-                        foreground: strokeColor,
-                    ])
+            singleLine = line
+            maxLineWidth = line.width
+            lineGap = 0
+            totalLineHeight = line.height
+        } else {
+            singleLine = nil
+            let rawLines = key.text
+                .replacingOccurrences(of: "\r\n", with: "\n")
+                .replacingOccurrences(of: "\r", with: "\n")
+                .split(separator: "\n", omittingEmptySubsequences: false)
+            measuredLines.reserveCapacity(rawLines.count)
+            var widest: CGFloat = 0
+            var heightSum: CGFloat = 0
+            for rawLine in rawLines {
+                let line = makeLineMetrics(
+                    text: String(rawLine),
+                    font: font,
+                    fontAscent: fontAscent,
+                    fontDescent: fontDescent,
+                    color: color,
+                    hasStroke: key.hasStroke
                 )
-                : nil
-            var ascent: CGFloat = 0
-            var descent: CGFloat = 0
-            let lineWidth = CGFloat(CTLineGetTypographicBounds(colorLine, &ascent, &descent, nil))
-            let resolvedAscent = ascent > 0 ? ascent : fontAscent
-            let resolvedDescent = descent > 0 ? descent : fontDescent
-            maxLineWidth = max(maxLineWidth, lineWidth)
-            measuredLines.append(LineMetrics(
-                colorLine: colorLine,
-                blackLine: blackLine,
-                width: lineWidth,
-                ascent: resolvedAscent,
-                descent: resolvedDescent
-            ))
+                widest = max(widest, line.width)
+                heightSum += line.height
+                measuredLines.append(line)
+            }
+            maxLineWidth = widest
+            lineGap = measuredLines.count > 1 ? ceil(fontSize * 0.15) : 0
+            totalLineHeight = heightSum + lineGap * CGFloat(max(0, measuredLines.count - 1))
         }
-        let lineGap: CGFloat = measuredLines.count > 1 ? ceil(fontSize * 0.15) : 0
-        let totalLineHeight = measuredLines.reduce(0) { $0 + $1.height }
-            + lineGap * CGFloat(max(0, measuredLines.count - 1))
         guard maxLineWidth > 0, totalLineHeight > 0 else { return nil }
 
         let edge: CGFloat = key.hasStroke ? max(0.85, 2.0 / requestedScale) : 0
@@ -252,7 +376,7 @@ final class DanmakuTextRasterizer: @unchecked Sendable {
             height: pixelHeight,
             bitsPerComponent: 8,
             bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(),
+            space: deviceRGB,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else { return nil }
         context.scaleBy(x: scale, y: scale)
@@ -264,7 +388,7 @@ final class DanmakuTextRasterizer: @unchecked Sendable {
             context.stroke(CGRect(x: 0, y: 0, width: pointWidth, height: pointHeight).insetBy(dx: half, dy: half))
         }
         var topCursor = pointHeight - pad - frameInset
-        for (index, line) in measuredLines.enumerated() {
+        if let line = singleLine {
             let baselineY = topCursor - line.ascent
             if line.width > 0 {
                 drawGlyphs(
@@ -275,9 +399,22 @@ final class DanmakuTextRasterizer: @unchecked Sendable {
                     edge: edge
                 )
             }
-            topCursor -= line.height
-            if index + 1 < measuredLines.count {
-                topCursor -= lineGap
+        } else {
+            for (index, line) in measuredLines.enumerated() {
+                let baselineY = topCursor - line.ascent
+                if line.width > 0 {
+                    drawGlyphs(
+                        in: context,
+                        colorLine: line.colorLine,
+                        blackLine: line.blackLine,
+                        baseline: CGPoint(x: pad + frameInset, y: baselineY),
+                        edge: edge
+                    )
+                }
+                topCursor -= line.height
+                if index + 1 < measuredLines.count {
+                    topCursor -= lineGap
+                }
             }
         }
         guard let contents = context.makeImage() else { return nil }
@@ -298,21 +435,31 @@ final class DanmakuTextRasterizer: @unchecked Sendable {
     ) {
         if let blackLine {
             let diag = edge * 0.72
-            let steps: [(CGFloat, CGFloat)] = [
-                (-edge, 0), (edge, 0), (0, -edge), (0, edge),
-                (-diag, -diag), (diag, -diag), (-diag, diag), (diag, diag),
-            ]
-            for step in steps {
-                context.textPosition = CGPoint(x: baseline.x + step.0, y: baseline.y + step.1)
-                CTLineDraw(blackLine, context)
-            }
+            let bx = baseline.x
+            let by = baseline.y
+            context.textPosition = CGPoint(x: bx - edge, y: by)
+            CTLineDraw(blackLine, context)
+            context.textPosition = CGPoint(x: bx + edge, y: by)
+            CTLineDraw(blackLine, context)
+            context.textPosition = CGPoint(x: bx, y: by - edge)
+            CTLineDraw(blackLine, context)
+            context.textPosition = CGPoint(x: bx, y: by + edge)
+            CTLineDraw(blackLine, context)
+            context.textPosition = CGPoint(x: bx - diag, y: by - diag)
+            CTLineDraw(blackLine, context)
+            context.textPosition = CGPoint(x: bx + diag, y: by - diag)
+            CTLineDraw(blackLine, context)
+            context.textPosition = CGPoint(x: bx - diag, y: by + diag)
+            CTLineDraw(blackLine, context)
+            context.textPosition = CGPoint(x: bx + diag, y: by + diag)
+            CTLineDraw(blackLine, context)
         }
         context.saveGState()
         if blackLine != nil {
             context.setShadow(
                 offset: CGSize(width: 0, height: -0.6),
                 blur: 1.2,
-                color: CGColor(gray: 0, alpha: 0.50)
+                color: shadowColor
             )
         }
         context.textPosition = baseline

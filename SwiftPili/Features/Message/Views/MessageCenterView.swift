@@ -74,21 +74,47 @@ struct MessageCenterView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     @State private var selection: MessageSelection?
+    @State private var containerSize = WindowMetricsFallback.currentSize
+
+    private var usesSplit: Bool {
+        DetailSplitPolicy.usesSplit(
+            isRegularWidth: horizontalSizeClass == .regular,
+            containerSize: containerSize
+        )
+    }
 
     var body: some View {
-        GeometryReader { proxy in
-            let usesSplit = DetailSplitPolicy.usesSplit(
-                isRegularWidth: horizontalSizeClass == .regular,
-                containerSize: proxy.size
-            )
-            Group {
-                if usesSplit {
-                    splitLayout(containerWidth: proxy.size.width)
-                } else {
-                    sidebarList(usesSplit: false)
+        Group {
+            if usesSplit {
+                HStack(spacing: 0) {
+                    MessageSidebarView(
+                        viewModel: viewModel,
+                        coordinator: coordinator,
+                        usesSplit: true,
+                        selection: $selection
+                    )
+                    .frame(width: Self.sidebarWidth(for: containerSize.width))
+                    Divider()
+                        .opacity(0.45)
+                    MessageSplitDetailView(
+                        selection: selection,
+                        viewModel: viewModel,
+                        coordinator: coordinator
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
+            } else {
+                MessageSidebarView(
+                    viewModel: viewModel,
+                    coordinator: coordinator,
+                    usesSplit: false,
+                    selection: $selection
+                )
             }
-            .frame(width: proxy.size.width, height: proxy.size.height)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .detailContainerSize { size in
+            if containerSize != size { containerSize = size }
         }
         .appAmbientBrowseBackground()
         .navigationTitle("Messages")
@@ -96,31 +122,37 @@ struct MessageCenterView: View {
         .task { await viewModel.loadInitial() }
     }
 
-    private func sidebarList(usesSplit: Bool) -> some View {
-        let sessions = chatSessions
-        let tabs = MessageTab.allCases
-        return ScrollView {
+    private static func sidebarWidth(for containerWidth: CGFloat) -> CGFloat {
+        guard containerWidth.isFinite, containerWidth > 0 else { return 352 }
+        return min(max((containerWidth * 0.30).rounded(), 340), 360)
+    }
+}
+
+private struct MessageSidebarView: View {
+    let viewModel: MessageCenterViewModel
+    let coordinator: AppCoordinator
+    let usesSplit: Bool
+    @Binding var selection: MessageSelection?
+
+    var body: some View {
+        ScrollView {
             VStack(alignment: .leading, spacing: AppSpacing.xl) {
-                VStack(spacing: 0) {
-                    ForEach(Array(tabs.enumerated()), id: \.element) { index, tab in
-                        let isSelected = usesSplit && selection == .category(tab)
-                        let nextSelected = usesSplit && index + 1 < tabs.count
-                            && selection == .category(tabs[index + 1])
-                        categoryEntry(tab, usesSplit: usesSplit, isSelected: isSelected)
-                        if index < tabs.count - 1, !isSelected, !nextSelected {
-                            Divider()
-                                .opacity(0.35)
-                                .padding(.leading, usesSplit ? 70 : 66)
-                        }
-                    }
-                }
-                .padding(.vertical, usesSplit ? 4 : 0)
-                .background(
-                    AppFill.card,
-                    in: RoundedRectangle(cornerRadius: AppRadius.panel, style: .continuous)
+                MessageCategorySectionView(
+                    viewModel: viewModel,
+                    coordinator: coordinator,
+                    usesSplit: usesSplit,
+                    selection: $selection
                 )
 
-                chatsSection(sessions, usesSplit: usesSplit)
+                MessageChatsSectionView(
+                    viewModel: viewModel,
+                    coordinator: coordinator,
+                    usesSplit: usesSplit,
+                    selectedTalkerID: usesSplit ? selection?.talkerId : nil,
+                    onSelectChat: { talkerId, name, face in
+                        selection = .chat(talkerId: talkerId, name: name, face: face)
+                    }
+                )
             }
             .padding(.horizontal, usesSplit ? AppSpacing.m : AppSpacing.l)
             .padding(.vertical, AppSpacing.l)
@@ -128,6 +160,57 @@ struct MessageCenterView: View {
             .frame(maxWidth: .infinity)
         }
         .refreshable { await viewModel.loadInitial() }
+    }
+}
+
+private struct MessageCategorySectionView: View {
+    let viewModel: MessageCenterViewModel
+    let coordinator: AppCoordinator
+    let usesSplit: Bool
+    @Binding var selection: MessageSelection?
+
+    var body: some View {
+        let tabs = MessageTab.allCases
+        VStack(spacing: 0) {
+            ForEach(Array(tabs.enumerated()), id: \.element) { index, tab in
+                let isSelected = usesSplit && selection == .category(tab)
+                let nextSelected = usesSplit && index + 1 < tabs.count
+                    && selection == .category(tabs[index + 1])
+                categoryEntry(tab, isSelected: isSelected)
+                if index < tabs.count - 1, !isSelected, !nextSelected {
+                    Divider()
+                        .opacity(0.35)
+                        .padding(.leading, usesSplit ? 70 : 66)
+                }
+            }
+        }
+        .padding(.vertical, usesSplit ? 4 : 0)
+        .background(
+            AppFill.card,
+            in: RoundedRectangle(cornerRadius: AppRadius.panel, style: .continuous)
+        )
+    }
+
+    @ViewBuilder
+    private func categoryEntry(_ tab: MessageTab, isSelected: Bool) -> some View {
+        if usesSplit {
+            Button {
+                selection = .category(tab)
+            } label: {
+                categoryCard(tab, isSelected: isSelected)
+                    .background(MessageSelectionHighlight(isSelected: isSelected))
+                    .padding(.horizontal, 6)
+            }
+            .buttonStyle(.appControl)
+        } else {
+            NavigationLink {
+                MessageTabDestinationView(tab: tab, viewModel: viewModel, coordinator: coordinator)
+                    .contentLinks()
+            } label: {
+                categoryCard(tab)
+            }
+            .buttonStyle(.appControl)
+        }
     }
 
     private func categoryCard(_ tab: MessageTab, isSelected: Bool = false) -> some View {
@@ -151,7 +234,7 @@ struct MessageCenterView: View {
             Spacer(minLength: 4)
 
             if unread > 0 {
-                unreadBadge(unread)
+                MessageUnreadBadge(count: unread)
             } else {
                 Image(systemName: "chevron.right")
                     .font(.caption.weight(.semibold))
@@ -165,43 +248,67 @@ struct MessageCenterView: View {
         .contentShape(Rectangle())
     }
 
-    private var chatSessions: [SessionListResult.SessionItem] {
-        viewModel.sessions.filter {
-            ($0.systemMsgType ?? 0) == 0 && $0.talkerId < (1 << 40)
-        }
-    }
-
-    // MARK: - Category entries
-
-    @ViewBuilder
-    private func destination(for tab: MessageTab) -> some View {
+    private func unreadCount(for tab: MessageTab) -> Int {
         switch tab {
-        case .reply:
-            ReplyListView(viewModel: viewModel, coordinator: coordinator)
-                .appAmbientBrowseBackground()
-                .navigationTitle("Replies")
-                .navigationBarTitleDisplayMode(.inline)
-        case .at:
-            AtListView(viewModel: viewModel, coordinator: coordinator)
-                .appAmbientBrowseBackground()
-                .navigationTitle("Mentions")
-                .navigationBarTitleDisplayMode(.inline)
-        case .like:
-            LikeListView(viewModel: viewModel, coordinator: coordinator)
-                .appAmbientBrowseBackground()
-                .navigationTitle("Likes")
-                .navigationBarTitleDisplayMode(.inline)
-        case .system:
-            SystemListView(viewModel: viewModel, coordinator: coordinator)
-                .appAmbientBrowseBackground()
-                .navigationTitle("System")
-                .navigationBarTitleDisplayMode(.inline)
+        case .reply: viewModel.unread?.reply ?? 0
+        case .at: viewModel.unread?.at ?? 0
+        case .like: viewModel.unread?.like ?? 0
+        case .system: viewModel.unread?.sysMsg ?? 0
+        }
+    }
+}
+
+private struct MessageChatsSectionView: View {
+    let viewModel: MessageCenterViewModel
+    let coordinator: AppCoordinator
+    let usesSplit: Bool
+    let selectedTalkerID: Int?
+    let onSelectChat: (Int, String, String?) -> Void
+
+    var body: some View {
+        let sessions = viewModel.chatSessions
+        VStack(alignment: .leading, spacing: AppSpacing.s) {
+            HStack {
+                Text("Chats")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, usesSplit ? 10 : 4)
+
+            if !AuthManager.shared.isLoggedIn {
+                ContentUnavailableView(
+                    "Sign In Required", systemImage: "person.crop.circle.badge.exclamationmark"
+                )
+                .padding(.vertical, 24)
+            } else {
+                if !sessions.isEmpty {
+                    LazyVStack(spacing: 0) {
+                        ForEach(sessions) { session in
+                            sessionRow(session)
+                        }
+                    }
+                }
+
+                if let error = viewModel.sessionLoadError {
+                    MessageLoadFailureView(message: error) {
+                        Task { await viewModel.retrySessions() }
+                    }
+                } else if sessions.isEmpty {
+                    if viewModel.sessionsLoaded && !viewModel.isLoadingSessions {
+                        ContentUnavailableView("No Messages", systemImage: "bubble.left.and.bubble.right")
+                            .padding(.vertical, 24)
+                    } else {
+                        ProgressView()
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 24)
+                    }
+                }
+            }
         }
     }
 
-    // MARK: - Chat rows
-
-    private func sessionRow(_ session: SessionListResult.SessionItem, usesSplit: Bool) -> some View {
+    private func sessionRow(_ session: SessionListResult.SessionItem) -> some View {
         let resolved = viewModel.sessionUsers[session.talkerId]
         let face = session.accountInfo?.face
             ?? resolved?.face
@@ -211,7 +318,7 @@ struct MessageCenterView: View {
             ?? session.groupName
 
         let displayName = name ?? String(localized: "User \(session.talkerId)")
-        let isSelected = usesSplit && selection?.talkerId == session.talkerId
+        let isSelected = usesSplit && selectedTalkerID == session.talkerId
 
         return HStack(spacing: 12) {
             SessionAvatarView(talkerId: session.talkerId, name: name, face: face)
@@ -235,13 +342,13 @@ struct MessageCenterView: View {
                 }
 
                 HStack {
-                    Text(preview(for: session.lastMsg))
+                    Text(session.lastMsg?.displayContent ?? "")
                         .appFont(.messageBody)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                     Spacer()
                     if let unread = session.unreadCount, unread > 0 {
-                        unreadBadge(unread)
+                        MessageUnreadBadge(count: unread)
                     }
                 }
             }
@@ -257,11 +364,11 @@ struct MessageCenterView: View {
                     .padding(.leading, usesSplit ? 70 : 60)
             }
         }
-        .background(selectionHighlight(isSelected))
+        .background(MessageSelectionHighlight(isSelected: isSelected))
         .onTapGesture {
             guard (session.sessionType ?? 1) == 1 else { return }
             if usesSplit {
-                selection = .chat(talkerId: session.talkerId, name: displayName, face: face)
+                onSelectChat(session.talkerId, displayName, face)
             } else {
                 coordinator.navigate(to: .chat(
                     talkerId: session.talkerId,
@@ -272,24 +379,9 @@ struct MessageCenterView: View {
         }
     }
 
-    private func preview(for msg: SessionListResult.SessionItem.LastMsg?) -> String {
-        msg?.displayContent ?? ""
-    }
-
     private func sessionTimestamp(_ session: SessionListResult.SessionItem) -> Int? {
         guard let ts = session.lastMsg?.timestamp ?? session.sessionTs else { return nil }
         return ts > 4_000_000_000 ? ts / 1_000_000 : ts
-    }
-
-    private func unreadBadge(_ count: Int) -> some View {
-        Text("\(count)")
-            .appFont(.overlayBadge, monospacedDigit: true)
-            .fontWeight(.bold)
-            .foregroundStyle(.white)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 2.5)
-            .frame(minWidth: 20)
-            .background(Color.biliAccent, in: Capsule())
     }
 
     private struct SessionAvatarView: View {
@@ -318,43 +410,19 @@ struct MessageCenterView: View {
                 }
         }
     }
-
-    private func unreadCount(for tab: MessageTab) -> Int {
-        switch tab {
-        case .reply: viewModel.unread?.reply ?? 0
-        case .at: viewModel.unread?.at ?? 0
-        case .like: viewModel.unread?.like ?? 0
-        case .system: viewModel.unread?.sysMsg ?? 0
-        }
-    }
 }
 
-extension MessageCenterView {
-    // MARK: - iPad landscape list-detail
+private struct MessageSplitDetailView: View {
+    let selection: MessageSelection?
+    let viewModel: MessageCenterViewModel
+    let coordinator: AppCoordinator
 
-    private func sidebarWidth(for containerWidth: CGFloat) -> CGFloat {
-        guard containerWidth.isFinite, containerWidth > 0 else { return 352 }
-        return min(max((containerWidth * 0.30).rounded(), 340), 360)
-    }
-
-    private func splitLayout(containerWidth: CGFloat) -> some View {
-        HStack(spacing: 0) {
-            sidebarList(usesSplit: true)
-                .frame(width: sidebarWidth(for: containerWidth))
-            Divider()
-                .opacity(0.45)
-            splitDetail
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-    }
-
-    @ViewBuilder
-    private var splitDetail: some View {
+    var body: some View {
         switch selection {
         case .category(let tab):
             VStack(spacing: 0) {
                 splitCategoryHeader(tab)
-                destination(for: tab)
+                MessageTabDestinationView(tab: tab, viewModel: viewModel, coordinator: coordinator)
                     .contentLinks()
                     .id(tab)
             }
@@ -455,77 +523,60 @@ extension MessageCenterView {
                 .opacity(0.45)
         }
     }
+}
 
-    @ViewBuilder
-    private func categoryEntry(_ tab: MessageTab, usesSplit: Bool, isSelected: Bool) -> some View {
-        if usesSplit {
-            Button {
-                selection = .category(tab)
-            } label: {
-                categoryCard(tab, isSelected: isSelected)
-                    .background(selectionHighlight(isSelected))
-                    .padding(.horizontal, 6)
-            }
-            .buttonStyle(.appControl)
-        } else {
-            NavigationLink {
-                destination(for: tab)
-                    .contentLinks()
-            } label: {
-                categoryCard(tab)
-            }
-            .buttonStyle(.appControl)
+private struct MessageTabDestinationView: View {
+    let tab: MessageTab
+    let viewModel: MessageCenterViewModel
+    let coordinator: AppCoordinator
+
+    var body: some View {
+        switch tab {
+        case .reply:
+            ReplyListView(viewModel: viewModel, coordinator: coordinator)
+                .appAmbientBrowseBackground()
+                .navigationTitle("Replies")
+                .navigationBarTitleDisplayMode(.inline)
+        case .at:
+            AtListView(viewModel: viewModel, coordinator: coordinator)
+                .appAmbientBrowseBackground()
+                .navigationTitle("Mentions")
+                .navigationBarTitleDisplayMode(.inline)
+        case .like:
+            LikeListView(viewModel: viewModel, coordinator: coordinator)
+                .appAmbientBrowseBackground()
+                .navigationTitle("Likes")
+                .navigationBarTitleDisplayMode(.inline)
+        case .system:
+            SystemListView(viewModel: viewModel, coordinator: coordinator)
+                .appAmbientBrowseBackground()
+                .navigationTitle("System")
+                .navigationBarTitleDisplayMode(.inline)
         }
     }
+}
 
-    private func selectionHighlight(_ isSelected: Bool) -> some View {
+private struct MessageUnreadBadge: View {
+    let count: Int
+
+    var body: some View {
+        Text("\(count)")
+            .appFont(.overlayBadge, monospacedDigit: true)
+            .fontWeight(.bold)
+            .foregroundStyle(.white)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2.5)
+            .frame(minWidth: 20)
+            .background(Color.biliAccent, in: Capsule())
+    }
+}
+
+private struct MessageSelectionHighlight: View {
+    let isSelected: Bool
+
+    var body: some View {
         RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
             .fill(isSelected ? Color.biliAccent.opacity(0.14) : Color.clear)
-    }
-
-    private func chatsSection(
-        _ sessions: [SessionListResult.SessionItem],
-        usesSplit: Bool
-    ) -> some View {
-        VStack(alignment: .leading, spacing: AppSpacing.s) {
-            HStack {
-                Text("Chats")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-            }
-            .padding(.horizontal, usesSplit ? 10 : 4)
-
-            if !AuthManager.shared.isLoggedIn {
-                ContentUnavailableView(
-                    "Sign In Required", systemImage: "person.crop.circle.badge.exclamationmark"
-                )
-                .padding(.vertical, 24)
-            } else {
-                if !sessions.isEmpty {
-                    LazyVStack(spacing: 0) {
-                        ForEach(sessions) { session in
-                            sessionRow(session, usesSplit: usesSplit)
-                        }
-                    }
-                }
-
-                if let error = viewModel.sessionLoadError {
-                    MessageLoadFailureView(message: error) {
-                        Task { await viewModel.retrySessions() }
-                    }
-                } else if sessions.isEmpty {
-                    if viewModel.sessionsLoaded && !viewModel.isLoadingSessions {
-                        ContentUnavailableView("No Messages", systemImage: "bubble.left.and.bubble.right")
-                            .padding(.vertical, 24)
-                    } else {
-                        ProgressView()
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 24)
-                    }
-                }
-            }
-        }
     }
 }
 

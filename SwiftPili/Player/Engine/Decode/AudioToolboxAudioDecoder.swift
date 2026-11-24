@@ -25,6 +25,7 @@ actor AudioToolboxAudioDecoder: MediaAudioDecoding {
     )
     private(set) var framesProduced = 0
     private var pendingAccessUnits: [PendingAccessUnit] = []
+    private var decodeScratch: [Float] = []
     private var hasVerifiedNativePCMFormat = false
     private var hasVerifiedSRCLayout = false
     private var nativeAccessUnitBoundaryKnown = false
@@ -352,19 +353,20 @@ actor AudioToolboxAudioDecoder: MediaAudioDecoding {
             converterRatioCapacityFrames
         )
         let expectedNativeFrames = converterCapacityFrames
-        var pcm = [Float](
-            repeating: 0,
-            count: converterCapacityFrames * Int(outChannels)
-        )
+        let neededSamples = converterCapacityFrames * Int(outChannels)
+        if decodeScratch.count < neededSamples {
+            decodeScratch = [Float](repeating: 0, count: neededSamples)
+        }
         var packetSize = UInt32(converterCapacityFrames)
         let userData = Unmanaged.passUnretained(box).toOpaque()
         let convStatus: OSStatus = withExtendedLifetime((retainedConverterInput, box)) {
-            pcm.withUnsafeMutableBytes { raw in
+            decodeScratch.withUnsafeMutableBytes { raw in
+                let byteCount = neededSamples * MemoryLayout<Float>.size
                 var bufferList = AudioBufferList(
                     mNumberBuffers: 1,
                     mBuffers: AudioBuffer(
                         mNumberChannels: outChannels,
-                        mDataByteSize: UInt32(raw.count),
+                        mDataByteSize: UInt32(byteCount),
                         mData: raw.baseAddress
                     )
                 )
@@ -427,14 +429,15 @@ actor AudioToolboxAudioDecoder: MediaAudioDecoding {
             return []
         }
         let emitted = pendingAccessUnits[0]
-        let outputPCM: [Float]
+        let passthroughRate = abs(nativeDecodedSampleRate - outSampleRate) <= 0.5
+        let resampledPCM: [Float]
         let outputFrames: Int
-        if abs(nativeDecodedSampleRate - outSampleRate) <= 0.5 {
-            outputPCM = Array(pcm.prefix(frames * Int(outChannels)))
+        if passthroughRate {
+            resampledPCM = []
             outputFrames = frames
         } else {
-            outputPCM = pcmResampler.process(pcm, frameCount: frames)
-            outputFrames = outputPCM.count / Int(outChannels)
+            resampledPCM = pcmResampler.process(decodeScratch, frameCount: frames)
+            outputFrames = resampledPCM.count / Int(outChannels)
         }
         guard outputFrames > 0 else {
             if !pendingAccessUnits.isEmpty {
@@ -474,23 +477,49 @@ actor AudioToolboxAudioDecoder: MediaAudioDecoding {
                     } ?? "")
             )
         }
-        let emittedPCM: [Float]
         let emittedChannels: Int
+        let pcmData: Data
         if duplicatesMonoToStereo {
-            var stereo = [Float]()
-            stereo.reserveCapacity(outputPCM.count * 2)
-            for sample in outputPCM {
-                stereo.append(sample)
-                stereo.append(sample)
-            }
-            emittedPCM = stereo
             emittedChannels = Int(Self.engineChannelCount)
+            let monoCount = passthroughRate ? frames : resampledPCM.count
+            let stereo = [Float](unsafeUninitializedCapacity: monoCount * 2) { dst, initializedCount in
+                guard let d = dst.baseAddress else {
+                    initializedCount = 0
+                    return
+                }
+                if passthroughRate {
+                    decodeScratch.withUnsafeBufferPointer { src in
+                        guard let s = src.baseAddress else { return }
+                        for i in 0..<monoCount {
+                            let sample = s[i]
+                            d[i * 2] = sample
+                            d[i * 2 + 1] = sample
+                        }
+                    }
+                } else {
+                    resampledPCM.withUnsafeBufferPointer { src in
+                        guard let s = src.baseAddress else { return }
+                        for i in 0..<monoCount {
+                            let sample = s[i]
+                            d[i * 2] = sample
+                            d[i * 2 + 1] = sample
+                        }
+                    }
+                }
+                initializedCount = monoCount * 2
+            }
+            pcmData = stereo.withUnsafeBufferPointer { Data(buffer: $0) }
         } else {
-            emittedPCM = outputPCM
             emittedChannels = Int(outChannels)
-        }
-        let pcmData = emittedPCM.withUnsafeBufferPointer {
-            Data(buffer: $0)
+            if passthroughRate {
+                let sampleCount = frames * Int(outChannels)
+                pcmData = decodeScratch.withUnsafeBufferPointer { buf in
+                    guard let base = buf.baseAddress else { return Data() }
+                    return Data(bytes: base, count: sampleCount * MemoryLayout<Float>.size)
+                }
+            } else {
+                pcmData = resampledPCM.withUnsafeBufferPointer { Data(buffer: $0) }
+            }
         }
         let duration = TimeInterval(outputFrames) / outSampleRate
         framesProduced += 1
@@ -569,6 +598,7 @@ actor AudioToolboxAudioDecoder: MediaAudioDecoding {
         nativeAccessUnitBoundaryKnown = false
         input = nil
         pendingAccessUnits.removeAll()
+        decodeScratch.removeAll()
         noPCMReturns = 0
         lastDiagnostics = MediaAudioDecodeDiagnostics(
             status: .idle,

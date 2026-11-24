@@ -215,8 +215,7 @@ extension SearchResultsCollectionViewController {
     }
 
     private func sectionKey(at index: Int) -> SearchSectionKey? {
-        let sections = dataSource?.snapshot().sectionIdentifiers ?? []
-        return index < sections.count ? sections[index] : nil
+        index < currentSections.count ? currentSections[index] : nil
     }
 
     private func bucketTitle(for type: SearchType) -> String {
@@ -377,6 +376,7 @@ extension SearchResultsCollectionViewController {
                 if reconfigureSkeletons || reconfigureAll { snapshot.reconfigureItems(keys) }
             }
             lastReconfiguredWidth = currentContentWidth
+            currentSections = snapshot.sectionIdentifiers
             dataSource.apply(snapshot, animatingDifferences: false)
             return
         }
@@ -414,6 +414,7 @@ extension SearchResultsCollectionViewController {
             if !targets.isEmpty { snapshot.reconfigureItems(targets) }
         }
         lastReconfiguredWidth = currentContentWidth
+        currentSections = snapshot.sectionIdentifiers
         dataSource.apply(snapshot, animatingDifferences: false)
     }
 

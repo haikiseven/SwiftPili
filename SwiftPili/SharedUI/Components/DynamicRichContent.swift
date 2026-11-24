@@ -77,6 +77,10 @@ enum DynamicRichContent {
     }
 
     static func repeatsGallery(_ pictures: [OpusPicture], bodies: [[Node]]) -> Bool {
+        guard !pictures.isEmpty,
+              bodies.contains(where: { $0.contains(where: isPictureAttachment) }) else {
+            return false
+        }
         let gallery = pictures.compactMap {
             pictureIdentity(source: $0.url, width: $0.width, height: $0.height)
         }

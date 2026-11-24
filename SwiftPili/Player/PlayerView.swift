@@ -24,7 +24,6 @@ final class PlayerVerticalPagingCoordinator {
     @MainActor
     func install(_ handlers: Handlers) {
         self.handlers = handlers
-        UIHitchMonitor.count("sink")
     }
 
     @MainActor
@@ -63,6 +62,8 @@ struct PlayerView: View {
     let screenLease: PlayerOwnerLease?
     let presentationReceipt: PlayerPresentationReceipt?
     let fullscreenHostIdentity: UUID?
+    let placeholderCoverURL: String?
+    let showsLoadingIndicator: Bool
 
     init(
         owner: String,
@@ -79,6 +80,8 @@ struct PlayerView: View {
         screenLease: PlayerOwnerLease? = nil,
         presentationReceipt: PlayerPresentationReceipt? = nil,
         fullscreenHostIdentity: UUID? = nil,
+        placeholderCoverURL: String? = nil,
+        showsLoadingIndicator: Bool = true,
         gestureDisplay: PlayerGestureDisplay = PlayerGestureDisplay()
     ) {
         self.owner = owner
@@ -95,6 +98,8 @@ struct PlayerView: View {
         self.screenLease = screenLease
         self.presentationReceipt = presentationReceipt
         self.fullscreenHostIdentity = fullscreenHostIdentity
+        self.placeholderCoverURL = placeholderCoverURL
+        self.showsLoadingIndicator = showsLoadingIndicator
         _gestureDisplay = State(initialValue: gestureDisplay)
     }
 
@@ -218,8 +223,33 @@ struct PlayerView: View {
         )
     }
 
+    private var ownerPlaybackError: String? {
+        isOwner ? (vm.error ?? vm.videoPresentationFailureMessage) : nil
+    }
+
     private var isPlaybackUnavailable: Bool {
-        (vm.error ?? vm.videoPresentationFailureMessage) != nil
+        ownerPlaybackError != nil
+    }
+
+    private var hasRenderedFirstFrameForOwner: Bool {
+        isOwner && vm.hasRenderedFirstFrame && vm.currentURL != nil
+    }
+
+    private var resolvedPlaceholderCoverURL: String? {
+        if let placeholderCoverURL, !placeholderCoverURL.isEmpty {
+            return placeholderCoverURL
+        }
+        if isOwner, let ambientCover = vm.ambientCoverURL, !ambientCover.isEmpty {
+            return ambientCover
+        }
+        return nil
+    }
+
+    private var usableCoverViewportSize: CGSize? {
+        guard let size = allocatedInlineViewport, size.width > 1, size.height > 1 else {
+            return nil
+        }
+        return size
     }
 
     private var showsUnifiedInlineAmbient: Bool {
@@ -235,7 +265,6 @@ struct PlayerView: View {
     }
 
     var body: some View {
-        let _ = UIHitchMonitor.countBody("player")
         let isFullscreenTransitioning = surfaceRole == .fullscreen
             && PlayerFullscreenTransitionState.shared.isGeometryTransitioning
         let effectiveCornerRadius = isFullscreenPresentation
@@ -246,6 +275,13 @@ struct PlayerView: View {
                     isPiPRestoringInline: vm.isPiPRestoringInline
                 )
             )
+        let outgoingStill = !isOwner ? vm.outgoingRouteStill(for: owner) : nil
+        let activeFreezeFrame = isOwner ? vm.freezeFrame.flatMap { $0.size.width > 0 ? $0 : nil } : nil
+        let showsFirstFrameCover = !hasRenderedFirstFrameForOwner
+            && outgoingStill == nil
+            && activeFreezeFrame == nil
+            && !isPlaybackUnavailable
+        let showsCoverProgress = showsLoadingIndicator && (!isOwner || vm.playbackIntent != .pausedByUser)
         ZStack {
             if isFullscreenPresentation {
                 Color.black
@@ -283,24 +319,38 @@ struct PlayerView: View {
                 PlayerDanmakuOverlay(player: vm)
             }
 
-            if !isOwner,
-               let still = vm.outgoingRouteStill(for: owner)
-                   ?? (vm.outgoingRouteStill?.owner == owner ? vm.outgoingRouteStill?.image : nil),
-               still.size.width > 0 {
+            if let still = outgoingStill {
                 Image(uiImage: still)
                     .resizable()
                     .scaledToFit()
                     .allowsHitTesting(false)
             }
 
-            if isOwner, let frame = vm.freezeFrame, frame.size.width > 0 {
+            if let frame = activeFreezeFrame {
                 Image(uiImage: frame)
                     .resizable()
                     .scaledToFit()
                     .allowsHitTesting(false)
             }
 
-            if vm.isBuffering {
+            ZStack {
+                if showsFirstFrameCover {
+                    PlayerFirstFrameCoverOverlay(
+                        coverURL: resolvedPlaceholderCoverURL,
+                        viewportSize: usableCoverViewportSize,
+                        showsProgress: showsCoverProgress
+                    )
+                    .transition(.opacity)
+                }
+            }
+            .animation(
+                reduceMotion ? nil : .easeOut(duration: 0.2),
+                value: showsFirstFrameCover
+            )
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+
+            if isOwner, vm.isBuffering, !showsFirstFrameCover, !isPlaybackUnavailable {
                 ProgressView()
                     .controlSize(.large)
                     .tint(.white)
@@ -364,7 +414,7 @@ struct PlayerView: View {
                 .zIndex(2)
             }
 
-            if let error = vm.error ?? vm.videoPresentationFailureMessage {
+            if let error = ownerPlaybackError {
                 let title: LocalizedStringKey = vm.unavailability == nil
                     ? "Playback Failed"
                     : "Playback Unavailable"
@@ -409,26 +459,6 @@ struct PlayerView: View {
                             gestureDisplay: gestureDisplay,
                             chromeInsets: chromeInsets
                         )
-                    }
-                    .overlay {
-                        GeometryReader { proxy in
-                            Color.clear
-                                .onChange(of: chromeInsets, initial: true) { _, i in
-                                    guard PlayerLog.isCapturing else { return }
-                                    let rect = proxy.frame(in: .global)
-                                    PlayerLog.log(
-                                        "[PlayerChrome] statsCard "
-                                            + "box=\(Int(rect.minY.rounded()))..\(Int(rect.maxY.rounded())) "
-                                            + "presentation=\(vm.isFullscreen ? "fullscreen" : "\(container)") "
-                                            + "insetTop=\(Int(i.top.rounded())) "
-                                            + "insetBottom=\(Int(i.bottom.rounded())) "
-                                            + "insetH=\(Int(i.horizontal.rounded())) "
-                                            + "cardTop=\(Int((rect.minY + 8 + i.top).rounded())) "
-                                            + "transport=\(transportPlacement)"
-                                    )
-                                }
-                        }
-                        .allowsHitTesting(false)
                     }
                     .clipped()
                     .allowsHitTesting(false)
@@ -495,29 +525,10 @@ struct PlayerView: View {
         .background { if isFullscreenPresentation { Color.black } }
         .ignoresSafeArea(.keyboard, edges: .all)
         .ignoresSafeArea(.all, edges: isFullscreenPresentation ? .all : [])
-        .background(
-            GeometryReader { proxy in
-                Color.clear
-                    .onAppear {
-                        recordGeometrySettlement(size: proxy.size)
-                        publishSurfaceSizeIfAllowed(proxy.size)
-                    }
-                    .onChange(of: proxy.size) { _, newValue in
-                        recordGeometrySettlement(size: newValue)
-                        publishSurfaceSizeIfAllowed(newValue)
-                    }
-                    .onChange(of: vm.isPiPRestoringInline, initial: true) { _, restoring in
-                        guard PlayerLog.isCapturing else { return }
-                        let rect = proxy.frame(in: .global)
-                        PlayerLog.log(
-                            "[Surface][PiPTrace] swiftUI restore=\(restoring ? 1 : 0) "
-                                + "rect=\(Int(rect.minX.rounded())),\(Int(rect.minY.rounded()))-"
-                                + "\(Int(rect.width.rounded()))x\(Int(rect.height.rounded())) "
-                                + "fullscreen=\(vm.isFullscreen ? 1 : 0)"
-                        )
-                    }
-            }
-        )
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { newValue in
+            recordGeometrySettlement(size: newValue)
+            publishSurfaceSizeIfAllowed(newValue)
+        }
         .overlay(alignment: .top) {
             VStack(spacing: 6) {
                 if swipeSeekActive {
@@ -686,7 +697,6 @@ struct PlayerView: View {
             }
             .onChanged { gesture in
                 guard isOwner, surfaceLease != nil else { return }
-                UIHitchMonitor.count("gesture")
                 if surfaceTouchInFlight, gesture.startLocation != surfaceStartLocation {
                     resetSurfaceTouch(reason: "stale touch — previous one was system-cancelled")
                 }
@@ -771,7 +781,6 @@ struct PlayerView: View {
                         || value == 0 || value == 1
                     else { return }
                     surfaceDrag.appliedAdjust = value
-                    UIHitchMonitor.count("hw")
                     if verticalAdjustIsVolume {
                         SystemVolumeController.shared.setVolume(Float(value))
                     } else {
@@ -903,6 +912,36 @@ struct PlayerView: View {
 
     private func scheduleHideControls() {
         if isOwner { vm.scheduleHideControls(isSeeking: gestureDisplay.isSeeking) }
+    }
+}
+
+private struct PlayerFirstFrameCoverOverlay: View {
+    let coverURL: String?
+    let viewportSize: CGSize?
+    let showsProgress: Bool
+
+    var body: some View {
+        ZStack {
+            Color.black
+            if let coverURL, !coverURL.isEmpty {
+                CoverImage(
+                    urlString: coverURL,
+                    displaySize: viewportSize,
+                    contentMode: .fit,
+                    groundColor: .black,
+                    isDecorative: true,
+                    fillsOfferedBox: viewportSize != nil
+                )
+            }
+            Color.black.opacity(0.18)
+            if showsProgress {
+                ProgressView()
+                    .controlSize(.large)
+                    .tint(.white)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
     }
 }
 

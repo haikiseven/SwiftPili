@@ -18,7 +18,6 @@ struct MediaGridView: View {
         case comment
     }
 
-    @Environment(\.imageDiagnosticsScreen) private var diagnosticsScreen
     @Environment(\.rowCardColumnWidth) private var envColumnWidth
 
     let media: [Media]
@@ -231,7 +230,7 @@ struct MediaGridView: View {
         if item.isGIF {
             AnimatedMediaImage(
                 urlString: item.url.absoluteString, contentMode: .scaleAspectFill,
-                screen: diagnosticsScreen, onLoadedImage: onLoaded
+                onLoadedImage: onLoaded
             )
         } else if item.isLongImage {
             CoverImage(
@@ -332,43 +331,24 @@ private struct CommentGridLayout: Layout {
 private struct AnimatedMediaImage: View {
     let urlString: String
     let contentMode: UIView.ContentMode
-    let screen: String
     var onLoadedImage: ((UIImage) -> Void)?
 
+    @Environment(\.displayScale) private var displayScale
+
     var body: some View {
-        KFAnimatedImage(URL(string: urlString.httpsURL))
+        var kf = KFAnimatedImage(URL(string: urlString.httpsURL))
             .configure { view in
                 view.contentMode = contentMode
                 view.clipsToBounds = true
             }
+            .backgroundDecode()
+            .scaleFactor(displayScale > 0 ? displayScale : 1)
             .purgeFramesOnBackground()
             .cancelOnDisappear(true)
-            .onSuccess { result in
-                let source: ImageDiagnosticsSource = switch result.cacheType {
-                case .memory: .memory
-                case .disk: .disk
-                case .none: .network
-                }
-                let image = result.image
-                onLoadedImage?(image)
-                ImageDiagnostics.noteCompletion(
-                    url: urlString,
-                    source: source,
-                    pixels: CGSize(
-                        width: image.size.width * image.scale,
-                        height: image.size.height * image.scale
-                    ),
-                    rendered: nil,
-                    at: ImageSite(screen: screen, component: "MediaGridView.gif")
-                )
-            }
-            .onFailure { _ in
-                ImageDiagnostics.noteFailure(
-                    url: urlString, rendered: nil,
-                    at: ImageSite(screen: screen, component: "MediaGridView.gif")
-                )
-            }
-            .imageLoadingCover()
+        if let onLoadedImage {
+            kf = kf.onSuccess { onLoadedImage($0.image) }
+        }
+        return kf.imageLoadingCover()
     }
 }
 
