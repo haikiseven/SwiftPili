@@ -72,34 +72,37 @@ enum FeedColumnPolicy {
         case termChips
     }
 
-    private static let firstStep: CGFloat = 680
+    private static let firstStep: CGFloat = 620
 
     static func columnCount(_ surface: Surface, availableWidth: CGFloat) -> Int {
         guard availableWidth.isFinite, availableWidth > 0 else { return 1 }
         switch surface {
         case .videoGrid:
             if availableWidth < firstStep { return 2 }
-            if availableWidth < 1070 { return 3 }
-            return 4
+            if availableWidth < 960 { return 3 }
+            if availableWidth < 1280 { return 4 }
+            return 5
         case .videoRow:
-            if availableWidth < firstStep { return 1 }
-            if availableWidth < 1250 { return 2 }
+            if availableWidth < 660 { return 1 }
+            if availableWidth < 1080 { return 2 }
             return 3
         case .liveGrid:
             if availableWidth < firstStep { return 2 }
-            if availableWidth < 960 { return 3 }
-            return 4
+            if availableWidth < 920 { return 3 }
+            if availableWidth < 1260 { return 4 }
+            return 5
         case .termChips:
             if availableWidth < firstStep { return 2 }
-            return 3
+            if availableWidth < 960 { return 3 }
+            return 4
         }
     }
 
     static func pgcPosterColumnCount(availableWidth: CGFloat) -> Int {
         guard availableWidth.isFinite, availableWidth > 0 else { return 3 }
         if availableWidth < firstStep { return 3 }
-        if availableWidth < 900 { return 4 }
-        if availableWidth < 1100 { return 5 }
+        if availableWidth < 840 { return 4 }
+        if availableWidth < 1060 { return 5 }
         return 6
     }
 
@@ -110,19 +113,28 @@ enum FeedColumnPolicy {
     }
 
     static func shelfCardWidth(availableWidth: CGFloat) -> CGFloat {
-        guard availableWidth.isFinite, availableWidth > 0 else { return 128 }
-        if availableWidth < firstStep { return 128 }
-        if availableWidth < 1070 { return 196 }
+        guard availableWidth.isFinite, availableWidth > 0 else { return 136 }
+        if availableWidth < 520 { return 136 }
+        if availableWidth < 760 { return 168 }
+        if availableWidth < 1060 { return 196 }
         return 220
+    }
+
+    static func horizontalMargin(for containerWidth: CGFloat) -> CGFloat {
+        guard containerWidth.isFinite, containerWidth > 0 else { return 16 }
+        if containerWidth < 680 { return 16 }
+        if containerWidth < 1000 { return 20 }
+        return 24
     }
 }
 
 enum PGCFollowedRailPolicy {
     static func cardWidth(availableWidth: CGFloat) -> CGFloat {
         guard availableWidth.isFinite, availableWidth > 0 else { return 96 }
-        if availableWidth < 680 { return 96 }
-        if availableWidth < 1070 { return 128 }
-        return 160
+        if availableWidth < 560 { return 96 }
+        if availableWidth < 860 { return 120 }
+        if availableWidth < 1120 { return 136 }
+        return 156
     }
 }
 
@@ -178,8 +190,8 @@ enum CommentMediaMetrics {
 }
 
 enum ReadableWidth {
-    static let feed: CGFloat = 760
-    static let form: CGFloat = 760
+    static let feed: CGFloat = 740
+    static let form: CGFloat = 680
 
     static func capped(_ availableWidth: CGFloat, to limit: CGFloat = feed) -> CGFloat {
         guard availableWidth.isFinite, availableWidth > 0 else { return limit }
@@ -188,11 +200,11 @@ enum ReadableWidth {
 }
 
 enum DetailSplitPolicy {
-    static let companionPreferredFraction: CGFloat = 0.4
+    static let companionPreferredFraction: CGFloat = 0.34
     static let companionMinimumWidth: CGFloat = 340
-    static let primaryMinimumWidth: CGFloat = 400
-    static let companionMaximumWidth: CGFloat = 420
-    static let primaryMaximumWidth: CGFloat = 820
+    static let primaryMinimumWidth: CGFloat = 440
+    static let companionMaximumWidth: CGFloat = 440
+    static let primaryMaximumWidth: CGFloat = 880
 
     static func usesSplit(
         isPad: Bool,

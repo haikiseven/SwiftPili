@@ -12,24 +12,6 @@ struct WatchLaterListView: View {
         model.items.isEmpty && (model.isBusy || (!model.hasLoaded && model.loadError == nil))
     }
 
-    private var rowItems: [MineLibraryRowItem] {
-        model.items.map { item in
-            let footer: UIKitRowVideoCell.FooterMode = if let stat = item.stat {
-                .stats(play: stat.view, danmaku: stat.danmaku)
-            } else {
-                .none
-            }
-            return MineLibraryRowItem(
-                id: .int(item.id),
-                title: item.title,
-                sources: VideoCoverSources(widescreen: item.pic),
-                duration: item.duration ?? 0,
-                subtitle: item.owner?.name,
-                footer: footer
-            )
-        }
-    }
-
     private var footerState: MineFeedFooterState {
         guard !model.items.isEmpty else { return .none }
         if let error = model.loadError {
@@ -47,7 +29,7 @@ struct WatchLaterListView: View {
             String(localized: "Watch Later")
         )
         MineLibraryRowFeedView(
-            items: rowItems,
+            items: model.rowItems,
             placeholderCount: showsInitialPlaceholder ? 6 : 0,
             placeholderLabel: placeholderLabel,
             footerState: footerState,
@@ -180,7 +162,26 @@ private final class WatchLaterListModel {
         case action(UUID)
     }
 
-    private(set) var items: [WatchLaterResult.WatchLaterItem] = []
+    private(set) var items: [WatchLaterResult.WatchLaterItem] = [] {
+        didSet {
+            rowItems = items.map { item in
+                let footer: UIKitRowVideoCell.FooterMode = if let stat = item.stat {
+                    .stats(play: stat.view, danmaku: stat.danmaku)
+                } else {
+                    .none
+                }
+                return MineLibraryRowItem(
+                    id: .int(item.id),
+                    title: item.title,
+                    sources: VideoCoverSources(widescreen: item.pic),
+                    duration: item.duration ?? 0,
+                    subtitle: item.owner?.name,
+                    footer: footer
+                )
+            }
+        }
+    }
+    private(set) var rowItems: [MineLibraryRowItem] = []
     var isBusy: Bool { loadRequestID != nil || actionID != nil }
     private(set) var hasLoaded = false
     private(set) var loadError: String?

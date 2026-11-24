@@ -12,9 +12,9 @@ enum DetailStageLayout {
     static let playerCornerRadius: CGFloat = 20
     static let panelCornerRadius: CGFloat = 28
     static let stageHeightFraction: CGFloat = 0.62
-    static let panelFraction: CGFloat = 0.30
+    static let panelFraction: CGFloat = 0.32
     static let panelMinimumWidth: CGFloat = 340
-    static let panelMaximumWidth: CGFloat = 420
+    static let panelMaximumWidth: CGFloat = 440
     static let heroTopMargin: CGFloat = 16
     static let heroContentGap: CGFloat = 12
 

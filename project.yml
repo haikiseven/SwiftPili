@@ -33,6 +33,8 @@ targets:
           - Resources/AppIcons
       - path: SwiftPili/Resources/AppIcons/AppIcon.icon
         buildPhase: resources
+      - path: SwiftPili/Resources/AppIcons/AppIconBlue.icon
+        buildPhase: resources
       - path: SwiftPili/Resources/AppIcons/AppIconPink.icon
         buildPhase: resources
       - path: SwiftPili/Resources/AppIcons/AppIconGreen.icon

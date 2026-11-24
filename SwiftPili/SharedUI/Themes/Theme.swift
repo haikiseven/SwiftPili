@@ -3,6 +3,7 @@ import UIKit
 
 enum AccentTheme: String, CaseIterable, Identifiable {
     case bilibiliPink = "Bilibili Pink"
+    case blue = "System Blue"
     case pink = "Pink"
     case green = "Green"
     case orange = "Orange"
@@ -15,6 +16,7 @@ enum AccentTheme: String, CaseIterable, Identifiable {
     var color: Color {
         switch self {
         case .bilibiliPink: Color(red: 0.984, green: 0.447, blue: 0.600)
+        case .blue: Color(uiColor: .systemBlue)
         case .pink: Color(red: 0.988, green: 0.690, blue: 0.851)
         case .green: Color(red: 0.392, green: 0.745, blue: 0.490)
         case .orange: Color(red: 0.949, green: 0.616, blue: 0.294)
@@ -25,6 +27,7 @@ enum AccentTheme: String, CaseIterable, Identifiable {
     var alternateIconName: String? {
         switch self {
         case .bilibiliPink: nil
+        case .blue: "AppIconBlue"
         case .pink: "AppIconPink"
         case .green: "AppIconGreen"
         case .orange: "AppIconOrange"

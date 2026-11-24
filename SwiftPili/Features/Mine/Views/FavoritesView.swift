@@ -140,12 +140,15 @@ struct FavoriteFolderPreviewRow: View {
     let folder: FavoriteFolderResult.FavoriteFolder
     let seedWidth: CGFloat
 
-    private static let horizontalInset: CGFloat = 16
     private let onPreviewsLoaded: (([FavoriteContentResult.FavoriteMedia]) -> Void)?
     @State private var viewModel: FavoriteFolderPreviewViewModel
     @Environment(AppCoordinator.self) private var coordinator
 
     @State private var shelfWidth: CGFloat
+    private var horizontalInset: CGFloat {
+        FeedColumnPolicy.horizontalMargin(for: seedWidth)
+    }
+
     private var cardWidth: CGFloat {
         FeedColumnPolicy.shelfCardWidth(availableWidth: shelfWidth)
     }
@@ -168,7 +171,8 @@ struct FavoriteFolderPreviewRow: View {
         self.seedWidth = seedWidth
         self.onPreviewsLoaded = onPreviewsLoaded
         _viewModel = State(initialValue: FavoriteFolderPreviewViewModel(cachedPreviews: cachedPreviews))
-        _shelfWidth = State(initialValue: max(0, seedWidth - Self.horizontalInset * 2))
+        let inset = FeedColumnPolicy.horizontalMargin(for: seedWidth)
+        _shelfWidth = State(initialValue: max(0, seedWidth - inset * 2))
     }
 
     var body: some View {
@@ -268,7 +272,7 @@ struct FavoriteFolderPreviewRow: View {
             }
         }
         .measuringContentWidth(into: $shelfWidth)
-        .padding(.horizontal, Self.horizontalInset)
+        .padding(.horizontal, horizontalInset)
         .padding(.vertical, 12)
         .task {
             await viewModel.loadIfNeeded(folderID: folder.id, onPreviewsLoaded: onPreviewsLoaded)

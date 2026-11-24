@@ -740,6 +740,7 @@
 "Controls" = "控件";
 "Accent Elements" = "强调色元素";
 "Bilibili Pink" = "哔哩哔哩粉";
+"System Blue" = "系统蓝";
 "Sync App Icon" = "同步应用图标";
 "Could not reach the video server. Check your connection and try again." = "无法连接视频服务器，请检查网络后重试。";
 
@@ -1003,18 +1004,22 @@
 "Included audio becomes AAC and loses Dolby / Atmos information." = "音轨转为 AAC，将失去杜比／Atmos 信息。";
 "Keep export" = "Keep export";
 "Local source" = "本地源文件";
-"MP4 · Choose a location in Files after export finishes." = "MP4 · 导出完成后在“文件”中选择保存位置。";
+"MP4 · Save to Photos, Files, or Share after export finishes." = "MP4 · 导出完成后可保存到相册、存储到「文件」或分享。";
 "Mode" = "模式";
 "No local audio track — silent export." = "没有本地音轨，将导出静音视频。";
 "No supported export recipe is available for these local tracks." = "这些本地轨道没有可用的导出配置。";
 "Original tracks" = "原轨封装";
 "Output" = "输出";
+"Photo Library access was denied. Enable it in Settings to save videos." = "相册访问权限已被拒绝。请在“设置”中开启权限以保存视频。";
 "Preparing export" = "正在准备导出";
 "Preserves source video, audio and available HDR / Dolby information without re-encoding." = "不重新编码，保留源视频、音轨及已有 HDR／杜比信息。";
 "Reading local tracks…" = "Reading local tracks…";
 "Ready to save" = "可以保存";
+"Save to Files" = "存储到「文件」";
+"Save to Photos" = "保存到相册";
 "Saved" = "已保存";
 "Saving" = "正在保存";
+"Share…" = "分享…";
 "Source HDR" = "源 HDR";
 "Source size" = "Source size";
 "Stopping export" = "正在停止导出";

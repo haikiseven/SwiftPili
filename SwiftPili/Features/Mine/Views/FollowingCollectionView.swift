@@ -86,12 +86,7 @@ struct FollowingGroupChipsBar: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
-            .background(
-                active
-                    ? AnyShapeStyle(Color.biliAccent.opacity(0.14))
-                    : AnyShapeStyle(Color(.tertiarySystemFill)),
-                in: Capsule()
-            )
+            .appSolidChipSurface(isSelected: active)
             .foregroundStyle(active ? AnyShapeStyle(.biliAccent) : AnyShapeStyle(.primary))
         }
         .buttonStyle(.appControl)
@@ -178,6 +173,7 @@ private final class FollowingCollectionViewController: UIKitBaseCollectionViewCo
     }
 
     private var dataSource: UICollectionViewDiffableDataSource<FollowingSectionKey, FollowingCellKey>?
+    private var currentSections: [FollowingSectionKey] = []
     private var rows: [FollowingRowData] = []
     private var rowByID: [Int: FollowingRowData] = [:]
     private var rowIndexByID: [Int: Int] = [:]
@@ -210,8 +206,7 @@ private final class FollowingCollectionViewController: UIKitBaseCollectionViewCo
                 trailing: sideInset
             )
 
-            let sections = dataSource?.snapshot().sectionIdentifiers ?? []
-            let isSkeleton = sectionIndex < sections.count && sections[sectionIndex] == .skeletons
+            let isSkeleton = sectionIndex < currentSections.count && currentSections[sectionIndex] == .skeletons
             if !isSkeleton, footerState != .none {
                 let footerSize = NSCollectionLayoutSize(
                     widthDimension: .fractionalWidth(1.0),
@@ -434,6 +429,7 @@ private final class FollowingCollectionViewController: UIKitBaseCollectionViewCo
             if !targets.isEmpty { snapshot.reconfigureItems(targets) }
         }
 
+        currentSections = snapshot.sectionIdentifiers
         lastReconfiguredWidth = currentContentWidth
         dataSource.apply(snapshot, animatingDifferences: false)
     }

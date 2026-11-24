@@ -44,6 +44,7 @@ extension UserSpaceViewModel {
             let coins = try await UserAPI.getUserCoinVideos(mid: mid)
             guard !Task.isCancelled, loadGeneration == generation else { return }
             userCoins = coins
+            bumpCoinRevision()
             var transaction = Transaction(animation: nil)
             transaction.disablesAnimations = true
             withTransaction(transaction) { _ = hiddenTabs.remove(.coins) }
@@ -60,6 +61,7 @@ extension UserSpaceViewModel {
             let likes = try await UserAPI.getUserLikeVideos(mid: mid).list ?? []
             guard !Task.isCancelled, loadGeneration == generation else { return }
             userLikes = likes
+            bumpLikeRevision()
             var transaction = Transaction(animation: nil)
             transaction.disablesAnimations = true
             withTransaction(transaction) { _ = hiddenTabs.remove(.likes) }
@@ -76,6 +78,7 @@ extension UserSpaceViewModel {
             let bangumi = try await PGCAPI.getFollowedBangumi(mid: mid).list ?? []
             guard !Task.isCancelled, loadGeneration == generation else { return }
             userBangumi = bangumi
+            bumpBangumiRevision()
             var transaction = Transaction(animation: nil)
             transaction.disablesAnimations = true
             withTransaction(transaction) { _ = hiddenTabs.remove(.bangumi) }
@@ -114,6 +117,7 @@ extension UserSpaceViewModel {
                 userVideos.append(contentsOf: fresh)
                 videoPage = requestedPage + 1
             }
+            bumpVideoRevision()
             if let total = result.page?.count {
                 totalVideoCount = total
                 videosHaveMore = !fresh.isEmpty && userVideos.count < total
@@ -155,6 +159,7 @@ extension UserSpaceViewModel {
             } else {
                 userDynamics.append(contentsOf: fresh)
             }
+            bumpDynamicRevision()
             dynamicOffset = result.offset ?? ""
             dynamicsHasMore = !fresh.isEmpty && !dynamicOffset.isEmpty
             dynamicsLoadFailed = false
@@ -185,6 +190,7 @@ extension UserSpaceViewModel {
             let result = try await UserAPI.getFavorites(mid: mid)
             guard !Task.isCancelled, loadGeneration == generation else { return }
             userFavorites = result.list ?? []
+            bumpFavoriteRevision()
             favoritesLoadFailed = false
         } catch {
             guard loadGeneration == generation else { return }
@@ -216,6 +222,7 @@ extension UserSpaceViewModel {
                 userArticles.append(contentsOf: fresh)
                 articlePage = requestedPage + 1
             }
+            bumpArticleRevision()
             articlesHaveMore = !fresh.isEmpty && userArticles.count < (result.count ?? .max)
             articlesLoadFailed = false
         } catch {

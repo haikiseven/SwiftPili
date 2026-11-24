@@ -66,9 +66,9 @@ enum AppTypeScale {
         case .libraryRowTitle:
             isRegularWidth ? .callout : .subheadline
         case .libraryRowMeta:
-            isRegularWidth ? .caption : .caption
+            isRegularWidth ? .footnote : .caption
         case .libraryRowFooter:
-            isRegularWidth ? .caption2 : .caption2
+            isRegularWidth ? .caption : .caption2
         case .shelfCardTitle:
             isRegularWidth ? .caption : .caption2
         case .screenTitle:
@@ -80,27 +80,27 @@ enum AppTypeScale {
         case .screenSummary:
             isRegularWidth ? .footnote : .caption
         case .screenStat:
-            isRegularWidth ? .caption : .caption
+            isRegularWidth ? .footnote : .caption
         case .commentAuthor:
             isRegularWidth ? .callout : .subheadline
         case .commentBody:
             isRegularWidth ? .callout : .subheadline
         case .commentMeta:
-            isRegularWidth ? .caption2 : .caption2
+            isRegularWidth ? .caption : .caption2
         case .commentAction:
             isRegularWidth ? .footnote : .footnote
         case .overlayBadge:
             isRegularWidth ? .caption2 : .caption2
         case .sectionTitle:
-            isRegularWidth ? .headline : .headline
+            isRegularWidth ? .title3 : .headline
         case .profileTitle:
-            isRegularWidth ? .title3 : .title3
+            isRegularWidth ? .title2 : .title3
         case .messageTitle:
             isRegularWidth ? .callout : .subheadline
         case .messageBody:
             isRegularWidth ? .callout : .subheadline
         case .messageMeta:
-            isRegularWidth ? .caption2 : .caption2
+            isRegularWidth ? .caption : .caption2
         case .controlLabel:
             isRegularWidth ? .subheadline : .footnote
         }

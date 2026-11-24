@@ -14,6 +14,7 @@ struct UserSpaceProfileHeader: View {
     let likes: Int?
     let views: Int?
     let isLoadingStats: Bool
+    var horizontalPadding: CGFloat = AppSpacing.l
     let onToggleFollow: () -> Void
     let onUnblock: () -> Void
     let openFollowing: () -> Void
@@ -32,6 +33,7 @@ struct UserSpaceProfileHeader: View {
             identityRow
 
             bioAndMetadataSection
+                .frame(maxWidth: ReadableWidth.feed, alignment: .leading)
 
             if showsRelationControls, isBlockedUser {
                 blockedBanner
@@ -47,7 +49,7 @@ struct UserSpaceProfileHeader: View {
                 openFollowers: openFollowers
             )
         }
-        .padding(.horizontal, AppSpacing.l)
+        .padding(.horizontal, horizontalPadding)
         .padding(.top, AppSpacing.s)
         .padding(.bottom, AppSpacing.xs)
     }
@@ -204,6 +206,11 @@ struct UserSpaceProfileHeader: View {
         .padding(.horizontal, AppSpacing.m)
         .padding(.vertical, AppSpacing.xs)
         .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
+                .strokeBorder(Color.red.opacity(0.20), lineWidth: AppStroke.hairlineWidth)
+                .allowsHitTesting(false)
+        )
     }
 
     private var isProfilePlaceholder: Bool { userInfo == nil }

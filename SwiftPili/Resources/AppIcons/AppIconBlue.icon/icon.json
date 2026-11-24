@@ -1,0 +1,133 @@
+{
+  "color-space-for-untagged-svg-colors": "display-p3",
+  "fill-specializations": [
+    {
+      "value": {
+        "linear-gradient": [
+          "display-p3:1.00000,1.00000,1.00000,1.00000",
+          "display-p3:0.94580,0.94889,0.96325,1.00000"
+        ]
+      }
+    },
+    {
+      "appearance": "dark",
+      "value": {
+        "linear-gradient": [
+          "display-p3:0.14580,0.14889,0.16691,1.00000",
+          "display-p3:0.05561,0.05870,0.06954,1.00000"
+        ]
+      }
+    }
+  ],
+  "groups": [
+    {
+      "layers": [
+        {
+          "glass": true,
+          "hidden-specializations": [
+            {
+              "value": false
+            },
+            {
+              "appearance": "dark",
+              "value": true
+            }
+          ],
+          "image-name": "play-light.svg",
+          "name": "Play Light"
+        },
+        {
+          "glass": true,
+          "hidden-specializations": [
+            {
+              "value": true
+            },
+            {
+              "appearance": "dark",
+              "value": false
+            }
+          ],
+          "image-name": "play-dark.svg",
+          "name": "Play Dark"
+        }
+      ],
+      "lighting": "individual",
+      "opacity-specializations": [
+        {
+          "value": 0.96
+        },
+        {
+          "appearance": "dark",
+          "value": 0.98
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.28
+      },
+      "specular": true,
+      "translucency": {
+        "enabled": true,
+        "value": 0.32
+      }
+    },
+    {
+      "blur-material": 0.45,
+      "layers": [
+        {
+          "glass": true,
+          "hidden-specializations": [
+            {
+              "value": false
+            },
+            {
+              "appearance": "dark",
+              "value": true
+            }
+          ],
+          "image-name": "disc-light.svg",
+          "name": "Optical Disc Light"
+        },
+        {
+          "glass": true,
+          "hidden-specializations": [
+            {
+              "value": true
+            },
+            {
+              "appearance": "dark",
+              "value": false
+            }
+          ],
+          "image-name": "disc-dark.svg",
+          "name": "Optical Disc Dark"
+        }
+      ],
+      "lighting": "individual",
+      "opacity-specializations": [
+        {
+          "value": 0.15
+        },
+        {
+          "appearance": "dark",
+          "value": 0.2
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.14
+      },
+      "specular": true,
+      "translucency": {
+        "enabled": true,
+        "value": 0.8
+      }
+    }
+  ],
+  "supported-platforms": {
+    "circles": [
+      "watchOS"
+    ],
+    "squares": "shared"
+  }
+}

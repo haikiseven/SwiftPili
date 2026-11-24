@@ -80,8 +80,9 @@ struct MineView: View {
         }
         .refreshable {
             viewModel.bind(authManager: authManager, accountManager: accountManager)
-            await viewModel.load()
-            await viewModel.loadHistory()
+            async let profile: () = viewModel.load()
+            async let history: () = viewModel.loadHistory()
+            _ = await (profile, history)
         }
         .readableFormWidth(.ambientBrowse)
         .scrollsToTopOnTabReselect(.mine)
@@ -96,8 +97,9 @@ struct MineView: View {
         }
         .task {
             viewModel.bind(authManager: authManager, accountManager: accountManager)
-            await viewModel.load()
-            await viewModel.loadHistory()
+            async let profile: () = viewModel.load()
+            async let history: () = viewModel.loadHistory()
+            _ = await (profile, history)
         }
         .sheet(isPresented: $showEditProfile) {
             MineEditProfileContent(viewModel: viewModel)

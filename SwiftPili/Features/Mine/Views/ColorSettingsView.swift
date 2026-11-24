@@ -70,17 +70,20 @@ struct ColorSettingsView: View {
             }
 
             Section("Preview") {
-                VStack(spacing: 12) {
-                    HStack(spacing: 22) {
+                VStack(spacing: AppSpacing.m) {
+                    HStack(spacing: AppSpacing.l) {
                         tabPreview("house.fill", selected: true)
                         tabPreview("bolt.horizontal.fill", selected: false)
                         tabPreview("person.fill", selected: false)
                     }
+                    .padding(.horizontal, AppSpacing.l)
+                    .padding(.vertical, AppSpacing.s)
+                    .appSolidChipSurface(isSelected: false)
                     .frame(maxWidth: .infinity)
 
                     Divider()
 
-                    HStack(spacing: 16) {
+                    HStack(spacing: AppSpacing.s) {
                         previewButton("Like", icon: "hand.thumbsup.fill")
                         previewButton("Coin", icon: "bitcoinsign.circle.fill")
                         previewButton("Favorite", icon: "star.fill")
@@ -90,7 +93,7 @@ struct ColorSettingsView: View {
                     ProgressView(value: 0.6)
                         .tint(effectiveContentAccent)
                 }
-                .padding(.vertical, 8)
+                .padding(.vertical, AppSpacing.s)
             }
         }
         .listRowBackground(AppFill.card)
@@ -99,22 +102,30 @@ struct ColorSettingsView: View {
         .navigationTitle("Color")
         .navigationBarTitleDisplayMode(.inline)
         .animation(motion.animation(normal: .easeInOut(duration: 0.2)), value: selected)
+        .animation(motion.animation(normal: .easeInOut(duration: 0.2)), value: scope)
     }
 
     private func row(theme: AccentTheme?, swatchLabel: LocalizedStringKey) -> some View {
         let isSelected = selected == theme
+        let swatchColor = theme?.color ?? Color.accentColor
         return Button {
             apply(theme: theme)
         } label: {
             HStack(spacing: AppSpacing.m) {
-                Group {
-                    if let theme {
-                        Circle().fill(theme.color)
-                    } else {
-                        Circle().fill(Color.accentColor)
+                Circle()
+                    .fill(swatchColor)
+                    .overlay(
+                        Circle()
+                            .strokeBorder(Color.primary.opacity(0.14), lineWidth: AppStroke.hairlineWidth)
+                    )
+                    .frame(width: 22, height: 22)
+                    .padding(2)
+                    .overlay {
+                        if isSelected {
+                            Circle()
+                                .strokeBorder(swatchColor.opacity(0.45), lineWidth: 1.5)
+                        }
                     }
-                }
-                .frame(width: 24, height: 24)
 
                 Text(swatchLabel)
                     .font(.body)
@@ -125,7 +136,7 @@ struct ColorSettingsView: View {
                 if isSelected {
                     Image(systemName: "checkmark")
                         .font(.body.weight(.semibold))
-                        .foregroundStyle(theme?.color ?? Color.accentColor)
+                        .foregroundStyle(swatchColor)
                 }
             }
             .padding(.vertical, 2)
@@ -136,21 +147,35 @@ struct ColorSettingsView: View {
     }
 
     private func tabPreview(_ symbol: String, selected isSelected: Bool) -> some View {
-        Image(systemName: symbol)
-            .font(.title3)
-            .foregroundStyle(
-                isSelected ? (selected?.color ?? Color.accentColor) : Color.secondary
+        let navColor = selected?.color ?? Color.accentColor
+        return Image(systemName: symbol)
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(isSelected ? navColor : Color.secondary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(
+                isSelected ? navColor.opacity(0.14) : Color.clear,
+                in: Capsule()
             )
     }
 
     private func previewButton(_ label: LocalizedStringKey, icon: String) -> some View {
-        VStack(spacing: 4) {
+        HStack(spacing: 5) {
             Image(systemName: icon)
-                .font(.title3)
-                .foregroundStyle(effectiveContentAccent)
+                .font(.caption.weight(.semibold))
             Text(label)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+                .appFont(.overlayBadge)
+                .fontWeight(.semibold)
+                .lineLimit(1)
         }
+        .foregroundStyle(effectiveContentAccent)
+        .padding(.horizontal, AppSpacing.m)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity)
+        .background(effectiveContentAccent.opacity(0.12), in: Capsule())
+        .overlay(
+            Capsule()
+                .strokeBorder(effectiveContentAccent.opacity(0.24), lineWidth: AppStroke.hairlineWidth)
+        )
     }
 }

@@ -740,6 +740,7 @@
 "Controls" = "Controls";
 "Accent Elements" = "Accent Elements";
 "Bilibili Pink" = "Bilibili Pink";
+"System Blue" = "System Blue";
 "Sync App Icon" = "Sync App Icon";
 "Could not reach the video server. Check your connection and try again." = "Could not reach the video server. Check your connection and try again.";
 
@@ -1003,18 +1004,22 @@
 "Included audio becomes AAC and loses Dolby / Atmos information." = "Included audio becomes AAC and loses Dolby / Atmos information.";
 "Keep export" = "Keep export";
 "Local source" = "Local source";
-"MP4 · Choose a location in Files after export finishes." = "MP4 · Choose a location in Files after export finishes.";
+"MP4 · Save to Photos, Files, or Share after export finishes." = "MP4 · Save to Photos, Files, or Share after export finishes.";
 "Mode" = "Mode";
 "No local audio track — silent export." = "No local audio track — silent export.";
 "No supported export recipe is available for these local tracks." = "No supported export recipe is available for these local tracks.";
 "Original tracks" = "Original tracks";
 "Output" = "Output";
+"Photo Library access was denied. Enable it in Settings to save videos." = "Photo Library access was denied. Enable it in Settings to save videos.";
 "Preparing export" = "Preparing export";
 "Preserves source video, audio and available HDR / Dolby information without re-encoding." = "Preserves source video, audio and available HDR / Dolby information without re-encoding.";
 "Reading local tracks…" = "Reading local tracks…";
 "Ready to save" = "Ready to save";
+"Save to Files" = "Save to Files";
+"Save to Photos" = "Save to Photos";
 "Saved" = "Saved";
 "Saving" = "Saving";
+"Share…" = "Share…";
 "Source HDR" = "Source HDR";
 "Source size" = "Source size";
 "Stopping export" = "Stopping export";

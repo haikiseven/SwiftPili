@@ -13,6 +13,7 @@ enum UserSpaceTab: String, CaseIterable {
 struct UserSpaceTabSelector: View {
     let tabs: [UserSpaceTab]
     @Binding var selection: UserSpaceTab
+    var horizontalPadding: CGFloat = AppSpacing.l
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,7 +25,7 @@ struct UserSpaceTabSelector: View {
                 label: { Text(LocalizedStringKey($0.rawValue)) },
                 onSelect: { selection = $0 }
             )
-            .padding(.horizontal, AppSpacing.l)
+            .padding(.horizontal, horizontalPadding)
 
             Divider()
                 .opacity(0.28)
@@ -48,6 +49,10 @@ struct UserSpaceSubmissionFilter: View {
         .background {
             Capsule()
                 .fill(Color.biliAccent.opacity(0.14))
+                .overlay(
+                    Capsule()
+                        .strokeBorder(Color.biliAccent.opacity(0.24), lineWidth: AppStroke.hairlineWidth)
+                )
                 .matchedGeometryEffect(id: showsArticles, in: indicator, isSource: false)
                 .animation(motion.animation(normal: .snappy(duration: 0.2, extraBounce: 0)), value: showsArticles)
         }

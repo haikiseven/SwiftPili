@@ -26,25 +26,29 @@ struct MineHistorySection: View {
         .listRowBackground(AppFill.card)
     }
 
+    private static let coverWidth: CGFloat = 80
+
     private func historyRow(_ item: HistoryResult.HistoryItem) -> some View {
-        HStack(spacing: 10) {
-            VideoCoverImage(sources: VideoCoverSources(widescreen: item.cover), width: 80)
-                .clipShape(RoundedRectangle(cornerRadius: AppRadius.badge))
-                .overlay(alignment: .bottomTrailing) {
+        let shape = RoundedRectangle(cornerRadius: AppRadius.badge, style: .continuous)
+        return HStack(spacing: 10) {
+            VideoCoverImage(sources: VideoCoverSources(widescreen: item.cover), width: Self.coverWidth)
+                .overlay(alignment: .bottomLeading) {
                     if item.duration > 0 {
                         let pct = FormatUtils.historyProgressFraction(
                             progress: item.progress,
                             duration: item.duration
                         )
-                        GeometryReader { geo in
-                            Rectangle()
-                                .fill(.biliAccent)
-                                .frame(width: geo.size.width * pct, height: 2)
-                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
-                        }
-                        .clipShape(RoundedRectangle(cornerRadius: AppRadius.badge))
+                        Rectangle()
+                            .fill(.biliAccent)
+                            .frame(width: Self.coverWidth * pct, height: 2)
                     }
                 }
+                .clipShape(shape)
+                .overlay(
+                    shape
+                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: AppStroke.hairlineWidth)
+                        .allowsHitTesting(false)
+                )
                 .zoomSourceAnchor(cornerRadius: AppRadius.badge)
 
             VStack(alignment: .leading, spacing: 2) {

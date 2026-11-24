@@ -123,7 +123,7 @@ struct OfflinePlayerMetadataView: View {
                 .background(Color.biliAccent.opacity(0.16), in: Capsule())
                 .overlay(
                     Capsule()
-                        .strokeBorder(Color.biliAccent.opacity(0.28), lineWidth: 0.5)
+                        .strokeBorder(Color.biliAccent.opacity(0.28), lineWidth: AppStroke.hairlineWidth)
                 )
 
             if !qualityLabel.isEmpty {
@@ -135,7 +135,7 @@ struct OfflinePlayerMetadataView: View {
                     .background(Color.white.opacity(0.10), in: Capsule())
                     .overlay(
                         Capsule()
-                            .strokeBorder(Color.white.opacity(0.12), lineWidth: 0.5)
+                            .strokeBorder(Color.white.opacity(0.12), lineWidth: AppStroke.hairlineWidth)
                     )
             }
 
@@ -149,7 +149,7 @@ struct OfflinePlayerMetadataView: View {
                     .background(Color.white.opacity(0.07), in: Capsule())
                     .overlay(
                         Capsule()
-                            .strokeBorder(Color.white.opacity(0.09), lineWidth: 0.5)
+                            .strokeBorder(Color.white.opacity(0.09), lineWidth: AppStroke.hairlineWidth)
                     )
             }
         }

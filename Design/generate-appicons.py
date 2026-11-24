@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generates SwiftPili's native Apple Icon Composer (.icon) bundles for all 5 AccentTheme variants.
+Generates SwiftPili's native Apple Icon Composer (.icon) bundles for all 6 AccentTheme variants.
 
 Each .icon bundle contains pure, effect-free 1024x1024 vector SVG layers and a standard icon.json
 manifest so iOS 26+ (and Xcode's actool fallback for iOS 18) render genuine Liquid Glass optics,
@@ -99,7 +99,7 @@ def hex_to_p3(hex_str: str) -> str:
     return f"display-p3:{rp:.5f},{gp:.5f},{bp:.5f},1.00000"
 
 
-# 5 AccentTheme variants matching SwiftPili/SharedUI/Themes/Theme.swift
+# 6 AccentTheme variants matching SwiftPili/SharedUI/Themes/Theme.swift
 # V2 Design: Pure neutral light/dark canvas + whisper-tinted translucent optical glass disc + crisp theme-colored play prism
 THEMES = [
     {
@@ -111,6 +111,17 @@ THEMES = [
         "play_light": "#FA628F",
         "play_dark": "#FF7AA3",
         "disc_light_opacity": 0.16,
+        "disc_dark_opacity": 0.20,
+    },
+    {
+        "bundle": "AppIconBlue.icon",
+        "theme": "blue",
+        # Theme.swift: UIColor.systemBlue (#007AFF light / #0A84FF dark)
+        "disc_light": "#007AFF",
+        "disc_dark": "#0A84FF",
+        "play_light": "#007AFF",
+        "play_dark": "#0A84FF",
+        "disc_light_opacity": 0.15,
         "disc_dark_opacity": 0.20,
     },
     {

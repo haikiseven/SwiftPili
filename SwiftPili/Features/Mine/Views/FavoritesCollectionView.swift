@@ -95,6 +95,7 @@ private enum FavoritesCellKey: Hashable, Sendable {
 @MainActor
 private final class FavoritesCollectionViewController: UIKitBaseCollectionViewController {
     private var dataSource: UICollectionViewDiffableDataSource<FavoritesSectionKey, FavoritesCellKey>?
+    private var currentSections: [FavoritesSectionKey] = []
     private var rows: [FavoriteFolderRowData] = []
     private var rowByID: [Int: FavoriteFolderRowData] = [:]
     private var placeholderCount = 0
@@ -121,14 +122,21 @@ private final class FavoritesCollectionViewController: UIKitBaseCollectionViewCo
                 self?.trailingSwipeActions(at: indexPath)
             }
             let section = NSCollectionLayoutSection.list(using: listConfig, layoutEnvironment: layoutEnvironment)
-            let isSkeleton = self?.dataSource?.snapshot().sectionIdentifiers[sectionIndex] == .skeletons
+            let isSkeleton = if let self, sectionIndex < self.currentSections.count {
+                self.currentSections[sectionIndex] == .skeletons
+            } else {
+                false
+            }
             if isSkeleton {
+                let inset = FeedColumnPolicy.horizontalMargin(
+                    for: layoutEnvironment.container.effectiveContentSize.width
+                )
                 section.interGroupSpacing = AppSpacing.m
                 section.contentInsets = NSDirectionalEdgeInsets(
                     top: AppSpacing.m,
-                    leading: AppSpacing.l,
+                    leading: inset,
                     bottom: AppSpacing.m,
-                    trailing: AppSpacing.l
+                    trailing: inset
                 )
             }
             return section
@@ -293,6 +301,7 @@ private final class FavoritesCollectionViewController: UIKitBaseCollectionViewCo
             if !targets.isEmpty { snapshot.reconfigureItems(targets) }
         }
 
+        currentSections = snapshot.sectionIdentifiers
         lastReconfiguredWidth = currentContentWidth
         CATransaction.begin()
         CATransaction.setDisableActions(true)

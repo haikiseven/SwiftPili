@@ -76,6 +76,10 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
     }()
     private let prefetchCoordinator = UIKitPrefetchCoordinator()
     private var shelfHeightConstraint: NSLayoutConstraint?
+    private var headerLeadingConstraint: NSLayoutConstraint?
+    private var headerTrailingConstraint: NSLayoutConstraint?
+    private var emptyLeadingConstraint: NSLayoutConstraint?
+    private var emptyTrailingConstraint: NSLayoutConstraint?
 
     private var shelfItems: [ShelfItem] = []
     private var cardWidth: CGFloat = 128
@@ -216,11 +220,19 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
     private func activateConstraints() {
         let shelfHeight = shelfCollectionView.heightAnchor.constraint(equalToConstant: 140)
         shelfHeightConstraint = shelfHeight
+        let headerLeading = headerButton.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16)
+        let headerTrailing = headerButton.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16)
+        let emptyLeading = emptyLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16)
+        let emptyTrailing = emptyLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -16)
+        headerLeadingConstraint = headerLeading
+        headerTrailingConstraint = headerTrailing
+        emptyLeadingConstraint = emptyLeading
+        emptyTrailingConstraint = emptyTrailing
 
         NSLayoutConstraint.activate([
             headerButton.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 12),
-            headerButton.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
-            headerButton.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
+            headerLeading,
+            headerTrailing,
             headerButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 32),
 
             shelfCollectionView.topAnchor.constraint(equalTo: headerButton.bottomAnchor, constant: 10),
@@ -229,8 +241,8 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
             shelfCollectionView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -12),
             shelfHeight,
 
-            emptyLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
-            emptyLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -16),
+            emptyLeading,
+            emptyTrailing,
             emptyLabel.centerYAnchor.constraint(equalTo: shelfCollectionView.centerYAnchor),
         ])
     }
@@ -247,7 +259,15 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
         self.coverPresentation = coverPresentation
 
         let traits = traitCollection
-        let availableShelfWidth = max(240, (containerWidth > 1 ? containerWidth : FeedWidth.fullContainerSeed) - 32)
+        let resolvedWidth = containerWidth > 1 ? containerWidth : FeedWidth.fullContainerSeed
+        let margin = FeedColumnPolicy.horizontalMargin(for: resolvedWidth)
+        headerLeadingConstraint?.constant = margin
+        headerTrailingConstraint?.constant = -margin
+        emptyLeadingConstraint?.constant = margin
+        emptyTrailingConstraint?.constant = -margin
+        shelfLayout.sectionInset = UIEdgeInsets(top: 0, left: margin, bottom: 0, right: margin)
+
+        let availableShelfWidth = max(240, resolvedWidth - margin * 2)
         cardWidth = FeedColumnPolicy.shelfCardWidth(availableWidth: availableShelfWidth)
         cardHeight = coverPresentation.height(forWidth: cardWidth)
 

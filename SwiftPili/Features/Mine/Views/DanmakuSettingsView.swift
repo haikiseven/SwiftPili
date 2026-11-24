@@ -20,7 +20,7 @@ struct DanmakuSettingsView: View {
     @AppStorage(DanmakuRenderPreferences.smartMaskKey)
     private var smartMask = DanmakuRenderPreferences.defaultSmartMask
     @State private var keywordDraft = ""
-    @State private var keywords: [String] = []
+    @State private var keywords = DanmakuRenderPreferences.load().blockedKeywords
 
     var body: some View {
         List {
@@ -37,9 +37,6 @@ struct DanmakuSettingsView: View {
         .accentContentBoundary()
         .navigationTitle("Danmaku")
         .navigationBarTitleDisplayMode(.inline)
-        .onAppear {
-            keywords = DanmakuRenderPreferences.load().blockedKeywords
-        }
     }
 
     private var masterSection: some View {
@@ -273,6 +270,7 @@ struct DanmakuPlayerSettingsPanel: View {
     var body: some View {
         switch surface {
         case .overlay:
+            let panelShape = RoundedRectangle(cornerRadius: AppRadius.panel, style: .continuous)
             let overlayContent = controls
                 .foregroundStyle(.white)
                 .padding(12)
@@ -285,8 +283,8 @@ struct DanmakuPlayerSettingsPanel: View {
             }
             .frame(width: 260)
             .frame(maxHeight: 420)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: AppRadius.card))
-            .clipShape(RoundedRectangle(cornerRadius: AppRadius.card))
+            .clipShape(panelShape)
+            .appGlass(in: panelShape)
             .environment(\.colorScheme, .dark)
         case .popover:
             let popoverContent = controls.padding(16)

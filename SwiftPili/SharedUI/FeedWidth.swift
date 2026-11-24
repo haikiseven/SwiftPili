@@ -48,11 +48,10 @@ enum SettingsScaffoldingMetrics {
 }
 
 enum FeedWidth {
-    private static let nominalPadding: CGFloat = 32
-
     @MainActor
     static var seed: CGFloat {
-        max(0, windowWidth - nominalPadding)
+        let width = windowWidth
+        return max(0, width - FeedColumnPolicy.horizontalMargin(for: width) * 2)
     }
 
     @MainActor

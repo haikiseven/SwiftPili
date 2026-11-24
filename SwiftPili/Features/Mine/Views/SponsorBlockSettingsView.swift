@@ -53,8 +53,12 @@ struct SponsorBlockSettingsView: View {
                     }
                 } label: {
                     HStack(spacing: 10) {
-                        RoundedRectangle(cornerRadius: AppRadius.badge)
+                        RoundedRectangle(cornerRadius: AppRadius.badge, style: .continuous)
                             .fill(category.color)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: AppRadius.badge, style: .continuous)
+                                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: AppStroke.hairlineWidth)
+                            )
                             .frame(width: 14, height: 14)
                         Text(category.displayName)
                     }

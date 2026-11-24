@@ -41,7 +41,7 @@ struct UserSpaceFeedActions {
     let onCommentDynamic: (DynamicFeedResult.DynamicItem) -> Void
     let onRepostDynamic: (DynamicFeedResult.DynamicItem) -> Void
     let interactionStore: MomentInteractionStore
-    let makeProfileHeader: () -> AnyView
+    let makeProfileHeader: (CGFloat) -> AnyView
     let makeSubmissionFilter: () -> AnyView
     let makeShelfHeader: (UserSpaceShelfKind) -> AnyView
     let makeFavoriteRow: (FavoriteFolderResult.FavoriteFolder, CGFloat, Bool) -> AnyView
@@ -52,7 +52,9 @@ struct UserSpaceFeedTrigger: Equatable {
     let headerIdentityKey: String
     let selectedTab: UserSpaceTab
     let showsArticles: Bool
-    let videoHash, articleHash, coinHash, likeHash, bangumiHash, favoriteHash, dynamicHash, loadingMask: Int
+    let videoRevision, articleRevision, coinRevision, likeRevision: UInt64
+    let bangumiRevision, favoriteRevision, dynamicRevision: UInt64
+    let loadingMask: Int
     let coverPresentation: CoverPresentation
 
     @MainActor
@@ -60,13 +62,13 @@ struct UserSpaceFeedTrigger: Equatable {
         self.headerIdentityKey = headerIdentityKey
         selectedTab = viewModel.selectedTab
         showsArticles = viewModel.showsArticles
-        videoHash = Self.hashIDs(viewModel.userVideos.map(\.aid))
-        articleHash = Self.hashIDs(viewModel.userArticles.map(\.id))
-        coinHash = Self.hashIDs(viewModel.userCoins.map(\.aid))
-        likeHash = Self.hashIDs(viewModel.userLikes.map(\.aid))
-        bangumiHash = Self.hashIDs(viewModel.userBangumi.map(\.seasonId))
-        favoriteHash = Self.hashIDs(viewModel.userFavorites.map(\.id))
-        dynamicHash = Self.hashIDs(viewModel.userDynamics.map { DynamicsViewModel.stableItemID($0) })
+        videoRevision = viewModel.videoRevision
+        articleRevision = viewModel.articleRevision
+        coinRevision = viewModel.coinRevision
+        likeRevision = viewModel.likeRevision
+        bangumiRevision = viewModel.bangumiRevision
+        favoriteRevision = viewModel.favoriteRevision
+        dynamicRevision = viewModel.dynamicRevision
         let flags = [
             viewModel.isLoadingVideos, viewModel.attemptedVideos, viewModel.videosLoadFailed, viewModel.videosHaveMore,
             viewModel.isLoadingArticles, viewModel.attemptedArticles, viewModel.articlesLoadFailed,
@@ -81,10 +83,13 @@ struct UserSpaceFeedTrigger: Equatable {
         self.coverPresentation = coverPresentation
     }
 
-    private static func hashIDs<S: Sequence>(_ ids: S) -> Int where S.Element: Hashable {
-        var hasher = Hasher()
-        for id in ids { hasher.combine(id) }
-        return hasher.finalize()
+    func hasVideoEntriesDifference(from previous: Self?) -> Bool {
+        guard let previous else { return true }
+        return videoRevision != previous.videoRevision
+            || articleRevision != previous.articleRevision
+            || coinRevision != previous.coinRevision
+            || likeRevision != previous.likeRevision
+            || coverPresentation != previous.coverPresentation
     }
 
     @MainActor
@@ -362,7 +367,7 @@ private extension UserSpaceView {
             onCommentDynamic: { openComment(for: $0) },
             onRepostDynamic: { repostTarget = $0 },
             interactionStore: interactions,
-            makeProfileHeader: { hostedSwiftUI { profileHeaderView } },
+            makeProfileHeader: { inset in hostedSwiftUI { profileHeaderView(horizontalInset: inset) } },
             makeSubmissionFilter: {
                 hostedSwiftUI { UserSpaceSubmissionFilter(showsArticles: Bindable(viewModel).showsArticles) }
             },
@@ -376,10 +381,11 @@ private extension UserSpaceView {
         )
     }
 
-    var profileHeaderView: some View {
+    func profileHeaderView(horizontalInset: CGFloat) -> some View {
         UserSpaceHostedHeaderView(
             mid: mid, viewModel: viewModel, relation: relation,
             showsRelationControls: showsRelationControls,
+            horizontalInset: horizontalInset,
             openFollowing: { coordinator.navigate(to: .following(mid: mid)) },
             openFollowers: { coordinator.navigate(to: .followers(mid: mid)) }
         )
@@ -388,13 +394,14 @@ private extension UserSpaceView {
     func favoriteRowView(
         _ folder: FavoriteFolderResult.FavoriteFolder, seedWidth: CGFloat, showsDivider: Bool
     ) -> some View {
-        VStack(spacing: 0) {
+        let inset = FeedColumnPolicy.horizontalMargin(for: seedWidth)
+        return VStack(spacing: 0) {
             FavoriteFolderPreviewRow(
                 folder: folder, seedWidth: seedWidth,
                 cachedPreviews: viewModel.favoriteFolderPreviews[folder.id],
                 onPreviewsLoaded: { viewModel.cacheFavoritePreviews($0, for: folder.id) }
             )
-            if showsDivider { Divider().padding(.leading, AppSpacing.l) }
+            if showsDivider { Divider().padding(.leading, inset) }
         }
     }
 
@@ -444,6 +451,7 @@ private struct UserSpaceHostedHeaderView: View {
     @Bindable var viewModel: UserSpaceViewModel
     let relation: UserSpaceRelationModel
     let showsRelationControls: Bool
+    let horizontalInset: CGFloat
     let openFollowing, openFollowers: () -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: AppSpacing.m) {
@@ -456,11 +464,16 @@ private struct UserSpaceHostedHeaderView: View {
                 followers: viewModel.relationStat?.follower ?? viewModel.userInfo?.cardFollowers,
                 likes: viewModel.upStat?.likes ?? viewModel.userInfo?.cardLikes,
                 views: viewModel.upStat?.archive?.view, isLoadingStats: viewModel.isLoadingStats,
+                horizontalPadding: horizontalInset,
                 onToggleFollow: { relation.toggleFollow(mid: mid) },
                 onUnblock: { relation.setBlocked(false, mid: mid) },
                 openFollowing: openFollowing, openFollowers: openFollowers
             )
-            UserSpaceTabSelector(tabs: viewModel.visibleTabs, selection: $viewModel.selectedTab)
+            UserSpaceTabSelector(
+                tabs: viewModel.visibleTabs,
+                selection: $viewModel.selectedTab,
+                horizontalPadding: horizontalInset
+            )
         }
     }
 }

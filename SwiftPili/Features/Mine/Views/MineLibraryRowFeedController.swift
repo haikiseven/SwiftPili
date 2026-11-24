@@ -26,6 +26,7 @@ final class MineLibraryRowFeedController: UIKitBaseCollectionViewController,
     }
 
     private var dataSource: UICollectionViewDiffableDataSource<MineRowSectionKey, MineRowCellKey>?
+    private var currentSections: [MineRowSectionKey] = []
     private var items: [MineLibraryRowItem] = []
     private var itemByID: [MineRowID: MineLibraryRowItem] = [:]
     private var itemIndexByID: [MineRowID: Int] = [:]
@@ -42,6 +43,13 @@ final class MineLibraryRowFeedController: UIKitBaseCollectionViewController,
     private var makeContextMenu: ((MineRowID) -> UIMenu?)?
     private var geometryTask: Task<Void, Never>?
 
+    override var layoutHorizontalInset: CGFloat {
+        let width = isViewLoaded && collectionView.bounds.width > 1
+            ? collectionView.bounds.width
+            : FeedWidth.fullContainerSeed
+        return FeedColumnPolicy.horizontalMargin(for: width)
+    }
+
     private var activeColumnCount: Int {
         max(1, FeedColumnPolicy.columnCount(.videoRow, availableWidth: currentContentWidth))
     }
@@ -56,15 +64,15 @@ final class MineLibraryRowFeedController: UIKitBaseCollectionViewController,
 
     override func makeCollectionLayout() -> UICollectionViewLayout {
         UICollectionViewCompositionalLayout { [weak self] sectionIndex, environment in
-            guard let self else { return nil }
-            let sections = dataSource?.snapshot().sectionIdentifiers ?? []
-            guard sectionIndex < sections.count else { return nil }
+            guard let self, sectionIndex < currentSections.count else { return nil }
             let effectiveWidth = environment.container.effectiveContentSize.width
-            let contentWidth = max(1, effectiveWidth - UIKitFeedLayoutMetrics.horizontalInset * 2)
+            let margin = FeedColumnPolicy.horizontalMargin(for: effectiveWidth)
+            let contentWidth = max(1, effectiveWidth - margin * 2)
             return makeRowSection(
                 contentWidth: contentWidth,
+                horizontalInset: margin,
                 traitCollection: environment.traitCollection,
-                isSkeleton: sections[sectionIndex] == .skeletons
+                isSkeleton: currentSections[sectionIndex] == .skeletons
             )
         }
     }
@@ -304,6 +312,7 @@ private extension MineLibraryRowFeedController {
 
     func makeRowSection(
         contentWidth: CGFloat,
+        horizontalInset: CGFloat,
         traitCollection: UITraitCollection,
         isSkeleton: Bool
     ) -> NSCollectionLayoutSection {
@@ -339,9 +348,9 @@ private extension MineLibraryRowFeedController {
         section.interGroupSpacing = UIKitFeedLayoutMetrics.listRowSpacing
         section.contentInsets = NSDirectionalEdgeInsets(
             top: UIKitFeedLayoutMetrics.topInset,
-            leading: UIKitFeedLayoutMetrics.horizontalInset,
+            leading: horizontalInset,
             bottom: UIKitFeedLayoutMetrics.bottomInset,
-            trailing: UIKitFeedLayoutMetrics.horizontalInset
+            trailing: horizontalInset
         )
 
         var supplementaries: [NSCollectionLayoutBoundarySupplementaryItem] = []
@@ -393,6 +402,7 @@ private extension MineLibraryRowFeedController {
             if !targets.isEmpty { snapshot.reconfigureItems(targets) }
         }
 
+        currentSections = snapshot.sectionIdentifiers
         lastReconfiguredWidth = currentContentWidth
         dataSource.apply(snapshot, animatingDifferences: false)
     }

@@ -44,7 +44,7 @@ final class UserSpaceViewModel {
     var dynamicsLoadFailed = false
 
     var userFavorites: [FavoriteFolderResult.FavoriteFolder] = []
-    private(set) var favoriteFolderPreviews: [Int: [FavoriteContentResult.FavoriteMedia]] = [:]
+    @ObservationIgnored private(set) var favoriteFolderPreviews: [Int: [FavoriteContentResult.FavoriteMedia]] = [:]
     var isLoadingFavorites = false
     var attemptedFavorites = false
     var favoritesLoadFailed = false
@@ -61,6 +61,14 @@ final class UserSpaceViewModel {
     var loadedCoins = false
     var loadedLikes = false
     var loadedBangumi = false
+
+    private(set) var videoRevision: UInt64 = 0
+    private(set) var articleRevision: UInt64 = 0
+    private(set) var dynamicRevision: UInt64 = 0
+    private(set) var favoriteRevision: UInt64 = 0
+    private(set) var coinRevision: UInt64 = 0
+    private(set) var likeRevision: UInt64 = 0
+    private(set) var bangumiRevision: UInt64 = 0
 
     private(set) var userInfoLoadFailed = false
     private(set) var isLoadingStats = true
@@ -85,6 +93,14 @@ final class UserSpaceViewModel {
     func cacheFavoritePreviews(_ items: [FavoriteContentResult.FavoriteMedia], for folderID: Int) {
         favoriteFolderPreviews[folderID] = items
     }
+
+    func bumpVideoRevision() { videoRevision &+= 1 }
+    func bumpArticleRevision() { articleRevision &+= 1 }
+    func bumpDynamicRevision() { dynamicRevision &+= 1 }
+    func bumpFavoriteRevision() { favoriteRevision &+= 1 }
+    func bumpCoinRevision() { coinRevision &+= 1 }
+    func bumpLikeRevision() { likeRevision &+= 1 }
+    func bumpBangumiRevision() { bangumiRevision &+= 1 }
 
     func loadIfNeeded(identity: LoadIdentity) async {
         guard !Task.isCancelled else { return }
@@ -256,6 +272,14 @@ private extension UserSpaceViewModel {
         loadedCoins = false
         loadedLikes = false
         loadedBangumi = false
+
+        videoRevision &+= 1
+        articleRevision &+= 1
+        dynamicRevision &+= 1
+        favoriteRevision &+= 1
+        coinRevision &+= 1
+        likeRevision &+= 1
+        bangumiRevision &+= 1
     }
 
     func runInitialLoad(mid: Int, generation: UInt64) async {

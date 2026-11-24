@@ -36,7 +36,9 @@ private final class UserSpaceFeedCollectionViewController: UIKitBaseCollectionVi
     private var trigger: UserSpaceFeedTrigger?
     private var actions: UserSpaceFeedActions?
     private var dataSource: UICollectionViewDiffableDataSource<UserSpaceSectionKey, UserSpaceCellKey>?
+    private var currentSections: [UserSpaceSectionKey] = []
     private var videoEntries: [String: (UIKitGridVideoCell.Model, UserSpaceVideoAction)] = [:]
+    private var lastVideoEntryWidth: CGFloat = 0
     private var activeIndexByID: [String: Int] = [:]
     private var bangumiByID: [Int: BangumiFollowResult.FollowedBangumi] = [:]
     private var favoriteByID: [Int: FavoriteFolderResult.FavoriteFolder] = [:]
@@ -44,6 +46,13 @@ private final class UserSpaceFeedCollectionViewController: UIKitBaseCollectionVi
     private var dynamicIndexByID: [String: Int] = [:]
     private var lastInlineTitleVisible = false
     private var geometryTask: Task<Void, Never>?
+
+    override var layoutHorizontalInset: CGFloat {
+        let width = isViewLoaded && collectionView.bounds.width > 1
+            ? collectionView.bounds.width
+            : FeedWidth.fullContainerSeed
+        return FeedColumnPolicy.horizontalMargin(for: width)
+    }
 
     init(mid: Int, viewModel: UserSpaceViewModel) {
         self.mid = mid
@@ -57,7 +66,7 @@ private final class UserSpaceFeedCollectionViewController: UIKitBaseCollectionVi
     var videoColWidth: CGFloat { colWidth(for: videoCols) }
     var posterCols: Int { FeedColumnPolicy.pgcPosterColumnCount(availableWidth: currentContentWidth) }
     var posterColWidth: CGFloat { colWidth(for: posterCols) }
-    var fullWidth: CGFloat { currentContentWidth + UIKitFeedLayoutMetrics.horizontalInset * 2 }
+    var fullWidth: CGFloat { currentContentWidth + layoutHorizontalInset * 2 }
     var dynamicCardWidth: CGFloat { ReadableWidth.capped(currentContentWidth, to: ReadableWidth.feed) }
 
     private func colWidth(for count: Int) -> CGFloat {
@@ -68,13 +77,17 @@ private final class UserSpaceFeedCollectionViewController: UIKitBaseCollectionVi
 
     override func makeCollectionLayout() -> UICollectionViewLayout {
         UICollectionViewCompositionalLayout { [weak self] sectionIndex, environment in
-            guard let self else { return nil }
-            let sections = dataSource?.snapshot().sectionIdentifiers ?? []
-            guard sectionIndex < sections.count else { return nil }
-            let inset = UIKitFeedLayoutMetrics.horizontalInset * 2
-            let width = max(1, environment.container.effectiveContentSize.width - inset)
-            let isLast = sectionIndex == sections.count - 1
-            return makeSectionLayout(sections[sectionIndex], contentWidth: width, isLast: isLast)
+            guard let self, sectionIndex < currentSections.count else { return nil }
+            let effectiveWidth = environment.container.effectiveContentSize.width
+            let margin = FeedColumnPolicy.horizontalMargin(for: effectiveWidth)
+            let width = max(1, effectiveWidth - margin * 2)
+            let isLast = sectionIndex == currentSections.count - 1
+            return makeSectionLayout(
+                currentSections[sectionIndex],
+                contentWidth: width,
+                horizontalInset: margin,
+                isLast: isLast
+            )
         }
     }
 
@@ -106,7 +119,7 @@ private final class UserSpaceFeedCollectionViewController: UIKitBaseCollectionVi
         let oldTrigger = trigger
         guard oldTrigger != newTrigger else { return }
         trigger = newTrigger
-        rebuildCaches()
+        rebuildCaches(previous: oldTrigger)
         if oldTrigger?.selectedTab != newTrigger.selectedTab || oldTrigger?.showsArticles != newTrigger.showsArticles {
             resetPaginationGate()
             prefetchCoordinator.cancelAll()
@@ -210,22 +223,37 @@ private extension UserSpaceFeedCollectionViewController {
         trigger?.coverPresentation ?? CoverPresentation(aspect: .current, display: .current)
     }
 
-    func rebuildCaches() {
+    func rebuildCaches(previous: UserSpaceFeedTrigger? = nil, forceAll: Bool = false) {
         let activeTrigger = trigger ?? UserSpaceFeedTrigger(
             viewModel: viewModel, headerIdentityKey: "", coverPresentation: activePresentation
         )
-        videoEntries = activeTrigger.buildVideoEntries(viewModel: viewModel, colWidth: videoColWidth)
-        let activeIDs = viewModel.showsArticles
-            ? viewModel.userArticles.map { "a:\($0.id)" }
-            : viewModel.userVideos.map { "v:\($0.aid)" }
-        activeIndexByID = keyed(activeIDs.enumerated().map { ($0.element, $0.offset) })
-        bangumiByID = keyed(viewModel.userBangumi.map { ($0.seasonId, $0) })
-        favoriteByID = keyed(viewModel.userFavorites.map { ($0.id, $0) })
-        let dynamics = viewModel.userDynamics.enumerated().map {
-            (DynamicsViewModel.stableItemID($0.element), $0.element, $0.offset)
+        let widthChanged = abs(lastVideoEntryWidth - videoColWidth) > 0.5
+        if forceAll || widthChanged || activeTrigger.hasVideoEntriesDifference(from: previous) {
+            videoEntries = activeTrigger.buildVideoEntries(viewModel: viewModel, colWidth: videoColWidth)
+            lastVideoEntryWidth = videoColWidth
         }
-        dynamicByID = keyed(dynamics.map { ($0.0, $0.1) })
-        dynamicIndexByID = keyed(dynamics.map { ($0.0, $0.2) })
+        if forceAll || previous == nil
+            || activeTrigger.videoRevision != previous?.videoRevision
+            || activeTrigger.articleRevision != previous?.articleRevision
+            || activeTrigger.showsArticles != previous?.showsArticles {
+            let activeIDs = viewModel.showsArticles
+                ? viewModel.userArticles.map { "a:\($0.id)" }
+                : viewModel.userVideos.map { "v:\($0.aid)" }
+            activeIndexByID = keyed(activeIDs.enumerated().map { ($0.element, $0.offset) })
+        }
+        if forceAll || previous == nil || activeTrigger.bangumiRevision != previous?.bangumiRevision {
+            bangumiByID = keyed(viewModel.userBangumi.map { ($0.seasonId, $0) })
+        }
+        if forceAll || previous == nil || activeTrigger.favoriteRevision != previous?.favoriteRevision {
+            favoriteByID = keyed(viewModel.userFavorites.map { ($0.id, $0) })
+        }
+        if forceAll || previous == nil || activeTrigger.dynamicRevision != previous?.dynamicRevision {
+            let dynamics = viewModel.userDynamics.enumerated().map {
+                (DynamicsViewModel.stableItemID($0.element), $0.element, $0.offset)
+            }
+            dynamicByID = keyed(dynamics.map { ($0.0, $0.1) })
+            dynamicIndexByID = keyed(dynamics.map { ($0.0, $0.2) })
+        }
     }
 
     func keyed<K: Hashable, V>(_ pairs: [(K, V)]) -> [K: V] {
@@ -357,7 +385,7 @@ private extension UserSpaceFeedCollectionViewController {
     func hostedView(for key: UserSpaceCellKey) -> AnyView? {
         guard let actions else { return nil }
         switch key {
-        case .profileHeader: return actions.makeProfileHeader()
+        case .profileHeader: return actions.makeProfileHeader(layoutHorizontalInset)
         case .submissionFilter: return actions.makeSubmissionFilter()
         case .shelfHeader(let kind): return actions.makeShelfHeader(kind)
         case .favoriteFolder(let id, let div):
@@ -370,10 +398,9 @@ private extension UserSpaceFeedCollectionViewController {
     }
 
     func makeSectionLayout(
-        _ key: UserSpaceSectionKey, contentWidth: CGFloat, isLast: Bool
+        _ key: UserSpaceSectionKey, contentWidth: CGFloat, horizontalInset hInset: CGFloat, isLast: Bool
     ) -> NSCollectionLayoutSection {
         let bottom = isLast ? UIKitFeedLayoutMetrics.bottomInset : 0
-        let hInset = UIKitFeedLayoutMetrics.horizontalInset
         switch key {
         case .profileHeader: return layoutSection(est: 240, insetH: 0, bottom: AppSpacing.m)
         case .submissionFilter: return layoutSection(est: 44, insetH: hInset, bottom: AppSpacing.s)
@@ -390,12 +417,12 @@ private extension UserSpaceFeedCollectionViewController {
             let est = max(80, (max(1, posterColWidth) * 4 / 3).rounded() + 58)
             return layoutSection(count: count, est: est, insetH: hInset, bottom: bottom, spacing: 16)
         case .shelfMoments:
-            let side = centeredReadableInset(for: contentWidth)
+            let side = centeredReadableInset(for: contentWidth, horizontalInset: hInset)
             return layoutSection(est: 220, insetH: side, trailingH: side, bottom: AppSpacing.xl, spacing: AppSpacing.m)
         case .shelfFavorites: return layoutSection(est: 180, insetH: 0, bottom: bottom)
         case .list:
             let isFav = viewModel.selectedTab == .favorite
-            let sideInset = isFav ? 0 : centeredReadableInset(for: contentWidth)
+            let sideInset = isFav ? 0 : centeredReadableInset(for: contentWidth, horizontalInset: hInset)
             return layoutSection(
                 est: isFav ? 180 : 220, insetH: sideInset, trailingH: sideInset,
                 top: isFav ? 0 : AppSpacing.xs, bottom: bottom, spacing: isFav ? 0 : AppSpacing.m
@@ -404,9 +431,9 @@ private extension UserSpaceFeedCollectionViewController {
         }
     }
 
-    private func centeredReadableInset(for contentWidth: CGFloat) -> CGFloat {
+    private func centeredReadableInset(for contentWidth: CGFloat, horizontalInset: CGFloat) -> CGFloat {
         let readable = ReadableWidth.capped(contentWidth, to: ReadableWidth.feed)
-        return UIKitFeedLayoutMetrics.horizontalInset + max(0, ((contentWidth - readable) / 2).rounded(.down))
+        return horizontalInset + max(0, ((contentWidth - readable) / 2).rounded(.down))
     }
     func layoutSection(
         count: Int = 1, est: CGFloat, insetH: CGFloat, trailingH: CGFloat? = nil,
@@ -459,6 +486,7 @@ private extension UserSpaceFeedCollectionViewController {
             }
             if !targets.isEmpty { snapshot.reconfigureItems(targets) }
         }
+        currentSections = snapshot.sectionIdentifiers
         lastReconfiguredWidth = currentContentWidth
         dataSource.apply(snapshot, animatingDifferences: false)
     }
@@ -467,7 +495,7 @@ private extension UserSpaceFeedCollectionViewController {
         geometryTask?.cancel()
         geometryTask = Task { @MainActor [weak self] in
             guard let self, !Task.isCancelled else { return }
-            rebuildCaches()
+            rebuildCaches(forceAll: true)
             applySnapshot(reconfigureAll: true)
         }
     }

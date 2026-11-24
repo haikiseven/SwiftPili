@@ -57,7 +57,7 @@
 		<true/>
 	</dict>
 	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>Save images from posts and comments to your photo library.</string>
+	<string>Save images and exported videos to your photo library.</string>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>

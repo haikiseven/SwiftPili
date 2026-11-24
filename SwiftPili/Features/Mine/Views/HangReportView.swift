@@ -55,8 +55,8 @@ struct HangReportView: View {
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
-                    entries = HangReportStore.shared.entries()
                     copied = false
+                    Task { await reloadEntries() }
                 } label: {
                     Label {
                         Text("Refresh")
@@ -66,8 +66,16 @@ struct HangReportView: View {
                 }
             }
         }
-        .onAppear {
-            entries = HangReportStore.shared.entries()
+        .task {
+            await reloadEntries()
         }
+    }
+
+    private func reloadEntries() async {
+        let loaded = await Task.detached(priority: .userInitiated) {
+            HangReportStore.shared.entries()
+        }.value
+        guard !Task.isCancelled else { return }
+        entries = loaded
     }
 }
