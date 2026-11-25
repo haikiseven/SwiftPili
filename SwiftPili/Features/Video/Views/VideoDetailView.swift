@@ -26,12 +26,34 @@ private struct CommentSourceChange: ViewModifier {
     }
 }
 
+private struct VideoDetailErrorAlertObserver: ViewModifier {
+    let model: VideoDetailViewModel
+    @State private var errorAlert: ToastMessage?
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: model.toast) { _, toast in
+                guard let toast, toast.style == .error else { return }
+                errorAlert = toast
+                model.toast = nil
+            }
+            .alert(
+                "Operation Failed",
+                isPresented: Binding(
+                    get: { errorAlert != nil },
+                    set: { if !$0 { errorAlert = nil } }
+                ),
+                presenting: errorAlert
+            ) { _ in
+                Button("OK", role: .cancel) { errorAlert = nil }
+            } message: { alert in
+                Text(alert.text)
+            }
+    }
+}
+
 struct VideoDetailView: View {
-    @AppMotion private var motion
-    let target: VideoRouteTarget
-    @State private var screenOwner: String
-    @State private var viewModel = VideoDetailViewModel()
-    private enum DetailSheet: Identifiable {
+    enum DetailSheet: Identifiable {
         enum ID: Hashable {
             case report(Int)
             case favorite
@@ -54,45 +76,76 @@ struct VideoDetailView: View {
         }
     }
 
-    private enum DetailDialog: Equatable {
-        case coin
-        case descriptionActions
-    }
-
-    private struct VideoShareState {
+    struct VideoShareState {
         var isPresenting = false
         var image: UIImage?
         var requestID: UUID?
         var preparation: Task<Void, Never>?
     }
 
-    @State private var commentPresentation = CommentZoomPresentation()
-    @State private var replyPresentation = CommentZoomPresentation()
-    @State private var composer = VideoCommentComposerState()
-    @State private var activeSheet: DetailSheet?
-    @State private var activeDialog: DetailDialog?
-    @State private var errorAlert: ToastMessage?
-    @State private var shareState = VideoShareState()
-    @State private var showThread: CommentThreadTarget?
-    @State private var commentTargetRpid: Int?
-    @State private var highlightedCommentRpid: Int?
-    @State private var previewImages: ImagePreviewItem?
-    @State private var isDescExpanded = false
-    @State private var downloadRequestSerial: UInt64 = 0
-    @State private var coinRequestInFlight = false
-    @State private var favoriteRequestInFlight = false
-    @State private var followRequestInFlight = false
-    @State private var partPicks = 0
-    @State private var pickedPartCid: Int?
-    @Namespace private var partIndicator
-    private final class PageOffsetStore {
+    final class PageOffsetStore {
         var offsets: [Int: CGFloat] = [:]
     }
 
-    @State private var pageOffsetStore = PageOffsetStore()
-    @State private var lastCondenseFlipAt: CFTimeInterval = 0
+    @AppMotion var motion
+    let target: VideoRouteTarget
+    @State var screenOwner: String
+    @State var viewModel = VideoDetailViewModel()
 
-    private var playerVideoHeight: CGFloat {
+    @State var commentPresentation = CommentZoomPresentation()
+    @State var replyPresentation = CommentZoomPresentation()
+    @State var composer = VideoCommentComposerState()
+    @State var activeSheet: DetailSheet?
+    @State var shareState = VideoShareState()
+    @State var showThread: CommentThreadTarget?
+    @State var commentTargetRpid: Int?
+    @State var highlightedCommentRpid: Int?
+    @State var previewImages: ImagePreviewItem?
+    @State var downloadRequestSerial: UInt64 = 0
+    @State var favoriteRequestInFlight = false
+    @State var pageOffsetStore = PageOffsetStore()
+    @State var lastCondenseFlipAt: CFTimeInterval = 0
+    @State var containerMetrics = PlayerDetailContainerMetrics()
+    @State var stageController = DetailStageController()
+    @State var commentLinkLifetime = ContentLinkLifetime()
+    @State var routePosition: PlayerRoutePosition?
+    @State var presentationScreenID = UUID()
+
+    @Environment(AppCoordinator.self) var coordinator
+    @Environment(\.horizontalSizeClass) var sizeClass
+    @Environment(\.scenePhase) var scenePhase
+
+    init(target: VideoRouteTarget, routePosition: PlayerRoutePosition? = nil) {
+        self.target = target
+        _routePosition = State(initialValue: routePosition)
+        _screenOwner = State(initialValue: "vod-detail-\(UUID().uuidString)")
+    }
+
+    var player: PlayerViewModel { PlayerViewModel.shared }
+    var videoID: VideoID { target.videoID }
+
+    var isActiveVideoRoute: Bool {
+        coordinator.isActivePlayerRoute(.video(videoID), position: routePosition)
+    }
+
+    var containerWidth: CGFloat { containerMetrics.containerWidth }
+    var isWideLayout: Bool { containerMetrics.isWideLayout(isRegularWidth: sizeClass == .regular) }
+    var usesCompactPhoneActions: Bool { containerMetrics.usesCompactPhoneActions }
+    var wideContainerHeight: CGFloat { containerMetrics.wideContainerHeight }
+    var isKeyboardDocked: Bool { containerMetrics.isKeyboardDocked }
+    var stagePresentation: DetailStagePresentation { stageController.presentation }
+    var showsWideChrome: Bool { isWideLayout }
+    var pageWidth: CGFloat { containerMetrics.pageWidth }
+    var pagerBottomInset: CGFloat { AppWindowMetrics.safeAreaInsets.bottom }
+
+    var stageGeometry: DetailStageLayout.Geometry {
+        stageController.geometry(containerWidth: pageWidth, containerHeight: wideContainerHeight)
+    }
+
+    private var showsHeroBar: Bool { stageController.showsHeroBar(isWideLayout: isWideLayout) }
+    private var wideVideoSize: CGSize { stageGeometry.playerSize }
+
+    var playerVideoHeight: CGFloat {
         if isWideLayout { return wideVideoSize.height }
         let fallbackBounds = WindowMetricsFallback.currentBounds
         let base = containerWidth > 0 ? containerWidth : min(fallbackBounds.width, fallbackBounds.height)
@@ -121,46 +174,17 @@ struct VideoDetailView: View {
     }
 
     private var playerAreaHeight: CGFloat {
-        DetailPlayerGeometry.pinnedHeaderHeight(
-            videoHeight: playerVideoHeight, isFullscreen: false
-        )
-    }
-    @State private var containerMetrics = PlayerDetailContainerMetrics()
-    @State private var stageController = DetailStageController()
-    private var containerWidth: CGFloat { containerMetrics.containerWidth }
-    private var isWideLayout: Bool { containerMetrics.isWideLayout(isRegularWidth: sizeClass == .regular) }
-    private var usesCompactPhoneActions: Bool { containerMetrics.usesCompactPhoneActions }
-    private var wideContainerHeight: CGFloat { containerMetrics.wideContainerHeight }
-    private var isKeyboardDocked: Bool { containerMetrics.isKeyboardDocked }
-    private var stagePresentation: DetailStagePresentation { stageController.presentation }
-    @Environment(AppCoordinator.self) private var coordinator
-    @Environment(\.horizontalSizeClass) private var sizeClass
-    @Environment(\.scenePhase) private var scenePhase
-    @Environment(\.openURL) private var openURL
-    @Environment(\.contentLinkContext) private var linkContext
-    @State private var commentLinkLifetime = ContentLinkLifetime()
-    @State private var pendingCommentLinkContext: ContentLinkContext?
-
-    @State private var routePosition: PlayerRoutePosition?
-
-    init(target: VideoRouteTarget, routePosition: PlayerRoutePosition? = nil) {
-        self.target = target
-        _routePosition = State(initialValue: routePosition)
-        _screenOwner = State(initialValue: "vod-detail-\(UUID().uuidString)")
+        DetailPlayerGeometry.pinnedHeaderHeight(videoHeight: playerVideoHeight, isFullscreen: false)
     }
 
-    private var accent: Color { .biliAccent }
-    private var stageGeometry: DetailStageLayout.Geometry {
-        stageController.geometry(containerWidth: pageWidth, containerHeight: wideContainerHeight)
+    private var detailContentTopInset: CGFloat {
+        playerAreaHeight + DetailPlayerGeometry.contentTopGap
     }
-    private var showsHeroBar: Bool { stageController.showsHeroBar(isWideLayout: isWideLayout) }
 
-    private var wideVideoSize: CGSize { stageGeometry.playerSize }
-
-    private var showsWideChrome: Bool { isWideLayout }
     private var hostOwnsInlineSurface: Bool {
         PlayerDetailSurfacePolicy.hostOwnsInlineSurface(player: player, lease: viewModel.playerLease)
     }
+
     private var hasUsableInlinePlayerChrome: Bool {
         guard isActiveVideoRoute, viewModel.error == nil, viewModel.unavailability == nil,
               player.error == nil, player.unavailability == nil,
@@ -169,24 +193,7 @@ struct VideoDetailView: View {
         return player.isCurrentOwner(lease) && player.mode == .vod
             && player.surfaceLease(matching: lease, role: .inline) != nil
     }
-    private static var compactCapsuleMinimumWidth: CGFloat { 600 }
-    private static var phoneShelfCardWidth: CGFloat { 220 }
 
-    private func setStagePresentation(_ next: DetailStagePresentation) {
-        stageController.transition(to: next, isWideLayout: isWideLayout, motion: motion)
-    }
-
-    private func handleStageScroll(_ offset: CGFloat) {
-        stageController.handleScroll(
-            offset: offset,
-            isWideLayout: showsWideChrome,
-            motion: motion,
-            logTag: "Stage"
-        )
-    }
-
-    @State private var presentationScreenID = UUID()
-    private var player: PlayerViewModel { PlayerViewModel.shared }
     private var presentationContext: PlayerScreenPresentationContext? {
         guard isActiveVideoRoute else { return nil }
         let source: PlayerPresentationSource? = if let aid = viewModel.videoInfo?.aid,
@@ -201,20 +208,11 @@ struct VideoDetailView: View {
             source: source
         )
     }
-    private var videoID: VideoID { target.videoID }
-
-    private var isActiveVideoRoute: Bool {
-        coordinator.isActivePlayerRoute(.video(videoID), position: routePosition)
-    }
 
     private var placeholderCoverURL: String? {
         if let pic = viewModel.videoInfo?.pic, !pic.isEmpty { return pic }
         let preview = target.preview.coverSource.desktopURL
         return preview.isEmpty ? nil : preview
-    }
-
-    private var detailContentTopInset: CGFloat {
-        playerAreaHeight + DetailPlayerGeometry.contentTopGap
     }
 
     private var playerPageNavigation: PlayerPageNavigationActions {
@@ -233,12 +231,17 @@ struct VideoDetailView: View {
         )
     }
 
-    private var pageWidth: CGFloat {
-        containerMetrics.pageWidth
+    func setStagePresentation(_ next: DetailStagePresentation) {
+        stageController.transition(to: next, isWideLayout: isWideLayout, motion: motion)
     }
 
-    private var pagerBottomInset: CGFloat {
-        AppWindowMetrics.safeAreaInsets.bottom
+    private func handleStageScroll(_ offset: CGFloat) {
+        stageController.handleScroll(
+            offset: offset,
+            isWideLayout: showsWideChrome,
+            motion: motion,
+            logTag: "Stage"
+        )
     }
 
     var body: some View {
@@ -263,60 +266,7 @@ struct VideoDetailView: View {
                     compactContent()
                 }
 
-                VStack(spacing: 0) {
-                    if isActiveVideoRoute {
-                        if hostOwnsInlineSurface {
-                            RoundedRectangle(cornerRadius: inlineCornerRadius, style: .continuous)
-                                .fill(Color.black)
-                                .frame(
-                                    width: isWideLayout ? wideVideoSize.width : nil,
-                                    height: playerVideoHeight
-                                )
-                                .frame(maxWidth: isWideLayout ? nil : .infinity)
-                        } else {
-                            PlayerView(
-                                owner: screenOwner,
-                                surfaceRole: .inline,
-                                pageNavigationActions: playerPageNavigation,
-                                inlineViewportSize: CGSize(
-                                    width: isWideLayout ? wideVideoSize.width : containerWidth,
-                                    height: playerVideoHeight
-                                ),
-                                inlineCornerRadius: inlineCornerRadius,
-                                screenLease: viewModel.playerLease,
-                                placeholderCoverURL: placeholderCoverURL,
-                                showsLoadingIndicator: viewModel.error == nil && viewModel.unavailability == nil
-                            )
-                        }
-                    } else {
-                        RouteActivationPlaceholderView(
-                            still: player.outgoingRouteStill(for: screenOwner),
-                            coverURL: placeholderCoverURL,
-                            height: playerVideoHeight,
-                            cornerRadius: inlineCornerRadius
-                        )
-                    }
-                }
-                .background {
-                    PlayerInlineSlotProbe(cornerRadius: inlineCornerRadius)
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
-                }
-                .frame(width: showsWideChrome ? wideVideoSize.width : nil)
-                .overlay(alignment: .topLeading) {
-                    PlayerDetailInlineNavigationOverlay(
-                        player: player,
-                        isActiveRoute: isActiveVideoRoute,
-                        hasInlineExitChrome: { hasUsableInlinePlayerChrome },
-                        cornerRadius: inlineCornerRadius,
-                        actions: playerPageNavigation
-                    )
-                }
-                .detailStagePlayerPlacement(
-                    isActive: showsWideChrome, geometry: stageGeometry, presentation: stagePresentation
-                )
-                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
-                .padding(.bottom, DetailPlayerGeometry.headerBottomInset(isFullscreen: false))
+                inlinePlayerSlot(cornerRadius: inlineCornerRadius)
             }
             .ignoresSafeArea(.keyboard, edges: .bottom)
             .frame(minWidth: 0, maxWidth: .infinity)
@@ -337,7 +287,15 @@ struct VideoDetailView: View {
                 }
             }
 
-            rootCommentToast
+            VideoDetailRootToastView(
+                model: viewModel,
+                commentPresentation: commentPresentation,
+                isWideLayout: isWideLayout,
+                showsWideChrome: showsWideChrome,
+                stagePresentation: stagePresentation,
+                stagePanelWidth: stageGeometry.panelWidth,
+                hasActiveThread: showThread != nil
+            )
         }
         .playerDetailChrome(
             isFullscreenPresentationActive: player.isFullscreenPresentationActive,
@@ -345,8 +303,7 @@ struct VideoDetailView: View {
             guardsIPadTopSafeArea: true,
             preventsContentDismissal: isActiveVideoRoute,
             presentationContext: presentationContext,
-            coordinator: coordinator,
-            watchdogScreen: "VideoDetail"
+            coordinator: coordinator
         ) {
             CinematicBackdrop(
                 coverURL: placeholderCoverURL,
@@ -392,23 +349,7 @@ struct VideoDetailView: View {
             else { return }
             viewModel.showToast(message, style: .error)
         }
-        .onChange(of: viewModel.toast) { _, toast in
-            guard let toast, toast.style == .error else { return }
-            errorAlert = toast
-            viewModel.toast = nil
-        }
-        .alert(
-            "Operation Failed",
-            isPresented: Binding(
-                get: { errorAlert != nil },
-                set: { if !$0 { errorAlert = nil } }
-            ),
-            presenting: errorAlert
-        ) { _ in
-            Button("OK", role: .cancel) { errorAlert = nil }
-        } message: { alert in
-            Text(alert.text)
-        }
+        .modifier(VideoDetailErrorAlertObserver(model: viewModel))
         .imagePreview(item: $previewImages)
         .sheet(item: $activeSheet) { sheet in
             switch sheet {
@@ -437,7 +378,10 @@ struct VideoDetailView: View {
         }
         .modifier(CommentSourceChange(model: viewModel) { source in
             composer.collapseImmediatelyIfSourceCleared(source)
-            if let showThread, showThread.type != 1 || showThread.oid != source?.aid || composer.replyCommentSource != source {
+            if let showThread,
+               showThread.type != 1
+                || showThread.oid != source?.aid
+                || composer.replyCommentSource != source {
                 commentPresentation.cancelPendingAction()
                 replyPresentation.cancelPendingAction()
                 replyPresentation.isPresented = false
@@ -448,422 +392,88 @@ struct VideoDetailView: View {
         })
     }
 
-    private var rootCommentToast: some View {
-        VideoDetailCommentPresentationReader(presentation: commentPresentation) { commentsPresented in
-            let handledByWidePanel = showsWideChrome && stagePresentation == .stage && showThread == nil
-            let handledByCompactOverlay = !isWideLayout && commentsPresented
-            let visibleToast = (!handledByWidePanel && !handledByCompactOverlay
-                && (isWideLayout || !commentsPresented))
-                ? viewModel.toast.flatMap { $0.style == .error ? nil : $0 }
-                : nil
-            Group {
-                if let toast = visibleToast {
-                    ToastView(message: toast)
-                }
-            }
-            .animation(motion.feedbackAnimation(normal: .spring(duration: 0.3)), value: visibleToast)
-            .frame(maxWidth: showsWideChrome ? stageGeometry.panelWidth : .infinity)
-            .padding(.trailing, showsWideChrome ? DetailStageLayout.outerMargin : 0)
-            .padding(.bottom, showsWideChrome ? DetailStageLayout.outerMargin : 0)
-            .frame(maxWidth: .infinity, alignment: showsWideChrome ? .trailing : .center)
-        }
-    }
-
-    private func dialogBinding(_ dialog: DetailDialog) -> Binding<Bool> {
-        Binding(
-            get: { activeDialog == dialog },
-            set: { isPresented in
-                if !isPresented, activeDialog == dialog {
-                    activeDialog = nil
-                }
-            }
-        )
-    }
-
-    private func commentFeedbackAndComposer(isCompactOverlay: Bool) -> some View {
-        let model = viewModel
-        let requestedID = videoID
-        return VideoDetailCommentComposerOverlay(
-            composer: composer,
-            model: model,
-            commentPresentation: commentPresentation,
-            requestedVideoID: requestedID,
-            isCompactOverlay: isCompactOverlay,
-            showsWideChrome: showsWideChrome,
-            isWideLayout: isWideLayout,
-            stagePresentation: stagePresentation,
-            hasActiveThread: showThread != nil,
-            isInlineCommentInputEligible: isInlineCommentInputEligible,
-            isModelCurrent: { viewModel === model && videoID == requestedID },
-            onRevealPostedComment: { postedRpid, target, model, sourceIsCurrent in
-                revealAcceptedComment(
-                    postedRpid,
-                    replyingTo: target,
-                    model: model,
-                    sourceIsCurrent: sourceIsCurrent
-                )
-            }
-        )
-    }
-
-    private var isInlineCommentInputEligible: Bool {
-        !player.isFullscreen && AuthManager.shared.isLoggedIn && !viewModel.commentsClosed
-    }
-
-    private func statsLine(_ info: VideoInfo) -> some View {
-        HStack(spacing: 10) {
-            Text("\(FormatUtils.viewCount(info.stat.view)) plays")
-            Text("\(FormatUtils.viewCount(info.stat.danmaku)) danmaku")
-            if let online = viewModel.onlineCount, !online.isEmpty {
-                HStack(spacing: 3) {
-                    Circle()
-                        .fill(.green)
-                        .frame(width: 5, height: 5)
-                    Text("\(online) watching")
-                }
-            }
-            Spacer()
-            Text(FormatUtils.timeAgo(from: info.pubdate))
-        }
-        .appFont(.screenStat)
-        .foregroundStyle(.secondary)
-    }
-
-    private func descriptionBlock(_ info: VideoInfo) -> some View {
-        let hasDesc = !info.desc.isEmpty && info.desc != "-"
-        return VStack(alignment: .leading, spacing: 10) {
-            if hasDesc {
-                EmoteText.linkified(
-                    info.desc, links: info.descLinks, accent: .biliAccent
-                )
-                    .appFont(.screenSummary)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .linkAwareLongPress(minimumDuration: 0.4) {
-                        activeDialog = .descriptionActions
-                    }
-                    .linkAwareTap {
-                        withAnimation(motion.animation(normal: .snappy(duration: 0.22, extraBounce: 0))) {
-                            isDescExpanded.toggle()
-                        }
-                    }
-                    .confirmationDialog(
-                        "", isPresented: dialogBinding(.descriptionActions), titleVisibility: .hidden
-                    ) {
-                        Button {
-                            UIPasteboard.general.string = info.desc
-                        } label: {
-                            Text("Copy Description")
-                        }
-                    }
-            }
-
-            if !viewModel.tags.isEmpty {
-                descriptionTags
-            }
-        }
-    }
-
-    private func ownerRow(_ info: VideoInfo, fillsWidth: Bool) -> some View {
-        HStack(spacing: 10) {
-            AvatarImage(urlString: info.owner.face, size: 36)
-
-            Text(info.owner.name)
-                .appFont(.screenOwner)
-                .fontWeight(.medium)
-                .lineLimit(fillsWidth ? nil : 1)
-
-            if fillsWidth { Spacer() }
-
-            if let following = viewModel.isFollowingUp {
-                Button {
-                    Task {
-                        followRequestInFlight = true
-                        await viewModel.toggleFollowUp()
-                        followRequestInFlight = false
-                    }
-                } label: {
-                    (following ? Text("Following") : Text("+ Follow"))
-                        .appFont(.controlLabel)
-                        .fontWeight(.semibold)
-                        .foregroundStyle(following ? AnyShapeStyle(.secondary) : AnyShapeStyle(.white))
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 6)
-                        .background(
-                            following
-                                ? AnyShapeStyle(Color(.tertiarySystemFill))
-                                : AnyShapeStyle(Color.biliAccent),
-                            in: Capsule()
+    private func inlinePlayerSlot(cornerRadius: CGFloat) -> some View {
+        VStack(spacing: 0) {
+            if isActiveVideoRoute {
+                if hostOwnsInlineSurface {
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .fill(Color.black)
+                        .frame(
+                            width: isWideLayout ? wideVideoSize.width : nil,
+                            height: playerVideoHeight
                         )
-                        .appStateLabelFeedback(isOn: following, userActionInFlight: followRequestInFlight)
+                        .frame(maxWidth: isWideLayout ? nil : .infinity)
+                } else {
+                    PlayerView(
+                        owner: screenOwner,
+                        surfaceRole: .inline,
+                        pageNavigationActions: playerPageNavigation,
+                        inlineViewportSize: CGSize(
+                            width: isWideLayout ? wideVideoSize.width : containerWidth,
+                            height: playerVideoHeight
+                        ),
+                        inlineCornerRadius: cornerRadius,
+                        screenLease: viewModel.playerLease,
+                        placeholderCoverURL: placeholderCoverURL,
+                        showsLoadingIndicator: viewModel.error == nil && viewModel.unavailability == nil
+                    )
                 }
-                .buttonStyle(.appControl)
-                .disabled(followRequestInFlight)
-            }
-        }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            coordinator.navigate(to: .userSpace(info.owner.mid))
-        }
-    }
-
-    private func partsSelector(
-        _ pages: [VideoInfo.VideoPage], horizontalInset: CGFloat = 16
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            DetailSectionHeader("Parts", count: pages.count)
-                .padding(.horizontal, horizontalInset)
-
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(pages, id: \.cid) { page in
-                        let selected = page.cid == (pickedPartCid ?? viewModel.currentCid)
-                        PlaybackEntryChip(
-                            label: "P\(page.page)",
-                            detail: FormatUtils.duration(page.duration),
-                            title: page.part,
-                            isSelected: selected,
-                            indicator: partIndicator
-                        ) {
-                            guard !selected else { return }
-                            partPicks &+= 1
-                            pickPart(page)
-                        }
-                    }
-                }
-                .padding(.horizontal, horizontalInset)
-            }
-        }
-        .padding(.bottom, 6)
-        .appSelectionHaptic(userPicks: partPicks)
-    }
-
-    private func pickPart(_ page: VideoInfo.VideoPage) {
-        let start = {
-            guard pickedPartCid == page.cid else { return }
-            Task {
-                await viewModel.switchPage(page)
-                if pickedPartCid == page.cid { pickedPartCid = nil }
-            }
-        }
-        guard let animation = motion.animation(normal: .snappy(duration: 0.24)) else {
-            pickedPartCid = page.cid
-            start()
-            return
-        }
-        withAnimation(animation, completionCriteria: .logicallyComplete) {
-            pickedPartCid = page.cid
-        } completion: {
-            start()
-        }
-    }
-
-    @ViewBuilder
-    private func actionButtons(_ info: VideoInfo, compact: Bool = false) -> some View {
-        DetailActionButton(
-            icon: viewModel.isLiked ? "hand.thumbsup.fill" : "hand.thumbsup",
-            label: FormatUtils.viewCount(info.stat.like),
-            isActive: viewModel.isLiked,
-            count: info.stat.like,
-            compact: compact,
-            accessibilityTitle: "Like"
-        ) {
-            await viewModel.toggleLike()
-        }
-        DetailActionButton(
-            icon: viewModel.isCoined ? "b.circle.fill" : "b.circle",
-            label: FormatUtils.viewCount(info.stat.coin),
-            isActive: viewModel.isCoined,
-            count: info.stat.coin,
-            externalActionInFlight: coinRequestInFlight,
-            compact: compact,
-            accessibilityTitle: "Coin"
-        ) {
-            if viewModel.maxCoins - viewModel.coinCount >= 2 {
-                activeDialog = .coin
             } else {
-                await viewModel.addCoin(multiply: 1)
-            }
-        }
-        .confirmationDialog("Coin this video", isPresented: dialogBinding(.coin), titleVisibility: .visible) {
-            Button("Give 1 Coin") { addCoinFromDialog(1) }
-            Button("Give 2 Coins") { addCoinFromDialog(2) }
-        }
-        DetailActionButton(
-            icon: viewModel.isFavorited ? "star.fill" : "star",
-            label: FormatUtils.viewCount(info.stat.favorite),
-            isActive: viewModel.isFavorited,
-            count: info.stat.favorite,
-            externalActionInFlight: favoriteRequestInFlight,
-            compact: compact,
-            accessibilityTitle: "Favorite"
-        ) {
-            await viewModel.loadFavFolders()
-            activeSheet = .favorite
-        }
-        DetailActionButton(
-            icon: viewModel.isInWatchLater ? "clock.fill" : "clock",
-            label: String(localized: "Watch"),
-            isActive: viewModel.isInWatchLater,
-            compact: compact,
-            showsCaption: !compact,
-            accessibilityTitle: "Watch Later"
-        ) {
-            await viewModel.toggleWatchLater()
-        }
-        shareMenu(info, compact: compact)
-    }
-
-    private func addCoinFromDialog(_ coins: Int) {
-        Task {
-            coinRequestInFlight = true
-            await viewModel.addCoin(multiply: coins)
-            coinRequestInFlight = false
-        }
-    }
-
-    private func shareMenu(_ info: VideoInfo, compact: Bool = false) -> some View {
-        Menu {
-            Button {
-                prepareShareCard(info)
-            } label: {
-                Label("System Share", systemImage: "square.and.arrow.up")
-            }
-
-            Button {
-                UIPasteboard.general.string = "https://www.bilibili.com/video/\(info.bvid)"
-                Task { await viewModel.shareVideo() }
-            } label: {
-                Label("Copy Link", systemImage: "link")
-            }
-
-            Button {
-                UIPasteboard.general.string = info.bvid
-            } label: {
-                Label("Copy BV ID", systemImage: "doc.on.doc")
-            }
-
-            Button {
-                UIPasteboard.general.string = String(info.aid)
-            } label: {
-                Label("Copy AV ID", systemImage: "number")
-            }
-        } label: {
-            DetailActionButtonLabel(
-                compact: compact,
-                compactIconOnly: false,
-                isActive: viewModel.hasShared
-            ) {
-                Image(systemName: viewModel.hasShared ? "arrowshape.turn.up.right.fill" : "arrowshape.turn.up.right")
-                    .font(compact ? .subheadline : .body)
-                    .foregroundStyle(Color.primary)
-            } caption: {
-                Text(FormatUtils.viewCount(info.stat.share))
-                    .appFont(.controlLabel)
-                    .foregroundStyle(Color.primary)
-            }
-        }
-        .accessibilityLabel(Text("Share"))
-        .accessibilityValue(Text(info.stat.share, format: .number))
-    }
-
-    private func offerDownload(_ info: VideoInfo) {
-        let cid = viewModel.currentCid ?? info.cid
-        if let existing = DownloadManager.shared.existing(bvid: info.bvid, cid: cid) {
-            if existing.filesExist {
-                viewModel.showToast(String(localized: "Already downloaded"), style: .success)
-                return
-            }
-            guard DownloadManager.shared.delete(existing) else {
-                viewModel.showToast(String(localized: "Download is being exported"), style: .progress)
-                return
-            }
-        }
-        if DownloadManager.shared.isActive(bvid: info.bvid, cid: cid) {
-            viewModel.showToast(String(localized: "Download in progress"), style: .progress)
-            return
-        }
-        let isImmediate = DownloadManager.shared.hasImmediateQualityList(
-            aid: info.aid, cid: cid
-        )
-        if !isImmediate {
-            viewModel.showToast(String(localized: "Preparing…"), style: .progress)
-        }
-        downloadRequestSerial &+= 1
-        let serial = downloadRequestSerial
-        Task {
-            do {
-                let qualities = try await DownloadManager.shared.availableQualities(
-                    aid: info.aid, cid: cid
+                RouteActivationPlaceholderView(
+                    still: player.outgoingRouteStill(for: screenOwner),
+                    coverURL: placeholderCoverURL,
+                    height: playerVideoHeight,
+                    cornerRadius: cornerRadius
                 )
-                guard !Task.isCancelled,
-                      downloadRequestSerial == serial,
-                      viewModel.videoInfo?.aid == info.aid,
-                      (viewModel.currentCid ?? viewModel.videoInfo?.cid) == cid
-                else { return }
-                activeSheet = .download(DownloadQualityPresentation(
-                    info: info, cid: cid, qualities: qualities
-                ))
-            } catch {
-                guard !Task.isCancelled, downloadRequestSerial == serial else { return }
-                viewModel.showToast(error.localizedDescription, style: .error)
             }
         }
-    }
-
-    private func shareItems(for info: VideoInfo) -> [Any] {
-        if let shareImage = shareState.image { return [shareImage] }
-        if let url = URL(string: "https://www.bilibili.com/video/\(info.bvid)") { return [url] }
-        return [info.title]
-    }
-
-    private func prepareShareCard(_ info: VideoInfo) {
-        guard shareState.requestID == nil, !shareState.isPresenting, isActiveVideoRoute else { return }
-        let id = UUID()
-        let model = viewModel
-        let request = ShareCardRenderer.Request(
-            coverURL: info.pic, title: info.title, uploader: info.owner.name, description: info.desc,
-            linkURL: "https://www.bilibili.com/video/\(info.bvid)",
-            linkDisplay: "bilibili.com/video/\(info.bvid)",
-            accent: UIColor(Color.biliAccent).resolvedColor(with: UITraitCollection.current)
-        )
-        shareState.requestID = id
-        shareState.preparation = Task {
-            defer {
-                if shareState.requestID == id {
-                    shareState.requestID = nil
-                    shareState.preparation = nil
-                }
-            }
-            guard let image = try? await ShareCardRenderer.prepare(request),
-                  !Task.isCancelled, shareState.requestID == id,
-                  isActiveVideoRoute, viewModel === model, model.videoInfo?.bvid == info.bvid else { return }
-            shareState.image = image
-            shareState.isPresenting = true
-            ActivitySharePresenter.present(items: shareItems(for: info)) { completed in
-                shareState.isPresenting = false
-                guard completed else { return }
-                Task { await viewModel.shareVideo() }
-            }
+        .background {
+            PlayerInlineSlotProbe(cornerRadius: cornerRadius)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
         }
-    }
-
-    private func cancelSharePreparation() {
-        shareState.preparation?.cancel()
-        shareState.preparation = nil
-        shareState.requestID = nil
-    }
-
-    private func startDownload(_ info: VideoInfo, cid: Int, quality: Int) {
-        let duration = info.pages?.first(where: { $0.cid == cid })?.duration ?? info.duration
-        viewModel.showToast(String(localized: "Download started"), style: .progress)
-        Task {
-            await DownloadManager.shared.startDownload(
-                aid: info.aid, cid: cid, bvid: info.bvid, title: info.title,
-                coverURL: info.pic, ownerName: info.owner.name,
-                durationSeconds: duration, quality: quality
+        .frame(width: showsWideChrome ? wideVideoSize.width : nil)
+        .overlay(alignment: .topLeading) {
+            PlayerDetailInlineNavigationOverlay(
+                player: player,
+                isActiveRoute: isActiveVideoRoute,
+                hasInlineExitChrome: { hasUsableInlinePlayerChrome },
+                cornerRadius: cornerRadius,
+                actions: playerPageNavigation
             )
         }
+        .detailStagePlayerPlacement(
+            isActive: showsWideChrome, geometry: stageGeometry, presentation: stagePresentation
+        )
+        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+        .padding(.bottom, DetailPlayerGeometry.headerBottomInset(isFullscreen: false))
+    }
+
+    private func wideContent(bottomInset: CGFloat) -> some View {
+        let geometry = stageGeometry
+        let topInset = DetailStageLayout.contentTopInset(
+            playerHeight: geometry.playerSize.height, presentation: stagePresentation
+        )
+        let isStage = stagePresentation == .stage
+        return CinematicStageColumn(
+            topInset: topInset,
+            fadeGap: DetailStageLayout.contentGap(for: stagePresentation),
+            bottomSpacer: bottomInset + VideoDetailLayoutMetrics.contentBottomPadding
+                + (isStage ? 0 : wideContainerHeight * 0.35),
+            onOffset: handleStageScroll
+        ) {
+            detailColumn(
+                columnWidth: geometry.columnWidth,
+                horizontalInset: stagePresentation == .hero
+                    ? geometry.playerOriginX : VideoDetailLayoutMetrics.cinematicTextInset,
+                showsCommentsCapsule: true,
+                isCompact: false
+            )
+            .frame(width: geometry.columnWidth, alignment: .leading)
+            .padding(.leading, geometry.columnOriginX)
+        }
+        .frame(maxHeight: .infinity)
+        .ignoresSafeArea(edges: .bottom)
     }
 
     private func compactContent() -> some View {
@@ -876,686 +486,17 @@ struct VideoDetailView: View {
         }
     }
 
-    private var compactCommentsOverlay: some View {
-        CommentZoomContainer(
-            presentation: commentPresentation,
-            destination: commentsSurface(bottomInset: pagerBottomInset),
-            onPresentationChanged: { isPresented in
-                if isPresented { updatePlayerCondensation() }
-                if !isPresented {
-                    composer.collapse(motion: motion)
-                }
-            },
-            allowsInteractiveDismissal: showThread == nil,
-            onDismissed: resetCommentThreadAfterModalDismissal
-        )
-        .padding(.top, playerVideoHeight)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .clipped()
-        .ignoresSafeArea(.container, edges: .bottom)
-        .ignoresSafeArea(.keyboard, edges: .bottom)
-    }
-
-    private func openComments() {
-        commentPresentation.cancelPendingAction()
-        replyPresentation.cancelPendingAction()
-        if isWideLayout { setStagePresentation(.stage) }
-        commentPresentation.isPresented = true
-        if showThread != nil { replyPresentation.isPresented = true }
-    }
-
-    private func closeComments() {
-        commentPresentation.cancelPendingAction()
-        replyPresentation.cancelPendingAction()
-        composer.collapse(motion: motion)
-        if commentPresentation.isPresented {
-            commentPresentation.isPresented = false
-        } else {
-            let threadID = showThread?.id
-            replyPresentation.dismissThenPerform { finishCommentThreadDismissal(threadID) }
-        }
-    }
-
-    private func resetCommentThreadAfterModalDismissal() {
-        guard !commentPresentation.isPresented else { return }
-        updatePlayerCondensation()
-        replyPresentation.cancelPendingAction()
-        replyPresentation.isPresented = false
-        showThread = nil
-        composer.replyCommentSource = nil
-        replyPresentation.anchors.sourceProvider = nil
-    }
-
-    private func openCommentThread(_ target: CommentThreadTarget) {
-        guard let source = viewModel.currentCommentSource,
-              source.aid == target.oid, target.type == 1 else { return }
-        commentPresentation.cancelPendingAction()
-        replyPresentation.cancelPendingAction()
-        commentLinkLifetime.invalidate()
-        coordinator.contentLinks.cancel()
-        composer.collapse(motion: motion)
-        replyPresentation.anchors.sourceProvider = { nil }
-        composer.replyCommentSource = source
-        showThread = target
-        replyPresentation.isPresented = true
-    }
-
-    private func closeCommentThread() {
-        commentPresentation.cancelPendingAction()
-        replyPresentation.cancelPendingAction()
-        let threadID = showThread?.id
-        replyPresentation.dismissThenPerform { finishCommentThreadDismissal(threadID) }
-    }
-
-    private func finishCommentThreadDismissal(_ threadID: CommentThreadTarget.Identity?) {
-        guard !replyPresentation.isPresented, showThread?.id == threadID else { return }
-        showThread = nil
-        composer.replyCommentSource = nil
-        replyPresentation.anchors.sourceProvider = nil
-    }
-
-    private func openCommentThreadURL(
-        _ url: URL, context: ContentLinkContext, target: CommentThreadTarget
-    ) -> OpenURLAction.Result {
-        guard let origin = coordinator.contentLinkOrigin(context) else { return .discarded }
-        coordinator.contentLinks.open(url, context: origin) { route in
-            origin.beforeNavigate()
-            navigateFromCommentThread(to: route, target: target)
-        }
-        return .handled
-    }
-
-    private func navigateFromCommentThread(to route: Route, target: CommentThreadTarget) {
-        let model = viewModel
-        let requestedID = videoID
-        guard isActiveVideoRoute, replyPresentation.isPresented, showThread?.id == target.id,
-              let source = model.currentCommentSource, source == composer.replyCommentSource,
-              source.aid == target.oid, target.type == 1,
-              model.hasCommentSource(for: requestedID) else { return }
-        let navigationRevision = coordinator.contentLinkNavigationRevision
-        let accountRevision = AccountManager.shared.identityRevision
-        commentPresentation.cancelPendingAction()
-        replyPresentation.cancelPendingAction()
-        composer.collapse(motion: motion)
-        replyPresentation.dismissThenPerform {
-            finishCommentThreadDismissal(target.id)
-            commentPresentation.dismissThenPerform {
-                guard isActiveVideoRoute, viewModel === model, videoID == requestedID,
-                      model.currentCommentSource == source, model.hasCommentSource(for: requestedID),
-                      coordinator.contentLinkNavigationRevision == navigationRevision,
-                      AccountManager.shared.identityRevision == accountRevision else { return }
-                coordinator.navigate(to: route)
-            }
-        }
-    }
-
-    private func claimPlayerLeaseIfNeeded() -> PlayerOwnerLease? {
-        guard isActiveVideoRoute else { return nil }
-        if let existing = viewModel.playerLease, player.isCurrentOwner(existing) {
-            return existing
-        }
-        player.endForeignOwnerForRouteActivation(incomingOwner: screenOwner)
-        let lease = player.claimOwnerLease(owner: screenOwner)
-        viewModel.adoptPlayerLease(lease)
-        return lease
-    }
-
-    private func activateIfNeeded(settlesNavigationAdmission: Bool) async {
-        let targetID = videoID
-        defer {
-            if settlesNavigationAdmission {
-                if isActiveVideoRoute {
-                    coordinator.settleVideoNavigation(targetID)
-                } else {
-                    coordinator.cancelVideoNavigation(targetID)
-                }
-            }
-        }
-        guard isActiveVideoRoute, let lease = claimPlayerLeaseIfNeeded() else {
-            if !isActiveVideoRoute {
-                PlayerLog.log("[Navigation] historical VOD route activation ignored")
-            }
-            return
-        }
-        _ = await viewModel.load(id: targetID, owner: screenOwner, lease: lease)
-        await handlePendingCommentNavigationIfNeeded()
-    }
-
-    private func handlePendingCommentNavigationIfNeeded() async {
-        let model = viewModel
-        let requestedID = videoID
-        let sourceGeneration = model.commentSourceGeneration
-        guard isActiveVideoRoute,
-              let request = coordinator.pendingCommentNavigation,
-              request.anchor.videoID == requestedID,
-              model.videoInfo != nil else { return }
-
-        while model.commentsAwaitingInitialResponse,
-              viewModel === model, videoID == requestedID,
-              model.commentSourceGeneration == sourceGeneration,
-              isActiveVideoRoute, !Task.isCancelled {
-            try? await Task.sleep(for: .milliseconds(50))
-        }
-        guard !Task.isCancelled, isActiveVideoRoute, viewModel === model,
-              videoID == requestedID, model.commentSourceGeneration == sourceGeneration,
-              model.hasCommentSource(for: requestedID),
-              coordinator.consumeCommentNavigation(request, for: requestedID) else { return }
-
-        openComments()
-        let anchor = request.anchor
-        let rootRpid = anchor.rootRpid ?? anchor.rpid
-        let location = await model.locateComment(rpid: rootRpid)
-        guard !Task.isCancelled, isActiveVideoRoute, viewModel === model,
-              videoID == requestedID, model.commentSourceGeneration == sourceGeneration,
-              model.hasCommentSource(for: requestedID),
-              model.isCurrentCommentLocation(location) else { return }
-        guard case .found(let intent) = location,
-              let root = model.comments.first(where: { $0.rpid == rootRpid }) else {
-            model.showToast(String(localized: "Comment is unavailable"), style: .error)
-            return
-        }
-        if anchor.isNestedReply {
-            openCommentThread(CommentThreadTarget(
-                oid: intent.receipt.source.aid, type: 1, root: root, highlightRpid: anchor.rpid
-            ))
-        } else {
-            commentTargetRpid = anchor.rpid
-        }
-    }
-
-    private func relatedRouteTarget(_ video: VideoCard) -> VideoRouteTarget {
-        VideoRouteTarget.make(
-            bvid: video.bvid,
-            aid: nil,
-            title: video.title,
-            coverURL: video.pic,
-            mobileCoverURL: video.mobileCoverURL,
-            ownerName: video.owner.name,
-            durationSeconds: video.duration
-        ) ?? VideoRouteTarget(videoID: .bvid(video.bvid))
-    }
-
-    private func recordPageOffsets(_ offsets: [Int: CGFloat]) {
-        pageOffsetStore.offsets.merge(offsets) { _, new in new }
-        updatePlayerCondensation()
-    }
-
-    private func updatePlayerCondensation() {
-        guard !isWideLayout, player.isPortraitContent, !player.isFullscreenPresentationActive,
-              player.ownerKey == screenOwner else { return }
-        if player.portraitCondenseLocked { return }
-        let now = CACurrentMediaTime()
-        guard now - lastCondenseFlipAt > 0.4 else { return }
-        let offset = pageOffsetStore.offsets[commentPresentation.isPresented ? 1 : 0] ?? 0
-        let shouldCondense = PortraitVODCondensationPolicy.shouldAutoCollapse(
-            offset: offset,
-            isCondensed: player.inlineCondensed,
-            hasManualChoice: player.portraitCondenseLocked
-        )
-        guard shouldCondense else { return }
-        lastCondenseFlipAt = now
-        PlayerLog.log(
-            "[condense] auto-collapse "
-            + "offset=\(Int(offset)) threshold=\(Int(PortraitVODCondensationPolicy.collapseThreshold)) "
-            + "condensed=\(player.inlineCondensed)→\(shouldCondense) "
-            + "locked=\(player.portraitCondenseLocked)"
-        )
-        withAnimation(motion.animation(normal: .spring(duration: 0.3))) {
-            player.inlineCondensed = shouldCondense
-        }
-    }
-
-    @ViewBuilder
-    private func unavailableState(_ message: String) -> some View {
-        ContentUnavailableView {
-            Label(
-                viewModel.unavailability != nil
-                    ? String(localized: "Unavailable")
-                    : String(localized: "Couldn't Load"),
-                systemImage: viewModel.unavailability?.symbolName ?? "exclamationmark.triangle"
-            )
-        } description: {
-            Text(message)
-        } actions: {
-            if viewModel.unavailability?.isRetryable ?? true {
-                Button("Retry") {
-                    Task {
-                        await activateIfNeeded(settlesNavigationAdmission: false)
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(accent)
-            }
-        }
-        .padding(.top, 24)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-    }
-
-    private static var wideHeaderSingleRowWidth: CGFloat { 900 }
-    private static var cinematicTextInset: CGFloat { 4 }
-    private static var shelfCardWidth: CGFloat { 280 }
-    private static var panelComposerClearance: CGFloat { 84 }
-    private static var contentBottomPadding: CGFloat { 24 }
-
-    private func wideContent(bottomInset: CGFloat) -> some View {
-        ObservedModel(viewModel) { model in
-            wideContentBody(bottomInset: bottomInset, model: model)
-        }
-    }
-
-    private func wideContentBody(
-        bottomInset: CGFloat, model: VideoDetailViewModel
-    ) -> some View {
-        let geometry = stageGeometry
-        let topInset = DetailStageLayout.contentTopInset(
-            playerHeight: geometry.playerSize.height, presentation: stagePresentation
-        )
-        let isStage = stagePresentation == .stage
-        return CinematicStageColumn(
-            topInset: topInset,
-            fadeGap: DetailStageLayout.contentGap(for: stagePresentation),
-            bottomSpacer: bottomInset + Self.contentBottomPadding
-                + (isStage ? 0 : wideContainerHeight * 0.35),
-            onOffset: handleStageScroll
-        ) {
-            cinematicColumn(
-                model: model, columnWidth: geometry.columnWidth,
-                horizontalInset: stagePresentation == .hero
-                    ? geometry.playerOriginX : Self.cinematicTextInset
-            )
-            .frame(width: geometry.columnWidth, alignment: .leading)
-            .padding(.leading, geometry.columnOriginX)
-        }
-        .frame(maxHeight: .infinity)
-        .ignoresSafeArea(edges: .bottom)
-    }
-
-    @ViewBuilder
-    private func cinematicColumn(
-        model: VideoDetailViewModel,
-        columnWidth: CGFloat,
-        horizontalInset: CGFloat = Self.cinematicTextInset,
-        showsCommentsCapsule: Bool = true,
-        isCompact: Bool = false
-    ) -> some View {
-        let info = model.videoInfo
-        let inset = horizontalInset
-        if info != nil || viewModel.isLoading || viewModel.error == nil {
-            VStack(alignment: .leading, spacing: 18) {
-                if showsHeroBar, let info {
-                    heroBar(info, columnWidth: columnWidth, horizontalInset: inset)
-                    statsLine(info)
-                        .padding(.horizontal, inset)
-                } else {
-                    VStack(alignment: .leading, spacing: 8) {
-                        titleHeader(info: info, horizontalInset: inset)
-                        if let info {
-                            statsLine(info)
-                                .padding(.horizontal, inset)
-                        }
-                    }
-                    if let info {
-                        cinematicCreatorAndActions(
-                            info, columnWidth: columnWidth,
-                            showsCommentsCapsule: showsCommentsCapsule, horizontalInset: inset
-                        )
-                    }
-                }
-
-                if let info {
-                    let hasDesc = !info.desc.isEmpty && info.desc != "-"
-                    if isDescExpanded, hasDesc || !viewModel.tags.isEmpty {
-                        descriptionBlock(info)
-                            .padding(.horizontal, inset)
-                            .transition(motion.transition(normal: .opacity))
-                    }
-                    if let pages = info.pages, pages.count > 1 {
-                        partsSelector(pages, horizontalInset: inset)
-                    }
-                    if isCompact {
-                        hotCommentsPreviewCard(info, model: model)
-                            .padding(.horizontal, inset)
-                    }
-                    if !model.relatedVideos.isEmpty {
-                        if isCompact {
-                            relatedVideosGrid(model: model, columnWidth: columnWidth, horizontalInset: inset)
-                        } else {
-                            UpNextShelf(
-                                title: "Related",
-                                videos: model.relatedVideos,
-                                cardWidth: columnWidth >= Self.compactCapsuleMinimumWidth
-                                    ? Self.shelfCardWidth : Self.phoneShelfCardWidth,
-                                leadingInset: 0,
-                                target: relatedRouteTarget,
-                                clipsContent: true
-                            )
-                            .padding(.horizontal, inset)
-                            .padding(.top, 4)
-                        }
-                    }
-                } else {
-                    ProgressView()
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 12)
-                }
-            }
-        } else if let message = viewModel.error {
-            unavailableState(message)
-        }
-    }
-
-    private func titleHeader(
-        info: VideoInfo?, horizontalInset: CGFloat, fixedLineLimit: Int? = nil
-    ) -> some View {
-        let titleText = info?.title ?? target.preview.title
-        let hasDesc = info.map { !$0.desc.isEmpty && $0.desc != "-" } ?? false
-        let canExpand = info != nil && (hasDesc || !viewModel.tags.isEmpty || !titleText.isEmpty)
-        return HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(titleText)
-                .appFont(.editorialTitle)
-                .fontWeight(.bold)
-                .lineLimit(fixedLineLimit ?? (isDescExpanded ? nil : 2))
-                .multilineTextAlignment(.leading)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            if canExpand {
-                Image(systemName: "chevron.down")
-                    .font(.footnote.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .appDisclosureRotation(isExpanded: isDescExpanded)
-            }
-        }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            guard canExpand else { return }
-            withAnimation(motion.animation(normal: .snappy(duration: 0.22, extraBounce: 0))) {
-                isDescExpanded.toggle()
-            }
-        }
-        .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(canExpand ? .isButton : [])
-        .accessibilityHint(
-            canExpand
-                ? (isDescExpanded ? Text("Show Less") : Text("Show More"))
-                : Text("")
-        )
-        .padding(.horizontal, horizontalInset)
-    }
-
-    @ViewBuilder
-    private func hotCommentsPreviewCard(_ info: VideoInfo, model: VideoDetailViewModel) -> some View {
-        if !model.commentsClosed {
-            CommentZoomSource(anchors: commentPresentation.anchors) {
-                HotCommentsPreviewCard(
-                    comments: Array(model.comments.prefix(2)),
-                    total: info.stat.reply,
-                    isLoading: model.isLoadingComments || model.commentsAwaitingInitialResponse,
-                    isRegularWidth: sizeClass == .regular,
-                    action: openComments
-                )
-            }
-            .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    private func relatedVideosGrid(
-        model: VideoDetailViewModel, columnWidth: CGFloat, horizontalInset: CGFloat
-    ) -> some View {
-        let columnCount = columnWidth >= Self.compactCapsuleMinimumWidth ? 3 : 2
-        let cardColumnWidth = FeedColumnPolicy.columnWidth(
-            availableWidth: max(0, columnWidth - horizontalInset * 2),
-            count: columnCount,
-            spacing: 12
-        )
-        return VStack(alignment: .leading, spacing: 12) {
-            DetailSectionHeader("Related")
-                .padding(.horizontal, horizontalInset)
-            LazyVGrid(
-                columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: columnCount),
-                spacing: 12
-            ) {
-                ForEach(model.relatedVideos) { video in
-                    VideoNavigationButton(target: relatedRouteTarget(video)) {
-                        GridVideoCardView(
-                            title: video.title,
-                            sources: VideoCoverSources(widescreen: video.pic, fourByThree: video.mobileCoverURL),
-                            duration: video.duration,
-                            ownerName: video.owner.name,
-                            viewCount: video.stat.view,
-                            explicitColumnWidth: cardColumnWidth
-                        )
-                        .equatable()
-                    }
-                }
-            }
-            .rowCardColumnWidth(cardColumnWidth)
-            .padding(.horizontal, horizontalInset)
-        }
-        .padding(.top, 4)
-    }
-
-    @ViewBuilder
-    private func cinematicCreatorAndActions(
-        _ info: VideoInfo,
-        columnWidth: CGFloat,
-        showsCommentsCapsule: Bool = true,
-        horizontalInset: CGFloat
-    ) -> some View {
-        if usesCompactPhoneActions {
-            VStack(alignment: .leading, spacing: 12) {
-                ownerRow(info, fillsWidth: true)
-                HStack(spacing: 6) { actionButtons(info, compact: true) }
-            }
-            .padding(.horizontal, horizontalInset)
-        } else if columnWidth >= Self.wideHeaderSingleRowWidth {
-            HStack(spacing: 12) {
-                ownerRow(info, fillsWidth: false)
-                Spacer(minLength: 0)
-                if showsCommentsCapsule { heroCommentsCapsule(info) }
-                HStack(spacing: 8) { actionButtons(info) }
-            }
-            .padding(.horizontal, horizontalInset)
-        } else if columnWidth >= Self.compactCapsuleMinimumWidth {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 12) {
-                    ownerRow(info, fillsWidth: false)
-                    Spacer(minLength: 0)
-                    if showsCommentsCapsule { heroCommentsCapsule(info) }
-                }
-                HStack(spacing: 8) { actionButtons(info) }
-            }
-            .padding(.horizontal, horizontalInset)
-        } else {
-            VStack(alignment: .leading, spacing: 12) {
-                ownerRow(info, fillsWidth: true)
-                    .padding(.horizontal, horizontalInset)
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) { actionButtons(info) }
-                        .padding(.horizontal, horizontalInset)
-                }
-                .scrollClipDisabled()
-            }
-        }
-    }
-
-    private func heroBar(_ info: VideoInfo, columnWidth: CGFloat, horizontalInset: CGFloat) -> some View {
-        CinematicHeroBar {
-            titleHeader(info: info, horizontalInset: 0, fixedLineLimit: 1)
-        } leading: {
-            ownerRow(info, fillsWidth: false)
-        } trailing: {
-            let actions = HStack(spacing: 8) {
-                heroCommentsCapsule(info)
-                actionButtons(info)
-            }
-            if columnWidth >= Self.wideHeaderSingleRowWidth {
-                actions
-            } else {
-                ScrollView(.horizontal, showsIndicators: false) { actions }
-                    .scrollClipDisabled()
-            }
-        }
-        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
-            stageController.updateHeroBarHeight(height)
-        }
-        .padding(.horizontal, horizontalInset)
-    }
-
-    @ViewBuilder
-    private func heroCommentsCapsule(_ info: VideoInfo) -> some View {
-        if stagePresentation == .hero, !viewModel.commentsClosed {
-            Button(action: openComments) {
-                DetailActionButtonLabel {
-                    Image(systemName: "text.bubble")
-                        .font(.body)
-                } caption: {
-                    Text(FormatUtils.viewCount(info.stat.reply))
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                }
-            }
-            .buttonStyle(.appControl)
-            .accessibilityLabel(Text("Comments"))
-            .transition(.opacity)
-        }
-    }
-
-    private func commentReplyRegion<Main: View>(@ViewBuilder root: () -> Main) -> some View {
-        let target = showThread
-        return CommentReplyZoomContainer(
-            presentation: replyPresentation,
-            root: root(),
-            destination: Group {
-                if let target { commentThreadInline(target) }
-            },
-            ownsKeyboardSafeArea: !isWideLayout,
-            onDismissed: { finishCommentThreadDismissal(target?.id) }
-        )
-        .ignoresSafeArea(.container, edges: isWideLayout ? [] : .bottom)
-    }
-
-    private func commentThreadInline(_ target: CommentThreadTarget) -> some View {
-        VStack(spacing: 0) {
-            CommentThreadHeader(
-                isWideLayout: isWideLayout,
-                anchors: replyPresentation.anchors,
-                onBack: closeCommentThread,
-                onClose: closeComments
-            )
-            CommentThreadView(
-                oid: target.oid,
-                rootComment: target.root,
-                highlightRpid: target.highlightRpid,
-                type: target.type,
-                upMid: viewModel.videoInfo?.owner.mid,
-                isStandalonePage: false,
-                onAvatarTap: { mid in
-                    navigateFromCommentThread(to: .userSpace(mid), target: target)
-                }
-            )
-            .id(target.id)
-            .modifier(CommentThreadLinkHandoff { url, context in
-                openCommentThreadURL(url, context: context, target: target)
-            })
-            .contentLinks(isCurrent: {
-                isActiveVideoRoute && replyPresentation.isPresented && showThread?.id == target.id
-                    && composer.replyCommentSource == viewModel.currentCommentSource
-            })
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-    }
-
-    private func wideCommentPanel(
-        model: VideoDetailViewModel,
-        geometry: DetailStageLayout.Geometry
-    ) -> some View {
-        CinematicStagePanel(
-            geometry: geometry,
-            isStage: stagePresentation == .stage,
-            isKeyboardDocked: isKeyboardDocked
-        ) {
-            commentReplyRegion {
-                ZStack(alignment: .top) {
-                    wideCommentList(model: model)
-                        .transaction(value: stagePresentation) { $0.animation = nil }
-                        .allowsHitTesting(showThread == nil)
-                        .accessibilityHidden(showThread != nil)
-                    VideoDetailComposerDismissScrim(
-                        composer: composer,
-                        isActive: stagePresentation == .stage && showThread == nil
-                    )
-                }
-                .overlay(alignment: .bottom) {
-                    commentFeedbackAndComposer(isCompactOverlay: false)
-                }
-            }
-        }
-    }
-
-    private func wideCommentList(model: VideoDetailViewModel) -> some View {
-        let source = model.currentCommentSource
-        let requestedID = videoID
-        let headerView: AnyView? = model.videoInfo != nil ? AnyView(commentSectionHeader) : nil
-        let headerFingerprint = model.videoInfo.map { info in
-            VideoCommentHeaderFingerprint(
-                replyCount: info.stat.reply,
-                commentsClosed: model.commentsClosed,
-                commentSort: model.commentSort,
-                sourceAid: source?.aid,
-                sourceGeneration: source?.generation
-            )
-        }
-        return VideoDetailCommentList(
-            model: model,
-            requestedID: requestedID,
-            highlightedRpid: highlightedCommentRpid,
-            scrollToRpid: commentTargetRpid,
-            headerView: headerView,
-            headerFingerprint: headerFingerprint,
-            showsInitialVideoSkeletons: false,
-            closedTopPadding: 40,
-            bottomClearance: isInlineCommentInputEligible
-                ? max(120, Self.panelComposerClearance) : Self.panelComposerClearance,
-            showsScrollIndicators: false,
-            actions: commentRowActions,
-            unavailableView: nil,
-            unavailableFingerprint: nil,
-            onRefresh: {
-                guard viewModel === model, videoID == requestedID,
-                      model.hasCommentSource(for: requestedID),
-                      let request = model.prepareCommentRefresh(from: source) else { return false }
-                await model.performCommentRequest(request)
-                return false
-            },
-            onScrollOffsetChange: nil
-        )
-        .task(id: commentTargetRpid) {
-            guard let target = commentTargetRpid else { return }
-            setStagePresentation(.stage)
-            highlightedCommentRpid = target
-            try? await Task.sleep(for: .seconds(2))
-            guard !Task.isCancelled, highlightedCommentRpid == target else { return }
-            highlightedCommentRpid = nil
-            commentTargetRpid = nil
-        }
-    }
-
     private func detailsPage(topInset: CGFloat, bottomInset: CGFloat) -> some View {
-        ObservedModel(viewModel) { model in
-            detailsPageBody(topInset: topInset, bottomInset: bottomInset, model: model)
-        }
-    }
-
-    private func detailsPageBody(
-        topInset: CGFloat, bottomInset: CGFloat, model: VideoDetailViewModel
-    ) -> some View {
         ScrollView {
             Color.clear.frame(height: topInset)
-            cinematicColumn(
-                model: model, columnWidth: pageWidth, horizontalInset: 16,
-                showsCommentsCapsule: false, isCompact: true
+            detailColumn(
+                columnWidth: pageWidth,
+                horizontalInset: 16,
+                showsCommentsCapsule: false,
+                isCompact: true
             )
-                .frame(maxWidth: .infinity, alignment: .leading)
-            Color.clear.frame(height: bottomInset + Self.contentBottomPadding)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Color.clear.frame(height: bottomInset + VideoDetailLayoutMetrics.contentBottomPadding)
         }
         .onScrollGeometryChange(for: CGFloat.self) { geometry in
             -(geometry.contentOffset.y + geometry.contentInsets.top)
@@ -1567,742 +508,31 @@ struct VideoDetailView: View {
         .ignoresSafeArea(.container, edges: .bottom)
     }
 
-    private var commentSectionHeader: some View {
-        let model = viewModel
-        let source = model.currentCommentSource
-        return HStack(spacing: 6) {
-            Text("Comments").font(.headline)
-            if let count = model.videoInfo?.stat.reply, count > 0 {
-                Text(FormatUtils.viewCount(count))
-                    .font(.caption)
-                    .fontWeight(.medium)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-            }
-            Spacer(minLength: 8)
-            if !model.commentsClosed {
-                commentSortControl(capturedSource: source)
-            }
-        }
-        .padding(.vertical, 4)
-    }
-
-    private func commentPageHeader(model: VideoDetailViewModel) -> some View {
-        VStack(spacing: 0) {
-            Capsule()
-                .fill(.secondary.opacity(0.6))
-                .frame(width: 36, height: 5)
-                .padding(.top, 8)
-                .padding(.bottom, 4)
-                .accessibilityHidden(true)
-            HStack(alignment: .center, spacing: 8) {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text("Comments")
-                        .appFont(.sectionTitle)
-                        .fontWeight(.semibold)
-                    if let count = model.videoInfo?.stat.reply, count > 0 {
-                        Text(FormatUtils.viewCount(count))
-                            .font(.caption)
-                            .fontWeight(.medium)
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                    }
-                }
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                if !model.commentsClosed {
-                    commentSortControl(capturedSource: model.currentCommentSource)
-                        .background(
-                            CommentZoomRegion(anchors: commentPresentation.anchors, role: .sortControl)
-                                .padding(-4)
-                        )
-                }
-                CommentHeaderCircleButton(
-                    systemName: "xmark",
-                    accessibilityLabel: "Close comments",
-                    anchors: commentPresentation.anchors,
-                    role: .closeControl,
-                    action: closeComments
-                )
-            }
-            .padding(.horizontal, 16)
-            .padding(.bottom, 6)
-            Divider()
-                .opacity(0.35)
-        }
-        .frame(minHeight: 54)
-        .contentShape(Rectangle())
-        .background(CommentZoomRegion(anchors: commentPresentation.anchors, role: .header))
-    }
-
-    private func commentSortControl(
-        capturedSource: VideoDetailViewModel.CommentSource? = nil
+    private func detailColumn(
+        columnWidth: CGFloat,
+        horizontalInset: CGFloat,
+        showsCommentsCapsule: Bool,
+        isCompact: Bool
     ) -> some View {
-        let model = viewModel
-        let source = capturedSource ?? model.currentCommentSource
-        let requestedID = videoID
-        return CommentSortBar(selection: model.commentSort) { sort in
-            guard viewModel === model, videoID == requestedID,
-                  model.hasCommentSource(for: requestedID),
-                  model.currentCommentSource == source,
-                  let request = model.prepareCommentSort(sort, from: source) else { return }
-            Task { await model.performCommentRequest(request) }
-        }
-    }
-
-    private func commentsSurface(bottomInset: CGFloat) -> some View {
-        ObservedModel(viewModel) { model in
-            commentReplyRegion {
-                ZStack(alignment: .top) {
-                    VStack(spacing: 0) {
-                        commentPageHeader(model: model)
-                        commentsPageList(bottomInset: bottomInset, model: model)
-                            .ignoresSafeArea(.container, edges: .bottom)
-                    }
-                    .allowsHitTesting(showThread == nil)
-                    .accessibilityHidden(showThread != nil)
-                    VideoDetailComposerDismissScrim(
-                        composer: composer,
-                        isActive: showThread == nil
-                    )
-                }
-                .overlay(alignment: .bottom) {
-                    commentFeedbackAndComposer(isCompactOverlay: true)
-                }
-            }
-            .background {
-                CommentZoomContentSurface()
-                    .ignoresSafeArea(.container, edges: .bottom)
-                    .ignoresSafeArea(.keyboard, edges: .bottom)
-            }
-        }
-    }
-
-    private func commentsPageList(
-        bottomInset: CGFloat, model: VideoDetailViewModel
-    ) -> some View {
-        let source = model.currentCommentSource
-        let requestedID = videoID
-        let unavailableMessage = (model.videoInfo == nil && !model.isLoading) ? model.error : nil
-        let unavailableFingerprint = unavailableMessage.map { message in
-            VideoUnavailableFingerprint(
-                message: message,
-                symbolName: model.unavailability?.symbolName ?? "exclamationmark.triangle",
-                isRetryable: model.unavailability?.isRetryable ?? true
-            )
-        }
-        return VideoDetailCommentList(
-            model: model,
-            requestedID: requestedID,
-            highlightedRpid: highlightedCommentRpid,
-            scrollToRpid: commentTargetRpid,
-            headerView: nil,
-            headerFingerprint: nil,
-            showsInitialVideoSkeletons: true,
-            closedTopPadding: 60,
-            bottomClearance: (isInlineCommentInputEligible ? 120 : 0)
-                + bottomInset + Self.contentBottomPadding,
-            showsScrollIndicators: true,
-            actions: commentRowActions,
-            unavailableView: unavailableMessage.map { AnyView(unavailableState($0)) },
-            unavailableFingerprint: unavailableFingerprint,
-            onRefresh: {
-                guard viewModel === model, videoID == requestedID,
-                      model.hasCommentSource(for: requestedID),
-                      let request = model.prepareCommentRefresh(from: source) else { return false }
-                await model.performCommentRequest(request)
-                return false
-            },
-            onScrollOffsetChange: { offset in
-                recordPageOffsets([1: offset])
-            }
-        )
-        .task(id: commentTargetRpid) {
-            guard let target = commentTargetRpid else { return }
-            highlightedCommentRpid = target
-            try? await Task.sleep(for: .seconds(2))
-            guard !Task.isCancelled, highlightedCommentRpid == target else { return }
-            highlightedCommentRpid = nil
-            commentTargetRpid = nil
-        }
-    }
-
-    private var commentRowActions: VideoDetailCommentRowActions {
-        VideoDetailCommentRowActions(
-            isRouteActive: { isActiveVideoRoute },
-            currentVideoID: { videoID },
-            reply: { target in
-                composer.beginReply(
-                    to: target,
-                    aid: viewModel.videoInfo?.aid ?? 0,
-                    motion: motion
-                )
-            },
-            openThread: { target in
-                openCommentThread(target)
-            },
-            previewImages: { item in previewImages = item }
-        )
-    }
-
-    @ViewBuilder
-    private var descriptionTags: some View {
-        let tagSource = viewModel.currentTagSource
-        let musicTags = viewModel.tags.filter(\.isMusic)
-        let normalTags = viewModel.tags.filter { !$0.isMusic }
-
-        if !musicTags.isEmpty {
-            VStack(alignment: .leading, spacing: 6) {
-                ForEach(musicTags) { music in
-                    let destination = viewModel.musicDestination(for: music, source: tagSource)
-                    Button {
-                        guard isActiveVideoRoute,
-                              let current = viewModel.musicDestination(for: music, source: tagSource) else { return }
-                        coordinator.contentLinks.cancel()
-                        activeSheet = .music(current)
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "music.note")
-                            Text(music.tagName)
-                                .lineLimit(1)
-                            Spacer(minLength: 4)
-                            if destination != nil {
-                                Image(systemName: "chevron.right")
-                                    .font(.caption2)
-                                    .foregroundStyle(.tertiary)
-                            }
-                        }
-                        .font(.caption)
-                        .foregroundStyle(.biliAccent)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 7)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color.biliAccent.opacity(0.12), in: RoundedRectangle(cornerRadius: AppRadius.thumbnail))
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(destination == nil)
-                }
-            }
-        }
-
-        if !normalTags.isEmpty {
-            FlowLayout(spacing: 8) {
-                ForEach(normalTags) { tag in
-                    Button {
-                        if let jump = tag.jumpUrl, jump.hasPrefix("http"),
-                           let url = URL(string: jump.httpsURL) {
-                            openURL(url)
-                        } else {
-                            coordinator.navigate(to: .search(.all, keyword: tag.tagName))
-                        }
-                    } label: {
-                        Text(tag.tagName)
-                            .font(.caption)
-                            .lineLimit(1)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 7)
-                            .foregroundStyle(.secondary)
-                            .background(AppFill.nested, in: Capsule())
-                            .frame(minHeight: 36)
-                            .contentShape(.interaction, Capsule().inset(by: -4))
-                    }
-                    .buttonStyle(.appControl)
-                }
-            }
-        }
-    }
-
-    private func revealAcceptedComment(
-        _ postedRpid: Int,
-        replyingTo target: CommentResult.CommentItem?,
-        model: VideoDetailViewModel,
-        sourceIsCurrent: () -> Bool
-    ) {
-        guard sourceIsCurrent(), isActiveVideoRoute,
-              let source = model.currentCommentSource else { return }
-        openComments()
-        if let target {
-            let root = model.comments.first(where: { $0.rpid == target.rpid }) ?? target
-            openCommentThread(CommentThreadTarget(
-                oid: source.aid, type: 1, root: root, highlightRpid: postedRpid
-            ))
-        } else if model.comments.contains(where: { $0.rpid == postedRpid }) {
-            commentTargetRpid = postedRpid
-        }
-    }
-}
-
-private struct CommentThreadLinkHandoff: ViewModifier {
-    @Environment(\.contentLinkContext) private var context
-    @Environment(\.openURL) private var upstream
-    let open: @MainActor (URL, ContentLinkContext) -> OpenURLAction.Result
-
-    func body(content: Content) -> some View {
-        content
-            .environment(\.contentLinkDefersToParent, true)
-            .environment(\.openURL, OpenURLAction { url in
-                if BiliURLParser.handlesContent(url) {
-                    guard let context else { return .discarded }
-                    return open(url, context)
-                }
-                upstream(url)
-                return .handled
-            })
-    }
-}
-
-private struct FavoriteFolderSheet: View {
-    let folders: [FavFolderListResult.FavFolder]
-    @State var selection: Set<Int>
-    let onConfirm: (Set<Int>) -> Void
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        accentedBody.accentContentBoundary()
-    }
-
-    @ViewBuilder private var accentedBody: some View {
-        NavigationStack {
-            List(folders) { folder in
-                Button {
-                    if selection.contains(folder.id) {
-                        selection.remove(folder.id)
-                    } else {
-                        selection.insert(folder.id)
-                    }
-                } label: {
-                    HStack(spacing: 12) {
-                        FolderIconView(size: 36)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(folder.title)
-                                .foregroundStyle(.primary)
-                            if let count = folder.mediaCount {
-                                Text("\(count) items")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        Spacer()
-                        Image(systemName: selection.contains(folder.id) ? "checkmark.circle.fill" : "circle")
-                            .font(.title3)
-                            .foregroundStyle(selection.contains(folder.id)
-                                ? AnyShapeStyle(.biliAccent)
-                                : AnyShapeStyle(.quaternary))
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-            .navigationTitle("Add to Favorites")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") {
-                        onConfirm(selection)
-                        dismiss()
-                    }
-                    .fontWeight(.semibold)
-                }
-            }
-            .overlay {
-                if folders.isEmpty {
-                    ContentUnavailableView(
-                        "No Folders",
-                        systemImage: "folder.badge.questionmark",
-                        description: Text("Could not load your favorite folders. Check the log for details.")
-                    )
-                }
-            }
-        }
-        .appAdaptiveSheet(padSizing: .form)
-    }
-}
-
-private struct DownloadQualityPresentation: Identifiable {
-    let id = UUID()
-    let info: VideoInfo
-    let cid: Int
-    let qualities: [DownloadQualityOption]
-}
-
-private struct DownloadQualitySheet: View {
-    let qualities: [DownloadQualityOption]
-    let onSelect: (Int) -> Void
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        accentedBody.accentContentBoundary()
-    }
-
-    @ViewBuilder private var accentedBody: some View {
-        NavigationStack {
-            List {
-                ForEach(qualities, id: \.code) { quality in
-                    Button {
-                        onSelect(quality.code)
-                    } label: {
-                        HStack {
-                            Text(quality.label)
-                            Spacer()
-                            if let bytes = quality.estimatedBytes {
-                                Text(DownloadStoragePolicy.byteLabel(bytes))
-                                    .foregroundStyle(.secondary)
-                                    .monospacedDigit()
-                            }
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .navigationTitle("Download Quality")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
-                }
-            }
-        }
-    }
-}
-
-private struct VideoReportSheet: View {
-    let aid: Int
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        accentedBody.accentContentBoundary()
-    }
-
-    @ViewBuilder private var accentedBody: some View {
-        NavigationStack {
-            AuthedBiliWebView(url: URL(string: "https://www.bilibili.com/appeal/?avid=\(aid)")!)
-                .ignoresSafeArea(edges: .bottom)
-                .navigationTitle("Report Video")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button("Done") { dismiss() }
-                    }
-                }
-        }
-        .appAdaptiveSheet(compactDetents: [.large], padSizing: .page)
-    }
-}
-
-// MARK: - Comment list
-
-private struct VideoDetailCommentRowActions {
-    let isRouteActive: () -> Bool
-    let currentVideoID: () -> VideoID
-    let reply: (CommentResult.CommentItem) -> Void
-    let openThread: (CommentThreadTarget) -> Void
-    let previewImages: (ImagePreviewItem) -> Void
-}
-
-private struct VideoCommentHeaderFingerprint: Hashable, Sendable {
-    let replyCount: Int?
-    let commentsClosed: Bool
-    let commentSort: CommentSort
-    let sourceAid: Int?
-    let sourceGeneration: UInt64?
-}
-
-private struct VideoUnavailableFingerprint: Hashable, Sendable {
-    let message: String
-    let symbolName: String
-    let isRetryable: Bool
-}
-
-private struct VideoCommentRowFingerprint: Hashable, Sendable {
-    let upMid: Int?
-    let receiptSourceAid: Int?
-    let receiptSourceGeneration: UInt64?
-    let receiptSort: CommentSort?
-    let receiptLineage: UUID?
-    let requestedID: VideoID
-}
-
-private enum VideoCommentFooterFingerprint: Hashable, Sendable {
-    case unavailable(VideoUnavailableFingerprint)
-    case closed(topPadding: CGFloat)
-    case feedback(
-        hasLoaded: Bool,
-        failureCode: Int?,
-        isLoading: Bool,
-        isEmpty: Bool,
-        hasMore: Bool,
-        sourceAid: Int?,
-        sourceGeneration: UInt64?,
-        receiptLineage: UUID?
-    )
-
-    static func failureCode(_ failure: CommentLoadFeedback.Failure?) -> Int? {
-        switch failure {
-        case nil: nil
-        case .initial: 0
-        case .refresh: 1
-        case .pagination: 2
-        }
-    }
-}
-
-private struct VideoDetailCommentList: View {
-    let model: VideoDetailViewModel
-    let requestedID: VideoID
-    let highlightedRpid: Int?
-    let scrollToRpid: Int?
-    let headerView: AnyView?
-    let headerFingerprint: VideoCommentHeaderFingerprint?
-    let showsInitialVideoSkeletons: Bool
-    let closedTopPadding: CGFloat
-    let bottomClearance: CGFloat
-    let showsScrollIndicators: Bool
-    let actions: VideoDetailCommentRowActions
-    let unavailableView: AnyView?
-    let unavailableFingerprint: VideoUnavailableFingerprint?
-    let onRefresh: @MainActor () async -> Bool
-    let onScrollOffsetChange: ((CGFloat) -> Void)?
-
-    var body: some View {
-        let receipt = model.commentListReceipt
-        let receiptSource = receipt?.source
-        let commentLinkIsCurrent: @MainActor @Sendable () -> Bool = {
-            actions.isRouteActive()
-                && actions.currentVideoID() == requestedID
-                && receiptSource != nil
-                && model.hasCommentSource(for: requestedID)
-                && model.currentCommentSource == receiptSource
-        }
-        let footer = resolvedFooter(receipt: receipt)
-        let currentComments = model.comments
-        let visibleComments = CommentAIFilterEngine.shared.visibleComments(
-            from: currentComments,
-            upMid: model.videoInfo?.owner.mid
-        )
-        UIKitCommentFeedCollectionView(
-            headerItems: headerItems,
-            items: commentItems(visibleComments, receipt: receipt),
-            footerContent: footer.content,
-            footerFingerprint: footer.fingerprint,
-            skeletonCount: resolvedSkeletonCount,
-            highlightedItemID: highlightedRpid.map { AnyHashableSendable($0) },
-            scrollToItemID: scrollToRpid.map { AnyHashableSendable($0) },
-            showsItemDividers: true,
-            dividerLeadingInset: 48,
-            itemSpacing: AppSpacing.l,
-            headerSpacing: AppSpacing.l,
-            horizontalInset: AppSpacing.l,
-            topInset: headerView != nil ? AppSpacing.s : AppSpacing.l,
-            maxContentWidth: nil,
-            bottomClearance: bottomClearance,
-            ignoresBottomSafeArea: false,
-            showsScrollIndicators: showsScrollIndicators,
-            keyboardDismissMode: .onDrag,
-            thresholdOffset: 4,
-            onRefresh: onRefresh,
-            onScrollOffsetChange: onScrollOffsetChange,
-            onWillDisplayItemAt: { index in
-                triggerPagination(
-                    at: index,
-                    in: visibleComments,
-                    unfilteredCount: currentComments.count,
-                    receipt: receipt
-                )
-            }
-        )
-        .contentLinks(presentsFeedback: false, handlesURLs: true, isCurrent: commentLinkIsCurrent)
-    }
-
-    private var headerItems: [UIKitCommentFeedItem] {
-        guard let headerView, let headerFingerprint else { return [] }
-        return [
-            UIKitCommentFeedItem(
-                id: "video-comment-header",
-                fingerprint: headerFingerprint,
-                content: { headerView }
-            )
-        ]
-    }
-
-    private var isCommentAreaOpen: Bool {
-        model.videoInfo != nil && !model.commentsClosed
-    }
-
-    private var isEmptyInitialCommentLoad: Bool {
-        if model.videoInfo == nil {
-            return showsInitialVideoSkeletons && unavailableView == nil
-        }
-        return !model.commentsClosed
-            && model.comments.isEmpty
-            && (model.isLoadingComments || model.commentsAwaitingInitialResponse)
-    }
-
-    private var resolvedSkeletonCount: Int {
-        isEmptyInitialCommentLoad ? 6 : 0
-    }
-
-    private func commentItems(
-        _ comments: [CommentResult.CommentItem],
-        receipt: VideoDetailViewModel.CommentListReceipt?
-    ) -> [UIKitCommentFeedItem] {
-        guard isCommentAreaOpen else { return [] }
-        let upMid = model.videoInfo?.owner.mid
-        let extra = AnyHashableSendable(VideoCommentRowFingerprint(
-            upMid: upMid,
-            receiptSourceAid: receipt?.source.aid,
-            receiptSourceGeneration: receipt?.source.generation,
-            receiptSort: receipt?.sort,
-            receiptLineage: receipt?.lineage,
-            requestedID: requestedID
-        ))
-        return comments.map { comment in
-            UIKitCommentFeedItem(comment: comment, extraFingerprint: extra) {
-                VideoDetailCommentRow(
-                    comment: comment,
-                    upMid: upMid,
-                    receipt: receipt,
-                    requestedID: requestedID,
-                    model: model,
-                    actions: actions
-                )
-                .equatable()
-            }
-        }
-    }
-
-    private func resolvedFooter(
-        receipt: VideoDetailViewModel.CommentListReceipt?
-    ) -> (content: AnyView?, fingerprint: AnyHashableSendable?) {
-        if let unavailableView, let unavailableFingerprint, model.videoInfo == nil {
-            return (
-                unavailableView,
-                AnyHashableSendable(VideoCommentFooterFingerprint.unavailable(unavailableFingerprint))
-            )
-        }
-        guard model.videoInfo != nil else { return (nil, nil) }
-        if model.commentsClosed {
-            let view = ContentUnavailableView(
-                "Comments are turned off",
-                systemImage: "exclamationmark.bubble"
-            )
-            .padding(.top, closedTopPadding)
-            return (
-                AnyView(view),
-                AnyHashableSendable(VideoCommentFooterFingerprint.closed(topPadding: closedTopPadding))
-            )
-        }
-        if isEmptyInitialCommentLoad { return (nil, nil) }
-        let source = model.currentCommentSource
-        let isLoading = model.isLoadingComments || model.commentsAwaitingInitialResponse
-        let hasMore = model.commentsHaveMore
-        if !isLoading, model.commentFeedback.failure == nil, !model.comments.isEmpty, !hasMore {
-            return (nil, nil)
-        }
-        let feedbackView = CommentLoadFeedbackView(
-            feedback: model.commentFeedback,
-            isLoading: isLoading,
-            isEmpty: model.comments.isEmpty,
-            hasMore: hasMore
-        ) {
-            guard actions.currentVideoID() == requestedID,
-                  model.hasCommentSource(for: requestedID),
-                  model.currentCommentSource == source else { return }
-            let request = model.commentFeedback.failure == .pagination
-                ? model.prepareMoreComments(from: receipt) : model.prepareCommentRefresh(from: source)
-            if let request { Task { await model.performCommentRequest(request) } }
-        }
-        let fingerprint = VideoCommentFooterFingerprint.feedback(
-            hasLoaded: model.commentFeedback.hasLoaded,
-            failureCode: VideoCommentFooterFingerprint.failureCode(model.commentFeedback.failure),
-            isLoading: isLoading,
-            isEmpty: model.comments.isEmpty,
-            hasMore: hasMore,
-            sourceAid: source?.aid,
-            sourceGeneration: source?.generation,
-            receiptLineage: receipt?.lineage
-        )
-        return (AnyView(feedbackView), AnyHashableSendable(fingerprint))
-    }
-
-    private func triggerPagination(
-        at index: Int,
-        in comments: [CommentResult.CommentItem],
-        unfilteredCount: Int,
-        receipt: VideoDetailViewModel.CommentListReceipt?
-    ) {
-        let receiptSource = receipt?.source
-        guard actions.isRouteActive(),
-              actions.currentVideoID() == requestedID,
-              receiptSource != nil,
-              model.hasCommentSource(for: requestedID),
-              model.currentCommentSource == receiptSource,
-              comments.indices.contains(index) else { return }
-        let appearingRpid = comments.count < unfilteredCount ? nil : comments[index].rpid
-        guard let request = model.prepareMoreComments(
-            from: receipt, appearingRpid: appearingRpid
-        ) else { return }
-        Task { await model.performCommentRequest(request) }
-    }
-}
-
-private struct VideoDetailCommentRow: View, Equatable {
-    let comment: CommentResult.CommentItem
-    let upMid: Int?
-    let receipt: VideoDetailViewModel.CommentListReceipt?
-    let requestedID: VideoID
-    let model: VideoDetailViewModel
-    let actions: VideoDetailCommentRowActions
-
-    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.comment.rpid == rhs.comment.rpid
-            && lhs.upMid == rhs.upMid
-            && lhs.receipt == rhs.receipt
-            && lhs.requestedID == rhs.requestedID
-    }
-
-    var body: some View {
-        let model = model
-        let source = receipt?.source
-        let requestedID = requestedID
-        let actions = actions
-        let comment = comment
-        let sourceIsCurrent: @MainActor @Sendable () -> Bool = {
-            actions.isRouteActive()
-                && actions.currentVideoID() == requestedID && source != nil
-                && model.hasCommentSource(for: requestedID)
-                && model.currentCommentSource == source
-        }
-        let actionIsCurrent: @MainActor @Sendable () -> Bool = { sourceIsCurrent() }
-        CommentRowView(
-            comment: comment,
-            upMid: upMid,
-            onReply: { target in
-                guard actionIsCurrent() else { return }
-                actions.reply(target)
-            },
-            onViewThread: { root in
-                guard actionIsCurrent() else { return }
-                let target = CommentThreadTarget(oid: source?.aid ?? 0, type: 1, root: root)
-                actions.openThread(target)
-            },
-            onOpenReply: { root, rpid in
-                guard actionIsCurrent() else { return }
-                let target = CommentThreadTarget(oid: source?.aid ?? 0, type: 1, root: root, highlightRpid: rpid)
-                actions.openThread(target)
-            },
-            onImageTap: { item in
-                guard actionIsCurrent() else { return }
-                actions.previewImages(item)
-            },
-            onDelete: {
-                guard sourceIsCurrent() else { return }
-                model.removeComment(rpid: comment.rpid)
-                model.showToast(String(localized: "Comment deleted"), style: .success)
-            }
+        VideoDetailColumnView(
+            model: viewModel,
+            previewTitle: target.preview.title,
+            columnWidth: columnWidth,
+            horizontalInset: horizontalInset,
+            showsHeroBar: showsHeroBar,
+            showsCommentsCapsule: showsCommentsCapsule,
+            stagePresentation: stagePresentation,
+            isCompact: isCompact,
+            usesCompactPhoneActions: usesCompactPhoneActions,
+            isActiveVideoRoute: isActiveVideoRoute,
+            favoriteRequestInFlight: favoriteRequestInFlight,
+            commentPresentation: commentPresentation,
+            onHeroBarHeightChange: { height in stageController.updateHeroBarHeight(height) },
+            onOpenComments: openComments,
+            onPresentFavorite: { activeSheet = .favorite },
+            onShareCard: prepareShareCard,
+            onSelectMusic: { activeSheet = .music($0) },
+            onRetry: { Task { await activateIfNeeded(settlesNavigationAdmission: false) } }
         )
     }
 }

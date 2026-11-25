@@ -152,9 +152,7 @@ final class AudioNativeOutputBinding {
     private var nativeIsRunning: (@MainActor () -> Bool)?
     private var onInvalidation: (@MainActor () -> Void)?
     var reportsRunning: Bool {
-        let runningSpan = UIHitchMonitor.beginSpan("audio.running")
-        defer { UIHitchMonitor.endSpan(runningSpan) }
-        return nativeIsRunning?() ?? false
+        nativeIsRunning?() ?? false
     }
     var hasUnresolvedConfiguration: Bool {
         (revision?.current ?? 0) != (preparedStamp?.revision ?? 0)

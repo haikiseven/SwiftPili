@@ -467,8 +467,6 @@ final class EngineAudioRenderer: MediaAudioRendering {
     private(set) var timePitchResetCount = 0
 
     var presentationTiming: MediaAudioPresentationTiming {
-        let timingSpan = UIHitchMonitor.beginSpan("audio.timing")
-        defer { UIHitchMonitor.endSpan(timingSpan) }
         if knownOutputAvailability == .fillOnly {
             cachedOutputLatency = nil
             return .logical
@@ -492,9 +490,7 @@ final class EngineAudioRenderer: MediaAudioRendering {
                 outputLatency: cached.seconds, processingLatency: processing, appliedRate: rate
             )
         }
-        let latencySpan = UIHitchMonitor.beginSpan("audio.latency")
         let outputLatency = sourceNode.outputPresentationLatency
-        UIHitchMonitor.endSpan(latencySpan)
         guard nativeOutput.isCurrent(stamp), canSamplePresentationTiming,
               self.engine === engine, self.sourceNode === sourceNode,
               sourceNode.engine === engine, appliedOutputRate == rate else {
@@ -2365,14 +2361,12 @@ final class EngineAudioRenderer: MediaAudioRendering {
     }
 
     private func stop(preserveCommittedContent: Bool) {
-        let costSpan = UIHitchMonitor.beginSpan("audio.stop")
-        defer { UIHitchMonitor.endSpan(costSpan) }
         defer { noteOutputStateChange() }
         revokeAudioMaintenancePermission()
         equalizerHistoryDirty = true
         drainReportTask?.cancel()
         drainReportTask = nil
-        UIHitchMonitor.measureCounted("audio.stop.feeder") { retireFeeder() }
+        retireFeeder()
         mixerRampTask?.cancel()
         mixerRampTask = nil
         softTransitionActions.removeAll()
@@ -2383,10 +2377,8 @@ final class EngineAudioRenderer: MediaAudioRendering {
                 if preserveCommittedContent, eng.isRunning, eng.mainMixerNode.outputVolume > 0.000_1 {
                     enqueueHardwareStop(eng, detaching: [], rampDown: true)
                 } else {
-                    UIHitchMonitor.measureCounted("audio.stop.native") {
-                        eng.mainMixerNode.outputVolume = 0
-                        if eng.isRunning { eng.stop() }
-                    }
+                    eng.mainMixerNode.outputVolume = 0
+                    if eng.isRunning { eng.stop() }
                 }
             } else {
                 enqueueHardwareStop(eng, detaching: [])
@@ -2649,8 +2641,6 @@ final class EngineAudioRenderer: MediaAudioRendering {
     }
 
     func reportDrain() {
-        let drainSpan = UIHitchMonitor.beginSpan("tick.drain")
-        defer { UIHitchMonitor.endSpan(drainSpan) }
         if pullSource != nil, isRunning, !isSeekOutputGated {
             consumeSourceUnderflows()
         }
@@ -2661,10 +2651,8 @@ final class EngineAudioRenderer: MediaAudioRendering {
            timePitchProcessingLatencySeconds <= 0 {
             refreshTimePitchProcessingLatency()
         }
-        let nativeSpan = UIHitchMonitor.beginSpan("drain.native")
         refreshEqualizerLatency()
         sampleNativeOutputAvailability()
-        UIHitchMonitor.endSpan(nativeSpan)
         switch AudioHardwareStartAdmission.drainTickAction(
             startPending: hardwareStart.isPending,
             engineStarted: engineStarted,
