@@ -28,7 +28,6 @@ struct VideoEnhancementSettingsView: View {
             interpolationSection
 
             Section {
-                capabilityRow("VideoToolbox ML", status: capabilities.videoToolboxML)
                 capabilityRow("MetalFX Spatial", status: capabilities.metalFXSpatial)
                 capabilityRow("Frame Interpolation", status: capabilities.frameInterpolation)
             } header: {
@@ -46,31 +45,21 @@ struct VideoEnhancementSettingsView: View {
 
     private var superResolutionSection: some View {
         Section {
-            Picker(selection: binding(\.videoEnhancementDefaultSRMode, experiments.setVideoEnhancementDefaultSRMode)) {
-                ForEach(VideoSuperResolutionMode.allCases) { mode in
-                    Text(mode.settingsLabel).tag(mode)
+            Toggle(isOn: Binding(
+                get: { experiments.videoEnhancementDefaultSRMode == .metalFXSpatial },
+                set: { enabled in
+                    guard canMutate else { return }
+                    _ = experiments.setVideoEnhancementDefaultSRMode(enabled ? .metalFXSpatial : .off)
                 }
-            } label: {
-                Text("Default Super Resolution")
+            )) {
+                Label {
+                    Text("Default Super Resolution")
+                } icon: {
+                    SettingsIcon(symbol: "sparkles.tv")
+                }
             }
-            .pickerStyle(.inline)
-            .labelsHidden()
 
-            switch experiments.videoEnhancementDefaultSRMode {
-            case .off:
-                EmptyView()
-            case .videoToolboxML:
-                Picker(
-                    "Maximum Scale",
-                    selection: binding(\.videoEnhancementDefaultScale, experiments.setVideoEnhancementDefaultScale)
-                ) {
-                    ForEach(VideoSuperResolutionScale.allCases) { scale in
-                        Text(scale.label).tag(scale)
-                    }
-                }
-                .pickerStyle(.menu)
-                .menuOrder(.fixed)
-            case .metalFXSpatial:
+            if experiments.videoEnhancementDefaultSRMode == .metalFXSpatial {
                 VideoEnhancementTargetResolutionControls(
                     targetResolution: experiments.videoEnhancementDefaultTargetResolution,
                     isDisabled: false
@@ -122,8 +111,8 @@ struct VideoEnhancementSettingsView: View {
             Text(
                 """
                 Applies to SDR Demand VOD streams within the max input resolution. \
-                VideoToolbox ML uses native scale factors; MetalFX Spatial supports manual target resolution, \
-                which overrides Limit to Screen Resolution. High temperatures pause enhancement.
+                MetalFX Spatial supports manual target resolution, which overrides Limit to Screen Resolution. \
+                High temperatures pause enhancement.
                 """
             )
         }
@@ -144,13 +133,16 @@ struct VideoEnhancementSettingsView: View {
                 }
             }
 
-            VideoEnhancementTargetFPSControls(
-                rate: experiments.videoEnhancementDefaultRate,
-                isDisabled: false
-            ) { rate in
-                guard canMutate else { return }
-                _ = experiments.setVideoEnhancementDefaultRate(rate)
+            Picker(
+                "Target Frame Rate",
+                selection: binding(\.videoEnhancementDefaultRate, experiments.setVideoEnhancementDefaultRate)
+            ) {
+                ForEach(VideoInterpolationRate.allCases) { rate in
+                    Text(rate.label).tag(rate)
+                }
             }
+            .pickerStyle(.menu)
+            .menuOrder(.fixed)
         } header: {
             Text("Frame Interpolation")
         } footer: {

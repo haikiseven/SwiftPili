@@ -77,6 +77,7 @@ extension PlayerViewModel {
             superResolutionScale: videoSuperResolutionScale,
             superResolutionTargetResolution: videoSuperResolutionTargetResolution,
             superResolutionSharpness: videoSuperResolutionSharpness,
+            superResolutionSplitCompare: videoSuperResolutionMode == .metalFXSpatial && videoSuperResolutionSplitCompare,
             maxInputResolution: videoEnhancementMaxInputResolution,
             isLiveStream: mode == .live,
             limitToScreenResolution: ExperimentalSettingsStore.shared.videoEnhancementLimitToScreen
@@ -87,6 +88,9 @@ extension PlayerViewModel {
         guard ExperimentalSettingsStore.shared.isAllowed(.videoEnhancement) else { return }
         guard videoSuperResolutionMode != mode else { return }
         videoSuperResolutionMode = mode
+        if mode == .off {
+            videoSuperResolutionSplitCompare = false
+        }
         syncVideoEnhancementToBackend()
     }
 
@@ -126,6 +130,14 @@ extension PlayerViewModel {
               isVideoEnhancementEligibleForStream, videoSuperResolutionMode == .metalFXSpatial,
               videoSuperResolutionSharpness != sharpness else { return }
         videoSuperResolutionSharpness = sharpness
+        syncVideoEnhancementToBackend()
+    }
+
+    func setVideoSuperResolutionSplitCompare(_ enabled: Bool) {
+        guard ExperimentalSettingsStore.shared.isAllowed(.videoEnhancement),
+              isVideoEnhancementEligibleForStream, videoSuperResolutionMode == .metalFXSpatial,
+              videoSuperResolutionSplitCompare != enabled else { return }
+        videoSuperResolutionSplitCompare = enabled
         syncVideoEnhancementToBackend()
     }
 
@@ -173,6 +185,7 @@ extension PlayerViewModel {
         appliedVideoEnhancementDefaults = defaults
         if !defaults.allowed {
             videoSuperResolutionMode = .off
+            videoSuperResolutionSplitCompare = false
             videoFrameInterpolationEnabled = false
         } else if !previous.allowed {
             videoSuperResolutionMode = defaults.superResolutionMode

@@ -216,8 +216,6 @@ struct VideoEnhancementDisplaySurface: Equatable, Sendable {
         case .off: return nil
         // MetalFX supports arbitrary output sizes; match the screen.
         case .metalFXSpatial: return min(requested, magnification)
-        // VT only offers native factors (≥ 2×); allow the smallest one when the screen is between.
-        case .videoToolboxML: return min(requested, max(2, magnification))
         }
     }
 }

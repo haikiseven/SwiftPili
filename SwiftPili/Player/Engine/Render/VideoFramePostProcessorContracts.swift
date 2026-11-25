@@ -1,20 +1,138 @@
 import CoreMedia
 import CoreVideo
 import Foundation
-#if !targetEnvironment(simulator)
-import VideoToolbox
-#endif
+import os
 
-/// Fixed, memory-pressure-aware output pool limits and steady presentation lookahead.
+/// Dynamic, lead-matched, memory-pressure-aware output pool limits and steady presentation lookahead.
 enum VideoEnhancementPoolLimits {
-    static let defaultLead: TimeInterval = 0.35
+    struct Sizing: Equatable, Sendable {
+        let lead: TimeInterval
+        let superResolutionFrames: Int
+        let interpolationPairsPerPhase: Int
+
+        func interpolationFrames(phaseCount: Int) -> Int {
+            max(1, phaseCount) * interpolationPairsPerPhase
+        }
+    }
+
+    static let defaultLead: TimeInterval = 0.24
+
+    private struct State: Equatable, Sendable {
+        var roundedSourceFPS: Int = 30
+        var roundedOutputFPS: Int = 60
+        var maxPhasesPerPair: Int = 1
+        var underMemoryPressure: Bool = false
+        var sizing: Sizing = VideoEnhancementPoolLimits.computeSizing(
+            sourceFPS: 30,
+            outputFPS: 60,
+            maxPhasesPerPair: 1,
+            underMemoryPressure: false
+        )
+    }
+
+    private static let state = OSAllocatedUnfairLock(initialState: State())
+
+    static func computeSizing(
+        sourceFPS: Double,
+        outputFPS: Double,
+        maxPhasesPerPair: Int,
+        underMemoryPressure: Bool
+    ) -> Sizing {
+        let safeSourceFPS = (sourceFPS.isFinite && sourceFPS > 0) ? min(max(sourceFPS, 1), 240) : 30
+        let safeOutputFPS = (outputFPS.isFinite && outputFPS > 0)
+            ? min(max(outputFPS, safeSourceFPS), 240)
+            : safeSourceFPS
+        let safePhases = max(0, min(maxPhasesPerPair, VideoFrameInterpolationPlan.maximumPhasesPerPair))
+
+        let lead: TimeInterval
+        if underMemoryPressure {
+            lead = 0.14
+        } else if safeOutputFPS > 70 {
+            lead = 0.20
+        } else {
+            lead = 0.24
+        }
+
+        let srFrames: Int
+        let interpPairs: Int
+        if underMemoryPressure {
+            srFrames = min(26, max(8, Int(ceil((lead + 0.08) * safeOutputFPS)) + 2 * safePhases + 3))
+            interpPairs = min(12, max(5, Int(ceil((lead + 0.08) * safeSourceFPS)) + 4))
+        } else {
+            srFrames = min(56, max(12, Int(ceil((lead + 0.10) * safeOutputFPS)) + 2 * safePhases + 4))
+            interpPairs = min(20, max(8, Int(ceil((lead + 0.10) * safeSourceFPS)) + 5))
+        }
+
+        return Sizing(
+            lead: lead,
+            superResolutionFrames: srFrames,
+            interpolationPairsPerPhase: interpPairs
+        )
+    }
+
+    static func configure(
+        sourceFPS: Double,
+        outputFPS: Double,
+        maxPhasesPerPair: Int,
+        underMemoryPressure: Bool = VideoEnhancementGuardrails.isUnderMemoryPressure
+    ) {
+        let safeSourceFPS = (sourceFPS.isFinite && sourceFPS > 0) ? min(max(sourceFPS, 1), 240) : 30
+        let safeOutputFPS = (outputFPS.isFinite && outputFPS > 0)
+            ? min(max(outputFPS, safeSourceFPS), 240)
+            : safeSourceFPS
+        let roundedSource = Int(safeSourceFPS.rounded())
+        let roundedOutput = Int(safeOutputFPS.rounded())
+        let safePhases = max(0, min(maxPhasesPerPair, VideoFrameInterpolationPlan.maximumPhasesPerPair))
+
+        state.withLock { current in
+            guard current.roundedSourceFPS != roundedSource
+                || current.roundedOutputFPS != roundedOutput
+                || current.maxPhasesPerPair != safePhases
+                || current.underMemoryPressure != underMemoryPressure else {
+                return
+            }
+            current.roundedSourceFPS = roundedSource
+            current.roundedOutputFPS = roundedOutput
+            current.maxPhasesPerPair = safePhases
+            current.underMemoryPressure = underMemoryPressure
+            current.sizing = computeSizing(
+                sourceFPS: Double(roundedSource),
+                outputFPS: Double(roundedOutput),
+                maxPhasesPerPair: safePhases,
+                underMemoryPressure: underMemoryPressure
+            )
+        }
+    }
+
+    static func reset() {
+        state.withLock { $0 = State() }
+    }
+
+    private static func currentSizing() -> Sizing {
+        let livePressure = VideoEnhancementGuardrails.isUnderMemoryPressure
+        return state.withLock { current in
+            if livePressure, !current.underMemoryPressure {
+                return computeSizing(
+                    sourceFPS: Double(current.roundedSourceFPS),
+                    outputFPS: Double(current.roundedOutputFPS),
+                    maxPhasesPerPair: current.maxPhasesPerPair,
+                    underMemoryPressure: true
+                )
+            }
+            return current.sizing
+        }
+    }
+
+    static var currentLead: TimeInterval {
+        currentSizing().lead
+    }
 
     static var superResolutionFrames: Int {
-        VideoEnhancementGuardrails.isUnderMemoryPressure ? 6 : 12
+        currentSizing().superResolutionFrames
     }
 
     static func interpolationFrames(phaseCount: Int) -> Int {
-        max(1, phaseCount) * (VideoEnhancementGuardrails.isUnderMemoryPressure ? 3 : 5)
+        currentSizing().interpolationFrames(phaseCount: phaseCount)
     }
 }
 
@@ -258,8 +376,10 @@ struct VideoFrameInterpolationPlan: Sendable {
     /// Relative tolerance for taking the exact integer fast path (2×/3×/4×/5×), keeping all
     /// original frames and using low-latency LLFI for 2×/4× (e.g. 29.97/30→60, 23.976/24→48/96).
     static let exactIntegerTolerance: Double = 0.012
-    /// Small relative interval tolerance covering 1 ms container PTS quantization (used by dyadic fallback).
-    static let jitterFactor: Double = 1.0165
+    /// Widened relative headroom for dyadic LLFI multipliers so slightly-above-nominal 30.x fps
+    /// and VFR streams (up to ~33 fps for 60 fps 2× / 120 fps 4×, and ~66 fps for 120 fps 2×)
+    /// stay cleanly on hardware-fast LLFI instead of bypassing or ping-ponging multipliers.
+    static let dyadicHeadroom: Double = 1.10
 
     let phases: [Float]
     let pts: [TimeInterval]
@@ -275,18 +395,15 @@ struct VideoFrameInterpolationPlan: Sendable {
     /// Nominal output frame rate produced by this plan.
     let targetOutputFPS: Double
 
-    /// Whether the active interpolation backend supports arbitrary phases in `(0, 1)` (used for
-    /// 3×/5× integer multiples as well as non-integer CFR resampling such as 24/30.6/40/50→60 fps).
+    /// Whether the active interpolation backend supports arbitrary phases in `(0, 1)`.
+    /// On iOS 26+, interpolation is strictly locked to hardware-fast dyadic Apple LLFI (2× / 4×);
+    /// legacy iOS 18–25 Vision optical flow still accepts arbitrary phases when invoked explicitly.
     static var supportsArbitraryPhases: Bool {
         #if targetEnvironment(simulator)
-        return true
+        return false
         #else
         if #available(iOS 26.0, *) {
-            // VTFrameRateConversionConfiguration accepts arbitrary phases in (0, 1);
-            // VTLowLatencyFrameInterpolationConfiguration only produces 2^x - 1 dyadic phases.
-            // Restrict to dyadic multipliers only when a device supports LLFI without FRC.
-            return VTFrameRateConversionConfiguration.isSupported
-                || !VTLowLatencyFrameInterpolationConfiguration.isSupported
+            return false
         }
         return true
         #endif
@@ -332,7 +449,7 @@ struct VideoFrameInterpolationPlan: Sendable {
         guard interval.isFinite, interval > 0 else { return nil }
         guard let targetFPS = rate.targetFPS else { return 2 }
         let cap = Double(targetFPS)
-        let effectiveInterval = interval * jitterFactor + VideoFrameInterpolationTiming.tolerance
+        let effectiveInterval = interval * dyadicHeadroom + VideoFrameInterpolationTiming.tolerance
         return allowedMultipliers
             .filter { $0 >= 2 && $0 <= maximumMultiplier }
             .sorted(by: >)
@@ -559,5 +676,52 @@ struct VideoFrameInterpolationPlan: Sendable {
 
     static func outputPoolLimit(phaseCount: Int) -> Int {
         VideoEnhancementPoolLimits.interpolationFrames(phaseCount: phaseCount)
+    }
+
+    /// Synthesizes a representative interpolation plan for non-blocking session prewarm using
+    /// the initial reference frame's cadence and timestamp. When `frame.pts >= interval`, places
+    /// the synthetic pair at `(pts - interval, pts)` so low-latency VideoToolbox sessions stay
+    /// strictly monotonic and reusable for the very first real `(Frame 0, Frame 1)` pair.
+    static func prewarmPlan(
+        for frame: MediaVideoFrame,
+        cadenceInterval: TimeInterval? = nil,
+        rate: VideoInterpolationRate,
+        playbackRate: Double = 1.0,
+        supportsArbitraryPhases: Bool = Self.supportsArbitraryPhases
+    ) -> (previousPTS: TimeInterval, currentPTS: TimeInterval, plan: VideoFrameInterpolationPlan)? {
+        let rawInterval = (cadenceInterval.flatMap { $0.isFinite && $0 > 0 ? $0 : nil })
+            ?? (frame.duration.isFinite && frame.duration > 0 ? frame.duration : nil)
+        guard let interval = rawInterval,
+              interval >= 1.0 / 240.0,
+              interval <= VideoFrameInterpolationTiming.maximumDelta,
+              frame.pts.isFinite else {
+            return nil
+        }
+        let safePTS = max(0, frame.pts)
+        let previousPTS: TimeInterval
+        let currentPTS: TimeInterval
+        if safePTS >= interval {
+            previousPTS = safePTS - interval
+            currentPTS = safePTS
+        } else {
+            previousPTS = safePTS
+            currentPTS = safePTS + interval
+        }
+        switch Self.plan(
+            previousPTS: previousPTS,
+            currentPTS: currentPTS,
+            interval: interval,
+            cadenceInterval: interval,
+            isCadenceStable: true,
+            gridNextPTS: nil,
+            rate: rate,
+            playbackRate: playbackRate,
+            supportsArbitraryPhases: supportsArbitraryPhases
+        ) {
+        case let .plan(resolved) where !resolved.phases.isEmpty:
+            return (previousPTS, currentPTS, resolved)
+        default:
+            return nil
+        }
     }
 }

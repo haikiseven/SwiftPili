@@ -1,7 +1,6 @@
 import CoreVideo
 import Foundation
 import Metal
-import os
 #if canImport(MetalFX)
 import MetalFX
 #endif
@@ -322,11 +321,32 @@ final class MetalFXSuperResolutionBackend {
     private var inputRGBATexture: (any MTLTexture)?
     private var privateOutputTexture: (any MTLTexture)?
     private var outputPool: VideoSuperResolutionPool?
+    private var outputIsNV12 = false
     private var configuredOutput: (width: Int, height: Int)?
 
     #if canImport(MetalFX)
     private var scaler: (any MTLFXSpatialScaler)?
     #endif
+
+    static func prefersNV12Output(width: Int, height: Int) -> Bool {
+        width > 0 && height > 0 && width.isMultiple(of: 2) && height.isMultiple(of: 2)
+    }
+
+    /// Selects a scale-aware RCAS tap step so 4K upscaled edges (`>= 1.6×`, e.g. 1080p → 4K)
+    /// sharpen at source/screen-pixel scale rather than sub-pixel micro-taps washed out by downscaling.
+    static func rcasTapStep(
+        inputWidth: Int,
+        inputHeight: Int,
+        outputWidth: Int,
+        outputHeight: Int
+    ) -> UInt32 {
+        guard inputWidth > 0, inputHeight > 0 else { return 1 }
+        let scale = max(
+            Float(outputWidth) / Float(inputWidth),
+            Float(outputHeight) / Float(inputHeight)
+        )
+        return scale >= 1.6 ? 2 : 1
+    }
 
     deinit {
         tearDown()
@@ -344,7 +364,39 @@ final class MetalFXSuperResolutionBackend {
         inputRGBATexture = nil
         privateOutputTexture = nil
         outputPool = nil
+        outputIsNV12 = false
         configuredOutput = nil
+    }
+
+    /// Initializes the MetalFX spatial scaler, compute pipelines, private textures, and output pool
+    /// ahead of Frame 1 without submitting dummy GPU work.
+    func prewarm(
+        pixelBuffer: CVPixelBuffer,
+        maxScale: Float = 2,
+        targetDimensions: VideoSuperResolutionDimensions? = nil
+    ) {
+        #if canImport(MetalFX)
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        guard case let .output(output) = Self.resolveOutputDimensions(
+            width: width,
+            height: height,
+            maxScale: maxScale,
+            targetDimensions: targetDimensions
+        ) else { return }
+
+        let metal = VideoEnhancementMetalContext.shared
+        guard let resources = try? metal.resources(),
+              MTLFXSpatialScalerDescriptor.supportsDevice(resources.device) else {
+            return
+        }
+        _ = try? metal.pipeline(for: .nv12ToBGRA)
+        if scaler?.inputWidth != width || scaler?.inputHeight != height
+            || configuredOutput?.width != output.0 || configuredOutput?.height != output.1 {
+            _ = configureScaler(device: resources.device, width: width, height: height, output: output)
+        }
+        _ = try? metal.pipeline(for: outputIsNV12 ? .rcasToNV12 : .rcasSharpen)
+        #endif
     }
 
     /// - Parameters:
@@ -357,13 +409,15 @@ final class MetalFXSuperResolutionBackend {
         pixelBuffer: CVPixelBuffer,
         maxScale: Float = 2,
         targetDimensions: VideoSuperResolutionDimensions? = nil,
-        sharpness: VideoSuperResolutionSharpness = .standard
+        sharpness: VideoSuperResolutionSharpness = .standard,
+        splitCompare: Bool = false
     ) async -> VideoEnhancementBackendOutcome {
         let outcomes = await upscaleBatch(
             pixelBuffers: [pixelBuffer],
             maxScale: maxScale,
             targetDimensions: targetDimensions,
-            sharpness: sharpness
+            sharpness: sharpness,
+            splitCompare: splitCompare
         )
         return outcomes.first ?? .bypassed(reason: "MetalFX empty batch")
     }
@@ -374,7 +428,8 @@ final class MetalFXSuperResolutionBackend {
         pixelBuffers: [CVPixelBuffer],
         maxScale: Float = 2,
         targetDimensions: VideoSuperResolutionDimensions? = nil,
-        sharpness: VideoSuperResolutionSharpness = .standard
+        sharpness: VideoSuperResolutionSharpness = .standard,
+        splitCompare: Bool = false
     ) async -> [VideoEnhancementBackendOutcome] {
         guard !pixelBuffers.isEmpty else { return [] }
         #if !canImport(MetalFX)
@@ -395,7 +450,8 @@ final class MetalFXSuperResolutionBackend {
                     height: CVPixelBufferGetHeight(buffer),
                     maxScale: maxScale,
                     targetDimensions: targetDimensions,
-                    sharpness: sharpness
+                    sharpness: sharpness,
+                    splitCompare: splitCompare
                 )
                 outcomes.append(single.first ?? .bypassed(reason: "MetalFX empty batch"))
             }
@@ -408,7 +464,8 @@ final class MetalFXSuperResolutionBackend {
             height: height,
             maxScale: maxScale,
             targetDimensions: targetDimensions,
-            sharpness: sharpness
+            sharpness: sharpness,
+            splitCompare: splitCompare
         )
         #endif
     }
@@ -419,61 +476,49 @@ final class MetalFXSuperResolutionBackend {
     }
 
     #if canImport(MetalFX)
-    private struct EncodedFrame {
-        let index: Int
-        let commandBuffer: any MTLCommandBuffer
-        let sourceBuffer: CVPixelBuffer
-        let destBuffer: CVPixelBuffer
+    private enum OutputResolutionOutcome {
+        case output((Int, Int))
+        case bypassed(String)
     }
 
-    private final class BatchCompletionTracker: @unchecked Sendable {
-        private struct State {
-            var remaining: Int
-            var statuses: [Bool]
-            var continuation: CheckedContinuation<[Bool], Never>?
-        }
+    private struct EncodedFrame {
+        let index: Int
+        let sourceBuffer: CVPixelBuffer
+        let destBuffer: CVPixelBuffer
+        let colorMatrix: UInt32
+    }
 
-        private let lock: OSAllocatedUnfairLock<State>
-
-        init(count: Int) {
-            lock = OSAllocatedUnfairLock(initialState: State(
-                remaining: count,
-                statuses: Array(repeating: false, count: count),
-                continuation: nil
-            ))
-        }
-
-        func markCompleted(slot: Int, succeeded: Bool) {
-            let ready: (CheckedContinuation<[Bool], Never>, [Bool])? = lock.withLock { state in
-                state.statuses[slot] = succeeded
-                state.remaining -= 1
-                if state.remaining == 0, let continuation = state.continuation {
-                    state.continuation = nil
-                    return (continuation, state.statuses)
-                }
-                return nil
+    private static func resolveOutputDimensions(
+        width: Int,
+        height: Int,
+        maxScale: Float,
+        targetDimensions: VideoSuperResolutionDimensions?
+    ) -> OutputResolutionOutcome {
+        if let targetDimensions {
+            guard targetDimensions.width > width, targetDimensions.height > height else {
+                return .bypassed("Target resolution reached")
             }
-            if let (continuation, statuses) = ready {
-                continuation.resume(returning: statuses)
+            guard VideoSuperResolutionRasterBudget.contains(width: width, height: height),
+                  VideoSuperResolutionRasterBudget.contains(
+                    width: targetDimensions.width, height: targetDimensions.height
+                  ) else {
+                return .bypassed("MetalFX output exceeds raster budget")
             }
+            return .output((targetDimensions.width, targetDimensions.height))
         }
-
-        func awaitAll(commit: () -> Void) async -> [Bool] {
-            await withCheckedContinuation { continuation in
-                let alreadyFinished: [Bool]? = lock.withLock { state in
-                    if state.remaining == 0 {
-                        return state.statuses
-                    }
-                    state.continuation = continuation
-                    return nil
-                }
-                if let alreadyFinished {
-                    continuation.resume(returning: alreadyFinished)
-                    return
-                }
-                commit()
-            }
+        guard maxScale.isFinite, maxScale >= VideoEnhancementDisplaySurface.minimumUsefulMagnification else {
+            return .bypassed("Display resolution reached")
         }
+        let scale = min(maxScale, 4)
+        let candidates = [Self.evenSize(width, height, scale)]
+            + [4, 3, 2].filter { Float($0) < scale }.map { (width * $0, height * $0) }
+        guard VideoSuperResolutionRasterBudget.contains(width: width, height: height),
+              let resolved = candidates.first(where: {
+                  VideoSuperResolutionRasterBudget.contains(width: $0.0, height: $0.1)
+              }) else {
+            return .bypassed("MetalFX output exceeds raster budget")
+        }
+        return .output(resolved)
     }
 
     private func upscaleUniformBatch(
@@ -482,51 +527,35 @@ final class MetalFXSuperResolutionBackend {
         height: Int,
         maxScale: Float,
         targetDimensions: VideoSuperResolutionDimensions?,
-        sharpness: VideoSuperResolutionSharpness
+        sharpness: VideoSuperResolutionSharpness,
+        splitCompare: Bool
     ) async -> [VideoEnhancementBackendOutcome] {
         func bypassAll(_ reason: String) -> [VideoEnhancementBackendOutcome] {
             Array(repeating: .bypassed(reason: reason), count: pixelBuffers.count)
         }
 
         let output: (Int, Int)
-        if let targetDimensions {
-            guard targetDimensions.width > width, targetDimensions.height > height else {
-                return bypassAll("Target resolution reached")
-            }
-            guard VideoSuperResolutionRasterBudget.contains(width: width, height: height),
-                  VideoSuperResolutionRasterBudget.contains(
-                    width: targetDimensions.width, height: targetDimensions.height
-                  ) else {
-                return bypassAll("MetalFX output exceeds raster budget")
-            }
-            output = (targetDimensions.width, targetDimensions.height)
-        } else {
-            guard maxScale.isFinite, maxScale >= VideoEnhancementDisplaySurface.minimumUsefulMagnification else {
-                return bypassAll("Display resolution reached")
-            }
-            let scale = min(maxScale, 4)
-            let candidates = [Self.evenSize(width, height, scale)]
-                + [4, 3, 2].filter { Float($0) < scale }.map { (width * $0, height * $0) }
-            guard VideoSuperResolutionRasterBudget.contains(width: width, height: height),
-                  let resolved = candidates.first(where: {
-                      VideoSuperResolutionRasterBudget.contains(width: $0.0, height: $0.1)
-                  }) else {
-                return bypassAll("MetalFX output exceeds raster budget")
-            }
+        switch Self.resolveOutputDimensions(
+            width: width,
+            height: height,
+            maxScale: maxScale,
+            targetDimensions: targetDimensions
+        ) {
+        case let .output(resolved):
             output = resolved
+        case let .bypassed(reason):
+            return bypassAll(reason)
         }
 
         let metal = VideoEnhancementMetalContext.shared
         let resources: VideoEnhancementMetalContext.Resources
         let convertPipeline: any MTLComputePipelineState
-        let rcasPipeline: any MTLComputePipelineState
         do {
             resources = try metal.resources()
             guard MTLFXSpatialScalerDescriptor.supportsDevice(resources.device) else {
                 return bypassAll("MetalFX unsupported")
             }
             convertPipeline = try metal.pipeline(for: .nv12ToBGRA)
-            rcasPipeline = try metal.pipeline(for: .rcasSharpen)
         } catch {
             return bypassAll(error.stage)
         }
@@ -541,6 +570,24 @@ final class MetalFXSuperResolutionBackend {
             return bypassAll("MetalFX not configured")
         }
 
+        let rcasToNV12Pipeline: (any MTLComputePipelineState)?
+        let rcasPipeline: (any MTLComputePipelineState)?
+        do {
+            if outputIsNV12 {
+                rcasToNV12Pipeline = try metal.pipeline(for: .rcasToNV12)
+                rcasPipeline = nil
+            } else {
+                rcasToNV12Pipeline = nil
+                rcasPipeline = try metal.pipeline(for: .rcasSharpen)
+            }
+        } catch {
+            return bypassAll(error.stage)
+        }
+
+        guard let commandBuffer = resources.commandQueue.makeCommandBuffer() else {
+            return bypassAll("MetalFX command buffer failed")
+        }
+
         let outSize = (scaler.outputWidth, scaler.outputHeight)
         var outcomes = Array<VideoEnhancementBackendOutcome>(
             repeating: .bypassed(reason: "MetalFX GPU error"),
@@ -549,81 +596,131 @@ final class MetalFXSuperResolutionBackend {
         var pending: [EncodedFrame] = []
         pending.reserveCapacity(pixelBuffers.count)
         var retainedTextures: [CVMetalTexture] = []
-        retainedTextures.reserveCapacity(pixelBuffers.count * 3)
+        retainedTextures.reserveCapacity(pixelBuffers.count * (outputIsNV12 ? 4 : 3))
 
+        // Encode all frames sequentially into a single command buffer so the GPU executes the
+        // entire batch back-to-back with one kernel submission and one completion wake-up.
         for (index, pixelBuffer) in pixelBuffers.enumerated() {
             let destBuffer: CVPixelBuffer
             do throws(VideoSuperResolutionPool.Failure) {
                 destBuffer = try outputPool.allocate()
             } catch {
-                outcomes[index] = .bypassed(reason: error.isBusy ? error.reason : "BGRA output alloc failed")
+                let fallbackReason = outputIsNV12 ? "NV12 output alloc failed" : "BGRA output alloc failed"
+                outcomes[index] = .bypassed(reason: error.isBusy ? error.reason : fallbackReason)
                 continue
             }
-            guard let outputMapped = metal.makeTexture(
-                buffer: destBuffer, format: .bgra8Unorm, width: outSize.0, height: outSize.1, plane: 0
-            ) else {
-                outcomes[index] = .bypassed(reason: "Output Metal texture failed")
-                continue
+            if outputIsNV12, let rcasToNV12Pipeline {
+                let chromaSize = (outSize.0 / 2, outSize.1 / 2)
+                guard let outYMapped = metal.makeTexture(
+                    buffer: destBuffer, format: .r8Unorm, width: outSize.0, height: outSize.1,
+                    plane: 0, usage: .shaderWrite
+                ), let outCbCrMapped = metal.makeTexture(
+                    buffer: destBuffer, format: .rg8Unorm, width: chromaSize.0, height: chromaSize.1,
+                    plane: 1, usage: .shaderWrite
+                ) else {
+                    outcomes[index] = .bypassed(reason: "Output Metal texture failed")
+                    continue
+                }
+                guard let retainedInputs = encodeInputToBGRA(
+                    commandBuffer: commandBuffer,
+                    metal: metal,
+                    convertPipeline: convertPipeline,
+                    pixelBuffer: pixelBuffer,
+                    size: (width, height)
+                ) else {
+                    outcomes[index] = .bypassed(reason: "Input texture bind failed")
+                    continue
+                }
+                let colorMatrix = MetalNV12PixelConverter.colorMatrixIndex(
+                    for: pixelBuffer, width: width, height: height
+                )
+                guard encodeScaleAndOutputNV12(
+                    commandBuffer: commandBuffer,
+                    scaler: scaler,
+                    rcasToNV12Pipeline: rcasToNV12Pipeline,
+                    inputSize: (width, height),
+                    outputSize: outSize,
+                    chromaSize: chromaSize,
+                    outY: outYMapped.texture,
+                    outCbCr: outCbCrMapped.texture,
+                    sharpness: sharpness,
+                    colorMatrix: colorMatrix,
+                    splitCompare: splitCompare
+                ) else {
+                    outcomes[index] = .bypassed(reason: "MetalFX encode failed")
+                    continue
+                }
+                retainedTextures.append(contentsOf: retainedInputs)
+                retainedTextures.append(outYMapped.bridge)
+                retainedTextures.append(outCbCrMapped.bridge)
+                pending.append(EncodedFrame(
+                    index: index,
+                    sourceBuffer: pixelBuffer,
+                    destBuffer: destBuffer,
+                    colorMatrix: colorMatrix
+                ))
+            } else if let rcasPipeline {
+                guard let outputMapped = metal.makeTexture(
+                    buffer: destBuffer, format: .bgra8Unorm, width: outSize.0, height: outSize.1, plane: 0
+                ) else {
+                    outcomes[index] = .bypassed(reason: "Output Metal texture failed")
+                    continue
+                }
+                guard let retainedInputs = encodeInputToBGRA(
+                    commandBuffer: commandBuffer,
+                    metal: metal,
+                    convertPipeline: convertPipeline,
+                    pixelBuffer: pixelBuffer,
+                    size: (width, height)
+                ) else {
+                    outcomes[index] = .bypassed(reason: "Input texture bind failed")
+                    continue
+                }
+                guard encodeScaleAndOutput(
+                    commandBuffer: commandBuffer,
+                    scaler: scaler,
+                    rcasPipeline: rcasPipeline,
+                    inputSize: (width, height),
+                    outputSize: outSize,
+                    destination: outputMapped.texture,
+                    sharpness: sharpness,
+                    splitCompare: splitCompare
+                ) else {
+                    outcomes[index] = .bypassed(reason: "MetalFX encode failed")
+                    continue
+                }
+                retainedTextures.append(contentsOf: retainedInputs)
+                retainedTextures.append(outputMapped.bridge)
+                pending.append(EncodedFrame(
+                    index: index,
+                    sourceBuffer: pixelBuffer,
+                    destBuffer: destBuffer,
+                    colorMatrix: 0
+                ))
+            } else {
+                outcomes[index] = .bypassed(reason: "MetalFX pipeline unavailable")
             }
-            guard let commandBuffer = resources.commandQueue.makeCommandBuffer() else {
-                outcomes[index] = .bypassed(reason: "MetalFX command buffer failed")
-                continue
-            }
-            guard let retainedInputs = encodeInputToBGRA(
-                commandBuffer: commandBuffer,
-                metal: metal,
-                convertPipeline: convertPipeline,
-                pixelBuffer: pixelBuffer,
-                size: (width, height)
-            ) else {
-                outcomes[index] = .bypassed(reason: "Input texture bind failed")
-                continue
-            }
-            guard encodeScaleAndOutput(
-                commandBuffer: commandBuffer,
-                scaler: scaler,
-                rcasPipeline: rcasPipeline,
-                inputSize: (width, height),
-                outputSize: outSize,
-                destination: outputMapped.texture,
-                sharpness: sharpness
-            ) else {
-                outcomes[index] = .bypassed(reason: "MetalFX encode failed")
-                continue
-            }
-            retainedTextures.append(contentsOf: retainedInputs)
-            retainedTextures.append(outputMapped.bridge)
-            pending.append(EncodedFrame(
-                index: index,
-                commandBuffer: commandBuffer,
-                sourceBuffer: pixelBuffer,
-                destBuffer: destBuffer
-            ))
         }
 
         guard !pending.isEmpty else { return outcomes }
 
-        // Commit all command buffers back-to-back on the shared serial queue and suspend only ONCE.
-        let statuses: [Bool]
-        if pending.count == 1 {
-            let ok = await VideoEnhancementMetalContext.commitAndWait(pending[0].commandBuffer)
-            statuses = [ok]
-        } else {
-            let tracker = BatchCompletionTracker(count: pending.count)
-            statuses = await tracker.awaitAll {
-                for (slot, item) in pending.enumerated() {
-                    item.commandBuffer.addCompletedHandler { buffer in
-                        tracker.markCompleted(slot: slot, succeeded: buffer.status == .completed)
-                    }
-                    item.commandBuffer.commit()
-                }
-            }
-        }
+        let succeeded = await VideoEnhancementMetalContext.commitAndWait(commandBuffer)
         withExtendedLifetime(retainedTextures) {}
 
-        for (slot, item) in pending.enumerated() {
-            if statuses[slot] {
-                ScaledVideoOutputMetadata.copy(from: item.sourceBuffer, to: item.destBuffer, colorSpace: .rgbConverted)
+        for item in pending {
+            if succeeded {
+                if outputIsNV12 {
+                    ScaledVideoOutputMetadata.copy(
+                        from: item.sourceBuffer, to: item.destBuffer, colorSpace: .yuvSameAsSource
+                    )
+                    ScaledVideoOutputMetadata.ensureYCbCrMatrixAttachment(
+                        on: item.destBuffer, colorMatrixIndex: item.colorMatrix
+                    )
+                } else {
+                    ScaledVideoOutputMetadata.copy(
+                        from: item.sourceBuffer, to: item.destBuffer, colorSpace: .rgbConverted
+                    )
+                }
                 outcomes[item.index] = .processed(item.destBuffer)
             } else {
                 outcomes[item.index] = .bypassed(reason: "MetalFX GPU error")
@@ -654,8 +751,20 @@ final class MetalFXSuperResolutionBackend {
         outputDesc.usage = createdScaler.outputTextureUsage.union([.shaderRead])
 
         guard let inTex = device.makeTexture(descriptor: inputDesc),
-              let outTex = device.makeTexture(descriptor: outputDesc),
-              let pool = Self.makeBGRAOutputPool(width: outWidth, height: outHeight) else {
+              let outTex = device.makeTexture(descriptor: outputDesc) else {
+            return "MetalFX textures alloc failed"
+        }
+
+        let pool: VideoSuperResolutionPool
+        let isNV12: Bool
+        if Self.prefersNV12Output(width: outWidth, height: outHeight),
+           let nv12Pool = Self.makeNV12OutputPool(width: outWidth, height: outHeight) {
+            pool = nv12Pool
+            isNV12 = true
+        } else if let bgraPool = Self.makeBGRAOutputPool(width: outWidth, height: outHeight) {
+            pool = bgraPool
+            isNV12 = false
+        } else {
             return "MetalFX textures alloc failed"
         }
 
@@ -663,6 +772,7 @@ final class MetalFXSuperResolutionBackend {
         inputRGBATexture = inTex
         privateOutputTexture = outTex
         outputPool = pool
+        outputIsNV12 = isNV12
         configuredOutput = output
         return nil
     }
@@ -746,14 +856,18 @@ final class MetalFXSuperResolutionBackend {
         return [yMapped.bridge, cbcrMapped.bridge]
     }
 
-    private func encodeScaleAndOutput(
+    private func encodeScaleAndOutputNV12(
         commandBuffer: any MTLCommandBuffer,
         scaler: any MTLFXSpatialScaler,
-        rcasPipeline: any MTLComputePipelineState,
+        rcasToNV12Pipeline: any MTLComputePipelineState,
         inputSize: (Int, Int),
         outputSize: (Int, Int),
-        destination: any MTLTexture,
-        sharpness: VideoSuperResolutionSharpness
+        chromaSize: (Int, Int),
+        outY: any MTLTexture,
+        outCbCr: any MTLTexture,
+        sharpness: VideoSuperResolutionSharpness,
+        colorMatrix: UInt32,
+        splitCompare: Bool
     ) -> Bool {
         guard let inputRGBATexture, let privateOutputTexture else { return false }
         scaler.colorTexture = inputRGBATexture
@@ -762,12 +876,67 @@ final class MetalFXSuperResolutionBackend {
         scaler.outputTexture = privateOutputTexture
         scaler.encode(commandBuffer: commandBuffer)
 
-        if sharpness.rcasStrength > 0.001, destination.usage.contains(.shaderWrite) {
+        guard let compute = commandBuffer.makeComputeCommandEncoder() else { return false }
+        let tapStep = Self.rcasTapStep(
+            inputWidth: inputSize.0,
+            inputHeight: inputSize.1,
+            outputWidth: outputSize.0,
+            outputHeight: outputSize.1
+        )
+        var params = VideoEnhancementRCASNV12Params(
+            strength: sharpness.rcasStrength,
+            colorMatrix: colorMatrix,
+            tapStep: tapStep,
+            splitCompare: splitCompare ? 1 : 0
+        )
+        compute.setComputePipelineState(rcasToNV12Pipeline)
+        compute.setTexture(privateOutputTexture, index: 0)
+        compute.setTexture(outY, index: 1)
+        compute.setTexture(outCbCr, index: 2)
+        compute.setTexture(inputRGBATexture, index: 3)
+        compute.setBytes(&params, length: MemoryLayout<VideoEnhancementRCASNV12Params>.size, index: 0)
+        VideoEnhancementMetalContext.dispatchThreads(
+            encoder: compute, pipeline: rcasToNV12Pipeline,
+            width: chromaSize.0, height: chromaSize.1
+        )
+        compute.endEncoding()
+        return true
+    }
+
+    private func encodeScaleAndOutput(
+        commandBuffer: any MTLCommandBuffer,
+        scaler: any MTLFXSpatialScaler,
+        rcasPipeline: any MTLComputePipelineState,
+        inputSize: (Int, Int),
+        outputSize: (Int, Int),
+        destination: any MTLTexture,
+        sharpness: VideoSuperResolutionSharpness,
+        splitCompare: Bool
+    ) -> Bool {
+        guard let inputRGBATexture, let privateOutputTexture else { return false }
+        scaler.colorTexture = inputRGBATexture
+        scaler.inputContentWidth = inputSize.0
+        scaler.inputContentHeight = inputSize.1
+        scaler.outputTexture = privateOutputTexture
+        scaler.encode(commandBuffer: commandBuffer)
+
+        if (sharpness.rcasStrength > 0.001 || splitCompare), destination.usage.contains(.shaderWrite) {
             guard let compute = commandBuffer.makeComputeCommandEncoder() else { return false }
-            var params = VideoEnhancementRCASParams(strength: sharpness.rcasStrength)
+            let tapStep = Self.rcasTapStep(
+                inputWidth: inputSize.0,
+                inputHeight: inputSize.1,
+                outputWidth: outputSize.0,
+                outputHeight: outputSize.1
+            )
+            var params = VideoEnhancementRCASParams(
+                strength: sharpness.rcasStrength,
+                tapStep: tapStep,
+                splitCompare: splitCompare ? 1 : 0
+            )
             compute.setComputePipelineState(rcasPipeline)
             compute.setTexture(privateOutputTexture, index: 0)
             compute.setTexture(destination, index: 1)
+            compute.setTexture(inputRGBATexture, index: 2)
             compute.setBytes(&params, length: MemoryLayout<VideoEnhancementRCASParams>.size, index: 0)
             VideoEnhancementMetalContext.dispatchThreads(
                 encoder: compute, pipeline: rcasPipeline, width: outputSize.0, height: outputSize.1
@@ -786,6 +955,19 @@ final class MetalFXSuperResolutionBackend {
         )
         blit.endEncoding()
         return true
+    }
+
+    private static func makeNV12OutputPool(width: Int, height: Int) -> VideoSuperResolutionPool? {
+        let attrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height,
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
+        ]
+        return try? VideoSuperResolutionPool(
+            attributes: attrs as CFDictionary, label: "MetalFX destination", followsDisplayLookahead: true
+        )
     }
 
     private static func makeBGRAOutputPool(width: Int, height: Int) -> VideoSuperResolutionPool? {

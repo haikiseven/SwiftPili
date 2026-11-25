@@ -49,13 +49,27 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
     private let displayView: SampleBufferDisplayView
     private let presentationHoldView: PresentationImageHoldView
     private let synchronizer = AVSampleBufferRenderSynchronizer()
+    private static let maxPendingEnhancedFrames = 8
+    private static let maxPendingEnhancedStartFrames = 4
+
+    private struct PendingEnhancedFrame {
+        var frame: MediaVideoFrame
+        let isMidpoint: Bool
+        let sampleDurationOverride: TimeInterval?
+        var fallbackOriginal: MediaVideoFrame?
+        var commitsPresentationProgress: Bool
+    }
+
     private let postProcessor = VideoFramePostProcessor()
     private var enhancementAttempt: EnhancementAttempt?
+    private var busyWaitState: BusyWaitState?
     private var enhancementDeadlineTimer: EnhancementDeadlineTimer?
-    private var enhancementDeadlineTarget: (id: UInt64, boundary: UInt64)?
+    private var enhancementDeadlineTarget: EnhancementDeadlineTarget?
     private var nextEnhancementID: UInt64 = 0
     private var enhancementBoundary: UInt64 = 0
     private var enhancementReference: MediaVideoFrame?
+    private var pendingEnhancedOutput: [PendingEnhancedFrame] = []
+    private var pendingOutputDrainWake: (@MainActor () -> Void)?
     private var demandOutputFloor: TimeInterval = 0
     private var enhancementDiagnostics = EnhancementDiagnostics()
     private let thumbnailContext = CIContext()
@@ -230,7 +244,9 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
             view.trailingAnchor.constraint(equalTo: vc.view.trailingAnchor),
         ])
         let holdView = PresentationImageHoldView(frame: .zero)
-        holdView.backgroundColor = .black
+        holdView.backgroundColor = .clear
+        holdView.isOpaque = false
+        holdView.sampleBufferLayer.backgroundColor = UIColor.clear.cgColor
         holdView.isHidden = true
         holdView.isUserInteractionEnabled = false
         holdView.translatesAutoresizingMaskIntoConstraints = false
@@ -558,16 +574,27 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
     private var maxEnqueuedPresentationEnd: TimeInterval = 0
 
     func enqueuedAheadSeconds(from mediaTime: TimeInterval) -> TimeInterval {
-        guard mediaTime.isFinite, maxEnqueuedPresentationEnd.isFinite else { return 0 }
-        return max(0, maxEnqueuedPresentationEnd - max(0, mediaTime))
+        guard mediaTime.isFinite else { return 0 }
+        var horizon = maxEnqueuedPresentationEnd.isFinite ? maxEnqueuedPresentationEnd : 0
+        if let lastPending = pendingEnhancedOutput.last,
+           let pendingEnd = finitePresentationIntervalEnd(
+               start: lastPending.frame.pts,
+               duration: lastPending.frame.duration
+           ) {
+            horizon = max(horizon, pendingEnd)
+        }
+        return max(0, horizon - max(0, mediaTime))
     }
 
     var videoEnhancementConfiguration: VideoEnhancementConfiguration {
         get { postProcessor.configuration }
         set {
-            guard postProcessor.configuration != newValue else { return }
+            let oldValue = postProcessor.configuration
+            guard oldValue != newValue else { return }
             postProcessor.configuration = newValue
-            retireEnhancement(wakeWaitingDrain: true)
+            if !newValue.isShaderUniformOnlyChange(from: oldValue) {
+                retireEnhancement(wakeWaitingDrain: true)
+            }
         }
     }
 
@@ -575,12 +602,12 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         postProcessor.telemetry
     }
 
-    /// Presentation lookahead requested by video enhancement (`0.35 s` when active, `0.3 s` otherwise).
+    /// Presentation lookahead requested by video enhancement (dynamic, memory-pressure-aware when active; `0.3 s` otherwise).
     var preferredPresentLeadSeconds: TimeInterval {
         postProcessor.configuration.isRequested ? postProcessor.preferredPresentLeadSeconds : 0.3
     }
 
-    /// No-op retained for engine call-site compatibility; sessions initialize lazily on first real frame.
+    /// No-op retained for engine call-site compatibility; lightweight prewarm triggers once Frame 0 settles.
     func prewarmEnhancementIfNeeded(with _: MediaVideoFrame) {}
 
     func setDisplayPlayback(rate: Float, mediaTime: TimeInterval) {
@@ -600,8 +627,6 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
     }
 
     func present(_ frame: MediaVideoFrame) throws {
-        let costSpan = UIHitchMonitor.beginSpan("render.present")
-        defer { UIHitchMonitor.endSpan(costSpan) }
         try validatePresentationFrame(frame)
         retireEnhancement()
         attachSynchronizerIfNeeded()
@@ -670,38 +695,30 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         _ frame: MediaVideoFrame,
         renderer: AVSampleBufferVideoRenderer,
         isMidpoint: Bool,
-        sampleDurationOverride: TimeInterval? = nil
+        sampleDurationOverride: TimeInterval? = nil,
+        commitsProgress: Bool? = nil
     ) throws -> NativeFrameAdmission {
+        let shouldCommitProgress = commitsProgress ?? !isMidpoint
         guard !recoverFaultedRenderer(renderer) else { return .rendererFault }
         let isReadyForMoreMediaData = renderer.isReadyForMoreMediaData
         guard isReadyForMoreMediaData else { return .blocked }
-        let makeSpan = UIHitchMonitor.beginSpan("render.makeSample")
-        let sample: CMSampleBuffer
-        do {
-            sample = try Self.makeSampleBuffer(
-                pixelBuffer: frame.pixelBuffer,
-                pts: frame.pts,
-                duration: sampleDurationOverride ?? frame.duration,
-                timescale: mediaTimescale
-            )
-        } catch {
-            UIHitchMonitor.endSpan(makeSpan)
-            throw error
-        }
-        UIHitchMonitor.endSpan(makeSpan)
+        let sample = try Self.makeSampleBuffer(
+            pixelBuffer: frame.pixelBuffer,
+            pts: frame.pts,
+            duration: sampleDurationOverride ?? frame.duration,
+            timescale: mediaTimescale
+        )
 
-        UIHitchMonitor.measureCounted("render.enqueue") { renderer.enqueue(sample) }
+        renderer.enqueue(sample)
         guard !recoverFaultedRenderer(renderer) else { return .rendererFault }
-        if !isMidpoint { consecutiveRendererFaultCount = 0 }
+        if shouldCommitProgress { consecutiveRendererFaultCount = 0 }
         latestAmbientPixelBuffer = frame.pixelBuffer
-        guard !isMidpoint else {
-            SurfaceMoveProbe.noteFrameEnqueued()
+        guard shouldCommitProgress else {
             return .enqueued
         }
         if let end = finitePresentationIntervalEnd(start: frame.pts, duration: frame.duration) {
             maxEnqueuedPresentationEnd = max(maxEnqueuedPresentationEnd, end)
         }
-        SurfaceMoveProbe.noteFrameEnqueued()
         presentCount += 1
         lastEnqueuedPTS = frame.pts
         presentationProgressSerial &+= 1
@@ -717,7 +734,7 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
                 expectedHoldID: presentationImageHoldState?.id
             )
         }
-        if !didLogFirstEnqueueDisplaySnapshot {
+        if !isMidpoint, !didLogFirstEnqueueDisplaySnapshot {
             didLogFirstEnqueueDisplaySnapshot = true
             let surfaceReadiness = currentPresentationSurfaceReadiness()
             let displayReady = surfaceReadiness.displayLayerReady ? "1" : "0"
@@ -746,8 +763,6 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
     }
 
     var isReadyForMoreMediaData: Bool {
-        let costSpan = UIHitchMonitor.beginSpan("render.ready")
-        defer { UIHitchMonitor.endSpan(costSpan) }
         attachSynchronizerIfNeeded()
         guard !hasTerminalRendererFault else { return false }
         let renderer = displayView.sampleBufferLayer.sampleBufferRenderer
@@ -788,13 +803,9 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
     }
 
     func currentDisplayedImage() -> UIImage? {
-        let costSpan = UIHitchMonitor.beginSpan("still.total")
-        defer { UIHitchMonitor.endSpan(costSpan) }
         let renderer = displayView.sampleBufferLayer.sampleBufferRenderer
-        let pixelBuffer = UIHitchMonitor.measureCounted("still.pixels") {
-            frontmostNonWarmPresentationPixelBuffer()
-                ?? renderer.displayedPixelBuffer()
-        }
+        let pixelBuffer = frontmostNonWarmPresentationPixelBuffer()
+            ?? renderer.displayedPixelBuffer()
         guard let pixelBuffer else { return nil }
         let image = CIImage(cvPixelBuffer: pixelBuffer)
         let extent = image.extent.integral
@@ -804,9 +815,7 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         let scaled = scale < 1
             ? image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             : image
-        let cgImage = UIHitchMonitor.measureCounted("still.image") {
-            thumbnailContext.createCGImage(scaled, from: scaled.extent.integral)
-        }
+        let cgImage = thumbnailContext.createCGImage(scaled, from: scaled.extent.integral)
         guard let cgImage else {
             return nil
         }
@@ -1127,26 +1136,71 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
 
     // MARK: - Path A redesign step 3: ASBD-pull present feed
 
+    private var wantsNativeMediaDataRequest: Bool {
+        mediaDataWhenReadyHandler != nil || !pendingEnhancedOutput.isEmpty
+    }
+
+    private var pendingOutputWakeThreshold: Int {
+        enhancementAttempt != nil
+            ? Self.maxPendingEnhancedFrames
+            : (Self.maxPendingEnhancedStartFrames + 1)
+    }
+
+    private func syncNativeMediaDataRequest() {
+        let renderer = displayView.sampleBufferLayer.sampleBufferRenderer
+        if wantsNativeMediaDataRequest {
+            guard !isRequestingMediaData else { return }
+            attachSynchronizerIfNeeded()
+            isRequestingMediaData = true
+            renderer.requestMediaDataWhenReady(on: DispatchQueue.main) { [weak self] in
+                MainActor.assumeIsolated {
+                    self?.handleNativeMediaDataWhenReady()
+                }
+            }
+        } else {
+            guard isRequestingMediaData else { return }
+            isRequestingMediaData = false
+            renderer.stopRequestingMediaData()
+        }
+    }
+
+    private func handleNativeMediaDataWhenReady() {
+        guard isRequestingMediaData else { return }
+        let renderer = displayView.sampleBufferLayer.sampleBufferRenderer
+        let savedWake = pendingOutputDrainWake
+        if !pendingEnhancedOutput.isEmpty {
+            let drainOutcome = drainPendingEnhancedOutput(renderer: renderer)
+            if drainOutcome == .rendererFault {
+                if let handler = mediaDataWhenReadyHandler {
+                    handler()
+                } else if let savedWake {
+                    savedWake()
+                }
+                syncNativeMediaDataRequest()
+                return
+            }
+        }
+        if pendingEnhancedOutput.count < pendingOutputWakeThreshold {
+            let wake = pendingOutputDrainWake
+            pendingOutputDrainWake = nil
+            if let handler = mediaDataWhenReadyHandler {
+                handler()
+            } else if let wake {
+                wake()
+            }
+        }
+        syncNativeMediaDataRequest()
+    }
+
     func requestMediaDataWhenReady(_ handler: @escaping () -> Void) {
         attachSynchronizerIfNeeded()
         mediaDataWhenReadyHandler = handler
-        guard !isRequestingMediaData else { return }
-        isRequestingMediaData = true
-        let renderer = displayView.sampleBufferLayer.sampleBufferRenderer
-        renderer.requestMediaDataWhenReady(on: DispatchQueue.main) { [weak self] in
-            MainActor.assumeIsolated {
-                guard let self else { return }
-                guard self.isRequestingMediaData else { return }
-                self.mediaDataWhenReadyHandler?()
-            }
-        }
+        syncNativeMediaDataRequest()
     }
 
     func stopRequestingMediaData() {
         mediaDataWhenReadyHandler = nil
-        guard isRequestingMediaData else { return }
-        isRequestingMediaData = false
-        displayView.sampleBufferLayer.sampleBufferRenderer.stopRequestingMediaData()
+        syncNativeMediaDataRequest()
     }
 
     func flush() {
@@ -1197,6 +1251,7 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         displayRate = 0
         maxEnqueuedPresentationEnd = 0
         latestAmbientPixelBuffer = nil
+        hasAmbientAccumulation = false
         flushRenderer(displayView.sampleBufferLayer.sampleBufferRenderer)
         flushCount += 1
         presentationProofState.clearCandidateAndFloor()
@@ -1748,14 +1803,35 @@ extension SampleBufferVideoRenderer {
 
     private enum MidpointDrainOutcome {
         case completed
-        case blockedOnASBD
         case rendererFault
+    }
+
+    private enum PendingOutputDrainOutcome {
+        case drained
+        case blocked
+        case rendererFault
+    }
+
+    private var lastQueuedPTS: TimeInterval? {
+        pendingEnhancedOutput.last?.frame.pts ?? lastEnqueuedPTS
     }
 
     private enum EnhancedOriginalAdmission {
         case unavailable
         case late
         case ready(MediaVideoFrame)
+    }
+
+    private enum EnhancementDeadlineTarget: Equatable {
+        case attempt(id: UInt64, boundary: UInt64)
+        case busyWait(frame: EnhancementFrameIdentity, boundary: UInt64)
+    }
+
+    private struct BusyWaitState {
+        let frame: EnhancementFrameIdentity
+        let boundary: UInt64
+        let deadline: ContinuousClock.Instant
+        let wake: @MainActor () -> Void
     }
 
     private struct EnhancementAttempt {
@@ -1818,8 +1894,6 @@ extension SampleBufferVideoRenderer {
         playbackRate: Double,
         onEnhancementWake: @escaping @MainActor () -> Void
     ) throws -> DemandFramePresentationResult {
-        let costSpan = UIHitchMonitor.beginSpan("render.present")
-        defer { UIHitchMonitor.endSpan(costSpan) }
         try validatePresentationFrame(frame)
         guard frame.pts + 1e-9 >= demandOutputFloor else {
             throw MediaEngineError.renderFailed("frame below current Demand output floor")
@@ -1832,8 +1906,33 @@ extension SampleBufferVideoRenderer {
         if recoverFaultedRenderer(renderer) {
             return recordRendererFault(renderer, reason: "ASBD fault before enqueue")
         }
+        if !pendingEnhancedOutput.isEmpty {
+            if drainPendingEnhancedOutput(renderer: renderer) == .rendererFault {
+                return recordRendererFault(renderer, reason: "ASBD fault draining pending enhancement output")
+            }
+            syncNativeMediaDataRequest()
+        }
         discardEnhancementForReplacedHead(frame)
-        guard renderer.isReadyForMoreMediaData else { return noteNativeWait() }
+        if !renderer.isReadyForMoreMediaData {
+            let canPipelineEnhancement: Bool
+            if tracksEnhancementAdmissions {
+                if enhancementAttempt != nil {
+                    canPipelineEnhancement = pendingEnhancedOutput.count < Self.maxPendingEnhancedFrames
+                } else {
+                    canPipelineEnhancement = pendingEnhancedOutput.count <= Self.maxPendingEnhancedStartFrames
+                }
+            } else {
+                canPipelineEnhancement = false
+            }
+            guard canPipelineEnhancement else {
+                if !pendingEnhancedOutput.isEmpty {
+                    pendingOutputDrainWake = onEnhancementWake
+                    syncNativeMediaDataRequest()
+                }
+                return noteNativeWait()
+            }
+        }
+        pendingOutputDrainWake = nil
         if let attempt = enhancementAttempt {
             return try resumeEnhancement(
                 attempt,
@@ -1863,7 +1962,7 @@ extension SampleBufferVideoRenderer {
             )
         }
         if let plan = admission.interpolationPlan, plan.phases.isEmpty {
-            if !plan.emitsOriginal, lastEnqueuedPTS != nil, !admission.canUpscale {
+            if !plan.emitsOriginal, lastQueuedPTS != nil, !admission.canUpscale {
                 recordSkippedOriginalAdmission(frame, committedPlan: plan, playbackRate: playbackRate)
                 return .enqueued
             }
@@ -1892,6 +1991,28 @@ extension SampleBufferVideoRenderer {
                 activeOriginalDuration: admission.activeOriginalDuration
             )
         }
+        let hasEligibleWork = request.canUpscale || request.midpointDelay != nil
+        if postProcessor.isBusy, hasEligibleWork {
+            let waitRunway = request.canUpscale ? request.originalDelay : (request.midpointDelay ?? request.originalDelay)
+            if let waitRunway, waitRunway > 0.015 {
+                parkForBusyWorker(
+                    frame: frame,
+                    originalDelay: waitRunway,
+                    wake: onEnhancementWake
+                )
+                return .waitingOnEnhancement
+            }
+            clearBusyWaitState()
+            let busyReason = recordBusyWorkerBypass(for: request)
+            postProcessor.noteBypass(busyReason)
+            return try admitOriginal(
+                frame,
+                renderer: renderer,
+                playbackRate: playbackRate,
+                activeOriginalDuration: admission.activeOriginalDuration
+            )
+        }
+        clearBusyWaitState()
         guard let deadlines = enhancementDeadlines(for: request) else {
             return try admitOriginal(
                 frame,
@@ -1905,9 +2026,80 @@ extension SampleBufferVideoRenderer {
     }
 
     private func discardEnhancementForReplacedHead(_ frame: MediaVideoFrame) {
-        guard let attempt = enhancementAttempt, attempt.frame != EnhancementFrameIdentity(frame) else { return }
+        let identity = EnhancementFrameIdentity(frame)
+        if let busy = busyWaitState, busy.frame != identity {
+            clearBusyWaitState()
+        }
+        guard let attempt = enhancementAttempt, attempt.frame != identity else { return }
         clearEnhancementAttempt()
         postProcessor.flush()
+    }
+
+    private func parkForBusyWorker(
+        frame: MediaVideoFrame,
+        originalDelay: TimeInterval,
+        wake: @escaping @MainActor () -> Void
+    ) {
+        let boundary = enhancementBoundary
+        let identity = EnhancementFrameIdentity(frame)
+        let waitSeconds = max(0.005, originalDelay - 0.010)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(waitSeconds))
+        busyWaitState = BusyWaitState(
+            frame: identity,
+            boundary: boundary,
+            deadline: deadline,
+            wake: wake
+        )
+        postProcessor.notifyWhenIdle { [weak self] in
+            self?.wakeFromBusyWorker(boundary: boundary)
+        }
+        armEnhancementDeadlineWake(
+            until: deadline,
+            target: .busyWait(frame: identity, boundary: boundary)
+        )
+    }
+
+    private func wakeFromBusyWorker(boundary: UInt64) {
+        guard enhancementBoundary == boundary,
+              let busy = busyWaitState,
+              busy.boundary == boundary else {
+            return
+        }
+        clearBusyWaitState()
+        busy.wake()
+    }
+
+    private func clearBusyWaitState() {
+        let hadBusyWait = busyWaitState != nil
+        busyWaitState = nil
+        if hadBusyWait {
+            postProcessor.clearIdleCallback()
+            if case .busyWait = enhancementDeadlineTarget {
+                cancelEnhancementDeadlineWake()
+            }
+        }
+    }
+
+    private func recordBusyWorkerBypass(for request: EnhancementPresentation) -> String {
+        if postProcessor.isWarming {
+            let reason = "Enhancement warming up"
+            if request.midpointDelay != nil {
+                enhancementDiagnostics.lastInterpolationBypass = reason
+            }
+            if request.canUpscale {
+                enhancementDiagnostics.superResolution.noteBypass(reason)
+            }
+            return reason
+        }
+        enhancementDiagnostics.workerBusy += 1
+        if request.midpointDelay != nil {
+            enhancementDiagnostics.lastInterpolationBypass = "Interpolation worker busy"
+        }
+        let busyReason = "Enhancement worker busy"
+        if request.canUpscale {
+            enhancementDiagnostics.superResolution.noteBypass(busyReason)
+        }
+        return busyReason
     }
 
     private func makeEnhancementPresentation(
@@ -1955,12 +2147,7 @@ extension SampleBufferVideoRenderer {
             return nil
         }
         guard !postProcessor.isBusy else {
-            enhancementDiagnostics.workerBusy += 1
-            if request.midpointDelay != nil {
-                enhancementDiagnostics.lastInterpolationBypass = "Interpolation worker busy"
-            }
-            let busyReason = "Enhancement worker busy"
-            if request.canUpscale { enhancementDiagnostics.superResolution.noteBypass(busyReason) }
+            let busyReason = recordBusyWorkerBypass(for: request)
             postProcessor.noteBypass(busyReason)
             return nil
         }
@@ -2014,15 +2201,14 @@ extension SampleBufferVideoRenderer {
             guard let self, self.enhancementBoundary == boundary else { return }
             self.receiveEnhancementUpdate(update, id: id)
         }
-        armEnhancementDeadlineWake(until: attempt.workDeadline, id: id, boundary: boundary)
+        armEnhancementDeadlineWake(until: attempt.workDeadline, target: .attempt(id: id, boundary: boundary))
     }
 
     private func armEnhancementDeadlineWake(
         until deadline: ContinuousClock.Instant,
-        id: UInt64,
-        boundary: UInt64
+        target: EnhancementDeadlineTarget
     ) {
-        enhancementDeadlineTarget = (id: id, boundary: boundary)
+        enhancementDeadlineTarget = target
         let timer = enhancementDeadlineTimer ?? {
             let created = EnhancementDeadlineTimer { [weak self] in
                 self?.handleEnhancementDeadlineWake()
@@ -2036,16 +2222,37 @@ extension SampleBufferVideoRenderer {
     private func handleEnhancementDeadlineWake() {
         guard let target = enhancementDeadlineTarget else { return }
         enhancementDeadlineTarget = nil
-        guard enhancementBoundary == target.boundary,
-              let attempt = enhancementAttempt,
-              attempt.id == target.id,
-              case .processing = attempt.state else { return }
-        if ContinuousClock.now < attempt.workDeadline {
-            armEnhancementDeadlineWake(until: attempt.workDeadline, id: attempt.id, boundary: target.boundary)
-            return
+        switch target {
+        case let .attempt(id, boundary):
+            guard enhancementBoundary == boundary,
+                  let attempt = enhancementAttempt,
+                  attempt.id == id,
+                  case .processing = attempt.state else { return }
+            if ContinuousClock.now < attempt.workDeadline {
+                armEnhancementDeadlineWake(
+                    until: attempt.workDeadline,
+                    target: .attempt(id: attempt.id, boundary: boundary)
+                )
+                return
+            }
+            expireEnhancement(attempt)
+            attempt.wake()
+        case let .busyWait(frame, boundary):
+            guard enhancementAttempt == nil,
+                  enhancementBoundary == boundary,
+                  let busy = busyWaitState,
+                  busy.boundary == boundary,
+                  busy.frame == frame else { return }
+            if ContinuousClock.now < busy.deadline {
+                armEnhancementDeadlineWake(
+                    until: busy.deadline,
+                    target: .busyWait(frame: frame, boundary: boundary)
+                )
+                return
+            }
+            clearBusyWaitState()
+            busy.wake()
         }
-        expireEnhancement(attempt)
-        attempt.wake()
     }
 
     private func receiveEnhancementUpdate(_ update: VideoFrameEnhancementUpdate, id: UInt64) {
@@ -2134,6 +2341,7 @@ extension SampleBufferVideoRenderer {
     private func clearEnhancementAttempt() {
         cancelEnhancementDeadlineWake()
         enhancementAttempt = nil
+        clearBusyWaitState()
     }
 
     private func retireEnhancement(wakeWaitingDrain: Bool = false) {
@@ -2141,14 +2349,28 @@ extension SampleBufferVideoRenderer {
             if case .processing = attempt.state { return attempt }
             return nil
         }
-        if enhancementAttempt != nil || enhancementReference != nil { postProcessor.noteDiscontinuity() }
+        let busyWake = busyWaitState?.wake
+        let pendingWake = pendingOutputDrainWake
+        if enhancementAttempt != nil || enhancementReference != nil || busyWaitState != nil
+            || !pendingEnhancedOutput.isEmpty {
+            postProcessor.noteDiscontinuity()
+        }
         enhancementBoundary &+= 1
         enhancementDiagnostics = EnhancementDiagnostics(lastReport: enhancementDiagnostics.lastReport)
         clearEnhancementAttempt()
+        pendingEnhancedOutput.removeAll()
+        pendingOutputDrainWake = nil
+        syncNativeMediaDataRequest()
         enhancementReference = nil
         postProcessor.flush()
-        if wakeWaitingDrain, let waiting {
-            Task { @MainActor in waiting.wake() }
+        if wakeWaitingDrain {
+            if let waiting {
+                Task { @MainActor in waiting.wake() }
+            } else if let busyWake {
+                Task { @MainActor in busyWake() }
+            } else if let pendingWake {
+                Task { @MainActor in pendingWake() }
+            }
         }
     }
 
@@ -2198,9 +2420,6 @@ extension SampleBufferVideoRenderer {
         ) {
         case .completed:
             enhancementAttempt = current
-        case .blockedOnASBD:
-            enhancementAttempt = current
-            return noteNativeWait()
         case .rendererFault:
             return try admitOriginal(
                 frame,
@@ -2237,6 +2456,102 @@ extension SampleBufferVideoRenderer {
         )
     }
 
+    @discardableResult
+    private func drainPendingEnhancedOutput(
+        renderer: AVSampleBufferVideoRenderer
+    ) -> PendingOutputDrainOutcome {
+        guard !pendingEnhancedOutput.isEmpty else { return .drained }
+        if recoverFaultedRenderer(renderer) {
+            return .rendererFault
+        }
+        let clock = displayClockSeconds
+        let canDropLateMidpoints = clock.isFinite && displayRate > 0 && synchronizer.rate > 0
+        var headIndex = 0
+        defer {
+            if headIndex > 0 {
+                if headIndex >= pendingEnhancedOutput.count {
+                    pendingEnhancedOutput.removeAll(keepingCapacity: true)
+                } else {
+                    pendingEnhancedOutput.removeFirst(headIndex)
+                }
+            }
+        }
+        while headIndex < pendingEnhancedOutput.count {
+            let item = pendingEnhancedOutput[headIndex]
+            if item.isMidpoint, !item.commitsPresentationProgress,
+               canDropLateMidpoints, item.frame.pts < clock - 0.004 {
+                enhancementDiagnostics.noteInterpolationDeadline("Interpolation presentation deadline")
+                headIndex += 1
+                continue
+            }
+            guard renderer.isReadyForMoreMediaData else {
+                return .blocked
+            }
+            if let fallbackOriginal = item.fallbackOriginal {
+                switch enqueueOptionalFrame(
+                    item.frame,
+                    renderer: renderer,
+                    isMidpoint: item.isMidpoint,
+                    sampleDurationOverride: item.sampleDurationOverride,
+                    commitsProgress: item.commitsPresentationProgress
+                ) {
+                case .enqueued:
+                    headIndex += 1
+                case .blocked:
+                    return .blocked
+                case .rendererFault:
+                    headIndex = 0
+                    return .rendererFault
+                case nil:
+                    enhancementDiagnostics.superResolution.rejected += 1
+                    pendingEnhancedOutput[headIndex] = PendingEnhancedFrame(
+                        frame: fallbackOriginal,
+                        isMidpoint: false,
+                        sampleDurationOverride: item.sampleDurationOverride,
+                        fallbackOriginal: nil,
+                        commitsPresentationProgress: true
+                    )
+                    switch enqueueOptionalFrame(
+                        fallbackOriginal,
+                        renderer: renderer,
+                        isMidpoint: false,
+                        sampleDurationOverride: item.sampleDurationOverride,
+                        commitsProgress: true
+                    ) {
+                    case .enqueued:
+                        headIndex += 1
+                    case .blocked:
+                        return .blocked
+                    case .rendererFault:
+                        headIndex = 0
+                        return .rendererFault
+                    case nil:
+                        headIndex += 1
+                    }
+                }
+            } else {
+                switch enqueueOptionalFrame(
+                    item.frame,
+                    renderer: renderer,
+                    isMidpoint: item.isMidpoint,
+                    sampleDurationOverride: item.sampleDurationOverride,
+                    commitsProgress: item.commitsPresentationProgress
+                ) {
+                case .enqueued:
+                    headIndex += 1
+                case .blocked:
+                    return .blocked
+                case .rendererFault:
+                    headIndex = 0
+                    return .rendererFault
+                case nil:
+                    headIndex += 1
+                }
+            }
+        }
+        return .drained
+    }
+
     private func admitMidpointsIfUsable(
         _ attempt: inout EnhancementAttempt,
         original: MediaVideoFrame,
@@ -2251,49 +2566,39 @@ extension SampleBufferVideoRenderer {
         var admittedCount = initialAdmittedCount
         var lastAdmitted = initialLastAdmitted
         var newlyAdmitted = 0
-        for index in remaining.indices {
-            let midpoint = remaining[index].frame
-            let previousPTS = lastAdmitted?.pts ?? reference.pts
+        for item in remaining {
+            let midpoint = item.frame
+            let basePreviousPTS = lastAdmitted?.pts ?? reference.pts
+            let previousPTS = lastQueuedPTS.map { max(basePreviousPTS, $0) } ?? basePreviousPTS
             guard isUsableMidpoint(midpoint, after: previousPTS, before: original.pts) else { continue }
             guard isMidpointTimely(midpoint, clock: clock, playbackRate: playbackRate) else { continue }
-            switch enqueueOptionalFrame(midpoint, renderer: renderer, isMidpoint: true) {
-            case .enqueued:
-                admittedCount += 1
-                newlyAdmitted += 1
-                lastAdmitted = midpoint
-            case .blocked:
-                attempt.midpoint = .draining(
-                    remaining: Array(remaining[index...]),
-                    admittedCount: admittedCount,
-                    lastAdmitted: lastAdmitted
-                )
-                if newlyAdmitted > 0, let lastAdmitted {
-                    enhancementDiagnostics.midpointsEnqueued += newlyAdmitted
-                    postProcessor.noteMidpointAccepted(
-                        lastAdmitted,
-                        previous: reference,
-                        original: original,
-                        acceptedCount: admittedCount,
-                        plan: attempt.committedPlan
-                    )
-                }
-                return .blockedOnASBD
-            case nil:
-                continue
-            case .rendererFault:
-                return .rendererFault
-            }
+            pendingEnhancedOutput.append(PendingEnhancedFrame(
+                frame: midpoint,
+                isMidpoint: true,
+                sampleDurationOverride: nil,
+                fallbackOriginal: nil,
+                commitsPresentationProgress: false
+            ))
+            admittedCount += 1
+            newlyAdmitted += 1
+            lastAdmitted = midpoint
         }
         attempt.midpoint = .resolved(admittedCount: admittedCount, lastAdmitted: lastAdmitted)
-        if newlyAdmitted > 0, let lastAdmitted {
-            enhancementDiagnostics.midpointsEnqueued += newlyAdmitted
-            postProcessor.noteMidpointAccepted(
-                lastAdmitted,
-                previous: reference,
-                original: original,
-                acceptedCount: admittedCount,
-                plan: attempt.committedPlan
-            )
+        if newlyAdmitted > 0 {
+            if drainPendingEnhancedOutput(renderer: renderer) == .rendererFault {
+                return .rendererFault
+            }
+            syncNativeMediaDataRequest()
+            if let lastAdmitted {
+                enhancementDiagnostics.midpointsEnqueued += newlyAdmitted
+                postProcessor.noteMidpointAccepted(
+                    lastAdmitted,
+                    previous: reference,
+                    original: original,
+                    acceptedCount: admittedCount,
+                    plan: attempt.committedPlan
+                )
+            }
         }
         return .completed
     }
@@ -2373,24 +2678,34 @@ extension SampleBufferVideoRenderer {
         renderer: AVSampleBufferVideoRenderer
     ) -> DemandFramePresentationResult {
         let boundary = enhancementBoundary
-        consecutiveRendererFaultCount = 0
-        if let end = finitePresentationIntervalEnd(start: lastMidpoint.pts, duration: lastMidpoint.duration) {
-            maxEnqueuedPresentationEnd = max(maxEnqueuedPresentationEnd, end)
-        }
-        presentCount += 1
-        lastEnqueuedPTS = lastMidpoint.pts
-        presentationProgressSerial &+= 1
-        if presentationProgressSerial == 0 { presentationProgressSerial = 1 }
-        lastPresentationProgressUptime = ProcessInfo.processInfo.systemUptime
-        if presentationProofState.isAwaiting {
-            reduceAndPublishPresentationProof(
-                framePTS: lastMidpoint.pts,
-                frameDuration: lastMidpoint.duration,
-                surfaceReadiness: currentPresentationSurfaceReadiness(),
-                rendererHealthy: renderer.status != .failed
-                    && !renderer.requiresFlushToResumeDecoding,
-                expectedHoldID: presentationImageHoldState?.id
-            )
+        let lastPendingIndex = pendingEnhancedOutput.indices.last
+        let lastMidpointStillPending = lastPendingIndex.map { idx in
+            let item = pendingEnhancedOutput[idx]
+            return item.isMidpoint && item.frame.pts == lastMidpoint.pts
+        } ?? false
+        if lastMidpointStillPending, let lastPendingIndex {
+            pendingEnhancedOutput[lastPendingIndex].commitsPresentationProgress = true
+            syncNativeMediaDataRequest()
+        } else {
+            consecutiveRendererFaultCount = 0
+            if let end = finitePresentationIntervalEnd(start: lastMidpoint.pts, duration: lastMidpoint.duration) {
+                maxEnqueuedPresentationEnd = max(maxEnqueuedPresentationEnd, end)
+            }
+            presentCount += 1
+            lastEnqueuedPTS = lastMidpoint.pts
+            presentationProgressSerial &+= 1
+            if presentationProgressSerial == 0 { presentationProgressSerial = 1 }
+            lastPresentationProgressUptime = ProcessInfo.processInfo.systemUptime
+            if presentationProofState.isAwaiting {
+                reduceAndPublishPresentationProof(
+                    framePTS: lastMidpoint.pts,
+                    frameDuration: lastMidpoint.duration,
+                    surfaceReadiness: currentPresentationSurfaceReadiness(),
+                    rendererHealthy: renderer.status != .failed
+                        && !renderer.requiresFlushToResumeDecoding,
+                    expectedHoldID: presentationImageHoldState?.id
+                )
+            }
         }
         if enhancementBoundary == boundary {
             recordOriginalAdmission(
@@ -2423,6 +2738,7 @@ extension SampleBufferVideoRenderer {
         )
         guard tracksEnhancementAdmissions else { return }
         enhancementReference = original
+        postProcessor.prewarmIfNeeded(with: original, playbackRate: playbackRate)
         reportEnhancementDiagnosticsIfNeeded()
     }
 
@@ -2442,14 +2758,16 @@ extension SampleBufferVideoRenderer {
         _ frame: MediaVideoFrame,
         renderer: AVSampleBufferVideoRenderer,
         isMidpoint: Bool,
-        sampleDurationOverride: TimeInterval? = nil
+        sampleDurationOverride: TimeInterval? = nil,
+        commitsProgress: Bool? = nil
     ) -> NativeFrameAdmission? {
         do {
             return try enqueueSingleFrame(
                 frame,
                 renderer: renderer,
                 isMidpoint: isMidpoint,
-                sampleDurationOverride: sampleDurationOverride
+                sampleDurationOverride: sampleDurationOverride,
+                commitsProgress: commitsProgress
             )
         } catch {
             postProcessor.noteBypass("Invalid enhancement output")
@@ -2490,6 +2808,53 @@ extension SampleBufferVideoRenderer {
         } else {
             sampleDurationOverride = nil
         }
+
+        let shouldQueueForPipeline = !pendingEnhancedOutput.isEmpty
+            || (!renderer.isReadyForMoreMediaData && tracksEnhancementAdmissions && (result != nil || midpointCount > 0))
+        if shouldQueueForPipeline {
+            let pendingItem: PendingEnhancedFrame
+            let admittedEnhancedOriginal: MediaVideoFrame?
+            if case let .ready(candidate) = enhancedOriginal {
+                pendingItem = PendingEnhancedFrame(
+                    frame: candidate,
+                    isMidpoint: false,
+                    sampleDurationOverride: sampleDurationOverride,
+                    fallbackOriginal: original,
+                    commitsPresentationProgress: true
+                )
+                admittedEnhancedOriginal = candidate
+            } else {
+                pendingItem = PendingEnhancedFrame(
+                    frame: original,
+                    isMidpoint: false,
+                    sampleDurationOverride: sampleDurationOverride,
+                    fallbackOriginal: nil,
+                    commitsPresentationProgress: true
+                )
+                admittedEnhancedOriginal = nil
+            }
+            pendingEnhancedOutput.append(pendingItem)
+            if drainPendingEnhancedOutput(renderer: renderer) == .rendererFault {
+                return recordRendererFault(renderer, reason: "ASBD fault draining pending enhancement output")
+            }
+            syncNativeMediaDataRequest()
+            if enhancementBoundary == boundary {
+                if case .late = enhancedOriginal {
+                    enhancementDiagnostics.superResolution.late += 1
+                }
+                recordOriginalAdmission(
+                    original,
+                    result: result,
+                    midpointCount: midpointCount,
+                    upscaled: admittedEnhancedOriginal,
+                    emittedOriginal: true,
+                    committedPlan: committedPlan,
+                    playbackRate: effectiveRate
+                )
+            }
+            return .enqueued
+        }
+
         var admittedEnhancedOriginal: MediaVideoFrame?
         if case let .ready(candidate) = enhancedOriginal {
             switch enqueueOptionalFrame(
@@ -2565,6 +2930,7 @@ extension SampleBufferVideoRenderer {
         )
         guard tracksEnhancementAdmissions else { return }
         enhancementReference = original
+        postProcessor.prewarmIfNeeded(with: original, playbackRate: playbackRate)
         if emittedOriginal {
             enhancementDiagnostics.originalsEnqueued += 1
         }
@@ -2694,13 +3060,11 @@ final class SampleBufferDisplayView: UIView {
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        SurfaceMoveProbe.noteWindowMembership(inWindow: window != nil, generation: -1)
         onPresentationSurfaceChanged?()
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        SurfaceMoveProbe.noteDisplaySized(bounds: bounds)
         onPresentationSurfaceChanged?()
     }
 

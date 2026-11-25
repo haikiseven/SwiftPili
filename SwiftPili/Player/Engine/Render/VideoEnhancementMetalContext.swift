@@ -23,6 +23,15 @@ struct VideoEnhancementNV12StageCopyParams {
 
 struct VideoEnhancementRCASParams {
     var strength: Float
+    var tapStep: UInt32
+    var splitCompare: UInt32
+}
+
+struct VideoEnhancementRCASNV12Params {
+    var strength: Float
+    var colorMatrix: UInt32
+    var tapStep: UInt32
+    var splitCompare: UInt32
 }
 
 /// Shared GPU infrastructure for all video enhancement backends (MetalFX SR, VideoToolbox SR/FI
@@ -54,6 +63,7 @@ final class VideoEnhancementMetalContext: @unchecked Sendable {
         case nv12StageCopyY
         case nv12StageCopyCbCr
         case rcasSharpen
+        case rcasToNV12
 
         // VisionFrameInterpolation.metal
         case visionInterpolationPrepare

@@ -17,7 +17,27 @@ private struct VideoFrameEnhancementJob: Sendable {
     var isUpscaling: Bool { configuration.superResolutionMode != .off && upscalingBypassReason == nil }
 }
 
+private struct VideoFrameWarmJob: Sendable {
+    let frame: PostProcessFrameBox
+    let configuration: VideoEnhancementConfiguration
+    let superResolutionCap: Float
+    let superResolutionTargetDimensions: VideoSuperResolutionDimensions?
+    let interpolationPreviousPTS: TimeInterval?
+    let interpolationCurrentPTS: TimeInterval?
+    let interpolationPlan: VideoFrameInterpolationPlan?
+
+    var isUpscaling: Bool {
+        configuration.superResolutionMode != .off
+            && (superResolutionTargetDimensions != nil || superResolutionCap > 0)
+    }
+}
+
 private enum WorkerCommand: Sendable {
+    case prewarm(
+        job: VideoFrameWarmJob,
+        isAlive: @Sendable () -> Bool,
+        complete: @Sendable (Bool) async -> Void
+    )
     case process(
         job: VideoFrameEnhancementJob,
         isAlive: @Sendable () -> Bool,
@@ -49,6 +69,9 @@ private actor VideoFramePostProcessorActor {
         let pipeline = VideoFramePostProcessorPipeline()
         for await command in stream {
             switch command {
+            case let .prewarm(job, isAlive, complete):
+                let completed = await pipeline.prewarm(job, isAlive: isAlive)
+                await complete(completed)
             case let .process(job, isAlive, publishMidpoints, complete):
                 let result = await pipeline.process(
                     job,
@@ -68,15 +91,39 @@ private actor VideoFramePostProcessorActor {
 
 @MainActor
 final class VideoFramePostProcessor {
+    private struct WarmKey: Equatable, Sendable {
+        let superResolutionMode: VideoSuperResolutionMode
+        let superResolutionScale: VideoSuperResolutionScale
+        let superResolutionTargetResolution: VideoSuperResolutionTargetResolution
+        let limitToScreenResolution: Bool
+        let frameInterpolationEnabled: Bool
+        let interpolationRate: VideoInterpolationRate
+        let maxInputResolution: VideoEnhancementMaxInputResolution
+        let width: Int
+        let height: Int
+        let pixelFormat: OSType
+        let roundedPlaybackRate: Int
+    }
+
     private let workerChannel = OSAllocatedUnfairLock(initialState: WorkerChannelState())
     private var nextJobID: UInt64 = 0
     private var inFlightJobID: UInt64?
+    private(set) var isWarming = false
+    private var warmedKey: WarmKey?
+    private var idleCallback: (@MainActor () -> Void)?
     private var cadenceEstimator = VideoFrameCadenceEstimator()
     private var interpolationGridNextPTS: TimeInterval?
 
     var configuration = VideoEnhancementConfiguration.disabled {
         didSet {
             guard configuration != oldValue else { return }
+            if configuration.isShaderUniformOnlyChange(from: oldValue) {
+                return
+            }
+            warmedKey = nil
+            if !configuration.isRequested || configuration.isLiveStream {
+                VideoEnhancementPoolLimits.reset()
+            }
             pendingExpectation = nil
             telemetryWindow.reset()
             cadenceEstimator.reset()
@@ -117,7 +164,7 @@ final class VideoFramePostProcessor {
     var displaySurface: VideoEnhancementDisplaySurface?
 
     /// Steady presentation lookahead requested when video enhancement is active.
-    var preferredPresentLeadSeconds: TimeInterval { VideoEnhancementPoolLimits.defaultLead }
+    var preferredPresentLeadSeconds: TimeInterval { VideoEnhancementPoolLimits.currentLead }
 
     var interpolationLabel: String {
         if #available(iOS 26.0, *) { return "VT FI" }
@@ -160,13 +207,6 @@ final class VideoFramePostProcessor {
         switch configuration.superResolutionMode {
         case .off:
             return .bypassed("Off")
-        case .videoToolboxML:
-            let requested = configuration.superResolutionScale.factor
-            guard configuration.limitToScreenResolution, let displaySurface else { return .scaleCap(requested) }
-            guard let cap = displaySurface.superResolutionCap(
-                inputWidth: inputWidth, inputHeight: inputHeight, requested: requested, mode: .videoToolboxML
-            ) else { return .bypassed("Display resolution reached") }
-            return .scaleCap(cap)
         case .metalFXSpatial:
             if let targetShortEdge = configuration.superResolutionTargetResolution.shortEdge {
                 // Explicit manual target resolution overrides Limit to Screen Resolution.
@@ -196,6 +236,7 @@ final class VideoFramePostProcessor {
         playbackRate: Double = 1.0
     ) -> VideoEnhancementAdmissionOutcome {
         guard configuration.isRequested, ExperimentalSettingsPolicy.videoEnhancementEnabled else {
+            VideoEnhancementPoolLimits.reset()
             let empty = VideoEnhancementTelemetry()
             if frameTelemetry != empty {
                 frameTelemetry = empty
@@ -249,7 +290,14 @@ final class VideoFramePostProcessor {
             return .ineligible(bypassReason: reason, activeOriginalDuration: nil)
         }
 
+        let estimatedCadence = cadenceEstimator.estimatedInterval(fallbackDuration: frame.duration)
+
         guard let previous else {
+            updatePoolLimits(
+                cadenceInterval: estimatedCadence,
+                playbackRate: playbackRate,
+                committedPlan: nil
+            )
             return .ineligible(
                 bypassReason: "No accepted reference",
                 activeOriginalDuration: activeOriginalDuration
@@ -271,6 +319,12 @@ final class VideoFramePostProcessor {
             pairPlan = nil
             pairBypass = fiStreamBypass
         }
+
+        updatePoolLimits(
+            cadenceInterval: estimatedCadence,
+            playbackRate: playbackRate,
+            committedPlan: pairPlan
+        )
 
         return .eligible(VideoEnhancementAdmission(
             configuration: configuration,
@@ -471,6 +525,12 @@ final class VideoFramePostProcessor {
         }
         guard configuration.isRequested, !configuration.isLiveStream else { return }
 
+        updatePoolLimits(
+            cadenceInterval: cadenceEstimator.estimatedInterval(fallbackDuration: original.duration),
+            playbackRate: playbackRate,
+            committedPlan: committedPlan
+        )
+
         let speed = VideoFrameInterpolationPlan.normalizedPlaybackRate(playbackRate)
         if let plan = committedPlan, let nextGrid = plan.nextGridPTS {
             if emittedOriginal == plan.emitsOriginal, midpointCount > 0 || plan.phases.isEmpty {
@@ -527,7 +587,178 @@ final class VideoFramePostProcessor {
         ))
     }
 
+    // MARK: - Pool Limits & Worker Idle Notifications
+
+    private func updatePoolLimits(
+        cadenceInterval: TimeInterval?,
+        playbackRate: Double,
+        committedPlan: VideoFrameInterpolationPlan?
+    ) {
+        guard configuration.isRequested, !configuration.isLiveStream else {
+            VideoEnhancementPoolLimits.reset()
+            return
+        }
+        guard let cadenceInterval, cadenceInterval.isFinite, cadenceInterval > 0 else { return }
+        let speed = VideoFrameInterpolationPlan.normalizedPlaybackRate(playbackRate)
+        let sourceFPS = (1.0 / cadenceInterval) * speed
+        guard sourceFPS.isFinite, sourceFPS > 0 else { return }
+
+        let outputFPS: Double
+        let maxPhasesPerPair: Int
+        if let plan = committedPlan {
+            outputFPS = max(sourceFPS, plan.targetOutputFPS)
+            let ratio = outputFPS / sourceFPS
+            let estimatedPhases = max(plan.phases.count, Int(ceil(ratio)) - 1)
+            maxPhasesPerPair = max(0, min(estimatedPhases, VideoFrameInterpolationPlan.maximumPhasesPerPair))
+        } else if configuration.frameInterpolationEnabled {
+            if let targetFPS = configuration.interpolationRate.targetFPS {
+                outputFPS = max(sourceFPS, Double(targetFPS))
+            } else {
+                outputFPS = sourceFPS * 2.0
+            }
+            let ratio = outputFPS / sourceFPS
+            maxPhasesPerPair = ratio > 1.05
+                ? max(1, min(Int(ceil(ratio)) - 1, VideoFrameInterpolationPlan.maximumPhasesPerPair))
+                : 0
+        } else {
+            outputFPS = sourceFPS
+            maxPhasesPerPair = 0
+        }
+
+        VideoEnhancementPoolLimits.configure(
+            sourceFPS: sourceFPS,
+            outputFPS: outputFPS,
+            maxPhasesPerPair: maxPhasesPerPair,
+            underMemoryPressure: VideoEnhancementGuardrails.isUnderMemoryPressure
+        )
+    }
+
+    func notifyWhenIdle(_ callback: @escaping @MainActor () -> Void) {
+        guard isBusy else {
+            callback()
+            return
+        }
+        idleCallback = callback
+    }
+
+    func clearIdleCallback() {
+        idleCallback = nil
+    }
+
+    private func notifyIdleIfNeeded() {
+        guard !isBusy, let callback = idleCallback else { return }
+        idleCallback = nil
+        callback()
+    }
+
     // MARK: - Persistent Worker Submission & Lifecycle
+
+    private func ensureWorkerChannel() -> (
+        generation: UInt64,
+        continuation: AsyncStream<WorkerCommand>.Continuation
+    ) {
+        let (generation, continuation, newStream): (
+            UInt64,
+            AsyncStream<WorkerCommand>.Continuation,
+            AsyncStream<WorkerCommand>?
+        ) = workerChannel.withLock { state in
+            if let existing = state.continuation {
+                return (state.generation, existing, nil)
+            }
+            let (stream, cont) = AsyncStream<WorkerCommand>.makeStream()
+            state.continuation = cont
+            return (state.generation, cont, stream)
+        }
+        if let newStream {
+            VideoFramePostProcessorActor.launchLoop(stream: newStream)
+        }
+        return (generation, continuation)
+    }
+
+    /// Lightweight non-blocking session prewarm triggered when the initial reference frame is
+    /// accepted, so VideoToolbox / MetalFX / Vision cold-start model load finishes before Frame 1
+    /// exhausts its presentation runway.
+    func prewarmIfNeeded(with frame: MediaVideoFrame, playbackRate: Double = 1.0) {
+        guard inFlightJobID == nil,
+              configuration.isRequested,
+              !configuration.isLiveStream,
+              ExperimentalSettingsPolicy.videoEnhancementEnabled else {
+            return
+        }
+        guard VideoEnhancementGuardrails.commonBypassReason(
+            configuration: configuration,
+            pixelBuffer: frame.pixelBuffer
+        ) == nil else {
+            return
+        }
+
+        let width = CVPixelBufferGetWidth(frame.pixelBuffer)
+        let height = CVPixelBufferGetHeight(frame.pixelBuffer)
+        let pixelFormat = CVPixelBufferGetPixelFormatType(frame.pixelBuffer)
+        let speed = VideoFrameInterpolationPlan.normalizedPlaybackRate(playbackRate)
+        let key = WarmKey(
+            superResolutionMode: configuration.superResolutionMode,
+            superResolutionScale: configuration.superResolutionScale,
+            superResolutionTargetResolution: configuration.superResolutionTargetResolution,
+            limitToScreenResolution: configuration.limitToScreenResolution,
+            frameInterpolationEnabled: configuration.frameInterpolationEnabled,
+            interpolationRate: configuration.interpolationRate,
+            maxInputResolution: configuration.maxInputResolution,
+            width: width,
+            height: height,
+            pixelFormat: pixelFormat,
+            roundedPlaybackRate: Int((speed * 100).rounded())
+        )
+        guard key != warmedKey else { return }
+
+        let srPlan = resolveSuperResolutionPlan(for: frame).resolved
+        let estimatedCadence = cadenceEstimator.estimatedInterval(fallbackDuration: frame.duration)
+        let fiWarmPlan: (previousPTS: TimeInterval, currentPTS: TimeInterval, plan: VideoFrameInterpolationPlan)?
+        if configuration.frameInterpolationEnabled, interpolationInputBypassReason(frame) == nil {
+            fiWarmPlan = VideoFrameInterpolationPlan.prewarmPlan(
+                for: frame,
+                cadenceInterval: estimatedCadence,
+                rate: configuration.interpolationRate,
+                playbackRate: speed
+            )
+        } else {
+            fiWarmPlan = nil
+        }
+
+        warmedKey = key
+        guard srPlan != nil || fiWarmPlan != nil else { return }
+
+        updatePoolLimits(
+            cadenceInterval: estimatedCadence,
+            playbackRate: speed,
+            committedPlan: fiWarmPlan?.plan
+        )
+
+        nextJobID &+= 1
+        let jobID = nextJobID
+        inFlightJobID = jobID
+        isWarming = true
+
+        let warmJob = VideoFrameWarmJob(
+            frame: PostProcessFrameBox(frame: frame),
+            configuration: configuration,
+            superResolutionCap: srPlan?.scaleCap ?? 0,
+            superResolutionTargetDimensions: srPlan?.targetDimensions,
+            interpolationPreviousPTS: fiWarmPlan?.previousPTS,
+            interpolationCurrentPTS: fiWarmPlan?.currentPTS,
+            interpolationPlan: fiWarmPlan?.plan
+        )
+
+        let channel = workerChannel
+        let (generation, continuation) = ensureWorkerChannel()
+        let isAlive: @Sendable () -> Bool = {
+            channel.withLock { $0.generation == generation }
+        }
+        let complete: @Sendable (Bool) async -> Void = { [weak self] completed in
+            await self?.finishPrewarm(jobID: jobID, generation: generation, key: key, completed: completed)
+        }
+        continuation.yield(.prewarm(job: warmJob, isAlive: isAlive, complete: complete))
+    }
 
     func submit(
         _ frame: MediaVideoFrame,
@@ -563,22 +794,7 @@ final class VideoFramePostProcessor {
         )
 
         let channel = workerChannel
-        let (generation, continuation, newStream): (
-            UInt64,
-            AsyncStream<WorkerCommand>.Continuation,
-            AsyncStream<WorkerCommand>?
-        ) = channel.withLock { state in
-            if let existing = state.continuation {
-                return (state.generation, existing, nil)
-            }
-            let (stream, cont) = AsyncStream<WorkerCommand>.makeStream()
-            state.continuation = cont
-            return (state.generation, cont, stream)
-        }
-        if let newStream {
-            VideoFramePostProcessorActor.launchLoop(stream: newStream)
-        }
-
+        let (generation, continuation) = ensureWorkerChannel()
         let isAlive: @Sendable () -> Bool = {
             channel.withLock { $0.generation == generation }
         }
@@ -608,17 +824,22 @@ final class VideoFramePostProcessor {
     }
 
     func tearDown() {
+        inFlightJobID = nil
+        isWarming = false
+        warmedKey = nil
         pendingExpectation = nil
         telemetryWindow.reset()
         cadenceEstimator.reset()
         interpolationGridNextPTS = nil
         lastProcessingMs = 0
         frameTelemetry = VideoEnhancementTelemetry()
+        VideoEnhancementPoolLimits.reset()
         let continuation: AsyncStream<WorkerCommand>.Continuation? = workerChannel.withLock { state in
             state.generation &+= 1
             return state.continuation
         }
         continuation?.yield(.tearDown)
+        notifyIdleIfNeeded()
     }
 
     private func deliverMidpoints(
@@ -632,24 +853,47 @@ final class VideoFramePostProcessor {
         onUpdate(.midpointReady(midpoints))
     }
 
+    private func finishPrewarm(
+        jobID: UInt64,
+        generation: UInt64,
+        key: WarmKey,
+        completed: Bool
+    ) {
+        _ = generation
+        guard inFlightJobID == jobID else { return }
+        inFlightJobID = nil
+        isWarming = false
+        if !completed, warmedKey == key {
+            warmedKey = nil
+        }
+        notifyIdleIfNeeded()
+    }
+
     private func finish(
         _ result: VideoFrameEnhancementResult,
         jobID: UInt64,
         generation: UInt64,
         onUpdate: @MainActor (VideoFrameEnhancementUpdate) -> Void
     ) {
+        let becameIdle: Bool
         if inFlightJobID == jobID {
             inFlightJobID = nil
+            becameIdle = true
+        } else {
+            becameIdle = false
         }
-        guard workerChannel.withLock({ $0.generation == generation }) else { return }
-        onUpdate(.finished(result))
+        if workerChannel.withLock({ $0.generation == generation }) {
+            onUpdate(.finished(result))
+        }
+        if becameIdle {
+            notifyIdleIfNeeded()
+        }
     }
 }
 
 // MARK: - Single-Consumer Background Pipeline
 
 private final class VideoFramePostProcessorPipeline {
-    private let vtSuperRes = VideoToolboxSuperResolutionBackend()
     private let metalFXSuperRes = MetalFXSuperResolutionBackend()
     private let vtFrameInterp = VideoToolboxFrameInterpolationBackend()
     private let visionFrameInterp = VisionFrameInterpolationBackend()
@@ -669,9 +913,6 @@ private final class VideoFramePostProcessorPipeline {
     private func releaseIdleBackends(for configuration: VideoEnhancementConfiguration) {
         let mode = configuration.superResolutionMode
         if mode != lastSuperResolutionMode {
-            if lastSuperResolutionMode == .videoToolboxML {
-                vtSuperRes.tearDown()
-            }
             if lastSuperResolutionMode == .metalFXSpatial {
                 metalFXSuperRes.tearDown()
             }
@@ -686,14 +927,12 @@ private final class VideoFramePostProcessorPipeline {
     }
 
     func flush() {
-        vtSuperRes.flush()
         metalFXSuperRes.flush()
         resetInterpolation()
         smoothedMs = 0
     }
 
     func tearDown() {
-        vtSuperRes.tearDown()
         metalFXSuperRes.tearDown()
         vtFrameInterp.tearDown()
         visionFrameInterp.tearDown()
@@ -703,11 +942,69 @@ private final class VideoFramePostProcessorPipeline {
         lastInterpolationEnabled = false
     }
 
+    func prewarm(
+        _ job: VideoFrameWarmJob,
+        isAlive: @escaping @Sendable () -> Bool
+    ) async -> Bool {
+        guard isAlive() else { return false }
+        releaseIdleBackends(for: job.configuration)
+        let frame = job.frame.frame
+
+        if job.isUpscaling {
+            switch job.configuration.superResolutionMode {
+            case .off:
+                break
+            case .metalFXSpatial:
+                metalFXSuperRes.prewarm(
+                    pixelBuffer: frame.pixelBuffer,
+                    maxScale: job.superResolutionCap,
+                    targetDimensions: job.superResolutionTargetDimensions
+                )
+            }
+        }
+
+        guard isAlive() else { return false }
+
+        if let plan = job.interpolationPlan,
+           let prevPTS = job.interpolationPreviousPTS,
+           let currPTS = job.interpolationCurrentPTS {
+            resetInterpolation()
+            let warmPrev = MediaVideoFrame(
+                pts: prevPTS,
+                duration: plan.sourceInterval,
+                pixelBuffer: frame.pixelBuffer
+            )
+            let warmCurr = MediaVideoFrame(
+                pts: currPTS,
+                duration: plan.sourceInterval,
+                pixelBuffer: frame.pixelBuffer
+            )
+            _ = await interpolate(
+                warmPrev,
+                plan: nil,
+                maxInputResolution: job.configuration.maxInputResolution,
+                hasTimeRemaining: isAlive
+            )
+            if isAlive() {
+                _ = await interpolate(
+                    warmCurr,
+                    plan: plan,
+                    maxInputResolution: job.configuration.maxInputResolution,
+                    hasTimeRemaining: isAlive
+                )
+            }
+            resetInterpolation()
+        }
+
+        return isAlive()
+    }
+
     func process(
         _ job: VideoFrameEnhancementJob,
         isAlive: @escaping @Sendable () -> Bool,
         publishMidpoints: @Sendable ([PostProcessFrameBox]) async -> Void
     ) async -> VideoFrameEnhancementResult {
+        _ = publishMidpoints
         let start = ContinuousClock.now
         releaseIdleBackends(for: job.configuration)
         let frame = job.current.frame
@@ -720,13 +1017,8 @@ private final class VideoFramePostProcessorPipeline {
 
         let previousIdentity = EnhancementFrameIdentity(previous)
         let formatMatches = VideoFramePairFormat.matches(previous.pixelBuffer, frame.pixelBuffer)
-        if !formatMatches {
-            if job.configuration.superResolutionMode == .videoToolboxML {
-                vtSuperRes.flush()
-            }
-            if interpolationReference != nil {
-                resetInterpolation()
-            }
+        if !formatMatches, interpolationReference != nil {
+            resetInterpolation()
         }
 
         // Stage 1: Frame interpolation (raw synthesized midpoints in strictly ascending PTS order).
@@ -734,10 +1026,7 @@ private final class VideoFramePostProcessorPipeline {
         let shouldUpscaleOriginal = job.isUpscaling
             && ((job.interpolationPlan?.emitsOriginal ?? true) || interpolation.midpoints.isEmpty)
 
-        // Stage 2: Super resolution.
-        // - MetalFX Spatial batches midpoints + original into a single GPU command buffer submission.
-        // - VideoToolbox ML processes midpoints then original in strictly ascending PTS order so
-        //   VTSRSession temporal `lastSubmittedPTS` stays strictly monotonic with zero session teardown.
+        // Stage 2: Super resolution (MetalFX Spatial + RCAS batches midpoints + original into one GPU submission).
         var originalOutcome: VideoEnhancementBackendOutcome?
         if job.isUpscaling {
             switch job.configuration.superResolutionMode {
@@ -749,14 +1038,6 @@ private final class VideoFramePostProcessorPipeline {
                     interpolation: &interpolation,
                     shouldUpscaleOriginal: shouldUpscaleOriginal,
                     isAlive: isAlive
-                )
-            case .videoToolboxML:
-                originalOutcome = await runVideoToolboxSRStage(
-                    job,
-                    interpolation: &interpolation,
-                    shouldUpscaleOriginal: shouldUpscaleOriginal,
-                    isAlive: isAlive,
-                    publishMidpoints: publishMidpoints
                 )
             }
         } else if job.configuration.superResolutionMode != .off,
@@ -840,6 +1121,7 @@ private final class VideoFramePostProcessorPipeline {
         let frame = job.current.frame
         let midpointDeadline = job.deadlines.midpoint
         let hasMidpointTime = midpointDeadline.map { isAlive() && .now < $0 } ?? false
+        let splitCompare = job.configuration.superResolutionSplitCompare
 
         if !interpolation.midpoints.isEmpty, hasMidpointTime {
             if shouldUpscaleOriginal {
@@ -849,7 +1131,8 @@ private final class VideoFramePostProcessorPipeline {
                     pixelBuffers: buffers,
                     maxScale: job.superResolutionCap,
                     targetDimensions: job.superResolutionTargetDimensions,
-                    sharpness: job.configuration.superResolutionSharpness
+                    sharpness: job.configuration.superResolutionSharpness,
+                    splitCompare: splitCompare
                 )
                 guard outcomes.count == buffers.count else {
                     return .bypassed(reason: "MetalFX batch mismatch")
@@ -879,7 +1162,8 @@ private final class VideoFramePostProcessorPipeline {
                     pixelBuffers: buffers,
                     maxScale: job.superResolutionCap,
                     targetDimensions: job.superResolutionTargetDimensions,
-                    sharpness: job.configuration.superResolutionSharpness
+                    sharpness: job.configuration.superResolutionSharpness,
+                    splitCompare: splitCompare
                 )
                 guard outcomes.count == buffers.count else {
                     interpolation.srBypassReason = "MetalFX batch mismatch"
@@ -917,67 +1201,8 @@ private final class VideoFramePostProcessorPipeline {
             pixelBuffer: frame.pixelBuffer,
             maxScale: job.superResolutionCap,
             targetDimensions: job.superResolutionTargetDimensions,
-            sharpness: job.configuration.superResolutionSharpness
-        )
-    }
-
-    private func runVideoToolboxSRStage(
-        _ job: VideoFrameEnhancementJob,
-        interpolation: inout InterpolationStage,
-        shouldUpscaleOriginal: Bool,
-        isAlive: @escaping @Sendable () -> Bool,
-        publishMidpoints: @Sendable ([PostProcessFrameBox]) async -> Void
-    ) async -> VideoEnhancementBackendOutcome? {
-        let frame = job.current.frame
-        if !interpolation.midpoints.isEmpty, let midpointDeadline = job.deadlines.midpoint {
-            let hasMidpointTime: @Sendable () -> Bool = { isAlive() && .now < midpointDeadline }
-            var upscaledMidpoints = interpolation.midpoints
-            var allMidpointsUpscaled = true
-            for index in interpolation.midpoints.indices {
-                guard hasMidpointTime() else {
-                    allMidpointsUpscaled = false
-                    interpolation.srBypassReason = "Super resolution deadline"
-                    break
-                }
-                let midpoint = interpolation.midpoints[index]
-                let pts = CMTime(seconds: max(0, midpoint.pts), preferredTimescale: 1_000_000_000)
-                let outcome = await vtSuperRes.upscale(
-                    pixelBuffer: midpoint.pixelBuffer,
-                    pts: pts,
-                    maxScale: job.superResolutionCap,
-                    hasTimeRemaining: hasMidpointTime
-                )
-                if case let .processed(buffer) = outcome {
-                    upscaledMidpoints[index].pixelBuffer = buffer
-                } else {
-                    allMidpointsUpscaled = false
-                    if case let .bypassed(reason) = outcome {
-                        interpolation.srBypassReason = reason
-                    }
-                    break
-                }
-            }
-            if allMidpointsUpscaled {
-                interpolation.midpoints = upscaledMidpoints
-                interpolation.midpointsUpscaled = true
-            }
-            if shouldUpscaleOriginal, !interpolation.midpoints.isEmpty, hasMidpointTime() {
-                await publishMidpoints(interpolation.midpoints.map(PostProcessFrameBox.init))
-            }
-        }
-
-        guard shouldUpscaleOriginal else { return nil }
-        let originalDeadline = job.deadlines.original
-        let hasOriginalTime: @Sendable () -> Bool = { isAlive() && .now < originalDeadline }
-        guard hasOriginalTime() else {
-            return .bypassed(reason: "Super resolution deadline")
-        }
-        let pts = CMTime(seconds: max(0, frame.pts), preferredTimescale: 1_000_000_000)
-        return await vtSuperRes.upscale(
-            pixelBuffer: frame.pixelBuffer,
-            pts: pts,
-            maxScale: job.superResolutionCap,
-            hasTimeRemaining: hasOriginalTime
+            sharpness: job.configuration.superResolutionSharpness,
+            splitCompare: splitCompare
         )
     }
 

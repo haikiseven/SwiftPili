@@ -8,37 +8,8 @@ import MetalFX
 import VideoToolbox
 #endif
 
-enum VideoSuperResolutionBackend: String, Codable, CaseIterable, Identifiable, Sendable {
-    case videoToolboxML = "videotoolbox_ml"
-    case metalFXSpatial = "metalfx_spatial"
-
-    var id: String { rawValue }
-
-    var label: String {
-        switch self {
-        case .videoToolboxML: String(localized: "VideoToolbox ML")
-        case .metalFXSpatial: String(localized: "MetalFX Spatial")
-        }
-    }
-
-    var shortLabel: String {
-        switch self {
-        case .videoToolboxML: "VideoToolbox"
-        case .metalFXSpatial: "MetalFX"
-        }
-    }
-
-    var mode: VideoSuperResolutionMode {
-        switch self {
-        case .videoToolboxML: .videoToolboxML
-        case .metalFXSpatial: .metalFXSpatial
-        }
-    }
-}
-
 enum VideoSuperResolutionMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case off
-    case videoToolboxML
     case metalFXSpatial
 
     var id: String { rawValue }
@@ -46,7 +17,6 @@ enum VideoSuperResolutionMode: String, Codable, CaseIterable, Identifiable, Send
     var settingsLabel: String {
         switch self {
         case .off: String(localized: "Off")
-        case .videoToolboxML: String(localized: "VideoToolbox ML")
         case .metalFXSpatial: String(localized: "MetalFX Spatial")
         }
     }
@@ -54,7 +24,6 @@ enum VideoSuperResolutionMode: String, Codable, CaseIterable, Identifiable, Send
     var shortLabel: String {
         switch self {
         case .off: String(localized: "Off")
-        case .videoToolboxML: "VideoToolbox"
         case .metalFXSpatial: "MetalFX"
         }
     }
@@ -64,7 +33,6 @@ enum VideoSuperResolutionMode: String, Codable, CaseIterable, Identifiable, Send
     var telemetryLabel: String {
         switch self {
         case .off: "Off"
-        case .videoToolboxML: "VT ML SR"
         case .metalFXSpatial: "MetalFX SR"
         }
     }
@@ -72,122 +40,57 @@ enum VideoSuperResolutionMode: String, Codable, CaseIterable, Identifiable, Send
     var persistenceValue: String {
         switch self {
         case .off: "off"
-        case .videoToolboxML: "videotoolbox_ml"
         case .metalFXSpatial: "metalfx_spatial"
         }
     }
 
     init?(persistedValue: String) {
         switch persistedValue {
-        case "off": self = .off
-        case "videotoolbox_ml", "videoToolboxML": self = .videoToolboxML
-        case "metalfx_spatial", "metalFXSpatial": self = .metalFXSpatial
-        default: return nil
+        case "off":
+            self = .off
+        case "metalfx_spatial", "metalFXSpatial", "videotoolbox_ml", "videoToolboxML":
+            self = .metalFXSpatial
+        default:
+            return nil
         }
     }
 }
 
-enum VideoInterpolationRate: Equatable, Hashable, Sendable {
-    case doubleRate
-    case fps48
-    case fps60
-    case fps90
-    case fps120
-    case custom(Int)
+enum VideoInterpolationRate: Int, CaseIterable, Identifiable, Sendable {
+    case doubleRate = 0
+    case fps60 = 60
+    case fps120 = 120
 
-    static let minimumCustomFPS = 30
-    static let maximumCustomFPS = 120
-    static let customStep = 1
-
-    enum Preset: Int, CaseIterable, Identifiable, Sendable {
-        case doubleRate = 0
-        case fps48 = 48
-        case fps60 = 60
-        case fps90 = 90
-        case fps120 = 120
-        case custom = -1
-
-        var id: Self { self }
-
-        var label: String {
-            switch self {
-            case .doubleRate: String(localized: "2× Source Frame Rate")
-            case .fps48: String(localized: "Up to 48 fps")
-            case .fps60: String(localized: "Up to 60 fps")
-            case .fps90: String(localized: "Up to 90 fps")
-            case .fps120: String(localized: "Up to 120 fps")
-            case .custom: String(localized: "Custom")
-            }
-        }
-    }
-
-    static func clampedCustomFPS(_ fps: Int) -> Int {
-        min(maximumCustomFPS, max(minimumCustomFPS, fps))
-    }
-
-    static func fromTargetFPS(_ fps: Int) -> Self {
-        let clamped = clampedCustomFPS(fps)
-        switch clamped {
-        case 48: return .fps48
-        case 60: return .fps60
-        case 90: return .fps90
-        case 120: return .fps120
-        default: return .custom(clamped)
-        }
-    }
+    var id: Self { self }
 
     init(persistedValue: Int) {
-        if persistedValue == 0 {
+        switch persistedValue {
+        case 0:
             self = .doubleRate
-        } else if (Self.minimumCustomFPS...Self.maximumCustomFPS).contains(persistedValue) {
-            self = Self.fromTargetFPS(persistedValue)
-        } else {
+        case 1...75:
+            self = .fps60
+        case 76...:
+            self = .fps120
+        default:
             self = .doubleRate
         }
     }
 
-    var persistedValue: Int { targetFPS ?? 0 }
+    var persistedValue: Int { rawValue }
 
     var targetFPS: Int? {
         switch self {
         case .doubleRate: nil
-        case .fps48: 48
         case .fps60: 60
-        case .fps90: 90
         case .fps120: 120
-        case let .custom(fps): Self.clampedCustomFPS(fps)
-        }
-    }
-
-    var preset: Preset {
-        switch self {
-        case .doubleRate: .doubleRate
-        case .fps48: .fps48
-        case .fps60: .fps60
-        case .fps90: .fps90
-        case .fps120: .fps120
-        case .custom: .custom
         }
     }
 
     var label: String {
         switch self {
         case .doubleRate: String(localized: "2× Source Frame Rate")
-        case .fps48: String(localized: "Up to 48 fps")
         case .fps60: String(localized: "Up to 60 fps")
-        case .fps90: String(localized: "Up to 90 fps")
         case .fps120: String(localized: "Up to 120 fps")
-        case let .custom(fps):
-            String(format: String(localized: "Up to %lld fps"), Int64(Self.clampedCustomFPS(fps)))
-        }
-    }
-
-    static func customDefault(from current: Self) -> Self {
-        switch current {
-        case .custom: current
-        case .fps48: .custom(50)
-        case .fps90, .fps120: .custom(100)
-        case .doubleRate, .fps60: .custom(72)
         }
     }
 }
@@ -229,9 +132,9 @@ enum VideoSuperResolutionSharpness: String, CaseIterable, Identifiable, Sendable
     var rcasStrength: Float {
         switch self {
         case .off: 0
-        case .light: 0.35
-        case .standard: 0.65
-        case .strong: 0.90
+        case .light: 0.45
+        case .standard: 0.80
+        case .strong: 1.00
         }
     }
 }
@@ -431,16 +334,31 @@ struct VideoEnhancementConfiguration: Equatable, Sendable {
     var superResolutionScale: VideoSuperResolutionScale = .two
     var superResolutionTargetResolution: VideoSuperResolutionTargetResolution = .auto
     var superResolutionSharpness: VideoSuperResolutionSharpness = .standard
+    /// Real-time split-screen A/B comparison (left: bilinear original, right: MetalFX + RCAS).
+    var superResolutionSplitCompare: Bool = false
     var maxInputResolution: VideoEnhancementMaxInputResolution = .p1080
     var isLiveStream: Bool = false
     /// Cap SR output to the on-screen pixel size (and skip SR when it would not be visible).
-    /// Applies to VideoToolbox ML and MetalFX Auto mode; explicit MetalFX target resolutions override it.
+    /// Applies to MetalFX Auto mode; explicit MetalFX target resolutions override it.
     var limitToScreenResolution: Bool = true
 
     static let disabled = Self()
 
     var isRequested: Bool {
         superResolutionMode != .off || frameInterpolationEnabled
+    }
+
+    /// Returns `true` when changing from `other` only alters per-frame MetalFX shader uniforms
+    /// (`superResolutionSharpness` or `superResolutionSplitCompare`) and requires zero pipeline flush.
+    func isShaderUniformOnlyChange(from other: Self) -> Bool {
+        superResolutionMode == other.superResolutionMode
+            && frameInterpolationEnabled == other.frameInterpolationEnabled
+            && interpolationRate == other.interpolationRate
+            && superResolutionScale == other.superResolutionScale
+            && superResolutionTargetResolution == other.superResolutionTargetResolution
+            && maxInputResolution == other.maxInputResolution
+            && isLiveStream == other.isLiveStream
+            && limitToScreenResolution == other.limitToScreenResolution
     }
 }
 
@@ -474,30 +392,14 @@ enum VideoEnhancementCapabilityStatus: Equatable, Sendable {
 }
 
 struct VideoEnhancementCapabilities: Equatable, Sendable {
-    let videoToolboxML: VideoEnhancementCapabilityStatus
     let metalFXSpatial: VideoEnhancementCapabilityStatus
     let frameInterpolation: VideoEnhancementCapabilityStatus
 
     static var current: Self {
         Self(
-            videoToolboxML: currentVideoToolboxMLSupport(),
             metalFXSpatial: currentMetalFXSpatialSupport(),
             frameInterpolation: currentFrameInterpolationSupport()
         )
-    }
-
-    private static func currentVideoToolboxMLSupport() -> VideoEnhancementCapabilityStatus {
-        #if targetEnvironment(simulator)
-        return .simulatorUnsupported
-        #else
-        if #available(iOS 26.0, *) {
-            let supported = VTSuperResolutionScalerConfiguration.isSupported
-                || VTLowLatencySuperResolutionScalerConfiguration.isSupported
-            return supported ? .supported : .unsupported
-        } else {
-            return .requiresIOS26
-        }
-        #endif
     }
 
     private static func currentMetalFXSpatialSupport() -> VideoEnhancementCapabilityStatus {
@@ -516,9 +418,7 @@ struct VideoEnhancementCapabilities: Equatable, Sendable {
         return .simulatorUnsupported
         #else
         if #available(iOS 26.0, *) {
-            let supported = VTFrameRateConversionConfiguration.isSupported
-                || VTLowLatencyFrameInterpolationConfiguration.isSupported
-            return supported ? .supported : .unsupported
+            return VTLowLatencyFrameInterpolationConfiguration.isSupported ? .supported : .unsupported
         } else {
             return MTLCreateSystemDefaultDevice() != nil ? .supportedVisionFallback : .unsupported
         }
@@ -663,18 +563,6 @@ enum VideoEnhancementPreferences {
         }
         set {
             UserDefaults.standard.set(newValue.persistenceValue, forKey: defaultSRBackendKey)
-        }
-    }
-
-    static var defaultSRBackend: VideoSuperResolutionBackend {
-        get {
-            switch defaultSRMode {
-            case .off, .videoToolboxML: .videoToolboxML
-            case .metalFXSpatial: .metalFXSpatial
-            }
-        }
-        set {
-            defaultSRMode = newValue.mode
         }
     }
 

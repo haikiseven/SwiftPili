@@ -3,6 +3,84 @@ import CoreVideo
 import Foundation
 import VideoToolbox
 
+/// Pure, simulator-testable source/destination pixel-format negotiation helpers for VideoToolbox
+/// frame interpolation (`VTLowLatencyFrameInterpolationConfiguration` and
+/// `VTFrameRateConversionConfiguration`).
+enum VTInterpolationFormatNegotiation {
+    struct FormatPair: Equatable, Sendable {
+        let source: OSType
+        let destination: OSType
+    }
+
+    static func canStage(inputFormat: OSType, targetFormat: OSType) -> Bool {
+        if inputFormat == targetFormat {
+            return MetalNV12PixelConverter.isNV12(inputFormat)
+                || inputFormat == kCVPixelFormatType_32BGRA
+        }
+        if MetalNV12PixelConverter.isNV12(inputFormat) {
+            return MetalNV12PixelConverter.isNV12(targetFormat)
+                || targetFormat == kCVPixelFormatType_32BGRA
+        }
+        return false
+    }
+
+    /// Returns prioritized `(source, destination)` format pairs compatible with `nativeSupported`,
+    /// `sourceAttributeFormats`, `destinationAttributeFormats`, and GPU staging from `inputFormat`.
+    /// Prefers zero-copy matching `inputFormat` first, and prefers symmetric `destination == source`.
+    static func candidateFormatPairs(
+        inputFormat: OSType,
+        nativeSupported: [OSType],
+        sourceAttributeFormats: [OSType],
+        destinationAttributeFormats: [OSType]
+    ) -> [FormatPair] {
+        let sourceCandidates = VTSRNegotiation.candidateFormats(
+            preferred: VTSRNegotiation.sourceFormatPriority(for: inputFormat),
+            nativeSupported: nativeSupported,
+            attributeFormats: sourceAttributeFormats
+        ).filter { candidate in
+            candidate == inputFormat || canStage(inputFormat: inputFormat, targetFormat: candidate)
+        }
+
+        var pairs: [FormatPair] = []
+        for sourceFormat in sourceCandidates {
+            let destPreferred = VTSRNegotiation.destinationFormatPriority(for: sourceFormat)
+            var destCandidates = VTSRNegotiation.candidateFormats(
+                preferred: destPreferred,
+                nativeSupported: nativeSupported,
+                attributeFormats: destinationAttributeFormats
+            )
+            if destCandidates.isEmpty, !destinationAttributeFormats.isEmpty {
+                destCandidates = VTSRNegotiation.candidateFormats(
+                    preferred: destPreferred,
+                    nativeSupported: [],
+                    attributeFormats: destinationAttributeFormats
+                )
+            }
+            for destFormat in destCandidates {
+                let pair = FormatPair(source: sourceFormat, destination: destFormat)
+                if !pairs.contains(pair) {
+                    pairs.append(pair)
+                }
+            }
+        }
+        return pairs
+    }
+
+    static func selectFormatPair(
+        inputFormat: OSType,
+        nativeSupported: [OSType],
+        sourceAttributeFormats: [OSType],
+        destinationAttributeFormats: [OSType]
+    ) -> FormatPair? {
+        candidateFormatPairs(
+            inputFormat: inputFormat,
+            nativeSupported: nativeSupported,
+            sourceAttributeFormats: sourceAttributeFormats,
+            destinationAttributeFormats: destinationAttributeFormats
+        ).first
+    }
+}
+
 enum VideoInterpolationBackendOutcome {
     case interpolated(frames: [MediaVideoFrame])
     case passthrough
@@ -28,6 +106,7 @@ final class VideoToolboxFrameInterpolationBackend {
     private var previousFrame: StoredFrame?
     private var hasSubmittedPair = false
     private var sessionStorage: AnyObject?
+    private let pixelConverter = MetalNV12PixelConverter()
     private var rejectedConfigurations: [RejectedConfiguration] = []
     private var loggedEvents: [DiagnosticKey] = []
     #endif
@@ -36,6 +115,7 @@ final class VideoToolboxFrameInterpolationBackend {
         #if !targetEnvironment(simulator)
         previousFrame = nil
         hasSubmittedPair = false
+        pixelConverter.flush()
         #endif
     }
 
@@ -43,6 +123,7 @@ final class VideoToolboxFrameInterpolationBackend {
         flush()
         #if !targetEnvironment(simulator)
         sessionStorage = nil
+        pixelConverter.tearDown()
         #endif
     }
 
@@ -202,7 +283,8 @@ private extension VideoToolboxFrameInterpolationBackend {
                         "\(configuration.detail) startup=0 " +
                     "sourcePadding=\(configuration.source.padding) " +
                     "destinationPadding=\(configuration.destination.padding) " +
-                    "inputPadding=\(VTInterpolationPadding(input)) \(rejected.joined(separator: " | "))")
+                    "inputPadding=\(VTInterpolationPadding(input)) " +
+                    "rejected=[\(rejected.joined(separator: " | "))]")
                 return session
             } catch let failure as VTInterpolationFailure {
                 guard failure.isIncompatible else { throw failure }
@@ -211,7 +293,11 @@ private extension VideoToolboxFrameInterpolationBackend {
                 rejected.append(detail)
             }
         }
-        logOnce(raster, event: "negotiation mode=\(key.mode.diagnosticLabel)", rejected.joined(separator: " | "))
+        logOnce(
+            raster,
+            event: "negotiation mode=\(key.mode.diagnosticLabel)",
+            "rejected=[\(rejected.joined(separator: " | "))]"
+        )
         throw VTInterpolationFailure.unsupported
     }
 
@@ -243,13 +329,13 @@ private extension VideoToolboxFrameInterpolationBackend {
         if let previousInput {
             prev = previousInput
         } else {
-            prev = try await session.stage(previous.pixelBuffer)
+            prev = try await session.stage(previous.pixelBuffer, pixelConverter: pixelConverter)
         }
         let next: CVPixelBuffer
         if let currentInput {
             next = currentInput
         } else {
-            next = try await session.stage(current.pixelBuffer)
+            next = try await session.stage(current.pixelBuffer, pixelConverter: pixelConverter)
         }
         guard hasTimeRemaining() else { throw VTInterpolationFailure.deadline }
         let request = VTInterpolationSession.Request(
@@ -258,8 +344,11 @@ private extension VideoToolboxFrameInterpolationBackend {
         )
         try await session.process(request)
         // Never discard already-computed hardware output once `process` succeeds.
+        let outputColorSpace: ScaledVideoOutputMetadata.OutputColorSpace =
+            session.destination.requirements.raster.format == kCVPixelFormatType_32BGRA
+                ? .rgbConverted : .yuvSameAsSource
         for output in destinations {
-            VideoFramePairFormat.copyInterpretation(from: current.pixelBuffer, to: output)
+            ScaledVideoOutputMetadata.copy(from: current.pixelBuffer, to: output, colorSpace: outputColorSpace)
         }
         previousFrame = StoredFrame(current, staged: currentInput == nil ? next : nil)
         hasSubmittedPair = true
@@ -334,14 +423,9 @@ private struct VTInterpolationSessionKey: Equatable {
 
 private enum VTInterpolationKind: String {
     case lowLatency = "LLFI"
-    case frameRateConversion = "FRC"
 
     static func candidates(for key: VTInterpolationSessionKey) -> [Self] {
-        if key.lowLatencyLevel != nil,
-           key.raster.format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
-            return [.lowLatency, .frameRateConversion]
-        }
-        return [.frameRateConversion]
+        key.lowLatencyLevel != nil ? [.lowLatency] : []
     }
 
     @available(iOS 26.0, *)
@@ -356,15 +440,6 @@ private enum VTInterpolationKind: String {
             guard let config = VTLowLatencyFrameInterpolationConfiguration(
                 frameWidth: raster.width, frameHeight: raster.height, numberOfInterpolatedFrames: level
             ) else { return unavailable("dimensions") }
-            return VTInterpolationSession.Configuration.resolve(
-                config, kind: self, formats: config.supportedPixelFormats, raster: raster
-            )
-        case .frameRateConversion:
-            guard VTFrameRateConversionConfiguration.isSupported else { return unavailable("device") }
-            guard let config = VTFrameRateConversionConfiguration(
-                frameWidth: raster.width, frameHeight: raster.height, usePrecomputedFlow: false,
-                qualityPrioritization: .normal, revision: VTFrameRateConversionConfiguration.defaultRevision
-            ) else { return unavailable("dimensions/revision") }
             return VTInterpolationSession.Configuration.resolve(
                 config, kind: self, formats: config.supportedPixelFormats, raster: raster
             )
@@ -393,26 +468,60 @@ private final class VTInterpolationSession {
         ) -> Result<Self, VTInterpolationFailure> {
             let source = native.sourcePixelBufferAttributes
             let destination = native.destinationPixelBufferAttributes
-            let input = VTInterpolationBufferRequirements.resolve(source, for: raster)
-            let output = VTInterpolationBufferRequirements.resolve(destination, for: raster)
-            let detail = "\(kind.rawValue) supported=\(formats.map(VTInterpolationRaster.fourCC)) " +
-                "sourceFormats=\(VTInterpolationBufferRequirements.formatsDescription(source)) " +
-                "destinationFormats=\(VTInterpolationBufferRequirements.formatsDescription(destination)) " +
-                "sourceResolve=\(input.status) destinationResolve=\(output.status)"
-            guard formats.contains(raster.format) else { return .failure(.incompatible(detail)) }
+            let sourceAttrFormats = VTSRNegotiation.attributeFormats(from: source)
+            let destAttrFormats = VTSRNegotiation.attributeFormats(from: destination)
+            let pairs = VTInterpolationFormatNegotiation.candidateFormatPairs(
+                inputFormat: raster.format,
+                nativeSupported: formats,
+                sourceAttributeFormats: sourceAttrFormats,
+                destinationAttributeFormats: destAttrFormats
+            )
             let configurationStatuses = [
                 kCVReturnSuccess, kCVReturnInvalidArgument, kCVReturnInvalidPixelFormat,
                 kCVReturnInvalidSize, kCVReturnInvalidPixelBufferAttributes
             ]
-            guard configurationStatuses.contains(input.status), configurationStatuses.contains(output.status) else {
+            var lastSourceStatus: CVReturn = kCVReturnInvalidPixelFormat
+            var lastDestStatus: CVReturn = kCVReturnInvalidPixelFormat
+            var sawNonConfigurationStatus = false
+            var attempted: [String] = []
+
+            for pair in pairs {
+                let sourceRaster = VTInterpolationRaster(width: raster.width, height: raster.height, format: pair.source)
+                let destRaster = VTInterpolationRaster(width: raster.width, height: raster.height, format: pair.destination)
+                let input = VTInterpolationBufferRequirements.resolve(source, for: sourceRaster)
+                let output = VTInterpolationBufferRequirements.resolve(destination, for: destRaster)
+                lastSourceStatus = input.status
+                lastDestStatus = output.status
+                if !configurationStatuses.contains(input.status) || !configurationStatuses.contains(output.status) {
+                    sawNonConfigurationStatus = true
+                }
+                if let sourceRequirement = input.requirements, let destinationRequirement = output.requirements {
+                    let detail = "\(kind.rawValue) supported=\(VTSRNegotiation.formatsDescription(formats)) " +
+                        "sourceFormats=\(VTSRNegotiation.formatsDescription(sourceAttrFormats)) " +
+                        "destinationFormats=\(VTSRNegotiation.formatsDescription(destAttrFormats)) " +
+                        "selectedSource=\(VTInterpolationRaster.fourCC(pair.source)) " +
+                        "selectedDest=\(VTInterpolationRaster.fourCC(pair.destination)) " +
+                        "sourceResolve=\(input.status) destinationResolve=\(output.status)"
+                    return .success(Self(
+                        native: native, source: sourceRequirement, destination: destinationRequirement, detail: detail
+                    ))
+                }
+                attempted.append(
+                    "\(VTInterpolationRaster.fourCC(pair.source))->\(VTInterpolationRaster.fourCC(pair.destination))" +
+                    "(src=\(input.status),dst=\(output.status))"
+                )
+            }
+
+            let detail = "\(kind.rawValue) supported=\(VTSRNegotiation.formatsDescription(formats)) " +
+                "sourceFormats=\(VTSRNegotiation.formatsDescription(sourceAttrFormats)) " +
+                "destinationFormats=\(VTSRNegotiation.formatsDescription(destAttrFormats)) " +
+                "selectedSource=none selectedDest=none " +
+                "sourceResolve=\(lastSourceStatus) destinationResolve=\(lastDestStatus) " +
+                "attempted=[\(attempted.joined(separator: ","))]"
+            if sawNonConfigurationStatus {
                 return .failure(VTInterpolationFailure(reason: "VT FI attribute resolution failed", detail: detail))
             }
-            guard let sourceRequirement = input.requirements, let destinationRequirement = output.requirements else {
-                return .failure(.incompatible(detail))
-            }
-            return .success(Self(
-                native: native, source: sourceRequirement, destination: destinationRequirement, detail: detail
-            ))
+            return .failure(.incompatible(detail))
         }
     }
 
@@ -482,25 +591,31 @@ private final class VTInterpolationSession {
         self.key == key && (lastLLFISourcePTS.map { previousPTS >= $0 } ?? true)
     }
 
-    private var canStageNV12: Bool {
-        key.raster.format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-            || key.raster.format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+    private var canStageInput: Bool {
+        VTInterpolationFormatNegotiation.canStage(
+            inputFormat: key.raster.format,
+            targetFormat: source.raster.format
+        )
     }
 
     func layoutDetail(previous: CVPixelBuffer, current: CVPixelBuffer) -> String {
-        "\(kind.rawValue) sourcePadding=\(source.padding) destinationPadding=\(destination.requirements.padding) " +
+        "\(kind.rawValue) sourceRaster=\(source.raster.description) " +
+            "destRaster=\(destination.requirements.raster.description) " +
+            "sourcePadding=\(source.padding) destinationPadding=\(destination.requirements.padding) " +
             "previousPadding=\(VTInterpolationPadding(previous)) currentPadding=\(VTInterpolationPadding(current)) " +
             "previousIOSurface=\(CVPixelBufferGetIOSurface(previous) != nil) " +
             "currentIOSurface=\(CVPixelBufferGetIOSurface(current) != nil) " +
-            "stagingAllowed=\(canStageNV12)"
+            "stagingAllowed=\(canStageInput)"
     }
 
     func directInput(_ input: CVPixelBuffer) -> CVPixelBuffer? {
         source.accepts(input) ? input : nil
     }
 
-    func stage(_ input: CVPixelBuffer) async throws -> CVPixelBuffer {
-        guard canStageNV12 else {
+    func stage(_ input: CVPixelBuffer, pixelConverter: MetalNV12PixelConverter) async throws -> CVPixelBuffer {
+        let inputFormat = CVPixelBufferGetPixelFormatType(input)
+        let targetFormat = source.raster.format
+        guard VTInterpolationFormatNegotiation.canStage(inputFormat: inputFormat, targetFormat: targetFormat) else {
             throw VTInterpolationFailure(reason: "VT FI decoded buffers do not meet source requirements")
         }
         let pool = try stagingPool ?? VTInterpolationPool(
@@ -508,7 +623,20 @@ private final class VTInterpolationSession {
         )
         stagingPool = pool
         let staged = try pool.allocate()
-        try await VTNV12StagingCopy.copyAsync(from: input, to: staged)
+        let sameNV12 = inputFormat == targetFormat && MetalNV12PixelConverter.isNV12(inputFormat)
+        if sameNV12 {
+            try await VTNV12StagingCopy.copyAsync(from: input, to: staged)
+            return staged
+        }
+        let converted = await pixelConverter.convert(from: input, to: staged)
+        guard converted else {
+            let srcCC = VTInterpolationRaster.fourCC(inputFormat)
+            let dstCC = VTInterpolationRaster.fourCC(targetFormat)
+            throw VTInterpolationFailure(reason: "VT FI GPU staging failed (\(srcCC)->\(dstCC))")
+        }
+        let stagedColorSpace: ScaledVideoOutputMetadata.OutputColorSpace =
+            targetFormat == kCVPixelFormatType_32BGRA ? .rgbConverted : .yuvSameAsSource
+        ScaledVideoOutputMetadata.copy(from: input, to: staged, colorSpace: stagedColorSpace)
         return staged
     }
 
@@ -562,11 +690,6 @@ private final class VTInterpolationSession {
         case .lowLatency:
             return VTLowLatencyFrameInterpolationParameters(
                 sourceFrame: curr, previousFrame: prev, interpolationPhase: plan.phases, destinationFrames: output
-            )
-        case .frameRateConversion:
-            return VTFrameRateConversionParameters(
-                sourceFrame: prev, nextFrame: curr, opticalFlow: nil, interpolationPhase: plan.phases,
-                submissionMode: request.sequential ? .sequential : .random, destinationFrames: output
             )
         }
     }

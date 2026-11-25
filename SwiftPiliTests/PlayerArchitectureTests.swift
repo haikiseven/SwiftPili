@@ -906,6 +906,7 @@ struct PlayerArchitectureTests {
             .nv12RangeConvertY,
             .nv12RangeConvertCbCr,
             .rcasSharpen,
+            .rcasToNV12,
             .nv12StageCopyY,
             .nv12StageCopyCbCr,
             .visionInterpolationPrepare,
@@ -1182,5 +1183,841 @@ struct PlayerArchitectureTests {
             attributeFormats: [bgra]
         )
         #expect(destBgra == bgra)
+    }
+
+    @Test("VideoEnhancementPoolLimits.computeSizing scales lead and pools across 30/60/120 fps and memory pressure")
+    func videoEnhancementPoolLimitsComputeSizingAcrossRatesAndMemoryPressure() {
+        defer { VideoEnhancementPoolLimits.reset() }
+
+        // 30 fps SR-only
+        let sr30 = VideoEnhancementPoolLimits.computeSizing(
+            sourceFPS: 30, outputFPS: 30, maxPhasesPerPair: 0, underMemoryPressure: false
+        )
+        #expect(sr30.lead == 0.24)
+        #expect(sr30.superResolutionFrames >= Int(ceil((sr30.lead + 0.10) * 30)))
+        #expect(sr30.interpolationFrames(phaseCount: 1) >= Int(ceil((sr30.lead + 0.10) * 30)))
+
+        // 30 -> 60 fps SR+FI
+        let srFi60 = VideoEnhancementPoolLimits.computeSizing(
+            sourceFPS: 30, outputFPS: 60, maxPhasesPerPair: 1, underMemoryPressure: false
+        )
+        #expect(srFi60.lead == 0.24)
+        #expect(srFi60.superResolutionFrames >= Int(ceil((srFi60.lead + 0.10) * 60)) + 1)
+        #expect(srFi60.interpolationFrames(phaseCount: 1) >= Int(ceil((srFi60.lead + 0.10) * 30)))
+
+        // 30 -> 120 fps SR+FI (3 phases per source pair)
+        let srFi120 = VideoEnhancementPoolLimits.computeSizing(
+            sourceFPS: 30, outputFPS: 120, maxPhasesPerPair: 3, underMemoryPressure: false
+        )
+        #expect(srFi120.lead == 0.20)
+        #expect(srFi120.superResolutionFrames >= Int(ceil((srFi120.lead + 0.10) * 120)) + 3)
+        #expect(srFi120.interpolationFrames(phaseCount: 3) >= 3 * Int(ceil((srFi120.lead + 0.10) * 30)))
+
+        // Memory pressure reduces lead and both pool caps
+        let pressure60 = VideoEnhancementPoolLimits.computeSizing(
+            sourceFPS: 30, outputFPS: 60, maxPhasesPerPair: 1, underMemoryPressure: true
+        )
+        #expect(pressure60.lead == 0.14)
+        #expect(pressure60.lead < srFi60.lead)
+        #expect(pressure60.superResolutionFrames < srFi60.superResolutionFrames)
+        #expect(pressure60.interpolationFrames(phaseCount: 1) < srFi60.interpolationFrames(phaseCount: 1))
+
+        let pressure120 = VideoEnhancementPoolLimits.computeSizing(
+            sourceFPS: 30, outputFPS: 120, maxPhasesPerPair: 3, underMemoryPressure: true
+        )
+        #expect(pressure120.lead == 0.14)
+        #expect(pressure120.superResolutionFrames < srFi120.superResolutionFrames)
+        #expect(pressure120.interpolationFrames(phaseCount: 3) < srFi120.interpolationFrames(phaseCount: 3))
+
+        // Shared configure / reset cycle
+        VideoEnhancementPoolLimits.configure(
+            sourceFPS: 30, outputFPS: 120, maxPhasesPerPair: 3, underMemoryPressure: false
+        )
+        #expect(VideoEnhancementPoolLimits.currentLead == srFi120.lead)
+        #expect(VideoEnhancementPoolLimits.superResolutionFrames == srFi120.superResolutionFrames)
+        #expect(VideoEnhancementPoolLimits.interpolationFrames(phaseCount: 3) == srFi120.interpolationFrames(phaseCount: 3))
+
+        VideoEnhancementPoolLimits.reset()
+        #expect(VideoEnhancementPoolLimits.currentLead == VideoEnhancementPoolLimits.defaultLead)
+    }
+
+    @Test("VideoFramePostProcessor.notifyWhenIdle fires cleanly on worker completion, teardown, and respects clearIdleCallback")
+    func videoFramePostProcessorNotifyWhenIdleFiresOnCompletionAndTearDown() async {
+        var rawBuffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            16,
+            16,
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            nil,
+            &rawBuffer
+        )
+        guard status == kCVReturnSuccess, let pixelBuffer = rawBuffer else {
+            Issue.record("Failed to allocate test CVPixelBuffer")
+            return
+        }
+
+        let processor = VideoFramePostProcessor()
+        defer { processor.tearDown() }
+
+        // 1) Fires immediately when already idle
+        let immediateCount = OSAllocatedUnfairLock(initialState: 0)
+        processor.notifyWhenIdle { immediateCount.withLock { $0 += 1 } }
+        #expect(immediateCount.withLock { $0 } == 1)
+
+        let prevFrame = MediaVideoFrame(pts: 1.0, duration: 1.0 / 30.0, pixelBuffer: pixelBuffer)
+        let currFrame = MediaVideoFrame(pts: 1.0 + 1.0 / 30.0, duration: 1.0 / 30.0, pixelBuffer: pixelBuffer)
+        let admission = VideoEnhancementAdmission(
+            configuration: VideoEnhancementConfiguration.disabled,
+            superResolution: nil,
+            superResolutionBypassReason: "Off",
+            interpolationPlan: nil,
+            interpolationBypassReason: "Off",
+            activeOriginalDuration: nil
+        )
+        let deadlines = VideoEnhancementDeadlines(
+            original: ContinuousClock.now.advanced(by: .seconds(1)),
+            midpoint: nil
+        )
+
+        // 2) Fires exactly once when an in-flight job completes
+        let completionCount = OSAllocatedUnfairLock(initialState: 0)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            processor.submit(currFrame, previous: prevFrame, admission: admission, deadlines: deadlines) { _ in }
+            #expect(processor.isBusy)
+            processor.notifyWhenIdle {
+                completionCount.withLock { $0 += 1 }
+                continuation.resume()
+            }
+            #expect(completionCount.withLock { $0 } == 0)
+        }
+        #expect(completionCount.withLock { $0 } == 1)
+        #expect(!processor.isBusy)
+
+        // 3) Fires once on tearDown() while busy and does not double-fire
+        let tearDownCount = OSAllocatedUnfairLock(initialState: 0)
+        processor.submit(currFrame, previous: prevFrame, admission: admission, deadlines: deadlines) { _ in }
+        #expect(processor.isBusy)
+        processor.notifyWhenIdle { tearDownCount.withLock { $0 += 1 } }
+        #expect(tearDownCount.withLock { $0 } == 0)
+        processor.tearDown()
+        #expect(!processor.isBusy)
+        #expect(tearDownCount.withLock { $0 } == 1)
+        processor.tearDown()
+        #expect(tearDownCount.withLock { $0 } == 1)
+
+        // 4) clearIdleCallback() prevents notification on subsequent tearDown()
+        let clearedCount = OSAllocatedUnfairLock(initialState: 0)
+        processor.submit(currFrame, previous: prevFrame, admission: admission, deadlines: deadlines) { _ in }
+        #expect(processor.isBusy)
+        processor.notifyWhenIdle { clearedCount.withLock { $0 += 1 } }
+        processor.clearIdleCallback()
+        processor.tearDown()
+        #expect(clearedCount.withLock { $0 } == 0)
+    }
+
+    @Test("MetalFX NV12 selection, ScaledVideoOutputMetadata YCbCr matrix stamping, prewarmPlan, and rcasToNV12 kernel")
+    nonisolated func metalFXNV12MetadataPrewarmPlanAndRCASToNV12Kernel() async throws {
+        // 1) MetalFX even-dimension NV12 output selection
+        #expect(MetalFXSuperResolutionBackend.prefersNV12Output(width: 2560, height: 1440))
+        #expect(MetalFXSuperResolutionBackend.prefersNV12Output(width: 3840, height: 2160))
+        #expect(!MetalFXSuperResolutionBackend.prefersNV12Output(width: 1921, height: 1080))
+        #expect(!MetalFXSuperResolutionBackend.prefersNV12Output(width: 1920, height: 1081))
+        #expect(!MetalFXSuperResolutionBackend.prefersNV12Output(width: 0, height: 1080))
+
+        func makeBuffer(width: Int, height: Int, format: OSType, ioSurface: Bool = false) -> CVPixelBuffer? {
+            var attrs: [String: Any] = [:]
+            if ioSurface {
+                attrs[kCVPixelBufferIOSurfacePropertiesKey as String] = [:] as [String: Any]
+                attrs[kCVPixelBufferMetalCompatibilityKey as String] = true
+            }
+            var buffer: CVPixelBuffer?
+            let status = CVPixelBufferCreate(
+                kCFAllocatorDefault, width, height, format,
+                attrs.isEmpty ? nil : attrs as CFDictionary, &buffer
+            )
+            return status == kCVReturnSuccess ? buffer : nil
+        }
+
+        // 2) ScaledVideoOutputMetadata YCbCr matrix stamping & non-overwrite guarantee
+        guard let buf709 = makeBuffer(width: 16, height: 16, format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+              let buf601 = makeBuffer(width: 16, height: 16, format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+              let buf2020 = makeBuffer(width: 16, height: 16, format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) else {
+            Issue.record("Failed to allocate test CVPixelBuffers for YCbCr matrix check")
+            return
+        }
+
+        ScaledVideoOutputMetadata.ensureYCbCrMatrixAttachment(on: buf709, colorMatrixIndex: 0)
+        ScaledVideoOutputMetadata.ensureYCbCrMatrixAttachment(on: buf601, colorMatrixIndex: 1)
+        ScaledVideoOutputMetadata.ensureYCbCrMatrixAttachment(on: buf2020, colorMatrixIndex: 2)
+        if let m709 = CVBufferCopyAttachment(buf709, kCVImageBufferYCbCrMatrixKey, nil) {
+            #expect(CFEqual(m709, kCVImageBufferYCbCrMatrix_ITU_R_709_2))
+        } else {
+            Issue.record("Expected BT.709 YCbCr matrix attachment")
+        }
+        if let m601 = CVBufferCopyAttachment(buf601, kCVImageBufferYCbCrMatrixKey, nil) {
+            #expect(CFEqual(m601, kCVImageBufferYCbCrMatrix_ITU_R_601_4))
+        } else {
+            Issue.record("Expected BT.601 YCbCr matrix attachment")
+        }
+        if let m2020 = CVBufferCopyAttachment(buf2020, kCVImageBufferYCbCrMatrixKey, nil) {
+            #expect(CFEqual(m2020, kCVImageBufferYCbCrMatrix_ITU_R_2020))
+        } else {
+            Issue.record("Expected BT.2020 YCbCr matrix attachment")
+        }
+        // Must preserve an existing attachment rather than overwriting it.
+        ScaledVideoOutputMetadata.ensureYCbCrMatrixAttachment(on: buf601, colorMatrixIndex: 0)
+        if let preserved = CVBufferCopyAttachment(buf601, kCVImageBufferYCbCrMatrixKey, nil) {
+            #expect(CFEqual(preserved, kCVImageBufferYCbCrMatrix_ITU_R_601_4))
+        } else {
+            Issue.record("Expected existing BT.601 attachment to be preserved")
+        }
+
+        // 3) VideoFrameInterpolationPlan.prewarmPlan behavior
+        let frame30Seek = MediaVideoFrame(pts: 10.0, duration: 1.0 / 30.0, pixelBuffer: buf709)
+        if let warm60 = VideoFrameInterpolationPlan.prewarmPlan(
+            for: frame30Seek, rate: .fps60, playbackRate: 1.0, supportsArbitraryPhases: true
+        ) {
+            #expect(abs(warm60.currentPTS - 10.0) < 1e-6)
+            #expect(abs(warm60.previousPTS - (10.0 - 1.0 / 30.0)) < 1e-6)
+            #expect(warm60.plan.allowsLowLatency)
+            #expect(warm60.plan.phases == [0.5])
+        } else {
+            Issue.record("Expected prewarmPlan for 30 -> 60 fps")
+        }
+
+        let frame24Start = MediaVideoFrame(pts: 0.0, duration: 1.0 / 24.0, pixelBuffer: buf709)
+        if let warm24 = VideoFrameInterpolationPlan.prewarmPlan(
+            for: frame24Start, rate: .fps60, playbackRate: 1.0, supportsArbitraryPhases: true
+        ) {
+            #expect(abs(warm24.previousPTS - 0.0) < 1e-6)
+            #expect(abs(warm24.currentPTS - 1.0 / 24.0) < 1e-6)
+            #expect(!warm24.plan.allowsLowLatency)
+            #expect(!warm24.plan.phases.isEmpty)
+        } else {
+            Issue.record("Expected prewarmPlan for 24 -> 60 fps")
+        }
+
+        let frame60 = MediaVideoFrame(pts: 2.0, duration: 1.0 / 60.0, pixelBuffer: buf709)
+        #expect(VideoFrameInterpolationPlan.prewarmPlan(
+            for: frame60, rate: .fps60, playbackRate: 1.0, supportsArbitraryPhases: true
+        ) == nil)
+
+        // 4) Fused rcasToNV12 Metal kernel numerical verification
+        guard MTLCreateSystemDefaultDevice() != nil else { return }
+        let width = 16
+        let height = 16
+        guard let srcBGRA = makeBuffer(width: width, height: height, format: kCVPixelFormatType_32BGRA, ioSurface: true),
+              let dst420v = makeBuffer(
+                width: width, height: height, format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, ioSurface: true
+              ) else {
+            Issue.record("Failed to allocate IOSurface test buffers for rcasToNV12")
+            return
+        }
+
+        #expect(CVPixelBufferLockBaseAddress(srcBGRA, []) == kCVReturnSuccess)
+        if let base = CVPixelBufferGetBaseAddress(srcBGRA)?.assumingMemoryBound(to: UInt8.self) {
+            let stride = CVPixelBufferGetBytesPerRow(srcBGRA)
+            for row in 0..<height {
+                let b: UInt8 = row < 4 ? 0 : (row < 8 ? 255 : 0)
+                let g: UInt8 = row < 4 ? 0 : (row < 8 ? 255 : 0)
+                let r: UInt8 = row < 4 ? 0 : 255
+                for col in 0..<width {
+                    let offset = row * stride + col * 4
+                    base[offset] = b
+                    base[offset + 1] = g
+                    base[offset + 2] = r
+                    base[offset + 3] = 255
+                }
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(srcBGRA, [])
+
+        let metal = VideoEnhancementMetalContext.shared
+        let resources = try metal.resources()
+        let pipeline = try metal.pipeline(for: .rcasToNV12)
+        for strength: Float in [0.0, 0.65] {
+            guard let cmd = resources.commandQueue.makeCommandBuffer(),
+                  let inTex = metal.makeTexture(
+                    buffer: srcBGRA, format: .bgra8Unorm, width: width, height: height, plane: 0
+                  ),
+                  let outY = metal.makeTexture(
+                    buffer: dst420v, format: .r8Unorm, width: width, height: height, plane: 0, usage: .shaderWrite
+                  ),
+                  let outCbCr = metal.makeTexture(
+                    buffer: dst420v, format: .rg8Unorm, width: width / 2, height: height / 2,
+                    plane: 1, usage: .shaderWrite
+                  ),
+                  let compute = cmd.makeComputeCommandEncoder() else {
+                Issue.record("Failed to set up rcasToNV12 compute encoder")
+                return
+            }
+            var params = VideoEnhancementRCASNV12Params(
+                strength: strength, colorMatrix: 0, tapStep: 1, splitCompare: 0
+            )
+            compute.setComputePipelineState(pipeline)
+            compute.setTexture(inTex.texture, index: 0)
+            compute.setTexture(outY.texture, index: 1)
+            compute.setTexture(outCbCr.texture, index: 2)
+            compute.setTexture(inTex.texture, index: 3)
+            compute.setBytes(&params, length: MemoryLayout<VideoEnhancementRCASNV12Params>.size, index: 0)
+            VideoEnhancementMetalContext.dispatchThreads(
+                encoder: compute, pipeline: pipeline, width: width / 2, height: height / 2
+            )
+            compute.endEncoding()
+            let retained = [inTex.bridge, outY.bridge, outCbCr.bridge]
+            let ok = await VideoEnhancementMetalContext.commitAndWait(cmd)
+            withExtendedLifetime(retained) {}
+            #expect(ok)
+
+            #expect(CVPixelBufferLockBaseAddress(dst420v, .readOnly) == kCVReturnSuccess)
+            if let yBase = CVPixelBufferGetBaseAddressOfPlane(dst420v, 0)?.assumingMemoryBound(to: UInt8.self),
+               let cbcrBase = CVPixelBufferGetBaseAddressOfPlane(dst420v, 1)?.assumingMemoryBound(to: UInt8.self) {
+                let yStride = CVPixelBufferGetBytesPerRowOfPlane(dst420v, 0)
+                let cbcrStride = CVPixelBufferGetBytesPerRowOfPlane(dst420v, 1)
+                // Black (row 1): Y=16, Cb=128, Cr=128
+                #expect(abs(Int(yBase[1 * yStride + 4]) - 16) <= 1)
+                #expect(abs(Int(cbcrBase[0 * cbcrStride + 4]) - 128) <= 1)
+                #expect(abs(Int(cbcrBase[0 * cbcrStride + 5]) - 128) <= 1)
+                // White (row 5): Y=235, Cb=128, Cr=128
+                #expect(abs(Int(yBase[5 * yStride + 4]) - 235) <= 1)
+                #expect(abs(Int(cbcrBase[2 * cbcrStride + 4]) - 128) <= 1)
+                #expect(abs(Int(cbcrBase[2 * cbcrStride + 5]) - 128) <= 1)
+                // BT.709 Pure Red (row 12): Y≈63, Cb≈102, Cr≈240
+                #expect(abs(Int(yBase[12 * yStride + 4]) - 63) <= 2)
+                #expect(abs(Int(cbcrBase[6 * cbcrStride + 4]) - 102) <= 2)
+                #expect(abs(Int(cbcrBase[6 * cbcrStride + 5]) - 240) <= 2)
+            }
+            CVPixelBufferUnlockBaseAddress(dst420v, .readOnly)
+        }
+
+        // 5) Verify 12-tap shared-neighborhood rcasToNV12 matches rcasSharpen (evaluateRCAS)
+        // on every pixel (including corners, edges, and 2x2 block boundaries) at strength = 0.65.
+        guard let edgeSrcBGRA = makeBuffer(
+            width: width, height: height, format: kCVPixelFormatType_32BGRA, ioSurface: true
+        ), let refSharpBGRA = makeBuffer(
+            width: width, height: height, format: kCVPixelFormatType_32BGRA, ioSurface: true
+        ), let edgeDst420v = makeBuffer(
+            width: width, height: height, format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, ioSurface: true
+        ) else {
+            Issue.record("Failed to allocate edge-comparison test buffers for rcasToNV12")
+            return
+        }
+
+        #expect(CVPixelBufferLockBaseAddress(edgeSrcBGRA, []) == kCVReturnSuccess)
+        if let base = CVPixelBufferGetBaseAddress(edgeSrcBGRA)?.assumingMemoryBound(to: UInt8.self) {
+            let stride = CVPixelBufferGetBytesPerRow(edgeSrcBGRA)
+            for row in 0..<height {
+                for col in 0..<width {
+                    let bright = ((row / 2 + col / 2).isMultiple(of: 2)) || (row == 0 && col == 0)
+                        || (row == height - 1 && col == width - 1) || (row == 3 && col == 7)
+                    let offset = row * stride + col * 4
+                    base[offset] = bright ? UInt8((col * 17) & 0xFF) : UInt8((row * 13) & 0x7F)
+                    base[offset + 1] = bright ? 220 : 35
+                    base[offset + 2] = bright ? UInt8(255 - ((row * 11) & 0x7F)) : UInt8((col * 9) & 0x7F)
+                    base[offset + 3] = 255
+                }
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(edgeSrcBGRA, [])
+
+        let sharpenPipeline = try metal.pipeline(for: .rcasSharpen)
+        guard let edgeCmd = resources.commandQueue.makeCommandBuffer(),
+              let edgeInTex = metal.makeTexture(
+                buffer: edgeSrcBGRA, format: .bgra8Unorm, width: width, height: height, plane: 0
+              ),
+              let refOutTex = metal.makeTexture(
+                buffer: refSharpBGRA, format: .bgra8Unorm, width: width, height: height,
+                plane: 0, usage: .shaderWrite
+              ),
+              let edgeOutY = metal.makeTexture(
+                buffer: edgeDst420v, format: .r8Unorm, width: width, height: height,
+                plane: 0, usage: .shaderWrite
+              ),
+              let edgeOutCbCr = metal.makeTexture(
+                buffer: edgeDst420v, format: .rg8Unorm, width: width / 2, height: height / 2,
+                plane: 1, usage: .shaderWrite
+              ),
+              let encoder = edgeCmd.makeComputeCommandEncoder() else {
+            Issue.record("Failed to set up rcasSharpen vs rcasToNV12 comparison encoder")
+            return
+        }
+        var sharpParams = VideoEnhancementRCASParams(strength: 0.80, tapStep: 1, splitCompare: 0)
+        encoder.setComputePipelineState(sharpenPipeline)
+        encoder.setTexture(edgeInTex.texture, index: 0)
+        encoder.setTexture(refOutTex.texture, index: 1)
+        encoder.setTexture(edgeInTex.texture, index: 2)
+        encoder.setBytes(&sharpParams, length: MemoryLayout<VideoEnhancementRCASParams>.size, index: 0)
+        VideoEnhancementMetalContext.dispatchThreads(
+            encoder: encoder, pipeline: sharpenPipeline, width: width, height: height
+        )
+
+        var nv12Params = VideoEnhancementRCASNV12Params(strength: 0.80, colorMatrix: 0, tapStep: 1, splitCompare: 0)
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(edgeInTex.texture, index: 0)
+        encoder.setTexture(edgeOutY.texture, index: 1)
+        encoder.setTexture(edgeOutCbCr.texture, index: 2)
+        encoder.setTexture(edgeInTex.texture, index: 3)
+        encoder.setBytes(&nv12Params, length: MemoryLayout<VideoEnhancementRCASNV12Params>.size, index: 0)
+        VideoEnhancementMetalContext.dispatchThreads(
+            encoder: encoder, pipeline: pipeline, width: width / 2, height: height / 2
+        )
+        encoder.endEncoding()
+        let edgeRetained = [edgeInTex.bridge, refOutTex.bridge, edgeOutY.bridge, edgeOutCbCr.bridge]
+        let edgeOK = await VideoEnhancementMetalContext.commitAndWait(edgeCmd)
+        withExtendedLifetime(edgeRetained) {}
+        #expect(edgeOK)
+
+        #expect(CVPixelBufferLockBaseAddress(refSharpBGRA, .readOnly) == kCVReturnSuccess)
+        #expect(CVPixelBufferLockBaseAddress(edgeDst420v, .readOnly) == kCVReturnSuccess)
+        if let refBase = CVPixelBufferGetBaseAddress(refSharpBGRA)?.assumingMemoryBound(to: UInt8.self),
+           let yBase = CVPixelBufferGetBaseAddressOfPlane(edgeDst420v, 0)?.assumingMemoryBound(to: UInt8.self),
+           let cbcrBase = CVPixelBufferGetBaseAddressOfPlane(edgeDst420v, 1)?.assumingMemoryBound(to: UInt8.self) {
+            let refStride = CVPixelBufferGetBytesPerRow(refSharpBGRA)
+            let yStride = CVPixelBufferGetBytesPerRowOfPlane(edgeDst420v, 0)
+            let cbcrStride = CVPixelBufferGetBytesPerRowOfPlane(edgeDst420v, 1)
+            let yScale: Double = 219.0 / 255.0
+            let yOffset: Double = 16.0 / 255.0
+            let cScale: Double = 224.0 / 255.0
+            let cOffset: Double = 128.0 / 255.0
+
+            for row in 0..<height {
+                for col in 0..<width {
+                    let refOff = row * refStride + col * 4
+                    let b = Double(refBase[refOff]) / 255.0
+                    let g = Double(refBase[refOff + 1]) / 255.0
+                    let r = Double(refBase[refOff + 2]) / 255.0
+                    let yExpected = Int(((0.2126 * r + 0.7152 * g + 0.0722 * b) * yScale + yOffset) * 255.0 + 0.5)
+                    let yActual = Int(yBase[row * yStride + col])
+                    #expect(abs(yActual - yExpected) <= 1)
+                }
+            }
+            for cy in 0..<(height / 2) {
+                for cx in 0..<(width / 2) {
+                    var sumR = 0.0
+                    var sumG = 0.0
+                    var sumB = 0.0
+                    for dy in 0..<2 {
+                        for dx in 0..<2 {
+                            let refOff = (cy * 2 + dy) * refStride + (cx * 2 + dx) * 4
+                            sumB += Double(refBase[refOff]) / 255.0
+                            sumG += Double(refBase[refOff + 1]) / 255.0
+                            sumR += Double(refBase[refOff + 2]) / 255.0
+                        }
+                    }
+                    let avgR = sumR * 0.25
+                    let avgG = sumG * 0.25
+                    let avgB = sumB * 0.25
+                    let yAvg = 0.2126 * avgR + 0.7152 * avgG + 0.0722 * avgB
+                    let cbExpected = Int((min(max(((avgB - yAvg) / 1.8556) * cScale + cOffset, 0.0), 1.0)) * 255.0 + 0.5)
+                    let crExpected = Int((min(max(((avgR - yAvg) / 1.5748) * cScale + cOffset, 0.0), 1.0)) * 255.0 + 0.5)
+                    let cbActual = Int(cbcrBase[cy * cbcrStride + cx * 2])
+                    let crActual = Int(cbcrBase[cy * cbcrStride + cx * 2 + 1])
+                    #expect(abs(cbActual - cbExpected) <= 2)
+                    #expect(abs(crActual - crExpected) <= 2)
+                }
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(edgeDst420v, .readOnly)
+        CVPixelBufferUnlockBaseAddress(refSharpBGRA, .readOnly)
+    }
+
+    @Test("VTInterpolationFormatNegotiation selects zero-copy 420v or falls back cleanly to 32BGRA / 420v for FRC")
+    func vtInterpolationFormatNegotiationSelectsCompatiblePairs() {
+        let nv12Video = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        let nv12Full = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        let bgra = kCVPixelFormatType_32BGRA
+
+        // 1) Preserves zero-copy 420v -> 420v when supported
+        let direct420v = VTInterpolationFormatNegotiation.selectFormatPair(
+            inputFormat: nv12Video,
+            nativeSupported: [bgra, nv12Video],
+            sourceAttributeFormats: [bgra, nv12Video],
+            destinationAttributeFormats: [bgra, nv12Video]
+        )
+        #expect(direct420v == VTInterpolationFormatNegotiation.FormatPair(source: nv12Video, destination: nv12Video))
+
+        // 2) Falls back to 32BGRA -> 32BGRA when FRC only supports 32BGRA
+        let bgraOnly = VTInterpolationFormatNegotiation.selectFormatPair(
+            inputFormat: nv12Video,
+            nativeSupported: [bgra],
+            sourceAttributeFormats: [bgra],
+            destinationAttributeFormats: [bgra]
+        )
+        #expect(bgraOnly == VTInterpolationFormatNegotiation.FormatPair(source: bgra, destination: bgra))
+
+        // 3) Converts 420f -> 420v when FRC only supports 420v
+        let fullToVideo = VTInterpolationFormatNegotiation.selectFormatPair(
+            inputFormat: nv12Full,
+            nativeSupported: [nv12Video],
+            sourceAttributeFormats: [nv12Video],
+            destinationAttributeFormats: [nv12Video]
+        )
+        #expect(fullToVideo == VTInterpolationFormatNegotiation.FormatPair(source: nv12Video, destination: nv12Video))
+
+        // 4) Converts 420f -> 32BGRA when FRC only supports 32BGRA
+        let fullToBGRA = VTInterpolationFormatNegotiation.selectFormatPair(
+            inputFormat: nv12Full,
+            nativeSupported: [bgra],
+            sourceAttributeFormats: [],
+            destinationAttributeFormats: []
+        )
+        #expect(fullToBGRA == VTInterpolationFormatNegotiation.FormatPair(source: bgra, destination: bgra))
+
+        // 5) Supports asymmetric source/destination attributes when destination differs from source
+        let asymmetric = VTInterpolationFormatNegotiation.selectFormatPair(
+            inputFormat: nv12Video,
+            nativeSupported: [nv12Video],
+            sourceAttributeFormats: [nv12Video],
+            destinationAttributeFormats: [bgra]
+        )
+        #expect(asymmetric == VTInterpolationFormatNegotiation.FormatPair(source: nv12Video, destination: bgra))
+
+        // 6) Rejects unstageable 32BGRA input when FRC only supports NV12
+        let unstageable = VTInterpolationFormatNegotiation.selectFormatPair(
+            inputFormat: bgra,
+            nativeSupported: [nv12Video],
+            sourceAttributeFormats: [nv12Video],
+            destinationAttributeFormats: [nv12Video]
+        )
+        #expect(unstageable == nil)
+
+        // 7) Staging capability matrix
+        #expect(VTInterpolationFormatNegotiation.canStage(inputFormat: nv12Video, targetFormat: nv12Video))
+        #expect(VTInterpolationFormatNegotiation.canStage(inputFormat: nv12Video, targetFormat: bgra))
+        #expect(VTInterpolationFormatNegotiation.canStage(inputFormat: nv12Full, targetFormat: nv12Video))
+        #expect(VTInterpolationFormatNegotiation.canStage(inputFormat: nv12Full, targetFormat: bgra))
+        #expect(VTInterpolationFormatNegotiation.canStage(inputFormat: bgra, targetFormat: bgra))
+        #expect(!VTInterpolationFormatNegotiation.canStage(inputFormat: bgra, targetFormat: nv12Video))
+        #expect(!VTInterpolationFormatNegotiation.canStage(inputFormat: bgra, targetFormat: nv12Full))
+    }
+
+    @Test("LLFI-only consolidation, widened 30.x/VFR dyadic headroom, preference migration, and shader-only config diff")
+    func llfiConsolidationWidenedHeadroomAndMigration() {
+        // Legacy persisted FPS values migrate cleanly to the nearest hardware-fast LLFI mode.
+        #expect(VideoInterpolationRate(persistedValue: 0) == .doubleRate)
+        #expect(VideoInterpolationRate(persistedValue: 48) == .fps60)
+        #expect(VideoInterpolationRate(persistedValue: 60) == .fps60)
+        #expect(VideoInterpolationRate(persistedValue: 72) == .fps60)
+        #expect(VideoInterpolationRate(persistedValue: 90) == .fps120)
+        #expect(VideoInterpolationRate(persistedValue: 100) == .fps120)
+        #expect(VideoInterpolationRate(persistedValue: 120) == .fps120)
+
+        // Legacy VideoToolbox ML SR preference migrates cleanly to MetalFX Spatial.
+        #expect(VideoSuperResolutionMode(persistedValue: "off") == .off)
+        #expect(VideoSuperResolutionMode(persistedValue: "videotoolbox_ml") == .metalFXSpatial)
+        #expect(VideoSuperResolutionMode(persistedValue: "videoToolboxML") == .metalFXSpatial)
+        #expect(VideoSuperResolutionMode(persistedValue: "metalfx_spatial") == .metalFXSpatial)
+
+        // Default planner is locked to dyadic LLFI (2x / 4x) with widened headroom for 30.x / VFR streams.
+        #expect(!VideoFrameInterpolationPlan.supportsArbitraryPhases)
+        for sourceFPS in [24.0, 25.0, 30.0, 30.6, 31.0, 32.5] {
+            let interval = 1.0 / sourceFPS
+            let outcome = VideoFrameInterpolationPlan.plan(
+                previousPTS: 1.0,
+                currentPTS: 1.0 + interval,
+                interval: interval,
+                cadenceInterval: interval,
+                isCadenceStable: true,
+                gridNextPTS: nil,
+                rate: .fps60
+            )
+            guard case let .plan(plan) = outcome else {
+                Issue.record("Expected 2x LLFI plan for \(sourceFPS) fps -> .fps60, got \(outcome)")
+                continue
+            }
+            #expect(plan.allowsLowLatency)
+            #expect(plan.phases == [0.5])
+            #expect(plan.emitsOriginal)
+            #expect(plan.nextGridPTS == nil)
+        }
+
+        // Under .fps120: <= 32.5 fps uses 4x LLFI, 35-65 fps uses 2x LLFI.
+        for sourceFPS in [24.0, 30.0, 32.5] {
+            let interval = 1.0 / sourceFPS
+            guard case let .plan(plan) = VideoFrameInterpolationPlan.plan(
+                previousPTS: 1.0,
+                currentPTS: 1.0 + interval,
+                interval: interval,
+                cadenceInterval: interval,
+                rate: .fps120
+            ) else {
+                Issue.record("Expected 4x LLFI plan for \(sourceFPS) fps -> .fps120")
+                continue
+            }
+            #expect(plan.allowsLowLatency)
+            #expect(plan.phases == [0.25, 0.5, 0.75])
+        }
+        for sourceFPS in [35.0, 48.0, 60.0, 65.0] {
+            let interval = 1.0 / sourceFPS
+            guard case let .plan(plan) = VideoFrameInterpolationPlan.plan(
+                previousPTS: 1.0,
+                currentPTS: 1.0 + interval,
+                interval: interval,
+                cadenceInterval: interval,
+                rate: .fps120
+            ) else {
+                Issue.record("Expected 2x LLFI plan for \(sourceFPS) fps -> .fps120")
+                continue
+            }
+            #expect(plan.allowsLowLatency)
+            #expect(plan.phases == [0.5])
+        }
+
+        // Scale-aware RCAS tap step selection.
+        #expect(MetalFXSuperResolutionBackend.rcasTapStep(
+            inputWidth: 1920, inputHeight: 1080, outputWidth: 2560, outputHeight: 1440
+        ) == 1)
+        #expect(MetalFXSuperResolutionBackend.rcasTapStep(
+            inputWidth: 1280, inputHeight: 720, outputWidth: 1920, outputHeight: 1080
+        ) == 1)
+        #expect(MetalFXSuperResolutionBackend.rcasTapStep(
+            inputWidth: 1920, inputHeight: 1080, outputWidth: 3840, outputHeight: 2160
+        ) == 2)
+        #expect(MetalFXSuperResolutionBackend.rcasTapStep(
+            inputWidth: 1280, inputHeight: 720, outputWidth: 2560, outputHeight: 1440
+        ) == 2)
+
+        // Shader-uniform-only config diff avoids pipeline flushes when toggling sharpness or split compare.
+        var base = VideoEnhancementConfiguration(superResolutionMode: .metalFXSpatial)
+        var toggledSplit = base
+        toggledSplit.superResolutionSplitCompare = true
+        toggledSplit.superResolutionSharpness = .strong
+        #expect(toggledSplit.isShaderUniformOnlyChange(from: base))
+        base.superResolutionTargetResolution = .p2160
+        #expect(!toggledSplit.isShaderUniformOnlyChange(from: base))
+    }
+
+    @Test("RCAS enhances edge contrast without [mn5, mx5] erasure, matches tapStep=2 parity, and renders split-screen compare")
+    nonisolated func rcasRealSharpeningAdaptiveTapStepAndSplitCompare() async throws {
+        guard MTLCreateSystemDefaultDevice() != nil else { return }
+
+        func makeIOSurfaceBuffer(width: Int, height: Int, format: OSType) -> CVPixelBuffer? {
+            let attrs: [String: Any] = [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+            ]
+            var buffer: CVPixelBuffer?
+            let status = CVPixelBufferCreate(
+                kCFAllocatorDefault, width, height, format, attrs as CFDictionary, &buffer
+            )
+            return status == kCVReturnSuccess ? buffer : nil
+        }
+
+        let width = 32
+        let height = 16
+        guard let stepSrc = makeIOSurfaceBuffer(width: width, height: height, format: kCVPixelFormatType_32BGRA),
+              let origDark = makeIOSurfaceBuffer(width: width, height: height, format: kCVPixelFormatType_32BGRA),
+              let sharpBGRA = makeIOSurfaceBuffer(width: width, height: height, format: kCVPixelFormatType_32BGRA),
+              let sharpNV12 = makeIOSurfaceBuffer(
+                width: width, height: height, format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+              ),
+              let splitNV12 = makeIOSurfaceBuffer(
+                width: width, height: height, format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+              ) else {
+            Issue.record("Failed to allocate IOSurface test buffers for RCAS edge/split tests")
+            return
+        }
+
+        // Fill a vertical step edge (left half gray=51 ~0.20, right half gray=204 ~0.80).
+        #expect(CVPixelBufferLockBaseAddress(stepSrc, []) == kCVReturnSuccess)
+        if let base = CVPixelBufferGetBaseAddress(stepSrc)?.assumingMemoryBound(to: UInt8.self) {
+            let stride = CVPixelBufferGetBytesPerRow(stepSrc)
+            for row in 0..<height {
+                for col in 0..<width {
+                    let v: UInt8 = col < (width / 2) ? 51 : 204
+                    let off = row * stride + col * 4
+                    base[off] = v
+                    base[off + 1] = v
+                    base[off + 2] = v
+                    base[off + 3] = 255
+                }
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(stepSrc, [])
+
+        // Uniform dark original (gray=30) for split-screen A/B comparison test.
+        #expect(CVPixelBufferLockBaseAddress(origDark, []) == kCVReturnSuccess)
+        if let base = CVPixelBufferGetBaseAddress(origDark)?.assumingMemoryBound(to: UInt8.self) {
+            let stride = CVPixelBufferGetBytesPerRow(origDark)
+            for row in 0..<height {
+                for col in 0..<width {
+                    let off = row * stride + col * 4
+                    base[off] = 30
+                    base[off + 1] = 30
+                    base[off + 2] = 30
+                    base[off + 3] = 255
+                }
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(origDark, [])
+
+        let metal = VideoEnhancementMetalContext.shared
+        let resources = try metal.resources()
+        let rcasPipeline = try metal.pipeline(for: .rcasSharpen)
+        let rcasNV12Pipeline = try metal.pipeline(for: .rcasToNV12)
+
+        guard let cmd = resources.commandQueue.makeCommandBuffer(),
+              let stepTex = metal.makeTexture(
+                buffer: stepSrc, format: .bgra8Unorm, width: width, height: height, plane: 0
+              ),
+              let origTex = metal.makeTexture(
+                buffer: origDark, format: .bgra8Unorm, width: width, height: height, plane: 0
+              ),
+              let sharpBGRATex = metal.makeTexture(
+                buffer: sharpBGRA, format: .bgra8Unorm, width: width, height: height,
+                plane: 0, usage: .shaderWrite
+              ),
+              let sharpYTex = metal.makeTexture(
+                buffer: sharpNV12, format: .r8Unorm, width: width, height: height,
+                plane: 0, usage: .shaderWrite
+              ),
+              let sharpCbCrTex = metal.makeTexture(
+                buffer: sharpNV12, format: .rg8Unorm, width: width / 2, height: height / 2,
+                plane: 1, usage: .shaderWrite
+              ),
+              let splitYTex = metal.makeTexture(
+                buffer: splitNV12, format: .r8Unorm, width: width, height: height,
+                plane: 0, usage: .shaderWrite
+              ),
+              let splitCbCrTex = metal.makeTexture(
+                buffer: splitNV12, format: .rg8Unorm, width: width / 2, height: height / 2,
+                plane: 1, usage: .shaderWrite
+              ),
+              let enc = cmd.makeComputeCommandEncoder() else {
+            Issue.record("Failed to create Metal resources for RCAS edge/split test")
+            return
+        }
+
+        // 1) Verify tapStep=2 rcasSharpen & rcasToNV12 both sharpen local edge extrema beyond [51, 204].
+        var pBGRA = VideoEnhancementRCASParams(strength: 0.80, tapStep: 2, splitCompare: 0)
+        enc.setComputePipelineState(rcasPipeline)
+        enc.setTexture(stepTex.texture, index: 0)
+        enc.setTexture(sharpBGRATex.texture, index: 1)
+        enc.setTexture(stepTex.texture, index: 2)
+        enc.setBytes(&pBGRA, length: MemoryLayout<VideoEnhancementRCASParams>.size, index: 0)
+        VideoEnhancementMetalContext.dispatchThreads(encoder: enc, pipeline: rcasPipeline, width: width, height: height)
+
+        var pNV12 = VideoEnhancementRCASNV12Params(strength: 0.80, colorMatrix: 0, tapStep: 2, splitCompare: 0)
+        enc.setComputePipelineState(rcasNV12Pipeline)
+        enc.setTexture(stepTex.texture, index: 0)
+        enc.setTexture(sharpYTex.texture, index: 1)
+        enc.setTexture(sharpCbCrTex.texture, index: 2)
+        enc.setTexture(stepTex.texture, index: 3)
+        enc.setBytes(&pNV12, length: MemoryLayout<VideoEnhancementRCASNV12Params>.size, index: 0)
+        VideoEnhancementMetalContext.dispatchThreads(
+            encoder: enc, pipeline: rcasNV12Pipeline, width: width / 2, height: height / 2
+        )
+
+        // 2) Verify split-screen compare renders origDark on left, stepSrc (204) on right, bright divider at center.
+        var pSplit = VideoEnhancementRCASNV12Params(strength: 0.0, colorMatrix: 0, tapStep: 1, splitCompare: 1)
+        enc.setComputePipelineState(rcasNV12Pipeline)
+        enc.setTexture(stepTex.texture, index: 0)
+        enc.setTexture(splitYTex.texture, index: 1)
+        enc.setTexture(splitCbCrTex.texture, index: 2)
+        enc.setTexture(origTex.texture, index: 3)
+        enc.setBytes(&pSplit, length: MemoryLayout<VideoEnhancementRCASNV12Params>.size, index: 0)
+        VideoEnhancementMetalContext.dispatchThreads(
+            encoder: enc, pipeline: rcasNV12Pipeline, width: width / 2, height: height / 2
+        )
+        enc.endEncoding()
+
+        let retained = [
+            stepTex.bridge, origTex.bridge, sharpBGRATex.bridge,
+            sharpYTex.bridge, sharpCbCrTex.bridge, splitYTex.bridge, splitCbCrTex.bridge,
+        ]
+        let ok = await VideoEnhancementMetalContext.commitAndWait(cmd)
+        withExtendedLifetime(retained) {}
+        #expect(ok)
+
+        #expect(CVPixelBufferLockBaseAddress(sharpBGRA, .readOnly) == kCVReturnSuccess)
+        #expect(CVPixelBufferLockBaseAddress(sharpNV12, .readOnly) == kCVReturnSuccess)
+        #expect(CVPixelBufferLockBaseAddress(splitNV12, .readOnly) == kCVReturnSuccess)
+        if let bgraBase = CVPixelBufferGetBaseAddress(sharpBGRA)?.assumingMemoryBound(to: UInt8.self),
+           let ySharpBase = CVPixelBufferGetBaseAddressOfPlane(sharpNV12, 0)?.assumingMemoryBound(to: UInt8.self),
+           let ySplitBase = CVPixelBufferGetBaseAddressOfPlane(splitNV12, 0)?.assumingMemoryBound(to: UInt8.self) {
+            let bgraStride = CVPixelBufferGetBytesPerRow(sharpBGRA)
+            let ySharpStride = CVPixelBufferGetBytesPerRowOfPlane(sharpNV12, 0)
+            let ySplitStride = CVPixelBufferGetBytesPerRowOfPlane(splitNV12, 0)
+
+            let row = height / 2
+            let darkEdgeCol = width / 2 - 1 // input 51, neighbor +2 is 204
+            let brightEdgeCol = width / 2   // input 204, neighbor -2 is 51
+            let darkOut = Int(bgraBase[row * bgraStride + darkEdgeCol * 4])
+            let brightOut = Int(bgraBase[row * bgraStride + brightEdgeCol * 4])
+            // Must sharpen strictly past [51, 204] instead of being clamped away!
+            #expect(darkOut < 46, "Expected RCAS dark-edge darkening < 46, got \(darkOut)")
+            #expect(brightOut > 209, "Expected RCAS bright-edge boost > 209, got \(brightOut)")
+
+            // Verify tapStep=2 rcasToNV12 matches rcasSharpen on those edge pixels.
+            let yScale = 219.0 / 255.0
+            let yOffset = 16.0 / 255.0
+            let expectedDarkY = Int((Double(darkOut) / 255.0 * yScale + yOffset) * 255.0 + 0.5)
+            let expectedBrightY = Int((Double(brightOut) / 255.0 * yScale + yOffset) * 255.0 + 0.5)
+            #expect(abs(Int(ySharpBase[row * ySharpStride + darkEdgeCol]) - expectedDarkY) <= 1)
+            #expect(abs(Int(ySharpBase[row * ySharpStride + brightEdgeCol]) - expectedBrightY) <= 1)
+
+            // Verify split-screen compare: left side = origDark (gray 30 -> Y≈42),
+            // right side = stepSrc (gray 204 -> Y≈191), center = bright white divider (>215).
+            let leftY = Int(ySplitBase[row * ySplitStride + 4])
+            let centerY = Int(ySplitBase[row * ySplitStride + (width / 2)])
+            let rightY = Int(ySplitBase[row * ySplitStride + (width - 4)])
+            #expect(abs(leftY - 42) <= 2, "Expected left split original Y≈42, got \(leftY)")
+            #expect(abs(rightY - 191) <= 2, "Expected right split enhanced Y≈191, got \(rightY)")
+            #expect(centerY > 215, "Expected bright split divider Y>215, got \(centerY)")
+        }
+        CVPixelBufferUnlockBaseAddress(splitNV12, .readOnly)
+        CVPixelBufferUnlockBaseAddress(sharpNV12, .readOnly)
+        CVPixelBufferUnlockBaseAddress(sharpBGRA, .readOnly)
+    }
+
+    @Test("SampleBufferVideoRenderer hold view and PlayerContainerView recovery cover stay transparent for ambient glow")
+    @MainActor
+    func rendererHoldViewAndRecoveryCoverPreserveAmbientTransparency() {
+        let renderer = SampleBufferVideoRenderer()
+        defer { renderer.invalidate() }
+
+        let hostView = renderer.hostViewController.view!
+        #expect(hostView.backgroundColor == .clear)
+        #expect(!hostView.isOpaque)
+
+        let displayView = hostView.subviews.first { $0 is SampleBufferDisplayView } as? SampleBufferDisplayView
+        let holdView = hostView.subviews.first { $0 is PresentationImageHoldView } as? PresentationImageHoldView
+        #expect(displayView != nil)
+        #expect(holdView != nil)
+        if let displayView {
+            #expect(displayView.backgroundColor == .clear)
+            #expect(!displayView.isOpaque)
+            #expect(displayView.sampleBufferLayer.backgroundColor?.alpha == 0)
+        }
+        if let holdView {
+            #expect(holdView.backgroundColor == .clear)
+            #expect(!holdView.isOpaque)
+            #expect(holdView.sampleBufferLayer.backgroundColor?.alpha == 0)
+        }
+
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 400, height: 225))
+        window.isHidden = false
+        let container = PlayerContainerView(frame: window.bounds)
+        window.addSubview(container)
+        container.attach(hostedVC: renderer.hostViewController, generation: 1)
+        container.syncHostedSurfaceLayoutIfNeeded()
+        defer {
+            container.attach(hostedVC: nil, generation: -1)
+            container.removeFromSuperview()
+            window.isHidden = true
+        }
+        let image = UIGraphicsImageRenderer(size: CGSize(width: 16, height: 9)).image { ctx in
+            UIColor.red.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 16, height: 9))
+        }
+        let mount = container.installRecoveryCover(image, identity: 1)
+        #expect(mount == .mounted)
+        let cover = container.subviews.compactMap { $0 as? UIImageView }.first
+        #expect(cover != nil)
+        if let cover {
+            #expect(cover.backgroundColor == .clear)
+            #expect(!cover.isOpaque)
+        }
     }
 }

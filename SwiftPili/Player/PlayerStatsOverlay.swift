@@ -277,7 +277,6 @@ struct PlayerStatsOverlay: View {
         var parts: [String] = []
         switch config.superResolutionMode {
         case .off: break
-        case .videoToolboxML: parts.append(String(localized: "VideoToolbox ML"))
         case .metalFXSpatial: parts.append("MetalFX")
         }
         if config.frameInterpolationEnabled {

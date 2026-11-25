@@ -240,8 +240,6 @@ private struct PlayerVideoEnhancementMenuItems: View {
         switch player.videoSuperResolutionMode {
         case .off:
             break
-        case .videoToolboxML:
-            parts.append(player.videoSuperResolutionMode.menuLabel)
         case .metalFXSpatial:
             if let shortEdge = player.videoSuperResolutionTargetResolution.shortEdge {
                 parts.append("\(player.videoSuperResolutionMode.menuLabel) \(shortEdge)p")
@@ -422,6 +420,11 @@ struct LandscapeStatusInfo: View {
             .font(.footnote)
             .fontWeight(.medium)
             .foregroundStyle(.white.opacity(0.9))
+        }
+        .onAppear {
+            if !UIDevice.current.isBatteryMonitoringEnabled {
+                UIDevice.current.isBatteryMonitoringEnabled = true
+            }
         }
     }
 

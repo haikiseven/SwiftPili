@@ -89,6 +89,25 @@ enum ScaledVideoOutputMetadata {
         )
     }
 
+    static func ycbcrMatrixAttachment(for colorMatrixIndex: UInt32) -> CFString {
+        switch colorMatrixIndex {
+        case 1: kCVImageBufferYCbCrMatrix_ITU_R_601_4
+        case 2: kCVImageBufferYCbCrMatrix_ITU_R_2020
+        default: kCVImageBufferYCbCrMatrix_ITU_R_709_2
+        }
+    }
+
+    static func ensureYCbCrMatrixAttachment(on output: CVPixelBuffer, colorMatrixIndex: UInt32) {
+        if CVBufferCopyAttachment(output, kCVImageBufferYCbCrMatrixKey, nil) == nil {
+            CVBufferSetAttachment(
+                output,
+                kCVImageBufferYCbCrMatrixKey,
+                ycbcrMatrixAttachment(for: colorMatrixIndex),
+                .shouldPropagate
+            )
+        }
+    }
+
     private static func scaleCleanAperture(
         _ key: CFString,
         horizontalScale: Double,
