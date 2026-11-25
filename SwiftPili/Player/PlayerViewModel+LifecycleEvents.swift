@@ -311,9 +311,14 @@ extension PlayerViewModel {
     @discardableResult
     func syncDemandPresentationCornerRadius() -> CGFloat {
         guard usesDemandPresentationContinuity else { return 0 }
-        let radius = PlayerPresentationCornerPolicy.cornerRadius(
+        let baseRadius = PlayerPresentationCornerPolicy.cornerRadius(
             isPiPRestoringInline: lifecycleRecovery.isPiPRestoringInline
         )
+        let isMiniSurface = renderAttachmentSurfaceLease?.role == .miniPlayer
+            || activeSurfaceLease?.role == .miniPlayer
+        let radius = isMiniSurface
+            ? max(baseRadius, InAppMiniPlayerLayoutPolicy.cornerRadius)
+            : baseRadius
         backend.setDemandPresentationCornerRadius(radius)
         renderAttachment?.setPresentationCornerRadius(radius)
         return radius

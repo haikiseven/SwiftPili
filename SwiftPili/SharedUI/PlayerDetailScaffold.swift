@@ -177,37 +177,34 @@ struct PlayerDetailChromeModifier<Backdrop: View>: ViewModifier {
     let presentationContext: PlayerScreenPresentationContext?
     let coordinator: AppCoordinator
     let liveRoom: LiveRoomViewModel?
-    let watchdogScreen: String?
     let backdrop: Backdrop
 
     func body(content: Content) -> some View {
-        watchdogWrapped(
-            dismissGated(
-                backdropApplied(
-                    safeAreaGuarded(
-                        content
-                            .allowsHitTesting(!isFullscreenPresentationActive)
-                            .accessibilityHidden(isFullscreenPresentationActive)
-                    )
+        dismissGated(
+            backdropApplied(
+                safeAreaGuarded(
+                    content
+                        .allowsHitTesting(!isFullscreenPresentationActive)
+                        .accessibilityHidden(isFullscreenPresentationActive)
                 )
-                .appSurface(.cinematic)
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar(.hidden, for: .navigationBar)
-                .toolbar(.hidden, for: .tabBar)
-                .toolbarBackground(.hidden, for: .navigationBar)
-                .keepsInteractivePopGesture()
             )
-            .background(alignment: .topLeading) {
-                if let presentationContext {
-                    PlayerFullscreenHost(
-                        context: presentationContext,
-                        navigation: coordinator,
-                        liveRoom: liveRoom
-                    )
-                }
-            }
-            .statusBarHidden(isStatusBarHidden)
+            .appSurface(.cinematic)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar(.hidden, for: .navigationBar)
+            .toolbar(.hidden, for: .tabBar)
+            .toolbarBackground(.hidden, for: .navigationBar)
+            .keepsInteractivePopGesture()
         )
+        .background(alignment: .topLeading) {
+            if let presentationContext {
+                PlayerFullscreenHost(
+                    context: presentationContext,
+                    navigation: coordinator,
+                    liveRoom: liveRoom
+                )
+            }
+        }
+        .statusBarHidden(isStatusBarHidden)
     }
 
     @ViewBuilder
@@ -232,15 +229,6 @@ struct PlayerDetailChromeModifier<Backdrop: View>: ViewModifier {
     private func dismissGated<Target: View>(_ view: Target) -> some View {
         if let preventsContentDismissal {
             view.preventsVideoDetailContentDismissal(isActive: preventsContentDismissal)
-        } else {
-            view
-        }
-    }
-
-    @ViewBuilder
-    private func watchdogWrapped<Target: View>(_ view: Target) -> some View {
-        if let watchdogScreen {
-            view.freezeWatchdogScreen(watchdogScreen)
         } else {
             view
         }
@@ -286,7 +274,6 @@ extension View {
         presentationContext: PlayerScreenPresentationContext?,
         coordinator: AppCoordinator,
         liveRoom: LiveRoomViewModel? = nil,
-        watchdogScreen: String? = nil,
         @ViewBuilder backdrop: () -> Backdrop
     ) -> some View {
         modifier(
@@ -298,7 +285,6 @@ extension View {
                 presentationContext: presentationContext,
                 coordinator: coordinator,
                 liveRoom: liveRoom,
-                watchdogScreen: watchdogScreen,
                 backdrop: backdrop()
             )
         )
@@ -311,8 +297,7 @@ extension View {
         preventsContentDismissal: Bool? = nil,
         presentationContext: PlayerScreenPresentationContext?,
         coordinator: AppCoordinator,
-        liveRoom: LiveRoomViewModel? = nil,
-        watchdogScreen: String? = nil
+        liveRoom: LiveRoomViewModel? = nil
     ) -> some View {
         modifier(
             PlayerDetailChromeModifier(
@@ -323,7 +308,6 @@ extension View {
                 presentationContext: presentationContext,
                 coordinator: coordinator,
                 liveRoom: liveRoom,
-                watchdogScreen: watchdogScreen,
                 backdrop: EmptyView()
             )
         )

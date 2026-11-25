@@ -1,5 +1,9 @@
 import Foundation
 
+private func enumCaseName(_ value: Any) -> String {
+    Mirror(reflecting: value).children.first?.label ?? String(describing: value)
+}
+
 struct DemandPresentationFence: Equatable {
     let lifecycleEpoch: UInt64
     let ownerKey: String
@@ -9,81 +13,38 @@ struct DemandPresentationFence: Equatable {
     let sessionGeneration: UInt64
     let renderGeneration: Int
     let pipBindingGeneration: UInt64
-    let userWantsPlaying: Bool
-    let playAfterResume: Bool
-    let playbackSuppressed: Bool
-
-    init(
-        lifecycleEpoch: UInt64,
-        ownerKey: String,
-        ownerLeaseGeneration: UInt64,
-        source: DecoderRecoveryAdmission.Source,
-        backendGeneration: UInt64,
-        sessionGeneration: UInt64,
-        renderGeneration: Int,
-        pipBindingGeneration: UInt64,
-        userWantsPlaying: Bool = true,
-        playAfterResume: Bool = false,
-        playbackSuppressed: Bool = false
-    ) {
-        self.lifecycleEpoch = lifecycleEpoch
-        self.ownerKey = ownerKey
-        self.ownerLeaseGeneration = ownerLeaseGeneration
-        self.source = source
-        self.backendGeneration = backendGeneration
-        self.sessionGeneration = sessionGeneration
-        self.renderGeneration = renderGeneration
-        self.pipBindingGeneration = pipBindingGeneration
-        self.userWantsPlaying = userWantsPlaying
-        self.playAfterResume = playAfterResume
-        self.playbackSuppressed = playbackSuppressed
-    }
+    var userWantsPlaying: Bool = true
+    var playAfterResume: Bool = false
+    var playbackSuppressed: Bool = false
 
     func with(
         userWantsPlaying: Bool? = nil,
         playAfterResume: Bool? = nil
     ) -> Self {
-        Self(
-            lifecycleEpoch: lifecycleEpoch,
-            ownerKey: ownerKey,
-            ownerLeaseGeneration: ownerLeaseGeneration,
-            source: source,
-            backendGeneration: backendGeneration,
-            sessionGeneration: sessionGeneration,
-            renderGeneration: renderGeneration,
-            pipBindingGeneration: pipBindingGeneration,
-            userWantsPlaying: userWantsPlaying ?? self.userWantsPlaying,
-            playAfterResume: playAfterResume ?? self.playAfterResume,
-            playbackSuppressed: playbackSuppressed
-        )
+        var copy = self
+        if let userWantsPlaying { copy.userWantsPlaying = userWantsPlaying }
+        if let playAfterResume { copy.playAfterResume = playAfterResume }
+        return copy
     }
 
-    func hasSameContinuityAuthority(as other: Self) -> Bool {
-        lifecycleEpoch == other.lifecycleEpoch
-            && ownerKey == other.ownerKey
-            && ownerLeaseGeneration == other.ownerLeaseGeneration
-            && source.hasSameAuthority(as: other.source)
-            && backendGeneration == other.backendGeneration
-            && sessionGeneration == other.sessionGeneration
-            && pipBindingGeneration == other.pipBindingGeneration
-    }
-
-    func hasSameResourceAuthority(as other: Self) -> Bool {
+    private func hasSameStreamBinding(as other: Self) -> Bool {
         ownerKey == other.ownerKey
             && ownerLeaseGeneration == other.ownerLeaseGeneration
             && source.hasSameAuthority(as: other.source)
             && backendGeneration == other.backendGeneration
-            && sessionGeneration == other.sessionGeneration
             && pipBindingGeneration == other.pipBindingGeneration
     }
 
+    func hasSameResourceAuthority(as other: Self) -> Bool {
+        hasSameStreamBinding(as: other) && sessionGeneration == other.sessionGeneration
+    }
+
+    func hasSameContinuityAuthority(as other: Self) -> Bool {
+        lifecycleEpoch == other.lifecycleEpoch && hasSameResourceAuthority(as: other)
+    }
+
     func isSameResourceAfterSeek(of earlier: Self) -> Bool {
-        ownerKey == earlier.ownerKey
-            && ownerLeaseGeneration == earlier.ownerLeaseGeneration
-            && source.hasSameAuthority(as: earlier.source)
-            && backendGeneration == earlier.backendGeneration
-            && pipBindingGeneration == earlier.pipBindingGeneration
-            && sessionGeneration > earlier.sessionGeneration
+        hasSameStreamBinding(as: earlier) && sessionGeneration > earlier.sessionGeneration
     }
 }
 
@@ -196,23 +157,14 @@ struct DemandPresentationLivenessAuthority: Equatable {
         expected != nil && expected == proved
     }
 
-    mutating func begin(_ fence: DemandPresentationFence) {
-        expected = Scope(fence)
-        proved = nil
-    }
-
     mutating func begin(
         _ fence: DemandPresentationFence,
-        preservingExistingProof: Bool
+        preservingExistingProof: Bool = false
     ) {
-        if preservingExistingProof {
-            let carriesProof = hasCurrentProof
-            let scope = Scope(fence)
-            expected = scope
-            proved = carriesProof ? scope : nil
-            return
-        }
-        begin(fence)
+        let carriesProof = preservingExistingProof && hasCurrentProof
+        let scope = Scope(fence)
+        expected = scope
+        proved = carriesProof ? scope : nil
     }
 
     mutating func prove(_ fence: DemandPresentationFence) {
@@ -295,10 +247,10 @@ struct DemandPiPStopTransaction: Equatable {
 struct DemandInlineRestoreTransaction: Equatable {
     let fence: DemandPresentationFence
     var completionToken: UInt64?
-    let nativeStopAuthority: DemandPiPStopAuthority?
-    var inlineAttached: Bool
-    var avKitCompletionSent: Bool
-    var nativeDidStop: Bool
+    var nativeStopAuthority: DemandPiPStopAuthority?
+    var inlineAttached = false
+    var avKitCompletionSent = false
+    var nativeDidStop = false
     var nativeStopRequested = false
 }
 
@@ -316,6 +268,23 @@ struct DemandWarmSuspensionState: Equatable {
     var inlineAttached = false
     var suspensionAcknowledgementFence: DemandPresentationFence?
     var videoFailure: DemandPresentationFailure?
+
+    var suspendEffect: DemandPresentationEffect {
+        reason == .pipDidStop
+            ? .suspendVideoLaneAfterPiPStop(fence)
+            : .warmSuspendVideoLane(fence)
+    }
+
+    mutating func resetForegroundPreparation(keepingInlineAttachment: Bool = false) {
+        prepareWhenSuspended = false
+        isPrepared = false
+        preparedWhileInactive = false
+        activeValidationRequested = false
+        attachRequested = false
+        if !keepingInlineAttachment {
+            inlineAttached = false
+        }
+    }
 }
 
 enum DemandVideoPresentationPhase: Equatable {
@@ -344,8 +313,11 @@ enum DemandVideoPresentationPhase: Equatable {
              .inlineAttachedUnproven(let fence),
              .pipStarting(let fence),
              .pipStartFailed(let fence),
-             .pipActive(let fence):
+             .pipActive(let fence),
+             .failed(let fence?, _):
             fence
+        case .failed(nil, _):
+            nil
         case .inlineVisible(let proof):
             proof.fence
         case .warmSuspendingForAudioOnly(let state), .warmSuspended(let state):
@@ -354,122 +326,10 @@ enum DemandVideoPresentationPhase: Equatable {
             transaction.fence
         case .restoringInline(let transaction):
             transaction.fence
-        case .failed(let fence, _):
-            fence
         }
     }
 
-    var diagnosticName: String {
-        switch self {
-        case .idle: "idle"
-        case .pausedInline: "pausedInline"
-        case .inlineVisible: "inlineVisible"
-        case .inlineNeedsAttachment: "inlineNeedsAttachment"
-        case .inlineAttachPending: "inlineAttachPending"
-        case .inlineAttachedUnproven: "inlineAttachedUnproven"
-        case .warmSuspendingForAudioOnly: "warmSuspendingForAudioOnly"
-        case .warmSuspended: "warmSuspended"
-        case .pipStarting: "pipStarting"
-        case .pipStartFailed: "pipStartFailed"
-        case .pipActive: "pipActive"
-        case .pipStopping: "pipStopping"
-        case .restoringInline: "restoringInline"
-        case .failed: "failed"
-        }
-    }
-}
-
-extension DemandPresentationEvent {
-    var diagnosticFence: DemandPresentationFence? {
-        switch self {
-        case .playbackEnded, .explicitReplay, .teardown:
-            nil
-        case .installInline(let fence),
-             .foregroundTransitionBegan(let fence),
-             .didBecomeActive(let fence),
-             .inlineAttached(let fence),
-             .inlineDetached(let fence),
-             .inlineAttachmentFailed(let fence),
-             .pipWillStart(let fence),
-             .pipDidStart(let fence),
-             .pipStartAbandoned(let fence),
-             .pipFailedToStart(let fence),
-             .pipWillStop(let fence),
-             .pipDidStop(let fence),
-             .pipPresentationNeedsReconcile(let fence),
-             .pipPresentationReconciled(let fence),
-             .pipPresentationReconcileFailed(let fence, _),
-             .transportSuppressed(let fence),
-             .explicitPlayRequested(let fence),
-             .videoLaneSuspensionMayProceed(let fence),
-             .videoLaneSeekCommitted(let fence, _):
-            fence
-        case .didEnterBackground(_, _, let fence, _):
-            fence
-        case .videoLaneSuspended(let fence, _),
-             .videoLanePrepared(let fence, _),
-             .videoLaneResumed(let fence, _):
-            fence
-        case .videoLanePreparationFailed(let fence, _, _):
-            fence
-        case .videoFailureKeptAudio(let fence, _, _):
-            fence
-        case .videoLaneResumeFailed(let fence, _):
-            fence
-        case .pipTransportIntent(let fence, _),
-             .requestPiPStop(let fence, _),
-             .forceRetirePiP(let fence, _),
-             .prepareInlineForPiPStop(let fence, _),
-             .restoreInlineRequested(let fence, _),
-             .rendererHealthChanged(let fence, _),
-             .runtimeVideoFault(let fence, _):
-            fence
-        case .presentationProved(let proof):
-            proof.fence
-        }
-    }
-
-    var diagnosticName: String {
-        switch self {
-        case .playbackEnded: "playbackEnded"
-        case .explicitReplay: "explicitReplay"
-        case .installInline: "installInline"
-        case .didEnterBackground: "didEnterBackground"
-        case .foregroundTransitionBegan: "foregroundTransitionBegan"
-        case .didBecomeActive: "didBecomeActive"
-        case .videoLaneSuspended: "videoLaneSuspended"
-        case .videoLaneSuspensionMayProceed: "videoLaneSuspensionMayProceed"
-        case .videoFailureKeptAudio: "videoFailureKeptAudio"
-        case .videoLanePrepared: "videoLanePrepared"
-        case .videoLanePreparationFailed: "videoLanePreparationFailed"
-        case .videoLaneResumed: "videoLaneResumed"
-        case .videoLaneResumeFailed: "videoLaneResumeFailed"
-        case .inlineAttached: "inlineAttached"
-        case .inlineDetached: "inlineDetached"
-        case .inlineAttachmentFailed: "inlineAttachmentFailed"
-        case .pipWillStart: "pipWillStart"
-        case .pipDidStart: "pipDidStart"
-        case .pipStartAbandoned: "pipStartAbandoned"
-        case .pipTransportIntent: "pipTransportIntent"
-        case .pipFailedToStart: "pipFailedToStart"
-        case .requestPiPStop: "requestPiPStop"
-        case .forceRetirePiP: "forceRetirePiP"
-        case .prepareInlineForPiPStop: "prepareInlineForPiPStop"
-        case .restoreInlineRequested: "restoreInlineRequested"
-        case .pipWillStop: "pipWillStop"
-        case .pipDidStop: "pipDidStop"
-        case .pipPresentationNeedsReconcile: "pipPresentationNeedsReconcile"
-        case .pipPresentationReconciled: "pipPresentationReconciled"
-        case .pipPresentationReconcileFailed: "pipPresentationReconcileFailed"
-        case .rendererHealthChanged: "rendererHealthChanged"
-        case .presentationProved: "presentationProved"
-        case .runtimeVideoFault: "runtimeVideoFault"
-        case .teardown: "teardown"
-        case .transportSuppressed: "transportSuppressed"
-        case .explicitPlayRequested: "explicitPlayRequested"
-        case .videoLaneSeekCommitted: "videoLaneSeekCommitted"
-        }
-    }
+    var diagnosticName: String { enumCaseName(self) }
 }
 
 enum DemandPresentationApplicationPhase: Equatable, Sendable {
@@ -478,11 +338,13 @@ enum DemandPresentationApplicationPhase: Equatable, Sendable {
     case background
 }
 
-enum DemandPresentationRecoveryStage: Int, Equatable, Sendable {
+enum DemandPresentationRecoveryStage: Int, Equatable, Comparable, Sendable {
     case retainedRenderer = 0
     case rendererFlushed = 1
     case decoderRecreated = 2
     case exhausted = 3
+
+    static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
 }
 
 enum DemandPresentationEvent: Equatable {
@@ -542,6 +404,51 @@ enum DemandPresentationEvent: Equatable {
     case transportSuppressed(fence: DemandPresentationFence)
     case explicitPlayRequested(fence: DemandPresentationFence)
     case videoLaneSeekCommitted(fence: DemandPresentationFence, resumesPlayback: Bool)
+
+    var diagnosticFence: DemandPresentationFence? {
+        switch self {
+        case .playbackEnded, .explicitReplay, .teardown:
+            nil
+        case .presentationProved(let proof):
+            proof.fence
+        case .didEnterBackground(_, _, let fence, _),
+             .installInline(let fence),
+             .foregroundTransitionBegan(let fence),
+             .didBecomeActive(let fence),
+             .inlineAttached(let fence),
+             .inlineDetached(let fence),
+             .inlineAttachmentFailed(let fence),
+             .pipWillStart(let fence),
+             .pipDidStart(let fence),
+             .pipStartAbandoned(let fence),
+             .pipFailedToStart(let fence),
+             .pipWillStop(let fence),
+             .pipDidStop(let fence),
+             .pipPresentationNeedsReconcile(let fence),
+             .pipPresentationReconciled(let fence),
+             .pipPresentationReconcileFailed(let fence, _),
+             .transportSuppressed(let fence),
+             .explicitPlayRequested(let fence),
+             .videoLaneSuspensionMayProceed(let fence),
+             .videoLaneSeekCommitted(let fence, _),
+             .videoLaneSuspended(let fence, _),
+             .videoLanePrepared(let fence, _),
+             .videoLaneResumed(let fence, _),
+             .videoLanePreparationFailed(let fence, _, _),
+             .videoFailureKeptAudio(let fence, _, _),
+             .videoLaneResumeFailed(let fence, _),
+             .pipTransportIntent(let fence, _),
+             .requestPiPStop(let fence, _),
+             .forceRetirePiP(let fence, _),
+             .prepareInlineForPiPStop(let fence, _),
+             .restoreInlineRequested(let fence, _),
+             .rendererHealthChanged(let fence, _),
+             .runtimeVideoFault(let fence, _):
+            fence
+        }
+    }
+
+    var diagnosticName: String { enumCaseName(self) }
 }
 
 enum DemandPresentationEffect: Equatable {
@@ -576,23 +483,20 @@ enum DemandForegroundPresentationDestination: Equatable, Sendable {
 extension LifecycleRecoveryCoordinator {
     var isPiPRestoringInline: Bool {
         switch presentationPhase {
-        case .restoringInline:
-            return true
-        case .pipActive, .pipStopping:
-            return presentationApplicationPhase == .active
-        default:
-            return false
+        case .restoringInline: true
+        case .pipActive, .pipStopping: presentationApplicationPhase == .active
+        default: false
         }
     }
 
     var hasPendingDemandExplicitPlay: Bool {
         switch presentationPhase {
         case .warmSuspendingForAudioOnly(let state), .warmSuspended(let state):
-            return state.explicitPlayRequested
+            state.explicitPlayRequested
         case .inlineAttachedUnproven(let fence):
-            return fence.playAfterResume
+            fence.playAfterResume
         default:
-            return false
+            false
         }
     }
 
@@ -606,10 +510,7 @@ extension LifecycleRecoveryCoordinator {
         switch presentationPhase {
         case .pipActive, .pipStopping, .restoringInline:
             return true
-        case .idle, .pausedInline, .inlineVisible, .inlineAttachedUnproven,
-             .warmSuspendingForAudioOnly, .warmSuspended, .pipStarting,
-             .pipStartFailed, .inlineNeedsAttachment, .inlineAttachPending,
-             .failed:
+        default:
             return false
         }
     }
@@ -619,12 +520,8 @@ extension LifecycleRecoveryCoordinator {
     ) -> [DemandPresentationEffect] {
         if terminalState.isTerminal {
             switch event {
-            case .playbackEnded:
-                return []
-            case .explicitReplay, .teardown:
-                break
-            default:
-                return []
+            case .explicitReplay, .teardown: break
+            default: return []
             }
         }
 
@@ -637,192 +534,37 @@ extension LifecycleRecoveryCoordinator {
             clearTerminalForReplay()
             return []
 
+        case .teardown:
+            presentationPhase = .idle
+            terminalState = .active
+            presentationApplicationPhase = .active
+            presentationRecoveryStage = .retainedRenderer
+            pipStartWasAbandoned = false
+            pipPresentationReconcilePending = false
+            return []
+
         case .installInline(let fence):
             pipStartWasAbandoned = false
             pipPresentationReconcilePending = false
-            presentationPhase = .inlineAttachedUnproven(
-                fence.with(playAfterResume: false)
-            )
+            presentationPhase = .inlineAttachedUnproven(fence.with(playAfterResume: false))
             presentationRecoveryStage = .retainedRenderer
             return []
 
         case let .didEnterBackground(configuration, observedPiPLease, fence, wantsPlaying):
-            let nativePiPStartPending: Bool
-            switch presentationPhase {
-            case .pipStarting(let current):
-                nativePiPStartPending = current.hasSameResourceAuthority(as: fence)
-            default:
-                nativePiPStartPending = false
-            }
-            presentationApplicationPhase = .background
-            presentationRecoveryStage = .retainedRenderer
-            pipPresentationReconcilePending = false
-            if configuration.mode != .disabled,
-               !observedPiPLease,
-               !nativePiPStartPending {
-                switch presentationPhase {
-                case .warmSuspendingForAudioOnly(var state)
-                    where state.fence.hasSameResourceAuthority(as: fence),
-                     .warmSuspended(var state)
-                    where state.fence.hasSameResourceAuthority(as: fence):
-                    if state.token == nil, state.suspensionAcknowledgementFence == nil {
-                        state.suspensionAcknowledgementFence = state.fence
-                    }
-                    let resumesPendingPlayAudio = state.explicitPlayRequested
-                        && state.shouldResumePlayback && state.prepareWhenSuspended
-                        && wantsPlaying && fence.userWantsPlaying && !fence.playbackSuppressed
-                    state.fence = fence
-                    state.prepareWhenSuspended = false
-                    state.isPrepared = false
-                    state.preparedWhileInactive = false
-                    state.activeValidationRequested = false
-                    state.attachRequested = false
-                    state.inlineAttached = false
-                    presentationPhase = state.token == nil
-                        ? .warmSuspendingForAudioOnly(state)
-                        : .warmSuspended(state)
-                    if resumesPendingPlayAudio, let token = state.token {
-                        return [.resumeSuspendedAudio(fence, token)]
-                    }
-                    return []
-                default:
-                    break
-                }
-            }
-            switch configuration.mode {
-            case .disabled:
-                presentationPhase = .pausedInline(fence)
-                return [.pauseForContinuationPolicy(fence)]
-            case .backgroundAudio:
-                if observedPiPLease || nativePiPStartPending {
-                    presentationPhase = observedPiPLease ? .pipActive(fence) : .pipStarting(fence)
-                    return []
-                }
-                return beginAudioOnlySuspension(fence: fence, resumesPlayback: wantsPlaying)
-            case .pictureInPicture:
-                if observedPiPLease {
-                    presentationPhase = .pipActive(fence)
-                } else if case .pipActive(let current) = presentationPhase,
-                          current.hasSameResourceAuthority(as: fence) {
-                    presentationPhase = .pipActive(current)
-                } else if nativePiPStartPending {
-                    presentationPhase = .pipStarting(fence)
-                } else {
-                    return beginAudioOnlySuspension(fence: fence, resumesPlayback: wantsPlaying)
-                }
-                return []
-            }
+            return reduceDidEnterBackground(
+                configuration: configuration,
+                observedPiPLease: observedPiPLease,
+                fence: fence,
+                wantsPlaying: wantsPlaying
+            )
 
         case .foregroundTransitionBegan(let fence):
-            guard acceptsPresentationEvent(fence) else { return [] }
-            presentationApplicationPhase = .foregroundTransitioning
-            switch presentationPhase {
-            case .pipActive, .pipStopping, .restoringInline:
-                return []
-            case .warmSuspendingForAudioOnly(var state):
-                if state.shouldResumePlayback { state.prepareWhenSuspended = true }
-                presentationPhase = .warmSuspendingForAudioOnly(state)
-                return []
-            case .warmSuspended(var state):
-                if state.videoFailure != nil { return [] }
-                if !state.shouldResumePlayback {
-                    state.fence = fence
-                    guard !state.attachRequested else { return [] }
-                    state.attachRequested = true
-                    presentationPhase = .warmSuspended(state)
-                    return [.attachPausedInline(fence)]
-                }
-                guard let token = state.token,
-                      !state.prepareWhenSuspended,
-                      !state.isPrepared else { return [] }
-                state.prepareWhenSuspended = true
-                presentationPhase = .warmSuspended(state)
-                return [.prepareVideoLaneForForeground(state.fence, token)]
-            default:
-                return []
-            }
+            return reduceForegroundTransitionBegan(fence)
 
         case .didBecomeActive(let fence):
-            guard acceptsPresentationEvent(fence) else { return [] }
-            presentationApplicationPhase = .active
-            switch presentationPhase {
-            case .pipActive(let currentFence):
-                if currentFence.renderGeneration != fence.renderGeneration {
-                    presentationPhase = .pipActive(fence)
-                }
-                return []
-            case .pipStopping, .restoringInline:
-                return []
-            case .pausedInline:
-                presentationPhase = .pausedInline(fence)
-                return [.attachPausedInline(fence)]
-            case .warmSuspendingForAudioOnly(var state):
-                state.fence = fence
-                if state.shouldResumePlayback {
-                    state.prepareWhenSuspended = true
-                } else if !state.attachRequested {
-                    state.attachRequested = true
-                    presentationPhase = .warmSuspendingForAudioOnly(state)
-                    return [.attachPausedInline(fence)]
-                }
-                presentationPhase = .warmSuspendingForAudioOnly(state)
-                return []
-            case .warmSuspended(var state):
-                let destinationChanged = state.fence.renderGeneration
-                    != fence.renderGeneration
-                state.fence = fence
-                if destinationChanged {
-                    state.attachRequested = false
-                    state.inlineAttached = false
-                }
-                guard !state.attachRequested else { return [] }
-                if state.videoFailure != nil {
-                    state.attachRequested = true
-                    presentationPhase = .warmSuspended(state)
-                    return [.attachPausedInline(fence)]
-                }
-                if !state.shouldResumePlayback {
-                    state.attachRequested = true
-                    presentationPhase = .warmSuspended(state)
-                    return [.attachPausedInline(fence)]
-                }
-                guard state.isPrepared else {
-                    if !state.prepareWhenSuspended {
-                        state.prepareWhenSuspended = true
-                        presentationPhase = .warmSuspended(state)
-                        guard let token = state.token else { return [] }
-                        return [.prepareVideoLaneForForeground(fence, token)]
-                    }
-                    presentationPhase = .warmSuspended(state)
-                    return []
-                }
-                if state.preparedWhileInactive,
-                   !state.activeValidationRequested,
-                   let token = state.token {
-                    state.isPrepared = false
-                    state.activeValidationRequested = true
-                    presentationPhase = .warmSuspended(state)
-                    return [.prepareVideoLaneForForeground(fence, token)]
-                }
-                state.attachRequested = true
-                presentationPhase = .warmSuspended(state)
-                return [.attachInline(fence)]
-            case .pipStarting:
-                presentationPhase = .inlineAttachPending(fence)
-                return [.attachInline(fence)]
-            case .pipStartFailed:
-                presentationPhase = .inlineAttachPending(fence)
-                return [.attachInline(fence)]
-            case .inlineNeedsAttachment:
-                presentationPhase = .inlineAttachPending(fence)
-                return [.attachInline(fence)]
-            case .inlineAttachPending, .inlineAttachedUnproven, .inlineVisible:
-                return []
-            default:
-                return []
-            }
+            return reduceDidBecomeActive(fence)
 
-        case let .videoLaneSuspensionMayProceed(fence):
+        case .videoLaneSuspensionMayProceed(let fence):
             guard case .warmSuspendingForAudioOnly(var state) = presentationPhase,
                   state.token == nil,
                   state.fence.hasSameResourceAuthority(as: fence)
@@ -830,9 +572,7 @@ extension LifecycleRecoveryCoordinator {
             state.fence = fence
             state.suspensionAcknowledgementFence = fence
             presentationPhase = .warmSuspendingForAudioOnly(state)
-            return [state.reason == .pipDidStop
-                ? .suspendVideoLaneAfterPiPStop(fence)
-                : .warmSuspendVideoLane(fence)]
+            return [state.suspendEffect]
 
         case let .videoFailureKeptAudio(fence, token, failure):
             guard acceptsPresentationEvent(fence),
@@ -853,77 +593,59 @@ extension LifecycleRecoveryCoordinator {
             return []
 
         case let .videoLaneSuspended(fence, token):
-            guard token.sessionGeneration == fence.sessionGeneration else { return [] }
-            switch presentationPhase {
-            case .warmSuspendingForAudioOnly(var state):
-                let pendingFence = state.suspensionAcknowledgementFence ?? state.fence
-                guard state.fence.hasSameResourceAuthority(as: fence),
-                      pendingFence.hasSameContinuityAuthority(as: fence) else { return [] }
-                state.suspensionAcknowledgementFence = nil
-                state.token = token
-                state.reason = token.reason
-                state.shouldResumePlayback = state.explicitPlayRequested
-                    ? true
-                    : (state.shouldResumePlayback && token.resumesPlayback)
-                presentationPhase = .warmSuspended(state)
-                if state.explicitPlayRequested, presentationApplicationPhase == .background {
-                    return [.resumeSuspendedAudio(state.fence, token)]
-                }
-                if state.prepareWhenSuspended && state.shouldResumePlayback {
-                    return [.prepareVideoLaneForForeground(state.fence, token)]
-                }
-                return []
-            case .warmSuspended(let state)
-                where acceptsPresentationEvent(fence) && state.token == token:
-                return []
-            default:
-                return []
+            guard token.sessionGeneration == fence.sessionGeneration,
+                  case .warmSuspendingForAudioOnly(var state) = presentationPhase else { return [] }
+            let pendingFence = state.suspensionAcknowledgementFence ?? state.fence
+            guard state.fence.hasSameResourceAuthority(as: fence),
+                  pendingFence.hasSameContinuityAuthority(as: fence) else { return [] }
+            state.suspensionAcknowledgementFence = nil
+            state.token = token
+            state.reason = token.reason
+            state.shouldResumePlayback = state.explicitPlayRequested
+                ? true
+                : (state.shouldResumePlayback && token.resumesPlayback)
+            presentationPhase = .warmSuspended(state)
+            if state.explicitPlayRequested, presentationApplicationPhase == .background {
+                return [.resumeSuspendedAudio(state.fence, token)]
             }
+            if state.prepareWhenSuspended && state.shouldResumePlayback {
+                return [.prepareVideoLaneForForeground(state.fence, token)]
+            }
+            return []
 
         case let .videoLanePrepared(fence, token):
-            guard acceptsPresentationEvent(fence) else { return [] }
-            switch presentationPhase {
-            case .warmSuspended(var state) where state.token == token && state.videoFailure == nil:
-                state.isPrepared = true
-                state.preparedWhileInactive = presentationApplicationPhase != .active
-                presentationPhase = .warmSuspended(state)
-                if presentationApplicationPhase == .active,
-                   state.shouldResumePlayback {
-                    if state.inlineAttached {
-                        let resumeFence = state.fence.with(
-                            playAfterResume: state.explicitPlayRequested
-                        )
-                        presentationPhase = .inlineAttachedUnproven(resumeFence)
-                        return [.resumeVideoLane(resumeFence, token)]
-                    }
-                    guard !state.attachRequested else { return [] }
-                    state.attachRequested = true
-                    presentationPhase = .warmSuspended(state)
-                    return [.attachInline(state.fence)]
-                }
-                return []
-            default:
+            guard acceptsPresentationEvent(fence),
+                  case .warmSuspended(var state) = presentationPhase,
+                  state.token == token,
+                  state.videoFailure == nil else { return [] }
+            state.isPrepared = true
+            state.preparedWhileInactive = presentationApplicationPhase != .active
+            presentationPhase = .warmSuspended(state)
+            guard presentationApplicationPhase == .active, state.shouldResumePlayback else {
                 return []
             }
+            if state.inlineAttached {
+                return resumeWarmVideoLane(
+                    fence: state.fence,
+                    playAfterResume: state.explicitPlayRequested,
+                    token: token
+                )
+            }
+            guard !state.attachRequested else { return [] }
+            return requestWarmInlineAttach(&state)
 
         case let .videoLanePreparationFailed(fence, token, failure):
-            guard acceptsPresentationEvent(fence) else { return [] }
-            switch presentationPhase {
-            case .warmSuspended(let state) where state.token == token:
-                let settleFence = state.fence
-                presentationPhase = .failed(settleFence, failure)
-                return [.settleFailure(settleFence, failure)]
-            default:
-                return []
-            }
+            guard acceptsPresentationEvent(fence),
+                  case .warmSuspended(let state) = presentationPhase,
+                  state.token == token else { return [] }
+            presentationPhase = .failed(state.fence, failure)
+            return [.settleFailure(state.fence, failure)]
 
         case let .videoLaneResumed(fence, token):
-            guard acceptsExactRenderPresentationEvent(fence) else { return [] }
-            guard case .inlineAttachedUnproven(let currentFence) = presentationPhase else {
-                return []
-            }
-            guard token.sessionGeneration == fence.sessionGeneration else { return [] }
-            guard currentFence.playAfterResume else { return [] }
+            guard acceptsExactRenderPresentationEvent(fence),
+                  case .inlineAttachedUnproven(let currentFence) = presentationPhase,
+                  token.sessionGeneration == fence.sessionGeneration,
+                  currentFence.playAfterResume else { return [] }
             let playFence = currentFence.with(playAfterResume: false)
             presentationPhase = .inlineAttachedUnproven(playFence)
             return [.playDemandVideoLane(playFence)]
@@ -935,89 +657,17 @@ extension LifecycleRecoveryCoordinator {
             return [.settleFailure(fence, failure)]
 
         case .inlineAttached(let fence):
-            guard acceptsPresentationEvent(fence) else { return [] }
-            switch presentationPhase {
-            case .warmSuspendingForAudioOnly(var state):
-                guard fence.renderGeneration == state.fence.renderGeneration else {
-                    return []
-                }
-                state.inlineAttached = true
-                presentationPhase = .warmSuspendingForAudioOnly(state)
-                return []
-            case .warmSuspended(var state):
-                guard fence.renderGeneration == state.fence.renderGeneration else {
-                    return []
-                }
-                guard presentationApplicationPhase == .active,
-                      state.isPrepared,
-                      let token = state.token else {
-                    state.inlineAttached = true
-                    presentationPhase = .warmSuspended(state)
-                    return []
-                }
-                let resumeFence = fence.with(
-                    playAfterResume: state.explicitPlayRequested
-                )
-                presentationPhase = .inlineAttachedUnproven(resumeFence)
-                return [.resumeVideoLane(resumeFence, token)]
-            case .restoringInline(var transaction):
-                var effects: [DemandPresentationEffect] = []
-                if !transaction.inlineAttached {
-                    transaction.inlineAttached = true
-                }
-                if !transaction.avKitCompletionSent,
-                   let completionToken = transaction.completionToken {
-                    transaction.avKitCompletionSent = true
-                    effects.append(.completeAVKitRestore(
-                        token: completionToken,
-                        success: true
-                    ))
-                }
-                if transaction.nativeDidStop {
-                    presentationPhase = .inlineAttachedUnproven(fence)
-                    effects.append(.restoreInlinePresentation(fence))
-                } else if let nativeStopAuthority = transaction.nativeStopAuthority,
-                          !transaction.nativeStopRequested {
-                    transaction.nativeStopRequested = true
-                    presentationPhase = .restoringInline(transaction)
-                    effects.append(.requestPiPStop(
-                        fence,
-                        nativeStopAuthority
-                    ))
-                } else {
-                    presentationPhase = .restoringInline(transaction)
-                }
-                return effects
-            case .pausedInline:
-                presentationPhase = .pausedInline(fence)
-                return []
-            case .inlineAttachPending:
-                presentationPhase = .inlineAttachedUnproven(fence)
-                return []
-            case .inlineAttachedUnproven:
-                presentationPhase = .inlineAttachedUnproven(fence)
-                return []
-            default:
-                return []
-            }
+            return reduceInlineAttached(fence)
 
         case .inlineDetached(let fence):
             guard acceptsPresentationEvent(fence) else { return [] }
             switch presentationPhase {
-            case .warmSuspendingForAudioOnly(var state):
-                guard fence.renderGeneration == state.fence.renderGeneration else {
-                    return []
-                }
+            case .warmSuspendingForAudioOnly(var state), .warmSuspended(var state):
+                guard fence.renderGeneration == state.fence.renderGeneration else { return [] }
                 state.inlineAttached = false
-                presentationPhase = .warmSuspendingForAudioOnly(state)
-            case .warmSuspended(var state):
-                guard fence.renderGeneration == state.fence.renderGeneration else {
-                    return []
-                }
-                state.inlineAttached = false
-                presentationPhase = .warmSuspended(state)
+                setWarmPhase(state)
             default:
-                return []
+                break
             }
             return []
 
@@ -1027,10 +677,7 @@ extension LifecycleRecoveryCoordinator {
             if case .restoringInline(let transaction) = presentationPhase,
                !transaction.avKitCompletionSent,
                let completionToken = transaction.completionToken {
-                effects.append(.completeAVKitRestore(
-                    token: completionToken,
-                    success: false
-                ))
+                effects.append(.completeAVKitRestore(token: completionToken, success: false))
             }
             presentationPhase = .failed(fence, .staleAuthority)
             effects.append(.settleFailure(fence, .staleAuthority))
@@ -1044,8 +691,7 @@ extension LifecycleRecoveryCoordinator {
             return []
 
         case .pipDidStart(let fence):
-            guard !pipStartWasAbandoned else { return [] }
-            guard acceptsPresentationEvent(fence) else { return [] }
+            guard !pipStartWasAbandoned, acceptsPresentationEvent(fence) else { return [] }
             pipPresentationReconcilePending = false
             presentationPhase = .pipActive(fence)
             presentationApplicationPhase = .background
@@ -1053,41 +699,29 @@ extension LifecycleRecoveryCoordinator {
 
         case .pipStartAbandoned(let fence):
             guard acceptsPresentationEvent(fence),
-                  case .pipStarting(let current) = presentationPhase,
-                  current.hasSameContinuityAuthority(as: fence) else {
-                return []
-            }
+                  case .pipStarting = presentationPhase else { return [] }
             pipStartWasAbandoned = true
             pipPresentationReconcilePending = false
             presentationApplicationPhase = .active
             presentationRecoveryStage = .retainedRenderer
             presentationPhase = .inlineAttachPending(fence)
-            return [
-                .abandonPiPStart(fence),
-                .attachInline(fence),
-            ]
+            return [.abandonPiPStart(fence), .attachInline(fence)]
 
         case let .pipTransportIntent(fence, userWantsPlaying):
-            guard acceptsPresentationEvent(fence),
-                  presentationPhase.fence?.renderGeneration
-                    == fence.renderGeneration else { return [] }
+            guard acceptsExactRenderPresentationEvent(fence) else { return [] }
             switch presentationPhase {
-            case .pipActive:
-                let currentFence = presentationPhase.fence ?? fence
+            case .pipActive(let currentFence):
                 presentationPhase = .pipActive(currentFence.with(
                     userWantsPlaying: userWantsPlaying,
                     playAfterResume: false
                 ))
-                return []
-            case .pipStarting:
-                let currentFence = presentationPhase.fence ?? fence
+            case .pipStarting(let currentFence):
                 presentationPhase = .pipStarting(currentFence.with(
                     userWantsPlaying: userWantsPlaying,
                     playAfterResume: false
                 ))
-                return []
             case .pipStopping(let transaction):
-                presentationPhase = .pipStopping(.init(
+                presentationPhase = .pipStopping(DemandPiPStopTransaction(
                     fence: transaction.fence.with(
                         userWantsPlaying: userWantsPlaying,
                         playAfterResume: false
@@ -1095,96 +729,32 @@ extension LifecycleRecoveryCoordinator {
                     authority: transaction.authority,
                     nativeDidStop: transaction.nativeDidStop
                 ))
-                return []
-            case .warmSuspendingForAudioOnly(var state):
-                guard state.reason == .pipDidStop, !state.explicitPlayRequested else {
-                    return []
-                }
+            case .warmSuspendingForAudioOnly(var state), .warmSuspended(var state):
+                guard state.reason == .pipDidStop, !state.explicitPlayRequested else { return [] }
                 state.shouldResumePlayback = userWantsPlaying
-                presentationPhase = .warmSuspendingForAudioOnly(state)
-                return []
-            case .warmSuspended(var state):
-                guard state.reason == .pipDidStop, !state.explicitPlayRequested else {
-                    return []
-                }
-                state.shouldResumePlayback = userWantsPlaying
-                presentationPhase = .warmSuspended(state)
-                return []
+                setWarmPhase(state)
             default:
-                return []
+                break
             }
+            return []
 
-        case let .transportSuppressed(fence):
+        case .transportSuppressed(let fence):
             guard acceptsPresentationEvent(fence) else { return [] }
             switch presentationPhase {
             case .warmSuspendingForAudioOnly(var state), .warmSuspended(var state):
                 state.shouldResumePlayback = false
                 state.explicitPlayRequested = false
                 state.prepareWhenSuspended = false
-                if state.token == nil {
-                    presentationPhase = .warmSuspendingForAudioOnly(state)
-                } else {
-                    presentationPhase = .warmSuspended(state)
-                }
+                setWarmPhase(state)
             case .inlineAttachedUnproven(let current):
                 presentationPhase = .inlineAttachedUnproven(current.with(playAfterResume: false))
-            default: break
+            default:
+                break
             }
             return []
 
-        case let .explicitPlayRequested(fence):
-            if let previousFence = presentationPhase.fence,
-               fence.isSameResourceAfterSeek(of: previousFence) {
-                switch presentationPhase {
-                case .warmSuspendingForAudioOnly, .warmSuspended:
-                    return reducePresentation(.videoLaneSeekCommitted(fence: fence, resumesPlayback: true))
-                default: break
-                }
-            }
-            guard acceptsPresentationEvent(fence) else { return [] }
-            switch presentationPhase {
-            case .warmSuspendingForAudioOnly(var state), .warmSuspended(var state):
-                guard !state.shouldResumePlayback else { return [] }
-                state.shouldResumePlayback = true
-                state.explicitPlayRequested = true
-                if presentationApplicationPhase == .background || state.videoFailure != nil {
-                    state.prepareWhenSuspended = false
-                    if let token = state.token {
-                        presentationPhase = .warmSuspended(state)
-                        return [.resumeSuspendedAudio(state.fence, token)]
-                    }
-                    presentationPhase = .warmSuspendingForAudioOnly(state)
-                    return [state.reason == .pipDidStop
-                        ? .suspendVideoLaneAfterPiPStop(state.fence)
-                        : .warmSuspendVideoLane(state.fence)]
-                }
-                state.prepareWhenSuspended = true
-                switch presentationPhase {
-                case .warmSuspendingForAudioOnly:
-                    presentationPhase = .warmSuspendingForAudioOnly(state)
-                    return [state.reason == .pipDidStop
-                        ? .suspendVideoLaneAfterPiPStop(state.fence)
-                        : .warmSuspendVideoLane(state.fence)]
-                case .warmSuspended:
-                    presentationPhase = .warmSuspended(state)
-                    guard let token = state.token else { return [] }
-                    if state.isPrepared {
-                        if state.inlineAttached {
-                            let resumeFence = state.fence.with(playAfterResume: true)
-                            presentationPhase = .inlineAttachedUnproven(resumeFence)
-                            return [.resumeVideoLane(resumeFence, token)]
-                        }
-                        state.attachRequested = true
-                        presentationPhase = .warmSuspended(state)
-                        return [.attachInline(state.fence)]
-                    }
-                    return [.prepareVideoLaneForForeground(state.fence, token)]
-                default:
-                    return []
-                }
-            default:
-                return []
-            }
+        case .explicitPlayRequested(let fence):
+            return reduceExplicitPlayRequested(fence)
 
         case let .videoLaneSeekCommitted(fence, resumesPlayback):
             switch presentationPhase {
@@ -1194,18 +764,13 @@ extension LifecycleRecoveryCoordinator {
                 state.token = nil
                 state.videoFailure = nil
                 state.suspensionAcknowledgementFence = fence
-                state.isPrepared = false
-                state.preparedWhileInactive = false
-                state.activeValidationRequested = false
-                state.attachRequested = false
+                state.resetForegroundPreparation(keepingInlineAttachment: true)
                 state.shouldResumePlayback = resumesPlayback
                 state.explicitPlayRequested = resumesPlayback
                 state.prepareWhenSuspended = resumesPlayback
                     && presentationApplicationPhase != .background
                 presentationPhase = .warmSuspendingForAudioOnly(state)
-                return [state.reason == .pipDidStop
-                    ? .suspendVideoLaneAfterPiPStop(fence)
-                    : .warmSuspendVideoLane(fence)]
+                return [state.suspendEffect]
             default:
                 return []
             }
@@ -1218,7 +783,7 @@ extension LifecycleRecoveryCoordinator {
                 presentationPhase = .pipStartFailed(fence)
                 return []
             }
-            return beginAudioOnlySuspension(
+            return beginWarmSuspension(
                 fence: fence,
                 resumesPlayback: fence.userWantsPlaying && !fence.playbackSuppressed
             )
@@ -1232,38 +797,26 @@ extension LifecycleRecoveryCoordinator {
             }
             switch presentationPhase {
             case .pipActive, .pipStarting:
-                presentationPhase = .pipStopping(.init(
+                presentationPhase = .pipStopping(DemandPiPStopTransaction(
                     fence: fence,
                     authority: authority,
                     nativeDidStop: false
                 ))
                 return [.requestPiPStop(fence, authority)]
-            case .pipStopping, .restoringInline:
-                return []
             default:
                 return []
             }
 
         case let .prepareInlineForPiPStop(fence, authority):
             guard acceptsPresentationEvent(fence),
-                  !authority.isForcedRetirement else { return [] }
-            switch presentationPhase {
-            case .pipActive:
-                pipPresentationReconcilePending = false
-                presentationPhase = .restoringInline(.init(
-                    fence: fence,
-                    completionToken: nil,
-                    nativeStopAuthority: authority,
-                    inlineAttached: false,
-                    avKitCompletionSent: false,
-                    nativeDidStop: false
-                ))
-                return [.attachInline(fence)]
-            case .restoringInline:
-                return []
-            default:
-                return []
-            }
+                  !authority.isForcedRetirement,
+                  case .pipActive = presentationPhase else { return [] }
+            pipPresentationReconcilePending = false
+            presentationPhase = .restoringInline(DemandInlineRestoreTransaction(
+                fence: fence,
+                nativeStopAuthority: authority
+            ))
+            return [.attachInline(fence)]
 
         case let .forceRetirePiP(fence, authority):
             guard acceptsPresentationEvent(fence), authority.isForcedRetirement else { return [] }
@@ -1271,60 +824,7 @@ extension LifecycleRecoveryCoordinator {
             return [.forceRetirePiP(fence, authority)]
 
         case let .restoreInlineRequested(fence, completionToken):
-            guard acceptsPresentationEvent(fence) else { return [] }
-            switch presentationPhase {
-            case .pipActive, .pipStopping:
-                presentationPhase = .restoringInline(.init(
-                    fence: fence,
-                    completionToken: completionToken,
-                    nativeStopAuthority: nil,
-                    inlineAttached: false,
-                    avKitCompletionSent: false,
-                    nativeDidStop: false
-                ))
-                return [.attachInline(fence)]
-            case .inlineNeedsAttachment:
-                presentationPhase = .restoringInline(.init(
-                    fence: fence,
-                    completionToken: completionToken,
-                    nativeStopAuthority: nil,
-                    inlineAttached: false,
-                    avKitCompletionSent: false,
-                    nativeDidStop: true
-                ))
-                return [.attachInline(fence)]
-            case .inlineAttachPending:
-                presentationPhase = .restoringInline(.init(
-                    fence: fence,
-                    completionToken: completionToken,
-                    nativeStopAuthority: nil,
-                    inlineAttached: false,
-                    avKitCompletionSent: false,
-                    nativeDidStop: true
-                ))
-                return []
-            case .inlineAttachedUnproven:
-                presentationPhase = .inlineAttachedUnproven(fence)
-                return [
-                    .completeAVKitRestore(token: completionToken, success: true),
-                    .restoreInlinePresentation(fence),
-                ]
-            case .restoringInline(var transaction):
-                if transaction.completionToken == nil {
-                    transaction.completionToken = completionToken
-                }
-                guard !transaction.avKitCompletionSent,
-                      transaction.inlineAttached,
-                      let token = transaction.completionToken else {
-                    presentationPhase = .restoringInline(transaction)
-                    return []
-                }
-                transaction.avKitCompletionSent = true
-                presentationPhase = .restoringInline(transaction)
-                return [.completeAVKitRestore(token: token, success: true)]
-            default:
-                return [.completeAVKitRestore(token: completionToken, success: false)]
-            }
+            return reduceRestoreInlineRequested(fence: fence, completionToken: completionToken)
 
         case .pipWillStop(let fence):
             guard acceptsPresentationEvent(fence) else { return [] }
@@ -1335,28 +835,10 @@ extension LifecycleRecoveryCoordinator {
             guard acceptsPresentationEvent(fence) else { return [] }
             pipPresentationReconcilePending = false
             let stopFence = fence.with(
-                userWantsPlaying: presentationPhase.fence?.userWantsPlaying
-                    ?? fence.userWantsPlaying,
+                userWantsPlaying: presentationPhase.fence?.userWantsPlaying ?? fence.userWantsPlaying,
                 playAfterResume: false
             )
             switch presentationPhase {
-            case .pipStopping(var transaction):
-                guard !transaction.nativeDidStop else { return [] }
-                transaction.nativeDidStop = true
-                if presentationApplicationPhase == .active {
-                    presentationPhase = .inlineAttachPending(stopFence)
-                    return [.attachInline(stopFence)]
-                }
-                let state = DemandWarmSuspensionState(
-                    fence: stopFence,
-                    token: nil,
-                    prepareWhenSuspended: false,
-                    isPrepared: false,
-                    shouldResumePlayback: stopFence.userWantsPlaying,
-                    reason: .pipDidStop
-                )
-                presentationPhase = .warmSuspendingForAudioOnly(state)
-                return [.suspendVideoLaneAfterPiPStop(stopFence)]
             case .restoringInline(var transaction):
                 guard !transaction.nativeDidStop else { return [] }
                 transaction.nativeDidStop = true
@@ -1366,21 +848,11 @@ extension LifecycleRecoveryCoordinator {
                 }
                 presentationPhase = .restoringInline(transaction)
                 return []
+            case .pipStopping(let transaction):
+                guard !transaction.nativeDidStop else { return [] }
+                return completeStoppedPiP(stopFence)
             case .pipActive:
-                if presentationApplicationPhase == .active {
-                    presentationPhase = .inlineAttachPending(stopFence)
-                    return [.attachInline(stopFence)]
-                }
-                let state = DemandWarmSuspensionState(
-                    fence: stopFence,
-                    token: nil,
-                    prepareWhenSuspended: false,
-                    isPrepared: false,
-                    shouldResumePlayback: stopFence.userWantsPlaying,
-                    reason: .pipDidStop
-                )
-                presentationPhase = .warmSuspendingForAudioOnly(state)
-                return [.suspendVideoLaneAfterPiPStop(stopFence)]
+                return completeStoppedPiP(stopFence)
             default:
                 return []
             }
@@ -1393,10 +865,7 @@ extension LifecycleRecoveryCoordinator {
             return [.reconcilePiPPresentation(fence)]
 
         case .pipPresentationReconciled(let fence):
-            guard acceptsPresentationEvent(fence),
-                  case .pipActive(let currentFence) = presentationPhase,
-                  fence.hasSameContinuityAuthority(as: currentFence),
-                  pipPresentationReconcilePending else { return [] }
+            guard let currentFence = activeReconcilingPiPFence(matching: fence) else { return [] }
             pipPresentationReconcilePending = false
             return reducePresentation(.prepareInlineForPiPStop(
                 fence: currentFence,
@@ -1404,41 +873,30 @@ extension LifecycleRecoveryCoordinator {
             ))
 
         case let .pipPresentationReconcileFailed(fence, failure):
-            guard acceptsPresentationEvent(fence),
-                  case .pipActive(let currentFence) = presentationPhase,
-                  fence.hasSameContinuityAuthority(as: currentFence),
-                  pipPresentationReconcilePending else { return [] }
+            guard let currentFence = activeReconcilingPiPFence(matching: fence) else { return [] }
             pipPresentationReconcilePending = false
             presentationPhase = .failed(currentFence, failure)
             return [.settleFailure(currentFence, failure)]
 
         case let .rendererHealthChanged(fence, health):
             guard acceptsExactRenderPresentationEvent(fence) else { return [] }
-            if case .warmSuspended(let state) = presentationPhase, state.videoFailure != nil { return [] }
+            if case .warmSuspended(let state) = presentationPhase, state.videoFailure != nil {
+                return []
+            }
             switch health {
             case .visible(let proof):
                 return reducePresentation(.presentationProved(proof))
             case .attachedButUnproven, .warmSuspended, .missingSurface:
                 return []
             case .needsFlush:
-                guard presentationRecoveryStage == .retainedRenderer else { return [] }
-                presentationRecoveryStage = .rendererFlushed
-                return [.flushAndPrimeRenderer(fence)]
+                return flushRendererIfRetained(fence)
             case .rendererFailed, .decoderInvalid:
-                guard presentationRecoveryStage.rawValue < DemandPresentationRecoveryStage.decoderRecreated.rawValue else {
-                    return []
-                }
-                presentationRecoveryStage = .decoderRecreated
-                return [.recreateVideoDecoder(fence)]
+                return recreateDecoderIfAllowed(fence)
             }
 
         case .presentationProved(let proof):
             guard proof.rendererReady,
-                  acceptsPresentationEvent(proof.fence),
-                  let expectedFence = presentationPhase.fence,
-                  proof.fence.renderGeneration == expectedFence.renderGeneration else {
-                return []
-            }
+                  acceptsExactRenderPresentationEvent(proof.fence) else { return [] }
             switch presentationPhase {
             case .inlineAttachedUnproven:
                 presentationPhase = .inlineVisible(proof)
@@ -1454,70 +912,427 @@ extension LifecycleRecoveryCoordinator {
             guard acceptsPresentationEvent(fence) else { return [] }
             switch presentationPhase {
             case .warmSuspendingForAudioOnly, .warmSuspended:
-                presentationRecoveryStage = decoderInvalid
-                    ? .decoderRecreated
-                    : .rendererFlushed
+                presentationRecoveryStage = decoderInvalid ? .decoderRecreated : .rendererFlushed
                 return []
             case .inlineNeedsAttachment where presentationApplicationPhase != .active:
-                return beginAudioOnlySuspension(
-                    fence: fence, resumesPlayback: fence.userWantsPlaying
-                )
+                return beginWarmSuspension(fence: fence, resumesPlayback: fence.userWantsPlaying)
             case .pipStarting, .pipActive, .pipStopping,
                  .inlineNeedsAttachment, .inlineAttachPending,
                  .inlineAttachedUnproven, .restoringInline:
-                if decoderInvalid,
-                   presentationRecoveryStage.rawValue < DemandPresentationRecoveryStage.decoderRecreated.rawValue {
-                    presentationRecoveryStage = .decoderRecreated
-                    return [.recreateVideoDecoder(fence)]
-                }
-                if presentationRecoveryStage == .retainedRenderer {
-                    presentationRecoveryStage = .rendererFlushed
-                    return [.flushAndPrimeRenderer(fence)]
-                }
-                return []
+                return decoderInvalid
+                    ? recreateDecoderIfAllowed(fence)
+                    : flushRendererIfRetained(fence)
             default:
                 return []
             }
+        }
+    }
 
-        case .teardown:
-            presentationPhase = .idle
-            terminalState = .active
-            presentationApplicationPhase = .active
-            presentationRecoveryStage = .retainedRenderer
-            pipStartWasAbandoned = false
-            pipPresentationReconcilePending = false
+    // MARK: - Multi-Branch Transition Reducers
+
+    private mutating func reduceDidEnterBackground(
+        configuration: PlaybackContinuationConfiguration,
+        observedPiPLease: Bool,
+        fence: DemandPresentationFence,
+        wantsPlaying: Bool
+    ) -> [DemandPresentationEffect] {
+        let nativePiPStartPending: Bool = if case .pipStarting(let current) = presentationPhase {
+            current.hasSameResourceAuthority(as: fence)
+        } else {
+            false
+        }
+        presentationApplicationPhase = .background
+        presentationRecoveryStage = .retainedRenderer
+        pipPresentationReconcilePending = false
+
+        if configuration.mode != .disabled, !observedPiPLease, !nativePiPStartPending {
+            switch presentationPhase {
+            case .warmSuspendingForAudioOnly(var state)
+                where state.fence.hasSameResourceAuthority(as: fence),
+                 .warmSuspended(var state)
+                where state.fence.hasSameResourceAuthority(as: fence):
+                if state.token == nil, state.suspensionAcknowledgementFence == nil {
+                    state.suspensionAcknowledgementFence = state.fence
+                }
+                let resumesPendingPlayAudio = state.explicitPlayRequested
+                    && state.shouldResumePlayback && state.prepareWhenSuspended
+                    && wantsPlaying && fence.userWantsPlaying && !fence.playbackSuppressed
+                state.fence = fence
+                state.resetForegroundPreparation()
+                setWarmPhase(state)
+                if resumesPendingPlayAudio, let token = state.token {
+                    return [.resumeSuspendedAudio(fence, token)]
+                }
+                return []
+            default:
+                break
+            }
+        }
+
+        switch configuration.mode {
+        case .disabled:
+            presentationPhase = .pausedInline(fence)
+            return [.pauseForContinuationPolicy(fence)]
+        case .backgroundAudio, .pictureInPicture:
+            if observedPiPLease {
+                presentationPhase = .pipActive(fence)
+                return []
+            }
+            if configuration.mode == .pictureInPicture,
+               case .pipActive(let current) = presentationPhase,
+               current.hasSameResourceAuthority(as: fence) {
+                presentationPhase = .pipActive(current)
+                return []
+            }
+            if nativePiPStartPending {
+                presentationPhase = .pipStarting(fence)
+                return []
+            }
+            return beginWarmSuspension(fence: fence, resumesPlayback: wantsPlaying)
+        }
+    }
+
+    private mutating func reduceForegroundTransitionBegan(
+        _ fence: DemandPresentationFence
+    ) -> [DemandPresentationEffect] {
+        guard acceptsPresentationEvent(fence) else { return [] }
+        presentationApplicationPhase = .foregroundTransitioning
+        switch presentationPhase {
+        case .warmSuspendingForAudioOnly(var state):
+            if state.shouldResumePlayback { state.prepareWhenSuspended = true }
+            presentationPhase = .warmSuspendingForAudioOnly(state)
+            return []
+        case .warmSuspended(var state):
+            if state.videoFailure != nil { return [] }
+            if !state.shouldResumePlayback {
+                state.fence = fence
+                guard !state.attachRequested else { return [] }
+                return requestWarmInlineAttach(&state, paused: true)
+            }
+            guard let token = state.token,
+                  !state.prepareWhenSuspended,
+                  !state.isPrepared else { return [] }
+            state.prepareWhenSuspended = true
+            presentationPhase = .warmSuspended(state)
+            return [.prepareVideoLaneForForeground(state.fence, token)]
+        default:
             return []
         }
     }
+
+    private mutating func reduceDidBecomeActive(
+        _ fence: DemandPresentationFence
+    ) -> [DemandPresentationEffect] {
+        guard acceptsPresentationEvent(fence) else { return [] }
+        presentationApplicationPhase = .active
+        switch presentationPhase {
+        case .pipActive(let currentFence):
+            if currentFence.renderGeneration != fence.renderGeneration {
+                presentationPhase = .pipActive(fence)
+            }
+            return []
+        case .pausedInline:
+            presentationPhase = .pausedInline(fence)
+            return [.attachPausedInline(fence)]
+        case .warmSuspendingForAudioOnly(var state):
+            state.fence = fence
+            if state.shouldResumePlayback {
+                state.prepareWhenSuspended = true
+                presentationPhase = .warmSuspendingForAudioOnly(state)
+                return []
+            }
+            guard !state.attachRequested else {
+                presentationPhase = .warmSuspendingForAudioOnly(state)
+                return []
+            }
+            return requestWarmInlineAttach(&state, paused: true)
+        case .warmSuspended(var state):
+            let destinationChanged = state.fence.renderGeneration != fence.renderGeneration
+            state.fence = fence
+            if destinationChanged {
+                state.attachRequested = false
+                state.inlineAttached = false
+            }
+            guard !state.attachRequested else { return [] }
+            if state.videoFailure != nil || !state.shouldResumePlayback {
+                return requestWarmInlineAttach(&state, paused: true)
+            }
+            guard state.isPrepared else {
+                if !state.prepareWhenSuspended {
+                    state.prepareWhenSuspended = true
+                    presentationPhase = .warmSuspended(state)
+                    guard let token = state.token else { return [] }
+                    return [.prepareVideoLaneForForeground(fence, token)]
+                }
+                presentationPhase = .warmSuspended(state)
+                return []
+            }
+            if state.preparedWhileInactive,
+               !state.activeValidationRequested,
+               let token = state.token {
+                state.isPrepared = false
+                state.activeValidationRequested = true
+                presentationPhase = .warmSuspended(state)
+                return [.prepareVideoLaneForForeground(fence, token)]
+            }
+            return requestWarmInlineAttach(&state)
+        case .pipStarting, .pipStartFailed, .inlineNeedsAttachment:
+            presentationPhase = .inlineAttachPending(fence)
+            return [.attachInline(fence)]
+        default:
+            return []
+        }
+    }
+
+    private mutating func reduceExplicitPlayRequested(
+        _ fence: DemandPresentationFence
+    ) -> [DemandPresentationEffect] {
+        if let previousFence = presentationPhase.fence,
+           fence.isSameResourceAfterSeek(of: previousFence) {
+            switch presentationPhase {
+            case .warmSuspendingForAudioOnly, .warmSuspended:
+                return reducePresentation(.videoLaneSeekCommitted(fence: fence, resumesPlayback: true))
+            default:
+                break
+            }
+        }
+        guard acceptsPresentationEvent(fence) else { return [] }
+        let isSuspending: Bool
+        var state: DemandWarmSuspensionState
+        switch presentationPhase {
+        case .warmSuspendingForAudioOnly(let current):
+            isSuspending = true
+            state = current
+        case .warmSuspended(let current):
+            isSuspending = false
+            state = current
+        default:
+            return []
+        }
+        guard !state.shouldResumePlayback else { return [] }
+        state.shouldResumePlayback = true
+        state.explicitPlayRequested = true
+        if presentationApplicationPhase == .background || state.videoFailure != nil {
+            state.prepareWhenSuspended = false
+            setWarmPhase(state)
+            if let token = state.token {
+                return [.resumeSuspendedAudio(state.fence, token)]
+            }
+            return [state.suspendEffect]
+        }
+        state.prepareWhenSuspended = true
+        if isSuspending {
+            presentationPhase = .warmSuspendingForAudioOnly(state)
+            return [state.suspendEffect]
+        }
+        presentationPhase = .warmSuspended(state)
+        guard let token = state.token else { return [] }
+        if state.isPrepared {
+            if state.inlineAttached {
+                return resumeWarmVideoLane(fence: state.fence, playAfterResume: true, token: token)
+            }
+            return requestWarmInlineAttach(&state)
+        }
+        return [.prepareVideoLaneForForeground(state.fence, token)]
+    }
+
+    private mutating func reduceInlineAttached(
+        _ fence: DemandPresentationFence
+    ) -> [DemandPresentationEffect] {
+        guard acceptsPresentationEvent(fence) else { return [] }
+        switch presentationPhase {
+        case .warmSuspendingForAudioOnly(var state), .warmSuspended(var state):
+            guard fence.renderGeneration == state.fence.renderGeneration else { return [] }
+            if case .warmSuspended = presentationPhase,
+               presentationApplicationPhase == .active,
+               state.isPrepared,
+               let token = state.token {
+                return resumeWarmVideoLane(
+                    fence: fence,
+                    playAfterResume: state.explicitPlayRequested,
+                    token: token
+                )
+            }
+            state.inlineAttached = true
+            setWarmPhase(state)
+            return []
+        case .restoringInline(var transaction):
+            var effects: [DemandPresentationEffect] = []
+            transaction.inlineAttached = true
+            if !transaction.avKitCompletionSent,
+               let completionToken = transaction.completionToken {
+                transaction.avKitCompletionSent = true
+                effects.append(.completeAVKitRestore(token: completionToken, success: true))
+            }
+            if transaction.nativeDidStop {
+                presentationPhase = .inlineAttachedUnproven(fence)
+                effects.append(.restoreInlinePresentation(fence))
+            } else if let nativeStopAuthority = transaction.nativeStopAuthority,
+                      !transaction.nativeStopRequested {
+                transaction.nativeStopRequested = true
+                presentationPhase = .restoringInline(transaction)
+                effects.append(.requestPiPStop(fence, nativeStopAuthority))
+            } else {
+                presentationPhase = .restoringInline(transaction)
+            }
+            return effects
+        case .pausedInline:
+            presentationPhase = .pausedInline(fence)
+            return []
+        case .inlineAttachPending, .inlineAttachedUnproven:
+            presentationPhase = .inlineAttachedUnproven(fence)
+            return []
+        default:
+            return []
+        }
+    }
+
+    private mutating func reduceRestoreInlineRequested(
+        fence: DemandPresentationFence,
+        completionToken: UInt64
+    ) -> [DemandPresentationEffect] {
+        guard acceptsPresentationEvent(fence) else { return [] }
+        switch presentationPhase {
+        case .pipActive, .pipStopping:
+            presentationPhase = .restoringInline(DemandInlineRestoreTransaction(
+                fence: fence,
+                completionToken: completionToken
+            ))
+            return [.attachInline(fence)]
+        case .inlineNeedsAttachment:
+            presentationPhase = .restoringInline(DemandInlineRestoreTransaction(
+                fence: fence,
+                completionToken: completionToken,
+                nativeDidStop: true
+            ))
+            return [.attachInline(fence)]
+        case .inlineAttachPending:
+            presentationPhase = .restoringInline(DemandInlineRestoreTransaction(
+                fence: fence,
+                completionToken: completionToken,
+                nativeDidStop: true
+            ))
+            return []
+        case .inlineAttachedUnproven:
+            presentationPhase = .inlineAttachedUnproven(fence)
+            return [
+                .completeAVKitRestore(token: completionToken, success: true),
+                .restoreInlinePresentation(fence),
+            ]
+        case .restoringInline(var transaction):
+            if transaction.completionToken == nil {
+                transaction.completionToken = completionToken
+            }
+            guard !transaction.avKitCompletionSent,
+                  transaction.inlineAttached,
+                  let token = transaction.completionToken else {
+                presentationPhase = .restoringInline(transaction)
+                return []
+            }
+            transaction.avKitCompletionSent = true
+            presentationPhase = .restoringInline(transaction)
+            return [.completeAVKitRestore(token: token, success: true)]
+        default:
+            return [.completeAVKitRestore(token: completionToken, success: false)]
+        }
+    }
+
+    // MARK: - Shared State Helpers
 
     private func acceptsPresentationEvent(_ fence: DemandPresentationFence) -> Bool {
         guard let current = presentationPhase.fence else { return true }
         return current.hasSameContinuityAuthority(as: fence)
     }
 
-    private mutating func beginAudioOnlySuspension(
-        fence: DemandPresentationFence,
-        resumesPlayback: Bool
-    ) -> [DemandPresentationEffect] {
-        presentationPhase = .warmSuspendingForAudioOnly(DemandWarmSuspensionState(
-            fence: fence,
-            token: nil,
-            prepareWhenSuspended: presentationApplicationPhase == .active && resumesPlayback,
-            isPrepared: false,
-            shouldResumePlayback: resumesPlayback,
-            reason: .audioOnlyBackground
-        ))
-        return [.warmSuspendVideoLane(fence)]
-    }
-
-    private func acceptsExactRenderPresentationEvent(
-        _ fence: DemandPresentationFence
-    ) -> Bool {
+    private func acceptsExactRenderPresentationEvent(_ fence: DemandPresentationFence) -> Bool {
         guard acceptsPresentationEvent(fence),
               let current = presentationPhase.fence else {
             return false
         }
         return current.renderGeneration == fence.renderGeneration
+    }
+
+    private func activeReconcilingPiPFence(
+        matching fence: DemandPresentationFence
+    ) -> DemandPresentationFence? {
+        guard acceptsPresentationEvent(fence),
+              case .pipActive(let currentFence) = presentationPhase,
+              pipPresentationReconcilePending else {
+            return nil
+        }
+        return currentFence
+    }
+
+    private mutating func setWarmPhase(_ state: DemandWarmSuspensionState) {
+        presentationPhase = state.token == nil
+            ? .warmSuspendingForAudioOnly(state)
+            : .warmSuspended(state)
+    }
+
+    private mutating func beginWarmSuspension(
+        fence: DemandPresentationFence,
+        resumesPlayback: Bool,
+        reason: DemandVideoLaneSuspensionReason = .audioOnlyBackground
+    ) -> [DemandPresentationEffect] {
+        let state = DemandWarmSuspensionState(
+            fence: fence,
+            token: nil,
+            prepareWhenSuspended: presentationApplicationPhase == .active && resumesPlayback,
+            isPrepared: false,
+            shouldResumePlayback: resumesPlayback,
+            reason: reason
+        )
+        presentationPhase = .warmSuspendingForAudioOnly(state)
+        return [state.suspendEffect]
+    }
+
+    private mutating func requestWarmInlineAttach(
+        _ state: inout DemandWarmSuspensionState,
+        paused: Bool = false
+    ) -> [DemandPresentationEffect] {
+        state.attachRequested = true
+        setWarmPhase(state)
+        return [paused ? .attachPausedInline(state.fence) : .attachInline(state.fence)]
+    }
+
+    private mutating func resumeWarmVideoLane(
+        fence: DemandPresentationFence,
+        playAfterResume: Bool,
+        token: DemandVideoSuspendToken
+    ) -> [DemandPresentationEffect] {
+        let resumeFence = fence.with(playAfterResume: playAfterResume)
+        presentationPhase = .inlineAttachedUnproven(resumeFence)
+        return [.resumeVideoLane(resumeFence, token)]
+    }
+
+    private mutating func completeStoppedPiP(
+        _ stopFence: DemandPresentationFence
+    ) -> [DemandPresentationEffect] {
+        if presentationApplicationPhase == .active {
+            presentationPhase = .inlineAttachPending(stopFence)
+            return [.attachInline(stopFence)]
+        }
+        return beginWarmSuspension(
+            fence: stopFence,
+            resumesPlayback: stopFence.userWantsPlaying,
+            reason: .pipDidStop
+        )
+    }
+
+    private mutating func flushRendererIfRetained(
+        _ fence: DemandPresentationFence
+    ) -> [DemandPresentationEffect] {
+        guard presentationRecoveryStage == .retainedRenderer else { return [] }
+        presentationRecoveryStage = .rendererFlushed
+        return [.flushAndPrimeRenderer(fence)]
+    }
+
+    private mutating func recreateDecoderIfAllowed(
+        _ fence: DemandPresentationFence
+    ) -> [DemandPresentationEffect] {
+        guard presentationRecoveryStage < .decoderRecreated else { return [] }
+        presentationRecoveryStage = .decoderRecreated
+        return [.recreateVideoDecoder(fence)]
     }
 }
 

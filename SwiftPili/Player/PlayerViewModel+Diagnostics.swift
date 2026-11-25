@@ -109,45 +109,6 @@ extension PlayerViewModel {
         demandBackgroundStageTape = nil
     }
 
-    nonisolated static func probeMainThreadAcrossTransition() {
-        guard PlayerLog.isCapturing else { return }
-        Task.detached(priority: .userInitiated) {
-            guard PlayerLog.isCapturing else { return }
-            var running = 0
-            var waiting = 0
-            var other = 0
-            var peakUsage = 0.0
-            let deadline = ContinuousClock.now + .seconds(2)
-            let postedAt = ContinuousClock.now
-            nonisolated(unsafe) var hopMilliseconds = -1
-            DispatchQueue.main.async {
-                let elapsed = ContinuousClock.now - postedAt
-                hopMilliseconds = Int(elapsed.components.seconds * 1000
-                    + elapsed.components.attoseconds / 1_000_000_000_000_000)
-            }
-            while ContinuousClock.now < deadline {
-                guard PlayerLog.isCapturing else { return }
-                let sample = PowerProfiler.sampleSystem()
-                if let main = sample.threads.first(where: { $0.isMain }) {
-                    peakUsage = max(peakUsage, main.usage)
-                    switch main.runStateLabel {
-                    case "running": running += 1
-                    case "waiting": waiting += 1
-                    default: other += 1
-                    }
-                }
-                guard PlayerLog.isCapturing else { return }
-                try? await Task.sleep(for: .milliseconds(50))
-            }
-            PlayerLog.log(
-                "[Lifecycle] background probe mainRunning=\(running) " +
-                "mainWaiting=\(waiting) mainOther=\(other) " +
-                "mainCpuPeak=\(Int(peakUsage))% " +
-                "mainQueueHop=\(hopMilliseconds)ms"
-            )
-        }
-    }
-
     func markDemandForegroundStage(
         _ stage: String,
         startsTransition: Bool = false,

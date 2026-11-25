@@ -127,14 +127,20 @@ struct RootView: View {
             ))
             .id(root)
             .onAppear { retainedCoverRoot = root }
+            .overlay {
+                InAppMiniPlayerOverlay(
+                    topBarClearance: 52,
+                    bottomBarClearance: 20,
+                    horizontalMargin: 16,
+                    isCovered: !detailCoverPresented.wrappedValue || coordinator.activePlayerDestination != nil
+                )
+            }
             .appNoticeOverlay()
         }
     }
 
     private func detailPage(_ occurrence: DetailRouteOccurrence) -> some View {
         coordinator.destination(for: occurrence.route, position: occurrence.position)
-            .imageDiagnosticsScreen("Root.detail")
-            .imageDiagnosticsScrollTracking()
             .accentContentBoundary()
     }
 
@@ -151,6 +157,14 @@ struct RootView: View {
             }
             .allowsHitTesting(!detailPresentation.projectionHeld)
             .accessibilityHidden(detailPresentation.projectionHeld)
+            .overlay {
+                InAppMiniPlayerOverlay(
+                    topBarClearance: showsSidebar ? 16 : 52,
+                    bottomBarClearance: showsSidebar ? 20 : (hasBottomChrome ? 120 : 68),
+                    horizontalMargin: showsSidebar ? 16 : 12,
+                    isCovered: detailCoverPresented.wrappedValue
+                )
+            }
             .appNoticeOverlay(bottomPadding: showsSidebar ? 8 : 54)
     }
 
@@ -252,11 +266,6 @@ struct RootView: View {
             } else {
                 coordinator.foldSidebarSelection()
             }
-        }
-        .overlay(alignment: .topTrailing) {
-            ImageDiagnosticsOverlay()
-                .padding(.top, 4)
-                .padding(.trailing, 6)
         }
         .onReceive(
             NotificationCenter.default.publisher(

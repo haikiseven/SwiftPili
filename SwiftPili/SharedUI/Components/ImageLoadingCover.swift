@@ -148,7 +148,6 @@ struct LoadingCover: View {
         .task {
             try? await Task.sleep(for: Self.spinnerDelay)
             guard !Task.isCancelled else { return }
-            ImageDiagnostics.noteIndicatorShown(shorterSide: shorterSide)
             spinnerVisible = true
         }
         .accessibilityHidden(true)

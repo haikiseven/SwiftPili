@@ -276,8 +276,7 @@ struct BangumiDetailView: View {
             guardsIPadTopSafeArea: true,
             preventsContentDismissal: isActiveBangumiRoute,
             presentationContext: presentationContext,
-            coordinator: coordinator,
-            watchdogScreen: "BangumiDetail"
+            coordinator: coordinator
         ) {
             CinematicBackdrop(
                 coverURL: placeholderCoverURL,

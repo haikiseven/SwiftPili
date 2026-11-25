@@ -275,6 +275,9 @@ extension PlayerViewModel {
         setMute(.seekTravel, false)
         if arrived != nil { refreshBufferedDisplayAfterSeek() }
         refreshAmbientSelection()
+        if arrived != nil {
+            sampleAmbientLiveFrameIfNeeded(at: CACurrentMediaTime(), force: true)
+        }
     }
 
     func pinSettledSeekDisplay(at position: TimeInterval) {

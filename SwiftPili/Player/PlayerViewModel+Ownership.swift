@@ -50,8 +50,23 @@ extension PlayerViewModel {
     func claimOwnerLease(owner: String, sceneID: UUID?) -> PlayerOwnerLease {
         retireFullscreenPresentation()
         let outgoingOwner = currentOwnerLease
-        let retainsRunningSession = !ownerKey.isEmpty
+        let isMiniPlayerReturnMigration = !ownerKey.isEmpty
+            && ownerKey != owner
+            && shouldPreserveSessionForMiniPlayerReturn(incomingOwner: owner)
+        let isMiniPlayerReturnSameOwner = !ownerKey.isEmpty
             && ownerKey == owner
+            && miniPlayer.returnHandoff != nil
+            && outgoingOwner == miniPlayer.returnHandoff?.previousOwnerLease
+        let isMiniPlayerReturn = isMiniPlayerReturnMigration || isMiniPlayerReturnSameOwner
+        if !isMiniPlayerReturn {
+            if miniPlayer.isActive {
+                miniPlayer.clearAll()
+            } else if miniPlayer.returnHandoff != nil {
+                miniPlayer.clearReturnHandoff()
+            }
+        }
+        let retainsRunningSession = !ownerKey.isEmpty
+            && (ownerKey == owner || isMiniPlayerReturnMigration)
             && outgoingOwner != nil
             && (sceneID == nil || routeOwnership.activeSceneID == nil || routeOwnership.activeSceneID == sceneID)
         if !retainsRunningSession {
@@ -59,20 +74,60 @@ extension PlayerViewModel {
             invalidateSurfaceSlot(reason: "owner-lease-replacement")
         }
         mediaResetRecovery.invalidate()
-        let keepsRunningSession = ownerKey == owner
+        let keepsRunningSession = ownerKey == owner || isMiniPlayerReturnMigration
         playerInfoHandoffPolicy.invalidate()
         pendingPlayerInfo = nil
-        claim(owner: owner)
+        if isMiniPlayerReturnMigration {
+            resetRecoveryBudget()
+            cdnFallbackActive = false
+            lifecycleRecoveryTask?.cancel()
+            lifecycleRecovery.invalidate()
+            invalidateLifecycleReadiness()
+            decoderRecoveryAdmission.invalidate()
+            nonLifecycleRecoveryTicket = nil
+            deferredPiPOwnerExit.cancel()
+            PlayerLog.log("[MiniPlayer] migrating live owner \(ownerKey) → \(owner)")
+            routeOwnership.ownerKey = owner
+        } else {
+            claim(owner: owner)
+        }
         if let recoveryCover { clearRecoveryCover(matching: recoveryCover.identity) }
         retireCDNFrameCover()
         ownerLeaseGeneration &+= 1
         routeOwnership.activeSceneID = sceneID
         let incomingOwner = PlayerOwnerLease(owner: owner, generation: ownerLeaseGeneration)
+        if isMiniPlayerReturn {
+            miniPlayer.markReturnHandoffAdopted(by: incomingOwner)
+            if ambientOwnerLease != nil {
+                ambientOwnerLease = incomingOwner
+            }
+            if ambientVideoLoadedOwner != nil {
+                ambientVideoLoadedOwner = incomingOwner
+            }
+            if let existingReq = ambientStoryboardRequest {
+                ambientStoryboardRequest = PlayerAmbientStoryboardLoader.Request(
+                    content: .init(
+                        aid: existingReq.content.aid,
+                        cid: existingReq.content.cid,
+                        owner: incomingOwner
+                    ),
+                    loadGeneration: existingReq.loadGeneration
+                )
+            }
+        }
         if retainsRunningSession {
             upgradeOrInvalidateSurfaceSlot(from: outgoingOwner, to: incomingOwner)
         }
         if keepsRunningSession, let outgoingOwner {
             _ = NowPlayingCenter.shared.deactivate(owner: outgoingOwner)
+        }
+        if isMiniPlayerReturn {
+            if let meta = nowPlayingMeta {
+                setNowPlaying(title: meta.title, artist: meta.artist, cover: meta.cover)
+            }
+            if mode == .vod {
+                admitDanmakuSession(openingAt: mediaTime)
+            }
         }
         updateDemandVideoLivenessContext()
         lifecycleRecoveryTask?.cancel()
@@ -117,6 +172,10 @@ extension PlayerViewModel {
         if coverage.retainsLease,
            fullscreenPresentationReceipt?.context.ownerLease == currentOwnerLease {
             PlayerLog.log("[Player] owner retained by exact fullscreen presentation owner=\(owner)")
+            return .leaseRetained
+        }
+        if miniPlayer.retainsOwnerLease(currentOwnerLease) {
+            PlayerLog.log("[Player] owner retained by in-app mini-player owner=\(owner)")
             return .leaseRetained
         }
         invalidateSurfaceSlot(reason: "owner-exit")
@@ -192,6 +251,7 @@ extension PlayerViewModel {
     }
 
     func endCurrentOwnerPlayback() {
+        miniPlayer.clearAll()
         guard !ownerKey.isEmpty else { return }
         endOwnerPlayback(owner: ownerKey)
     }
@@ -200,6 +260,10 @@ extension PlayerViewModel {
     func pauseForRouteDeparture(lease: PlayerOwnerLease?) -> Bool {
         guard let lease, isCurrentOwner(lease) else { return false }
         guard playbackIntent == .playing else { return false }
+        if miniPlayer.retainsOwnerLease(lease) {
+            PlayerLog.log("[Route] departing owner kept playing owner=\(lease.owner) (in-app mini-player)")
+            return false
+        }
         if PlayerOwnerExitPolicy.shouldKeepPlayback(
             ownerMatches: true,
             hasObservedPiPLease: backend.hasObservedPiPLease,
@@ -216,6 +280,16 @@ extension PlayerViewModel {
 
     func endForeignOwnerForRouteActivation(incomingOwner: String) {
         guard !ownerKey.isEmpty, ownerKey != incomingOwner else { return }
+        if shouldPreserveSessionForMiniPlayerReturn(incomingOwner: incomingOwner) {
+            PlayerLog.log(
+                "[MiniPlayer] preserving live session across owner migration " +
+                "outgoing=\(ownerKey) incoming=\(incomingOwner)"
+            )
+            return
+        }
+        if miniPlayer.isActive {
+            miniPlayer.clearAll()
+        }
         PlayerLog.log("[Route] ending departing owner=\(ownerKey) before incoming=\(incomingOwner) claims")
         endOwnerPlayback(owner: ownerKey)
     }
@@ -233,6 +307,7 @@ struct PlayerOwnerLease: Equatable, Sendable {
 enum PlayerSurfaceRole: String, Equatable, Sendable {
     case inline
     case fullscreen
+    case miniPlayer
 }
 
 struct PlayerSurfaceLease: Equatable, Sendable {

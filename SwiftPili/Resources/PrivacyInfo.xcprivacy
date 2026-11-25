@@ -26,20 +26,17 @@
 	    "…measure the amount of time that has elapsed between events that
 	    occurred within the app or to perform calculations to enable timers."
 	    Call sites: ProcessInfo.systemUptime as a monotonic clock in the player
-	    and download diagnostics — DownloadProgress, PlaybackDebugRecorder,
-	    FreezeStackSampler, FreezeMarkerStore, FreezeWatchdog, UIHitchMonitor,
-	    MediaEngineSession, EngineAudioRenderer, PathAHLSFMP4Demuxer,
-	    ImageDiagnostics. Elapsed intervals only; boot time is never sent.
+	    and download progress tracking — DownloadProgress, MediaEngineSession,
+	    EngineAudioRenderer, PathAHLSFMP4Demuxer. Elapsed intervals only; boot
+	    time is never sent.
 
 	  FileTimestamp — C617.1
 	    "…access the timestamps, size, or other metadata of files inside the app
 	    container, app group container, or the app's CloudKit container."
-	    Call sites, both via FileManager.attributesOfItem(atPath:) on files this
-	    app wrote: PlaybackDebugRecorder reads .modificationDate to age out its
-	    own log files, and PathAHTTPMediaSource reads .size of a local media
-	    file. The second reads no timestamp, but it calls the same API the
-	    category is about, so it is named here rather than left to be
-	    rediscovered.
+	    Call site via FileManager.attributesOfItem(atPath:) on files this app
+	    wrote: PathAHTTPMediaSource reads .size of a local media file. It reads
+	    no timestamp, but it calls the same API the category is about, so it is
+	    named here rather than left to be rediscovered.
 
 	  UserDefaults — CA92.1
 	    "…read and write information that is only accessible to the app itself."

@@ -132,7 +132,12 @@ final class AppCoordinator {
         guard layoutMigrationDepth == 0 else { return }
         let previous = activePlayerDestination
         guard previous != destination else { return }
-        routePlayer?.playerRouteWillChange(from: previous, to: destination)
+        let departingRoute = previous != nil ? activeTopRoute : nil
+        routePlayer?.playerRouteWillChange(
+            from: previous,
+            to: destination,
+            departingRoute: departingRoute
+        )
     }
 
     private func playerDestination(
@@ -408,6 +413,60 @@ final class AppCoordinator {
         contentLinks.cancel()
         pendingCommentNavigation = nil
         append(route)
+    }
+
+    func restoreFromMiniPlayer(_ session: InAppMiniPlayerSession) {
+        contentLinks.cancel()
+        pendingCommentNavigation = nil
+        videoNavigationAdmission.cancel()
+
+        if let position = session.originPosition {
+            if let sidebarID = position.sidebarID,
+               let row = SidebarDestination.myContent.first(where: { $0.id == sidebarID }),
+               selectedSidebarRow != row,
+               !sidebarRowStack(for: row).isEmpty {
+                let rowStack = SidebarDestination.folded(row, rowStack: sidebarRowStack(for: row))
+                if PlayerScreenRoute(route: rowStack.last) == session.originScreenRoute {
+                    selectedSidebarRow = row
+                    selectedTab = row.parentTab
+                    return
+                }
+            }
+            if selectedSidebarRow != nil || selectedTab != position.tab {
+                let tabStack = stack(for: position.tab)
+                if PlayerScreenRoute(route: tabStack.last) == session.originScreenRoute {
+                    if selectedSidebarRow != nil {
+                        selectedSidebarRow = nil
+                    }
+                    selectedTab = position.tab
+                    return
+                }
+            }
+        }
+
+        if let row = selectedSidebarRow {
+            let current = sidebarRowStack(for: row)
+            if let index = current.lastIndex(where: {
+                PlayerScreenRoute(route: $0) == session.originScreenRoute
+            }), index < current.count - 1 {
+                setSidebarRowStack(Array(current.prefix(through: index)), for: row)
+                return
+            }
+        } else {
+            let current = stack(for: selectedTab)
+            if let index = current.lastIndex(where: {
+                PlayerScreenRoute(route: $0) == session.originScreenRoute
+            }), index < current.count - 1 {
+                setStack(
+                    Array(current.prefix(through: index)),
+                    for: selectedTab,
+                    parkBeforeWrite: false
+                )
+                return
+            }
+        }
+
+        navigate(to: session.originRoute.withoutZoom)
     }
 
     private func append(_ route: Route) {

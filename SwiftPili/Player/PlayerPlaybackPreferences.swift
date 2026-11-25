@@ -2,6 +2,7 @@ import Foundation
 
 enum PlayerPlaybackPreferences {
     static let ambientModeDefaultsKey = "player_ambient_mode_enabled"
+    static let inAppMiniPlayerDefaultsKey = "in_app_mini_player_enabled"
     static let defaultWifiAudioQuality: AudioQualityTier = .hiRes
     static let defaultCellularAudioQuality: AudioQualityTier = .k192
 
@@ -90,6 +91,16 @@ enum PlayerPlaybackPreferences {
     static var pictureInPictureEnabled: Bool {
         get { UserDefaults.standard.object(forKey: "picture_in_picture_enabled") as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: "picture_in_picture_enabled") }
+    }
+
+    static var inAppMiniPlayerEnabled: Bool {
+        get {
+            PlayerDefaultBool.resolve(
+                key: inAppMiniPlayerDefaultsKey,
+                defaultValue: true
+            )
+        }
+        set { UserDefaults.standard.set(newValue, forKey: inAppMiniPlayerDefaultsKey) }
     }
 
     static var playbackContinuationConfiguration: PlaybackContinuationConfiguration {

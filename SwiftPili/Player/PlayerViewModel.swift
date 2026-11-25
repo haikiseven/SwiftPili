@@ -57,6 +57,12 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     let routeOwnership = PlayerRouteOwnershipCoordinator()
     @ObservationIgnored
     let session = PlayerSessionState()
+    @ObservationIgnored
+    let miniPlayer = InAppMiniPlayerState.shared
+
+    var isMiniPlayerActive: Bool {
+        miniPlayer.isActive
+    }
 
     // MARK: - Session State Facade
 
@@ -219,6 +225,11 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     var videoSuperResolutionSharpness: VideoSuperResolutionSharpness {
         get { session.videoSuperResolutionSharpness }
         set { session.videoSuperResolutionSharpness = newValue }
+    }
+
+    var videoSuperResolutionSplitCompare: Bool {
+        get { session.videoSuperResolutionSplitCompare }
+        set { session.videoSuperResolutionSplitCompare = newValue }
     }
 
     /// Defaults last applied to the per-player choices above; tuning-only changes don't reset them.
@@ -903,14 +914,6 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         }
         Self.startNetworkMonitor()
 
-        PowerProfiler.shared.playerMetrics = { [weak self] in
-            guard let self, self.currentURL != nil else { return nil }
-            return "fps=\(String(format: "%.1f", self.stats.fps))"
-                + " dec=\(self.stats.decoderType)"
-                + " net=\(Int(self.stats.networkSpeed / 1024))KB/s"
-                + (self.mode == .live ? " live" : "")
-        }
-
         NotificationCenter.default.addObserver(
             forName: AVAudioSession.interruptionNotification,
             object: nil,
@@ -954,7 +957,6 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
                 guard vm.usesDemandPresentationContinuity else { return }
                 vm.backend.noteDemandPiPEnvironmentWillResignActive()
                 vm.markDemandBackgroundStage("resign", startsTransition: true)
-                PlayerViewModel.probeMainThreadAcrossTransition()
             }
         }
 
@@ -1693,11 +1695,6 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         case handedOff
     }
 
-    @ObservationIgnored
-    var lastReportedSurfaceSize: CGSize = .zero
-    @ObservationIgnored
-    var lastReportedVerticalSizeClass = "nil"
-
     var hideControlsTask: Task<Void, Never>? {
         get { chrome.hideControlsTask }
         set { chrome.hideControlsTask = newValue }
@@ -1740,6 +1737,7 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
 
         advanceGeneration("stop:\(reason)")
         if !reason.preservesPresentation {
+            miniPlayer.clearAll()
             hasRenderedFirstFrame = false
             fullscreenTransition = FullscreenTransitionCoalescer()
             if isFullscreen { exitFullscreen() }
@@ -1784,7 +1782,6 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         byteRateSampler.reset()
         pipelineGoodput = 0
         resetMultiConnectionDisplay()
-        FreezeWatchdog.clearPlayer()
         let keepCounters = reason.preservesPresentation
         let lastStartup = stats.lastStartup
         let lastSeek = stats.lastSeek

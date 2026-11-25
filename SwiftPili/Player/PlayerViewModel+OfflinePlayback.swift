@@ -86,6 +86,12 @@ extension PlayerViewModel {
         ), isCurrentOwner(lease) else {
             return false
         }
+        if consumeMiniPlayerReturnIfLiveOffline(asset: asset, ownerLease: lease) {
+            if stats.decoderType.isEmpty {
+                prepareOfflineDecoderLabel(for: asset)
+            }
+            return isCurrentOwner(lease)
+        }
         startOfflinePlayback(asset, at: resumeAt ?? 0, preservePlayState: false)
         return isCurrentOwner(lease)
     }

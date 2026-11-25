@@ -57,6 +57,22 @@ extension PlayerViewModel {
             return
         }
         if let streamRetryID, !issueStreamRetry(streamRetryID) { return }
+        if consumeMiniPlayerReturnIfLiveVOD(
+            aid: aid,
+            cid: cid,
+            bvid: bvid,
+            source: source,
+            quality: quality,
+            ownerLease: ownerLease,
+            startupTraceToken: startupTraceToken,
+            mediaResetID: mediaResetID,
+            recoveryCoverIdentity: recoveryCoverIdentity,
+            cdnSwitchID: cdnSwitchID,
+            streamRetryID: streamRetryID
+        ) {
+            clearPlayerInfoHandoff(matching: ownerLease)
+            return
+        }
         let sameContent = mode == .vod
             && aid == currentAid
             && cid == currentCid

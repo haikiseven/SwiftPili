@@ -407,8 +407,7 @@ extension OfflinePlayerView {
             isStatusBarHidden: player.isFullscreen,
             guardsIPadTopSafeArea: nil,
             presentationContext: presentationContext,
-            coordinator: coordinator,
-            watchdogScreen: "OfflinePlayer"
+            coordinator: coordinator
         ) {
             PlayerAmbientPolicy.groundColor
                 .ignoresSafeArea()

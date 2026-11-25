@@ -32,7 +32,6 @@ extension PlayerViewModel {
     }
 
     private func sampleNetworkSpeed() {
-        PowerProfiler.tick(.netSampler)
         let info = backend.dynamicInfo
         let reading = PlaybackByteRateSampler.Reading(
             networkBytes: info?.networkBytesReceived ?? 0,
@@ -49,32 +48,6 @@ extension PlayerViewModel {
             stats.networkSpeed = network
         }
         evaluateDeliveryHealth(goodput: rates.goodput)
-        pushFreezeWatchdogSample()
-    }
-
-    private func pushFreezeWatchdogSample() {
-        FreezeWatchdog.notePlayer(FreezePlayerSample(
-            streamID: "\(mode)#\(playerGeneration)",
-            mode: "\(mode)",
-            engine: backendKind.shortLabel,
-            state: isBuffering ? "buffering" : (isPlaying ? "playing" : "paused"),
-            expectsProgress: isPlaying
-                && !isBuffering
-                && pendingSeekTarget == nil
-                && !currentPlaybackTerminalState.isTerminal,
-            mediaTime: mediaTime,
-            displayTime: displayTime,
-            fps: stats.fps,
-            clockSource: backendKind == .demandPaced ? "audio-drain" : "libvlc-internal",
-            runway: backend.bufferedContentAhead,
-            videoRunway: backend.videoDeliveryRunway,
-            available: bufferedTime,
-            networkKBs: Int(stats.networkSpeed / 1024),
-            goodputKBs: Int(pipelineGoodput / 1024),
-            quality: "\(currentQuality)",
-            host: stats.videoHost,
-            recovery: budget.summary
-        ))
     }
 
     // MARK: - Smart CDN delivery health (phase 1)

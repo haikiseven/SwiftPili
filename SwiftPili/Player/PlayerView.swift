@@ -526,7 +526,6 @@ struct PlayerView: View {
         .ignoresSafeArea(.keyboard, edges: .all)
         .ignoresSafeArea(.all, edges: isFullscreenPresentation ? .all : [])
         .onGeometryChange(for: CGSize.self) { $0.size } action: { newValue in
-            recordGeometrySettlement(size: newValue)
             publishSurfaceSizeIfAllowed(newValue)
         }
         .overlay(alignment: .top) {
@@ -579,7 +578,6 @@ struct PlayerView: View {
         .onAppear {
             claimScreenSurfaceIfCurrent()
             scheduleHideControls()
-            UIDevice.current.isBatteryMonitoringEnabled = true
         }
         .onDisappear {
             if let claimedSurfaceLease { vm.releaseSurfaceSlot(lease: claimedSurfaceLease) }
@@ -634,7 +632,6 @@ struct PlayerView: View {
             }
         }
         .onChange(of: verticalSizeClass) { _, newValue in
-            recordGeometrySettlement(size: surfaceSize)
             guard isOwner, DeviceCapability.supportsOrientationLock else { return }
             if newValue == .regular, vm.isFullscreen, AppOrientation.shared.mask.contains(.landscape) {
                 PlayerLog.log("[Player] window rotated to portrait behind isFullscreen — reconciling")
@@ -857,12 +854,6 @@ struct PlayerView: View {
 
     // MARK: - Helpers
 
-    private var verticalSizeClassLabel: String {
-        if verticalSizeClass == .compact { return "compact" }
-        if verticalSizeClass == .regular { return "regular" }
-        return "nil"
-    }
-
     private var surfaceGeometryPublicationContext: PlayerSurfaceGeometryPublicationPolicy.Context {
         let deviceClass: PlayerSurfaceGeometryPublicationPolicy.DeviceClass
         if DeviceCapability.supportsOrientationLock {
@@ -887,16 +878,6 @@ struct PlayerView: View {
             sceneSizeClass: sceneSizeClass,
             deviceClass: deviceClass
         )
-    }
-
-    private func recordGeometrySettlement(size: CGSize) {
-        guard isOwner, surfaceLease != nil else { return }
-        FullscreenTransitionDiagnostics.recordGeometrySettlement(
-            size: size,
-            isFullscreen: vm.isFullscreen,
-            verticalSizeClass: verticalSizeClassLabel
-        )
-        vm.noteSurfaceGeometry(size: size, verticalSizeClass: verticalSizeClassLabel)
     }
 
     private func publishSurfaceSizeIfAllowed(_ candidateSize: CGSize) {

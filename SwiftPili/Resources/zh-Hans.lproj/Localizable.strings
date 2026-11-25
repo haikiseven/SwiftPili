@@ -1371,7 +1371,9 @@
 "VideoEnhancementSharpnessLight" = "轻微";
 "Strong" = "较强";
 "Manual target resolution overrides Limit to Screen Resolution. Inputs already at or above the target skip upscaling." = "手动指定目标分辨率会覆盖「限制在屏幕分辨率」。输入已达到或高于目标分辨率时将自动跳过超分。";
-"Applies to SDR Demand VOD streams within the max input resolution. VideoToolbox ML uses native scale factors; MetalFX Spatial supports manual target resolution, which overrides Limit to Screen Resolution. High temperatures pause enhancement." = "适用于输入分辨率上限内的 SDR Demand 点播。VideoToolbox ML 使用原生放大倍率；MetalFX Spatial 支持手动指定目标分辨率，并覆盖「限制在屏幕分辨率」。设备温度过高时会暂停增强。";
+"Applies to SDR Demand VOD streams within the max input resolution. MetalFX Spatial supports manual target resolution, which overrides Limit to Screen Resolution. High temperatures pause enhancement." = "适用于输入分辨率上限内的 SDR Demand 点播。MetalFX Spatial 支持手动指定目标分辨率，并覆盖「限制在屏幕分辨率」。设备温度过高时会暂停增强。";
+"Split-Screen Compare" = "分屏对比";
+"Left: Original · Right: Super Resolution" = "左侧原画 · 右侧超分辨率";
 "Login Failed" = "登录失败";
 "Playback Failed" = "播放失败";
 "Playback Unavailable" = "无法播放";
@@ -1386,3 +1388,7 @@
 "Waiting…" = "等待中…";
 "Multi-Connection Downloads" = "多线程下载";
 "Downloads use parallel CDN connections on Wi-Fi for faster speeds and automatically limit concurrency on cellular." = "Wi-Fi 下通过多条 CDN 连接并行加速下载，蜂窝网络下自动限制并发连接数。";
+"In-App Mini Player" = "应用内悬浮小窗";
+"Keep playing in a floating mini window when leaving the player page." = "退出播放页时自动收起为悬浮小窗继续播放。";
+"Close mini player" = "关闭小窗";
+"Double tap to return to player" = "轻点两下返回播放页";

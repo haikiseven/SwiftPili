@@ -4,6 +4,30 @@ import Observation
 import SwiftUI
 import UIKit
 
+enum FullscreenTransitionSource: String, Sendable {
+    case button
+    case deviceOrientation
+    case verticalSizeClass
+}
+
+struct FullscreenTransitionCoalescer: Equatable, Sendable {
+    private(set) var pendingTarget: Bool?
+
+    mutating func shouldStart(target: Bool, currentState: Bool) -> Bool {
+        if pendingTarget == target { return false }
+        if target == currentState {
+            pendingTarget = nil
+            return false
+        }
+        pendingTarget = target
+        return true
+    }
+
+    mutating func settle() {
+        pendingTarget = nil
+    }
+}
+
 @MainActor
 @Observable
 final class PlayerFullscreenTransitionState {
@@ -97,39 +121,10 @@ extension PlayerViewModel {
         }
     }
 
-    private func coalesceFullscreenTransitionRequest(
-        target: Bool,
-        transitionID: UInt64
-    ) -> FullscreenTransitionRequestDecision {
-        fullscreenTransition.request(
-            target: target,
-            currentState: isFullscreen,
-            transitionID: transitionID
-        )
-    }
-
-    private func settleFullscreenTransition(
-        actualState: Bool
-    ) -> FullscreenTransitionSettlement {
-        fullscreenTransition.settle(actualState: actualState)
-    }
-
-    private func settleFullscreenPresentation(actualState: Bool) {
-        FullscreenTransitionDiagnostics.recordSettlement(
-            settleFullscreenTransition(actualState: actualState),
-            actualState: actualState,
-            playerGeneration: playerGeneration,
-            hasURL: currentURL != nil,
-            surfaceSize: lastReportedSurfaceSize,
-            verticalSizeClass: lastReportedVerticalSizeClass
-        )
+    private func settleFullscreenPresentation() {
+        fullscreenTransition.settle()
         if !showControls { showControls = true }
         scheduleHideControls()
-    }
-
-    func noteSurfaceGeometry(size: CGSize, verticalSizeClass: String) {
-        lastReportedSurfaceSize = size
-        lastReportedVerticalSizeClass = verticalSizeClass
     }
 
     func scheduleHideControls(isSeeking: Bool = false) {
@@ -185,18 +180,18 @@ extension PlayerViewModel {
               let receipt = fullscreenPresentationReceipt,
               isCurrentPresentation(presentation, receipt: receipt),
               currentURL != nil, error == nil, !terminalOpenFailure else {
-            settleFullscreenPresentation(actualState: false)
+            settleFullscreenPresentation()
             return
         }
         refreshInlineVideoRect()
         let transitionCover = captureFullscreenTransitionCover()
         guard presentation.reserveHost(receipt: receipt, transitionCover: transitionCover) else {
-            settleFullscreenPresentation(actualState: false)
+            settleFullscreenPresentation()
             return
         }
         guard prepareSurfaceHandoff(ownerLease: receipt.context.ownerLease, to: .fullscreen) else {
             presentation.cancelReservedHost(receipt: receipt)
-            settleFullscreenPresentation(actualState: false)
+            settleFullscreenPresentation()
             return
         }
         FullscreenLoginHandoff.shared.cancel()
@@ -215,7 +210,7 @@ extension PlayerViewModel {
             applyOrientation(targetMask)
         }
         presentation.reconcile()
-        settleFullscreenPresentation(actualState: isFullscreen)
+        settleFullscreenPresentation()
     }
 
     func exitFullscreen(
@@ -246,7 +241,7 @@ extension PlayerViewModel {
             applyOrientation(.portrait)
         }
         fullscreenPresentation?.reconcile()
-        settleFullscreenPresentation(actualState: false)
+        settleFullscreenPresentation()
     }
 
     func requestLoginFromFullscreen(sceneID: UUID? = nil) {
@@ -271,10 +266,6 @@ extension PlayerViewModel {
         let window = AppWindowMetrics.current
         window?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
         window?.windowScene?.requestGeometryUpdate(.iOS(interfaceOrientations: mask))
-        FullscreenTransitionDiagnostics.recordSceneGeometryRequest(
-            mask: Self.orientationMaskLabel(mask),
-            windowResolved: window != nil
-        )
     }
 
     private static func orientationMaskLabel(
@@ -289,24 +280,7 @@ extension PlayerViewModel {
     }
 
     func requestFullscreenTransition(target: Bool, source: FullscreenTransitionSource) {
-        let transitionID = FullscreenTransitionDiagnostics.nextTransitionID()
-        let currentState = isFullscreen
-        let decision = coalesceFullscreenTransitionRequest(
-            target: target,
-            transitionID: transitionID
-        )
-        FullscreenTransitionDiagnostics.recordRequest(
-            decision: decision,
-            source: source,
-            target: target,
-            currentState: currentState,
-            playerGeneration: playerGeneration,
-            hasURL: currentURL != nil,
-            surfaceSize: lastReportedSurfaceSize,
-            verticalSizeClass: lastReportedVerticalSizeClass
-        )
-
-        guard case .start = decision else { return }
+        guard fullscreenTransition.shouldStart(target: target, currentState: isFullscreen) else { return }
         if source == .button {
             FullscreenOrientationLatch.shared.recordButtonTransition(targetFullscreen: target)
         }
@@ -455,9 +429,40 @@ extension PlayerViewModel {
     }
 
     func playerRouteWillChange(from old: PlayerRouteDestination?, to new: PlayerRouteDestination?) {
-        guard old != new, let old,
-              let receipt = fullscreenPresentationReceipt,
-              receipt.context.route == old.route, receipt.context.position == old.position else { return }
+        playerRouteWillChange(from: old, to: new, departingRoute: nil)
+    }
+
+    func playerRouteWillChange(
+        from old: PlayerRouteDestination?,
+        to new: PlayerRouteDestination?,
+        departingRoute: Route?
+    ) {
+        guard old != new else { return }
+        if let new, miniPlayer.isActive {
+            handleMiniPlayerIncomingRoute(new)
+        }
+        guard let old else { return }
+        let matchedReceipt: PlayerPresentationReceipt? = {
+            guard let receipt = fullscreenPresentationReceipt,
+                  receipt.context.route == old.route,
+                  receipt.context.position == old.position else { return nil }
+            return receipt
+        }()
+        let departingLease: PlayerOwnerLease? = matchedReceipt?.context.ownerLease ?? {
+            guard let current = currentOwnerLease,
+                  ownerMatchesScreenRoute(current.owner, route: old.route) else { return nil }
+            return current
+        }()
+        if new == nil,
+           let lease = departingLease,
+           activateMiniPlayerIfEligible(
+               departing: old,
+               departingRoute: departingRoute,
+               ownerLease: lease
+           ) {
+            return
+        }
+        guard let receipt = matchedReceipt else { return }
         let lease = receipt.context.ownerLease
         retireFullscreenPresentation()
         endOwnerPlayback(lease: lease)

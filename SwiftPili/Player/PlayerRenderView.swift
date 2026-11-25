@@ -17,16 +17,11 @@ struct PlayerRenderView: UIViewRepresentable {
     let presentationCornerRadius: CGFloat
 
     func makeUIView(context _: Context) -> PlayerContainerView {
-        SurfaceMoveProbe.noteMountStep("makeUIView")
-        return PlayerContainerView()
+        PlayerContainerView()
     }
 
     func updateUIView(_ container: PlayerContainerView, context _: Context) {
         let player = PlayerViewModel.shared
-        SurfaceMoveProbe.noteMountStep(
-            "updateUIView",
-            detail: "gen=\(generation) vc=\(viewController != nil ? 1 : 0)"
-        )
         guard generation == player.playerGeneration else { return }
         if player.registerRenderAttachment(container, surfaceLease: surfaceLease) {
             let attachedGeneration = container.presentationSnapshot.renderGeneration ?? player.playerGeneration
@@ -89,7 +84,8 @@ final class PlayerContainerView: UIView, PlayerRenderAttachment {
         cover.alpha = 1
         cover.image = image
         cover.contentMode = .scaleAspectFit
-        cover.backgroundColor = .black
+        cover.backgroundColor = .clear
+        cover.isOpaque = false
         cover.isUserInteractionEnabled = false
         if cover.frame != bounds { cover.frame = bounds }
         cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -183,12 +179,6 @@ final class PlayerContainerView: UIView, PlayerRenderAttachment {
         }
         let facts = surfaceFacts(incoming: next)
         let needsReattach = InlineSurfaceBindingPolicy.needsReattach(facts)
-        FullscreenTransitionDiagnostics.recordRenderContainer(
-            phase: "update",
-            generation: generation,
-            hasController: next != nil,
-            reattaches: needsReattach
-        )
         guard needsReattach else {
             let previousGeneration = attachedGeneration
             attachedGeneration = generation
@@ -204,32 +194,17 @@ final class PlayerContainerView: UIView, PlayerRenderAttachment {
             return false
         }
         if hostedVC != nil {
-            FullscreenTransitionDiagnostics.recordRenderContainer(
-                phase: "detach",
-                generation: attachedGeneration ?? -1,
-                hasController: true,
-                reattaches: true
-            )
             PlayerLog.log(
                 "[Surface] inline detach generation=\(attachedGeneration ?? -1) " +
                     "attached=\(facts.hostedViewIsAttached ? 1 : 0) " +
                     "containment=\(facts.hasLiveContainment ? 1 : 0)"
             )
-            if facts.hostedViewIsAttached {
-                SurfaceMoveProbe.noteTeardown(generation: attachedGeneration ?? -1)
-            }
         }
         removeCurrentChild()
         hostedVC = next
         attachedGeneration = generation
         embedIfNeeded()
         if next != nil {
-            FullscreenTransitionDiagnostics.recordRenderContainer(
-                phase: "attach",
-                generation: generation,
-                hasController: true,
-                reattaches: true
-            )
             PlayerLog.log(
                 "[Surface] inline attached generation=\(generation) " +
                     "embedded=\(next?.view.superview === self ? 1 : 0) " +
@@ -262,10 +237,6 @@ final class PlayerContainerView: UIView, PlayerRenderAttachment {
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
-        SurfaceMoveProbe.noteMountStep(
-            "container.didMoveToWindow",
-            detail: "window=\(window != nil ? 1 : 0)"
-        )
         embedIfNeeded()
         syncHostedSurfaceLayoutIfNeeded()
         PlayerViewModel.shared.renderAttachmentDidChange(self)
@@ -325,13 +296,7 @@ final class PlayerContainerView: UIView, PlayerRenderAttachment {
     }
 
     private func embedIfNeeded() {
-        guard let vc = hostedVC, window != nil else {
-            SurfaceMoveProbe.noteMountStep(
-                "embedIfNeeded.refused",
-                detail: "vc=\(hostedVC != nil ? 1 : 0) window=\(window != nil ? 1 : 0)"
-            )
-            return
-        }
+        guard let vc = hostedVC, window != nil else { return }
         if vc.view.superview === self, vc.parent != nil { return }
 
         if vc.view.superview === self {
@@ -348,11 +313,6 @@ final class PlayerContainerView: UIView, PlayerRenderAttachment {
             vc.removeFromParent()
         }
 
-        SurfaceMoveProbe.noteEmbed(
-            generation: attachedGeneration ?? -1,
-            wasHosted: vc.view.superview != nil,
-            inWindow: window != nil
-        )
         if let parentVC = parentViewController {
             parentVC.addChild(vc)
             addSubview(vc.view)

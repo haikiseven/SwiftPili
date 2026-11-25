@@ -813,13 +813,13 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
         guard DeviceCapability.supportsOrientationLock else { return false }
         let window = host?.viewIfLoaded?.window ?? AppWindowMetrics.current
         guard let scene = window?.windowScene else { return false }
-        let current = PlayerPresentationCensus.mask(for: scene.interfaceOrientation)
+        let current = Self.interfaceOrientationMask(for: scene.interfaceOrientation)
         return !current.isEmpty && !mask.contains(current)
     }
 
     private func commitPendingOrientation(reason: String) {
         guard isCurrent, let mask = pendingMask, let receipt else { return }
-        let label = pendingMaskLabel ?? PlayerPresentationCensus.maskLabel(mask)
+        let label = pendingMaskLabel ?? Self.maskLabel(mask)
         pendingMask = nil
         pendingMaskLabel = nil
         rotationFallbackTask?.cancel()
@@ -832,7 +832,6 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
         host?.setNeedsUpdateOfSupportedInterfaceOrientations()
         let window = host?.viewIfLoaded?.window ?? AppWindowMetrics.current
         window?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
-        FullscreenTransitionDiagnostics.recordSceneGeometryRequest(mask: label, windowResolved: window != nil)
         logEvent("sceneRotationRequested", detail: "mask:\(label),why:\(reason)")
         let rotatingHost = host
         if willRotate, let rotatingHost {
@@ -877,33 +876,56 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
 
     // MARK: - Reporting
     private func logEvent(_ event: String, detail: String? = nil) {
-        SurfaceMoveProbe.noteHostMilestone(event)
         guard PlayerLog.isCapturing else { return }
         let window = AppWindowMetrics.current
         var line = "[Fullscreen] host event=\(event)"
-        if let window {
-            let census = PlayerPresentationCensus.census(of: window.layer)
-            line += " winLayers=\(census.count) winDepth=\(census.depth)"
-        } else {
-            line += " winLayers=n/a winDepth=n/a"
-        }
         if let hostView = host?.viewIfLoaded {
-            let census = PlayerPresentationCensus.census(of: hostView.layer)
-            line += " hostLayers=\(census.count) hostDepth=\(census.depth)"
             line += " hostOnWindow=\(hostView.window != nil ? "y" : "n")"
         } else {
-            line += " hostLayers=n/a hostDepth=n/a hostOnWindow=n/a"
+            line += " hostOnWindow=n/a"
         }
         line += " presenterOffWindow=\(viewIfLoaded?.window == nil ? "y" : "n")"
-        line += " mask=\(PlayerPresentationCensus.maskLabel(AppOrientation.shared.mask))"
+        line += " mask=\(Self.maskLabel(AppOrientation.shared.mask))"
         let scene = (host?.viewIfLoaded?.window ?? window)?.windowScene
-        line += " orient=\(scene.map { PlayerPresentationCensus.orientationLabel($0.interfaceOrientation) } ?? "n/a")"
+        line += " orient=\(scene.map { Self.orientationLabel($0.interfaceOrientation) } ?? "n/a")"
         let player = PlayerViewModel.shared
         line += " vmFS=\(player.isFullscreen ? "y" : "n")"
         line += " play=\(player.isPlaying ? "y" : "n")"
         line += " mt=\(String(format: "%.2f", player.mediaTime))"
         line += " detail=\(detail ?? "-")"
         PlayerLog.log(line)
+    }
+
+    private static func maskLabel(_ mask: UIInterfaceOrientationMask) -> String {
+        switch mask {
+        case .landscape: "landscape"
+        case .portrait: "portrait"
+        case .all: "all"
+        case .allButUpsideDown: "allButUpsideDown"
+        default: "other"
+        }
+    }
+
+    private static func orientationLabel(_ orientation: UIInterfaceOrientation) -> String {
+        switch orientation {
+        case .portrait: "portrait"
+        case .portraitUpsideDown: "portraitUpsideDown"
+        case .landscapeLeft: "landscapeLeft"
+        case .landscapeRight: "landscapeRight"
+        case .unknown: "unknown"
+        @unknown default: "unknown"
+        }
+    }
+
+    private static func interfaceOrientationMask(for orientation: UIInterfaceOrientation) -> UIInterfaceOrientationMask {
+        switch orientation {
+        case .portrait: .portrait
+        case .portraitUpsideDown: .portraitUpsideDown
+        case .landscapeLeft: .landscapeLeft
+        case .landscapeRight: .landscapeRight
+        case .unknown: []
+        @unknown default: []
+        }
     }
 }
 

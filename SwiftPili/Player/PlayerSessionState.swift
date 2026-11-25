@@ -34,6 +34,7 @@ final class PlayerSessionState {
     var videoSuperResolutionTargetResolution =
         ExperimentalSettingsStore.shared.videoEnhancementDefaultTargetResolution
     var videoSuperResolutionSharpness = ExperimentalSettingsStore.shared.videoEnhancementDefaultSharpness
+    var videoSuperResolutionSplitCompare = false
     var videoEnhancementMaxInputResolution = ExperimentalSettingsStore.shared.videoEnhancementMaxInputResolution
     var equalizerConfiguration = PlayerEqualizerPreferences.equalizerConfiguration
 

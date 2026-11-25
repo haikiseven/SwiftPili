@@ -3,26 +3,15 @@ import SwiftUI
 struct DiagnosticsSettingsView: View {
     private let experiments = ExperimentalSettingsStore.shared
     @AppStorage("debug_logging_enabled") private var debugLogging = false
-    @AppStorage(PlaybackDebugRecorder.defaultsKey) private var playbackReport = false
 
     var body: some View {
         let access = experiments.captureAccess(.diagnostics)
         List {
             Section("Reports") {
                 NavigationLink {
-                    PlaybackDebugReportView()
-                } label: {
-                    settingsLabel("View Playback Report", symbol: "doc.text.magnifyingglass")
-                }
-                NavigationLink {
                     HangReportView()
                 } label: {
                     settingsLabel("View App Reports", symbol: "exclamationmark.triangle")
-                }
-                NavigationLink {
-                    ImageDiagnosticsLogView()
-                } label: {
-                    settingsLabel("View Image Report", symbol: "photo.on.rectangle.angled")
                 }
             }
             #if DEBUG
@@ -39,23 +28,6 @@ struct DiagnosticsSettingsView: View {
                     settingsLabel("Debug Logging", symbol: "waveform.path.ecg")
                 }
                 .disabled(!canMutate(access))
-                Toggle(isOn: Binding(
-                    get: { playbackReport },
-                    set: {
-                        guard canMutate(access) else { return }
-                        PlaybackDebugRecorder.setEnabled($0)
-                    }
-                )) {
-                    settingsLabel("Playback Report", symbol: "waveform.path.ecg.rectangle")
-                }
-                .disabled(!canMutate(access))
-            }
-            Section("Image Diagnostics") {
-                NavigationLink {
-                    ImageDiagnosticsView()
-                } label: {
-                    settingsLabel("Image Diagnostics", symbol: "photo.badge.checkmark")
-                }
             }
         }
         .listRowBackground(AppFill.card)

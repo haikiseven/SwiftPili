@@ -13,11 +13,11 @@ extension RootView {
     private func stack(for tab: AppTab) -> some View {
         let path = coordinator.stackBinding(for: tab, hidingDetail: { hidesDetailInRootShell })
         switch tab {
-        case .home: tabStack(path, tab: tab, screen: "Home") { HomeView() }
-        case .dynamics: tabStack(path, tab: tab, screen: "Dynamics") { DynamicsView() }
-        case .live: tabStack(path, tab: tab, screen: "Live.List") { LiveListView() }
-        case .mine: tabStack(path, tab: tab, screen: "Mine") { MineView() }
-        case .search: tabStack(path, tab: tab, screen: "Search") { SearchView() }
+        case .home: tabStack(path, tab: tab) { HomeView() }
+        case .dynamics: tabStack(path, tab: tab) { DynamicsView() }
+        case .live: tabStack(path, tab: tab) { LiveListView() }
+        case .mine: tabStack(path, tab: tab) { MineView() }
+        case .search: tabStack(path, tab: tab) { SearchView() }
         }
     }
 
@@ -29,7 +29,6 @@ extension RootView {
             HStack(spacing: 12) {
                 if let account = AccountManager.shared.activeAccount {
                     AvatarImage(urlString: account.avatarURL, size: 56)
-                        .imageDiagnosticsScreen("Sidebar.account")
                         .overlay {
                             Circle()
                                 .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
@@ -65,8 +64,6 @@ extension RootView {
         ) {
             coordinator.destination(for: row.root)
                 .keepsInteractivePopGesture()
-                .imageDiagnosticsScreen("Sidebar.\(row.id)")
-                .imageDiagnosticsScrollTracking()
                 .navigationDestination(for: Route.self) { route in
                     coordinator.destination(
                         for: route, position: coordinator.playerRoutePosition(for: route, sidebarRow: row)
@@ -82,15 +79,12 @@ extension RootView {
     private func tabStack(
         _ path: Binding<[Route]>,
         tab: AppTab,
-        screen: String,
         @ViewBuilder root: () -> some View
     ) -> some View {
         NavigationStack(path: path) {
             root()
                 .keepsInteractivePopGesture()
                 .toolbar(path.wrappedValue.isEmpty ? .visible : .automatic, for: .tabBar)
-                .imageDiagnosticsScreen(screen)
-                .imageDiagnosticsScrollTracking()
                 .navigationDestination(for: Route.self) { route in
                     coordinator.destination(
                         for: route, position: coordinator.playerRoutePosition(for: route, tab: tab)
@@ -118,14 +112,12 @@ extension RootView {
                         coordinator.handleTabReselect(tab)
                     }
                     coordinator.selectedTab = tab
-                    FreezeWatchdog.noteScreen("tab:\(tab)")
                 case .row(let row):
                     if coordinator.selectedSidebarRow == row {
                         coordinator.handleSidebarRowReselect(row)
                     }
                     coordinator.selectedSidebarRow = row
                     coordinator.selectedTab = row.parentTab
-                    FreezeWatchdog.noteScreen("sidebar:\(row.id)")
                 }
             }
         )

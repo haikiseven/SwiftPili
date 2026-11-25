@@ -92,7 +92,6 @@ enum StartupTrace {
         active = true
         completed = false
         PlayerLog.log("[Startup] sid=\(sessionID) T0 playback-requested (\(context))")
-        AnimationFrameDiagnostics.begin(.startup)
         return token
     }
 
@@ -116,7 +115,6 @@ enum StartupTrace {
             PlayerLog.log("[Startup] sid=\(sessionID) COMPLETE ttff-proxy=\(total)ms")
             active = false
             completed = true
-            AnimationFrameDiagnostics.settle(.startup)
             onComplete?(total)
         }
     }
@@ -128,7 +126,6 @@ enum StartupTrace {
         PlayerLog.log("[Startup] sid=\(sessionID) aborted (\(reason)) at +\(elapsedMilliseconds(from: t0, to: CACurrentMediaTime()))ms")
         active = false
         completed = false
-        AnimationFrameDiagnostics.cancel(.startup)
     }
 
     static func abortIfStreaming(_ reason: String, token: Token?) {

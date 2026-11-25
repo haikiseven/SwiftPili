@@ -25,13 +25,11 @@ enum PlayerLog {
         guard ExperimentalSettingsPolicy.isAllowed(.diagnostics) else { return }
         UserDefaults.standard.set(enabled, forKey: "debug_logging_enabled")
         isEnabled = enabled
-        PowerProfiler.shared.setStreaming(isEnabled)
     }
 
     @MainActor
-    static func applyExperimentalPolicy(activateCollectors: Bool = true) {
+    static func applyExperimentalPolicy(activateCollectors _: Bool = true) {
         isEnabled = UserDefaults.standard.bool(forKey: "debug_logging_enabled") || debugRequestedAtLaunch
-        if activateCollectors { PowerProfiler.shared.setStreaming(isEnabled) }
     }
 
     nonisolated static let debugRequestedAtLaunch: Bool = {
@@ -41,17 +39,13 @@ enum PlayerLog {
             || info.arguments.contains("player-debug=1")
     }()
 
-    static var isCapturing: Bool { isEnabled || PlaybackDebugRecorder.isEnabled }
+    static var isCapturing: Bool { isEnabled }
 
     static func log(_ message: @autoclosure () -> String) {
-        let report = PlaybackDebugRecorder.isEnabled
-        guard isEnabled || report,
+        guard isEnabled,
               let access = ExperimentalSettingsPolicy.captureAccess(.diagnostics) else { return }
         let msg = redact(message())
         guard access.isValid else { return }
-        FreezeWatchdog.noteLogLine(msg)
-        if report { PlaybackDebugRecorder.shared.record(msg) }
-        guard isEnabled else { return }
         #if DEBUG
         sink.async {
             guard access.isValid, isEnabled else { return }
@@ -63,10 +57,6 @@ enum PlayerLog {
 
     static func diagnostic(_ message: @autoclosure () -> String) {
         let msg = redact(message())
-        FreezeWatchdog.noteLogLine(msg)
-        if PlaybackDebugRecorder.isEnabled {
-            PlaybackDebugRecorder.shared.record("⚠️ \(msg)")
-        }
         #if DEBUG
         sink.async { print("⚠️ \(msg)") }
         #endif

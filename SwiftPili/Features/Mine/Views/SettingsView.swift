@@ -14,6 +14,7 @@ struct SettingsView: View {
     @AppStorage(DownloadNetworkPolicy.multiConnectionSettingsKey) private var multiConnectionDownloads = true
     @State private var backgroundAudio = PlayerPlaybackPreferences.backgroundAudioEnabled
     @State private var pictureInPicture = PlayerPlaybackPreferences.pictureInPictureEnabled
+    @State private var inAppMiniPlayer = PlayerPlaybackPreferences.inAppMiniPlayerEnabled
     @AppStorage(AppearanceMode.storageKey) private var appearanceRaw = AppearanceMode.system.rawValue
     @AppStorage(HomeLayoutMode.storageKey) private var homeLayoutRaw = HomeLayoutMode.grid.rawValue
     @State private var coverAspect = CoverAspect.current
@@ -48,6 +49,7 @@ struct SettingsView: View {
         .onAppear {
             smartCDNEnabled = SmartCDNSelector.isEnabled
             currentCDNLabel = CDNService.current.label
+            inAppMiniPlayer = PlayerPlaybackPreferences.inAppMiniPlayerEnabled
         }
         .task { await refreshCacheSize() }
     }
@@ -217,6 +219,23 @@ private extension SettingsView {
                 settingsLabel("Picture in Picture", symbol: "pip")
             }
             .disabled(!backgroundAudio)
+
+            Toggle(isOn: Binding(
+                get: { inAppMiniPlayer },
+                set: { newValue in
+                    inAppMiniPlayer = newValue
+                    PlayerPlaybackPreferences.inAppMiniPlayerEnabled = newValue
+                    if !newValue {
+                        PlayerViewModel.shared.dismissMiniPlayer()
+                    }
+                }
+            )) {
+                Label {
+                    Text("In-App Mini Player")
+                } icon: {
+                    SettingsIcon(symbol: "rectangle.inset.bottomright.filled", tint: Color.biliAccent)
+                }
+            }
 
             Picker(selection: Binding(
                 get: { playbackOrder },

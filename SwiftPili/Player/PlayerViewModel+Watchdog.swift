@@ -24,7 +24,6 @@ extension PlayerViewModel {
     }
 
     private func watchdogTick() {
-        PowerProfiler.tick(.watchdog)
         synchronizeTerminalAdmissionFromBackend()
 
         if let standDown = watchdogStandDownReason {

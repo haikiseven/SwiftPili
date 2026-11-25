@@ -10,6 +10,10 @@ extension PlayerViewModel {
         duration: TimeInterval = 0,
         ownerLease: PlayerOwnerLease? = nil
     ) async -> ServerResumeLookup {
+        if shared.matchesLiveMiniPlayerReturnVOD(aid: aid, cid: cid, ownerLease: ownerLease) {
+            PlayerLog.log("[MiniPlayer] skipping serverResumePoint for live return aid=\(aid) cid=\(cid)")
+            return .noHistory
+        }
         let handoff = shared.issuePlayerInfoHandoff(
             aid: aid,
             cid: cid,

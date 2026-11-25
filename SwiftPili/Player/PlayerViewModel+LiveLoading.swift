@@ -134,6 +134,15 @@ extension PlayerViewModel {
             )
             return nil
         }
+        if let activeQuality = consumeMiniPlayerReturnIfLiveStream(
+            roomID: roomID,
+            ownerLease: ownerLease,
+            mediaResetID: mediaResetID,
+            preservingLiveReconnect: preservingLiveReconnect,
+            preservePlayState: preservePlayState
+        ) {
+            return activeQuality
+        }
         retireStartupTraceBeforeNonVODLoad(.live)
         let sameContent = mode == .live && currentRoomID == roomID
         let teardownReason = PlayerReloadPresentationPolicy.reason(

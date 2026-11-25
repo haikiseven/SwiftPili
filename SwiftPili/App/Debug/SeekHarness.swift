@@ -262,22 +262,6 @@ enum SeekHarness {
     private static func finish(seeks: Int) {
         guard isAdmitted else { return }
         PlayerLog.log("[SeekHarness] done n=\(seeks)")
-        let text = PlaybackDebugRecorder.reportText(from: PlaybackDebugRecorder.shared.snapshot())
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
-        guard let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
-            return
-        }
-        let directory = documents.appendingPathComponent("SeekHarness", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-            let file = directory.appendingPathComponent("\(formatter.string(from: Date())).txt")
-            try text.write(to: file, atomically: true, encoding: .utf8)
-            PlayerLog.log("[SeekHarness] report written \(file.lastPathComponent) bytes=\(text.utf8.count)")
-        } catch {
-            PlayerLog.log("[SeekHarness] report write failed: \(error.localizedDescription)")
-        }
     }
 }
 #endif

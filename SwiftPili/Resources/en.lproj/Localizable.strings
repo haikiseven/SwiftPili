@@ -1371,7 +1371,9 @@
 "VideoEnhancementSharpnessLight" = "Light";
 "Strong" = "Strong";
 "Manual target resolution overrides Limit to Screen Resolution. Inputs already at or above the target skip upscaling." = "Manual target resolution overrides Limit to Screen Resolution. Inputs already at or above the target skip upscaling.";
-"Applies to SDR Demand VOD streams within the max input resolution. VideoToolbox ML uses native scale factors; MetalFX Spatial supports manual target resolution, which overrides Limit to Screen Resolution. High temperatures pause enhancement." = "Applies to SDR Demand VOD streams within the max input resolution. VideoToolbox ML uses native scale factors; MetalFX Spatial supports manual target resolution, which overrides Limit to Screen Resolution. High temperatures pause enhancement.";
+"Applies to SDR Demand VOD streams within the max input resolution. MetalFX Spatial supports manual target resolution, which overrides Limit to Screen Resolution. High temperatures pause enhancement." = "Applies to SDR Demand VOD streams within the max input resolution. MetalFX Spatial supports manual target resolution, which overrides Limit to Screen Resolution. High temperatures pause enhancement.";
+"Split-Screen Compare" = "Split-Screen Compare";
+"Left: Original · Right: Super Resolution" = "Left: Original · Right: Super Resolution";
 "Login Failed" = "Login Failed";
 "Playback Failed" = "Playback Failed";
 "Playback Unavailable" = "Playback Unavailable";
@@ -1386,3 +1388,7 @@
 "Waiting…" = "Waiting…";
 "Multi-Connection Downloads" = "Multi-Connection Downloads";
 "Downloads use parallel CDN connections on Wi-Fi for faster speeds and automatically limit concurrency on cellular." = "Downloads use parallel CDN connections on Wi-Fi for faster speeds and automatically limit concurrency on cellular.";
+"In-App Mini Player" = "In-App Mini Player";
+"Keep playing in a floating mini window when leaving the player page." = "Keep playing in a floating mini window when leaving the player page.";
+"Close mini player" = "Close mini player";
+"Double tap to return to player" = "Double tap to return to player";

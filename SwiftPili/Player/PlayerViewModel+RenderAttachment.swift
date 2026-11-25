@@ -177,7 +177,7 @@ extension PlayerViewModel {
             return false
         }
         if activeSurfaceLease == nil {
-            _ = claimSurfaceSlot(ownerLease: ownerLease, role: .inline)
+            return claimSurfaceSlot(ownerLease: ownerLease, role: role) != nil
         }
         return handoffSurfaceSlot(ownerLease: ownerLease, to: role) != nil
     }

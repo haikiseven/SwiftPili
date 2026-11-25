@@ -184,20 +184,14 @@ private final class NavigationPopGestureOwner: NSObject, UIGestureRecognizerDele
         }
         guard PlayerLog.isCapturing, !Self.measuringPop else { return }
         Self.measuringPop = true
-        AnimationFrameDiagnostics.begin(.page)
         PlayerLog.log("[PopGesture] interactive pop began")
         transition.notifyWhenInteractionChanges { context in
             PlayerLog.log(
                 "[PopGesture] finger lifted — \(context.isCancelled ? "cancelling" : "completing")"
             )
         }
-        transition.animate(alongsideTransition: nil) { context in
+        transition.animate(alongsideTransition: nil) { _ in
             Self.measuringPop = false
-            if context.isCancelled {
-                AnimationFrameDiagnostics.cancel(.page)
-            } else {
-                AnimationFrameDiagnostics.settle(.page)
-            }
         }
     }
 
