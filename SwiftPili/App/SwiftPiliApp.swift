@@ -17,7 +17,7 @@ struct SwiftPiliApp: App {
         ExperimentalSettingsStore.shared.bootstrap()
         ExperimentalDiagnosticsRuntime.applyPolicy()
         BuvidManager.ensureBuvid()
-        CacheManager.performLaunchCleanup()
+        CacheManager.apply()
         DownloadExportCoordinator.shared.configure(native: NativeMediaExportBackend())
         PlayerPlaybackPreferences.clearDebugOnlyPlaybackExperiments()
         do {
@@ -42,25 +42,29 @@ struct SwiftPiliApp: App {
 private enum AppProcessBootstrap {
     private static var hasStarted = false
 
-    static func runIfNeeded(modelContainer: ModelContainer) async {
+    static func runIfNeeded(modelContainer: ModelContainer) {
         guard !hasStarted else { return }
         hasStarted = true
-        MainThreadIdentity.adopt()
         ExperimentalDiagnosticsRuntime.activateScene()
-        ExperimentalDiagnosticsRuntime.applyPolicy()
-        ImageDiagnostics.applyLaunchState()
         KeyboardAnimation.beginObserving()
         HangDiagnosticsReporter.start()
         DownloadManager.shared.container = modelContainer
         OfflineProgressStore.shared.container = modelContainer
-        ExperimentalDiagnosticsRuntime.applyPolicy()
-        if ExperimentalSettingsPolicy.isAllowed(.decoderPrewarm) {
-            VideoHardwareCapabilities.prewarm()
+
+        let allowDecoderPrewarm = ExperimentalSettingsPolicy.isAllowed(.decoderPrewarm)
+        Task.detached(priority: .utility) {
+            try? await Task.sleep(for: .milliseconds(600))
+            CacheManager.cleanExpiredDiskCache()
+            if allowDecoderPrewarm {
+                VideoHardwareCapabilities.prewarm()
+            }
+            await MainActor.run {
+                PlayerViewModel.prewarmPlaybackEngine()
+                SmartCDNSelector.shared.launch()
+            }
+            await BuvidManager.syncServerBuvid()
+            await BuvidManager.activateBuvid()
         }
-        PlayerViewModel.prewarmPlaybackEngine()
-        SmartCDNSelector.shared.launch()
-        await BuvidManager.syncServerBuvid()
-        await BuvidManager.activateBuvid()
     }
 }
 
@@ -84,10 +88,11 @@ private struct AppSceneRootView: View {
             .environment(\.downloadManager, DownloadManager.shared)
             .modelContainer(modelContainer)
             .onChange(of: AccountManager.shared.identityRevision) { _, _ in
+                HomeFeedSnapshotStore.shared.clear()
                 coordinator.resetForAccountChange()
             }
             .task {
-                await AppProcessBootstrap.runIfNeeded(modelContainer: modelContainer)
+                AppProcessBootstrap.runIfNeeded(modelContainer: modelContainer)
             }
             .task(id: AccountManager.shared.identityRevision) {
                 await BlocklistManager.shared.loadIfNeeded()

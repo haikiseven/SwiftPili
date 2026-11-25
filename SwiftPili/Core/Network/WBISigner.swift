@@ -30,8 +30,54 @@ struct WBISignerInFlightPolicy: Sendable {
     }
 }
 
+struct WBIMixinKeyCacheEntry: Equatable, Sendable {
+    let mixinKey: String
+    let fetchedAt: Date
+}
+
+struct WBIMixinKeyStorage: @unchecked Sendable {
+    static let mixinKeyDefaultsKey = "wbi_signer.mixin_key.v1"
+    static let fetchedAtDefaultsKey = "wbi_signer.fetched_at.v1"
+
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    func load() -> WBIMixinKeyCacheEntry? {
+        guard let key = defaults.string(forKey: Self.mixinKeyDefaultsKey),
+              !key.isEmpty,
+              let timestamp = defaults.object(forKey: Self.fetchedAtDefaultsKey) as? TimeInterval,
+              timestamp.isFinite, timestamp > 0 else {
+            return nil
+        }
+        return WBIMixinKeyCacheEntry(
+            mixinKey: key,
+            fetchedAt: Date(timeIntervalSince1970: timestamp)
+        )
+    }
+
+    func save(key: String, fetchedAt: Date) {
+        defaults.set(key, forKey: Self.mixinKeyDefaultsKey)
+        defaults.set(fetchedAt.timeIntervalSince1970, forKey: Self.fetchedAtDefaultsKey)
+    }
+
+    func clear() {
+        defaults.removeObject(forKey: Self.mixinKeyDefaultsKey)
+        defaults.removeObject(forKey: Self.fetchedAtDefaultsKey)
+    }
+}
+
 actor WBISigner {
     static let shared = WBISigner()
+
+    nonisolated static let mixinKeyTTL: TimeInterval = 12 * 3600
+    private nonisolated static let beijingTimeZone = TimeZone(secondsFromGMT: 8 * 3600) ?? .gmt
+
+    private let storage: WBIMixinKeyStorage
+    private let now: @Sendable () -> Date
+    private let fetchNavData: @Sendable () async throws -> Data
 
     private var generation: UInt64 = 0
     private var mixinKey: String?
@@ -41,6 +87,52 @@ actor WBISigner {
         task: Task<String, Error>
     )?
     private var inflightPolicy = WBISignerInFlightPolicy()
+
+    init(
+        storage: WBIMixinKeyStorage = WBIMixinKeyStorage(),
+        now: @escaping @Sendable () -> Date = Date.init,
+        fetchNavData: @escaping @Sendable () async throws -> Data = {
+            try await BiliAPIClient.shared.requestRaw(
+                BiliEndpoint(path: "/x/web-interface/nav", signType: .none)
+            )
+        }
+    ) {
+        self.storage = storage
+        self.now = now
+        self.fetchNavData = fetchNavData
+        if let cached = storage.load() {
+            if Self.isValidMixinKey(fetchedAt: cached.fetchedAt, now: now()) {
+                self.mixinKey = cached.mixinKey
+                self.lastFetchDate = cached.fetchedAt
+            } else {
+                storage.clear()
+            }
+        }
+    }
+
+    init(
+        defaults: UserDefaults,
+        now: @escaping @Sendable () -> Date = Date.init,
+        fetchNavData: @escaping @Sendable () async throws -> Data = {
+            try await BiliAPIClient.shared.requestRaw(
+                BiliEndpoint(path: "/x/web-interface/nav", signType: .none)
+            )
+        }
+    ) {
+        self.init(
+            storage: WBIMixinKeyStorage(defaults: defaults),
+            now: now,
+            fetchNavData: fetchNavData
+        )
+    }
+
+    nonisolated static func isValidMixinKey(fetchedAt: Date, now: Date = Date()) -> Bool {
+        let elapsed = now.timeIntervalSince(fetchedAt)
+        guard elapsed >= 0, elapsed < mixinKeyTTL else { return false }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = beijingTimeZone
+        return calendar.isDate(fetchedAt, inSameDayAs: now)
+    }
 
     private static let mixinKeyEncTab: [Int] = [
         46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
@@ -53,6 +145,7 @@ actor WBISigner {
         generation &+= 1
         mixinKey = nil
         lastFetchDate = nil
+        storage.clear()
         if let inflight = inflightFetch {
             inflightPolicy.finish(inflight.token)
             inflightFetch = nil
@@ -63,7 +156,7 @@ actor WBISigner {
     func sign(params: [String: String]) async throws -> [String: String] {
         let key = try await getMixinKey()
         var mutableParams = params
-        let wts = String(Int(Date().timeIntervalSince1970))
+        let wts = String(Int(now().timeIntervalSince1970))
         mutableParams["wts"] = wts
 
         let filteredCharacters = CharacterSet(charactersIn: "!'()*")
@@ -81,9 +174,10 @@ actor WBISigner {
     }
 
     private func getMixinKey() async throws -> String {
+        let currentDate = now()
         if let key = mixinKey,
            let date = lastFetchDate,
-           Date().timeIntervalSince(date) < 3600 {
+           Self.isValidMixinKey(fetchedAt: date, now: currentDate) {
             return key
         }
 
@@ -105,11 +199,10 @@ actor WBISigner {
         }
 
         let fetchGeneration = generation
+        let fetchNavData = self.fetchNavData
         PlayerLog.log("[WBI] mixin key cold — fetching nav (blocking this signed request)")
         let fetch = Task.detached(priority: nil) { () throws -> String in
-            let data = try await BiliAPIClient.shared.requestRaw(
-                BiliEndpoint(path: "/x/web-interface/nav", signType: .none)
-            )
+            let data = try await fetchNavData()
             return try Self.decodeMixinKey(from: data)
         }
         inflightFetch = (token: producerToken, task: fetch)
@@ -124,8 +217,10 @@ actor WBISigner {
             throw error
         }
         if generation == fetchGeneration {
+            let fetchedAt = now()
             mixinKey = key
-            lastFetchDate = Date()
+            lastFetchDate = fetchedAt
+            storage.save(key: key, fetchedAt: fetchedAt)
         }
         inflightPolicy.finish(producerToken)
         if inflightFetch?.token == producerToken {

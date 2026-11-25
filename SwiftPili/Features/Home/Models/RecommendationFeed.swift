@@ -51,6 +51,27 @@ struct RecommendationFeed: Sendable {
     private var admittedIDs: Set<Int> = []
     private var admittedBVIDs: Set<String> = []
 
+    static func hydrated(from items: [RecommendResult.RecommendItem]) -> RecommendationFeed {
+        var feed = RecommendationFeed()
+        var seenIDs: Set<Int> = []
+        var seenBVIDs: Set<String> = []
+        var accepted: [RecommendResult.RecommendItem] = []
+        accepted.reserveCapacity(items.count)
+        for item in items {
+            guard let bvid = playableBVID(item),
+                  seenIDs.insert(item.id).inserted,
+                  seenBVIDs.insert(bvid).inserted else { continue }
+            accepted.append(item)
+        }
+        guard !accepted.isEmpty else { return feed }
+        let generation = feed.makeGeneration(accepted)
+        feed.generations = [generation]
+        feed.items = accepted
+        feed.admittedIDs = seenIDs
+        feed.admittedBVIDs = seenBVIDs
+        return feed
+    }
+
     @concurrent
     func newItems(
         from incoming: [RecommendResult.RecommendItem],

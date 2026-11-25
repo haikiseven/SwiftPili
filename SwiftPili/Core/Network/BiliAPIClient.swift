@@ -1,15 +1,14 @@
 import Foundation
 
-actor BiliAPIClient {
+final class BiliAPIClient: Sendable {
     static let shared = BiliAPIClient()
 
-    nonisolated static let defaultUserAgent =
+    static let defaultUserAgent =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
         + "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    nonisolated static let defaultReferer = "https://www.bilibili.com"
+    static let defaultReferer = "https://www.bilibili.com"
 
     private let session: URLSession
-    private let decoder: JSONDecoder
 
     private init() {
         let config = URLSessionConfiguration.default
@@ -25,17 +24,15 @@ actor BiliAPIClient {
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.timeoutIntervalForRequest = BiliAPIRetryPolicy.perAttemptInactivityTimeout
         self.session = URLSession(configuration: config)
-
-        self.decoder = JSONDecoder()
     }
 
-    fileprivate struct RequestResult {
+    fileprivate struct RequestResult: Sendable {
         let data: Data
         let response: HTTPURLResponse
         let didRefreshWBI: Bool
     }
 
-    fileprivate enum TransientStatusAction {
+    fileprivate enum TransientStatusAction: Sendable {
         case proceed
         case retry
         case retryWithWBIRefresh
@@ -71,6 +68,7 @@ actor BiliAPIClient {
                 throw httpError(from: httpResponse)
             }
 
+            let decoder = JSONDecoder()
             let wrapper: BiliResponse<T>
             do {
                 wrapper = try decoder.decode(BiliResponse<T>.self, from: result.data)
@@ -96,7 +94,12 @@ actor BiliAPIClient {
                 throw .apiError(code: wrapper.code, message: wrapper.message)
             }
 
-            return try unwrapResponseData(wrapper, rawData: result.data, endpoint: endpoint)
+            return try unwrapResponseData(
+                wrapper,
+                rawData: result.data,
+                endpoint: endpoint,
+                decoder: decoder
+            )
         }
     }
 
@@ -279,7 +282,8 @@ private extension BiliAPIClient {
     func unwrapResponseData<T: Decodable>(
         _ wrapper: BiliResponse<T>,
         rawData: Data,
-        endpoint: BiliEndpoint
+        endpoint: BiliEndpoint,
+        decoder: JSONDecoder
     ) throws(BiliError) -> T {
         guard let result = wrapper.data else {
             if let empty = try? decoder.decode(T.self, from: Data("{}".utf8)) {

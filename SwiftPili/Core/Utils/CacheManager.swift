@@ -30,9 +30,13 @@ enum CacheManager {
         ImageDownloader.default.downloadTimeout = 8
     }
 
+    static func cleanExpiredDiskCache() {
+        ImageCache.default.cleanExpiredDiskCache()
+    }
+
     static func performLaunchCleanup() {
         apply()
-        ImageCache.default.cleanExpiredDiskCache()
+        cleanExpiredDiskCache()
     }
 
     static func currentDiskUsage() async -> UInt {
@@ -51,6 +55,7 @@ enum CacheManager {
             }
         }
         URLCache.shared.removeAllCachedResponses()
+        HomeFeedSnapshotStore.shared.clear()
         await SmartCDNSelector.shared.invalidateCache(reason: "manual Clear Cache")
     }
 
@@ -63,14 +68,8 @@ struct FastCoverCacheSerializer: CacheSerializer {
     static let shared = FastCoverCacheSerializer()
 
     func data(with image: KFCrossPlatformImage, original: Data?) -> Data? {
-        if let original {
-            let format = original.kf.imageFormat
-            if format == .GIF {
-                return DefaultCacheSerializer.default.data(with: image, original: original)
-            }
-            if format == .JPEG {
-                return image.jpegData(compressionQuality: 0.85)
-            }
+        if let original, !original.isEmpty {
+            return original
         }
         if Self.hasAlpha(image) {
             return image.pngData()

@@ -173,24 +173,14 @@ private struct HomeSectionTabContainer: View, Equatable {
         switch section {
         case .recommend:
             RecommendedListView(viewModel: viewModel, coordinator: coordinator, isSelected: isSelected)
-                .imageDiagnosticsScreen("Home.Recommended")
-                .imageDiagnosticsScrollTracking()
         case .popular:
             PopularListView(viewModel: viewModel, coordinator: coordinator, isSelected: isSelected)
-                .imageDiagnosticsScreen("Home.Popular")
-                .imageDiagnosticsScrollTracking()
         case .ranking:
             RankingListView(viewModel: viewModel, coordinator: coordinator, isSelected: isSelected)
-                .imageDiagnosticsScreen("Home.Ranking")
-                .imageDiagnosticsScrollTracking()
         case .anime:
             PGCListView(viewModel: viewModel, coordinator: coordinator, indexType: 1, isSelected: isSelected)
-                .imageDiagnosticsScreen("Home.Anime")
-                .imageDiagnosticsScrollTracking()
         case .movies:
             PGCListView(viewModel: viewModel, coordinator: coordinator, indexType: 2, isSelected: isSelected)
-                .imageDiagnosticsScreen("Home.Movies")
-                .imageDiagnosticsScrollTracking()
         }
     }
 }
@@ -341,9 +331,7 @@ private struct RecommendedListView: View {
         )
         .task {
             FeedPerformanceSignposts.screenAdmission(.home)
-            if viewModel.recommendedItems.isEmpty {
-                await viewModel.loadRecommended()
-            }
+            await viewModel.loadInitialRecommendedIfNeeded()
         }
     }
 }

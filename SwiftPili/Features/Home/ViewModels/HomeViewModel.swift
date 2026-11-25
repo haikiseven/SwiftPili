@@ -18,18 +18,40 @@ final class HomeViewModel {
     @ObservationIgnored
     private let fetchRecommendations: @MainActor (Int, Int) async throws -> RecommendResult
     @ObservationIgnored
+    private let snapshotStore: HomeFeedSnapshotStore
+    @ObservationIgnored
+    private let snapshotAccountScope: () -> String
+    @ObservationIgnored
+    private(set) var isShowingCachedSnapshot = false
+    @ObservationIgnored
     private var recommendationRefresh: FeedLoadToken?
     @ObservationIgnored
     private var pendingRecommendationLoad = false
     private static let refreshCardLimit = 13
     private static let refreshRequestLimit = 3
 
+    var needsInitialRecommendedLoad: Bool {
+        recommendedItems.isEmpty || isShowingCachedSnapshot
+    }
+
     init(
         fetchRecommendations: @escaping @MainActor (Int, Int) async throws -> RecommendResult = {
             try await HomeAPI.getRecommended(freshIdx: $0, ps: $1)
-        }
+        },
+        snapshotStore: HomeFeedSnapshotStore = .shared,
+        snapshotAccountScope: @escaping () -> String = { HomeFeedSnapshotStore.currentAccountScope }
     ) {
         self.fetchRecommendations = fetchRecommendations
+        self.snapshotStore = snapshotStore
+        self.snapshotAccountScope = snapshotAccountScope
+        let cached = snapshotStore.load(forAccountScope: snapshotAccountScope())
+        if !cached.isEmpty {
+            let hydrated = RecommendationFeed.hydrated(from: cached)
+            if !hydrated.items.isEmpty {
+                self.recommendationFeed = hydrated
+                self.isShowingCachedSnapshot = true
+            }
+        }
     }
     var popularItems: [VideoCard] = [] {
         didSet { popularRevision &+= 1 }
@@ -111,6 +133,11 @@ final class HomeViewModel {
         }
     }
 
+    func loadInitialRecommendedIfNeeded() async {
+        guard needsInitialRecommendedLoad else { return }
+        await loadRecommended()
+    }
+
     func loadRecommended(retrying failure: HomeFeedFailure? = nil) async {
         guard !Task.isCancelled else { return }
         guard recommendationRefresh == nil else {
@@ -150,6 +177,7 @@ final class HomeViewModel {
             )
         }
 
+        let replacingSnapshot = isShowingCachedSnapshot && requestedFreshIdx == 1
         do {
             try Task.checkCancellation()
             let result = try await fetchRecommendations(requestedFreshIdx, 30)
@@ -158,14 +186,27 @@ final class HomeViewModel {
                 outcome = .superseded
                 return
             }
-            let prepared = try await recommendationFeed.appendingPage(result.item ?? [])
+            let baseFeed = replacingSnapshot ? RecommendationFeed() : recommendationFeed
+            let prepared = try await baseFeed.appendingPage(result.item ?? [])
             try Task.checkCancellation()
             guard isCurrent(key, token: token) else {
                 outcome = .superseded
                 return
             }
-            recommendationFeed = prepared
-            freshIdx = max(freshIdx, requestedFreshIdx + 1)
+            if replacingSnapshot {
+                isShowingCachedSnapshot = false
+                if !prepared.items.isEmpty {
+                    recommendationFeed = prepared
+                    freshIdx = max(freshIdx, requestedFreshIdx + 1)
+                    persistRecommendationSnapshot()
+                }
+            } else {
+                recommendationFeed = prepared
+                freshIdx = max(freshIdx, requestedFreshIdx + 1)
+                if requestedFreshIdx == 1 {
+                    persistRecommendationSnapshot()
+                }
+            }
             if wasEmpty, !recommendedItems.isEmpty {
                 FeedPerformanceSignposts.firstContent(.home, generation: token.generation, count: recommendedItems.count)
             }
@@ -590,7 +631,9 @@ final class HomeViewModel {
                 return .unchanged
             }
             recommendationFeed = prepared.feed
+            isShowingCachedSnapshot = false
             freshIdx = max(freshIdx, batch.lastRequestIndex + 1)
+            persistRecommendationSnapshot()
             outcome = .success
             if wasEmpty {
                 FeedPerformanceSignposts.firstContent(
@@ -778,6 +821,11 @@ final class HomeViewModel {
         } else {
             updateFeedback(for: key) { _ in }
         }
+    }
+
+    private func persistRecommendationSnapshot() {
+        guard !recommendedItems.isEmpty else { return }
+        snapshotStore.save(recommendedItems, forAccountScope: snapshotAccountScope())
     }
 
     private func recordDuplicate(for key: HomeFeedKey, kind: FeedLoadKind) {
