@@ -5,6 +5,7 @@ import Observation
 import os
 import Testing
 import UIKit
+import Vision
 @testable import SwiftPili
 
 @Suite("PlayerArchitecture")
@@ -875,16 +876,42 @@ struct PlayerArchitectureTests {
         )
         #expect(outcome == .output(VideoSuperResolutionDimensions(width: 2560, height: 1440)))
 
-        // Memory pressure, HDR, and live stream hard bypass reasons
+        // 10-bit SDR (`x420` without HDR transfer) is admitted for both SR and FI;
+        // PQ/HLG HDR is admitted when Frame Interpolation is enabled, and bypassed for SR-only.
+        #expect(VideoEnhancementGuardrails.isSDR(p010))
+        #expect(!VideoEnhancementGuardrails.isSDR(pq8Bit))
+        #expect(!VideoEnhancementGuardrails.isSDR(hlg8Bit))
+        #expect(VideoEnhancementGuardrails.commonBypassReason(
+            configuration: config, pixelBuffer: p010, thermalState: .nominal, memoryPressure: false
+        ) == nil)
+        #expect(VideoEnhancementGuardrails.superResolutionBypassReason(p010) == nil)
+        #expect(VideoEnhancementGuardrails.superResolutionBypassReason(pq8Bit) == "HDR / 10-bit")
+
+        // Memory pressure, HDR (SR-only vs FI-enabled), and live stream hard bypass reasons
         #expect(VideoEnhancementGuardrails.commonBypassReason(
             configuration: config, pixelBuffer: nv12Video, thermalState: .nominal, memoryPressure: true
         ) == "Memory pressure")
         #expect(VideoEnhancementGuardrails.commonBypassReason(
             configuration: config, pixelBuffer: pq8Bit, thermalState: .nominal, memoryPressure: false
-        ) == "HDR / 10-bit")
+        ) == nil)
         #expect(VideoEnhancementGuardrails.commonBypassReason(
             configuration: config, pixelBuffer: hlg8Bit, thermalState: .nominal, memoryPressure: false
+        ) == nil)
+
+        var srOnlyConfig = config
+        srOnlyConfig.frameInterpolationEnabled = false
+        #expect(VideoEnhancementGuardrails.commonBypassReason(
+            configuration: srOnlyConfig, pixelBuffer: pq8Bit, thermalState: .nominal, memoryPressure: false
         ) == "HDR / 10-bit")
+        #expect(VideoEnhancementGuardrails.commonBypassReason(
+            configuration: srOnlyConfig, pixelBuffer: hlg8Bit, thermalState: .nominal, memoryPressure: false
+        ) == "HDR / 10-bit")
+
+        // Ultrawide 21:9 1080p (2560x1080) and macroblock-padded 1920x1088 pass .p1080, while 1440p (2560x1440) requires .p1440.
+        #expect(VideoEnhancementGuardrails.isWithin(width: 2560, height: 1080, limit: .p1080))
+        #expect(VideoEnhancementGuardrails.isWithin(width: 1920, height: 1088, limit: .p1080))
+        #expect(!VideoEnhancementGuardrails.isWithin(width: 2560, height: 1440, limit: .p1080))
+        #expect(VideoEnhancementGuardrails.isWithin(width: 2560, height: 1440, limit: .p1440))
 
         var liveConfig = config
         liveConfig.isLiveStream = true
@@ -910,8 +937,14 @@ struct PlayerArchitectureTests {
             .nv12StageCopyY,
             .nv12StageCopyCbCr,
             .visionInterpolationPrepare,
+            .visionInterpolationCoarseFlow,
             .visionInterpolationValidate,
+            .visionInterpolationRegularizeFlow,
+            .visionInterpolationClearSplat,
+            .visionInterpolationSplatPhase,
+            .visionInterpolationResolvePhase,
             .visionInterpolationSynthesize,
+            .visionInterpolationSynthesizeNV12,
         ]
         for kernel in expectedKernels {
             let pipeline = try context.pipeline(for: kernel)
@@ -920,6 +953,504 @@ struct PlayerArchitectureTests {
             let cached = try context.pipeline(for: kernel)
             #expect(cached.maxTotalThreadsPerThreadgroup == pipeline.maxTotalThreadsPerThreadgroup)
         }
+    }
+
+    @Test("Optical flow backend supports 24/30/60fps sources and adaptive quality hysteresis scales safely")
+    func opticalFlowBackend60fpsSupportAndAdaptiveHysteresis() {
+        func makeFrame(pts: TimeInterval, duration: TimeInterval, width: Int = 1920, height: Int = 1080) -> MediaVideoFrame? {
+            let attrs: [String: Any] = [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+            ]
+            var buffer: CVPixelBuffer?
+            guard CVPixelBufferCreate(
+                kCFAllocatorDefault, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                attrs as CFDictionary, &buffer
+            ) == kCVReturnSuccess, let buffer else { return nil }
+            return MediaVideoFrame(pts: pts, duration: duration, pixelBuffer: buffer)
+        }
+
+        // 24fps, 30fps, and 60fps sources are accepted; >65fps sources are bypassed.
+        guard let frame24 = makeFrame(pts: 0, duration: 1.0 / 24.0),
+              let frame30 = makeFrame(pts: 0, duration: 1.0 / 30.0),
+              let frame60 = makeFrame(pts: 0, duration: 1.0 / 60.0),
+              let frame90 = makeFrame(pts: 0, duration: 1.0 / 90.0) else {
+            Issue.record("Failed to allocate test CVPixelBuffers")
+            return
+        }
+        #expect(VisionFrameInterpolationBackend.inputBypassReason(frame24) == nil)
+        #expect(VisionFrameInterpolationBackend.inputBypassReason(frame30) == nil)
+        #expect(VisionFrameInterpolationBackend.inputBypassReason(frame60) == nil)
+        #expect(VisionFrameInterpolationBackend.inputBypassReason(frame90) != nil)
+
+        #expect(VisionFrameInterpolationBackend.acceptsPairDelta(1.0 / 24.0))
+        #expect(VisionFrameInterpolationBackend.acceptsPairDelta(1.0 / 30.0))
+        #expect(VisionFrameInterpolationBackend.acceptsPairDelta(1.0 / 60.0))
+        #expect(!VisionFrameInterpolationBackend.acceptsPairDelta(1.0 / 90.0))
+
+        // Zero-duration packets succeed when PTS cadenceInterval is known.
+        if let zeroDuration30 = makeFrame(pts: 0.0333, duration: 0) {
+            #expect(VisionFrameInterpolationBackend.inputBypassReason(zeroDuration30, cadenceInterval: 1.0 / 30.0) == nil)
+        }
+
+        // Adaptive controller caps at .balanced for 60fps, 3-phase (30->120fps), active SR, or .fair thermal.
+        var controller = OpticalFlowAdaptiveController()
+        #expect(controller.activeProfile(sourceFPS: 30, phaseCount: 1, thermalState: .nominal) == .high)
+        #expect(controller.activeProfile(sourceFPS: 60, phaseCount: 1, thermalState: .nominal) == .balanced)
+        #expect(controller.activeProfile(sourceFPS: 30, phaseCount: 3, thermalState: .nominal) == .balanced)
+        #expect(controller.activeProfile(sourceFPS: 30, phaseCount: 1, superResolutionActive: true, thermalState: .nominal) == .balanced)
+        #expect(controller.activeProfile(sourceFPS: 30, phaseCount: 1, thermalState: .fair) == .balanced)
+
+        // Single slow frame does not step down; 2 consecutive slow pairs step .high -> .balanced.
+        controller.recordCompletion(
+            elapsedMs: 19.0, pairIntervalSeconds: 1.0 / 30.0, sourceFPS: 30, phaseCount: 1, thermalState: .nominal
+        )
+        #expect(controller.activeProfile(sourceFPS: 30, phaseCount: 1, thermalState: .nominal) == .high)
+        controller.recordCompletion(
+            elapsedMs: 19.0, pairIntervalSeconds: 1.0 / 30.0, sourceFPS: 30, phaseCount: 1, thermalState: .nominal
+        )
+        #expect(controller.activeProfile(sourceFPS: 30, phaseCount: 1, thermalState: .nominal) == .balanced)
+
+        // Immediate deadline miss steps .balanced -> .fast.
+        controller.recordDeadlineMiss(sourceFPS: 30, phaseCount: 1, thermalState: .nominal)
+        #expect(controller.activeProfile(sourceFPS: 30, phaseCount: 1, thermalState: .nominal) == .fast)
+
+        // Recovery requires 30 consecutive fast pairs per tier to prevent oscillation.
+        for _ in 0..<(OpticalFlowAdaptiveController.fastPairsToStepUp - 1) {
+            controller.recordCompletion(
+                elapsedMs: 2.0, pairIntervalSeconds: 1.0 / 30.0, sourceFPS: 30, phaseCount: 1, thermalState: .nominal
+            )
+        }
+        #expect(controller.activeProfile(sourceFPS: 30, phaseCount: 1, thermalState: .nominal) == .fast)
+        controller.recordCompletion(
+            elapsedMs: 2.0, pairIntervalSeconds: 1.0 / 30.0, sourceFPS: 30, phaseCount: 1, thermalState: .nominal
+        )
+        #expect(controller.activeProfile(sourceFPS: 30, phaseCount: 1, thermalState: .nominal) == .balanced)
+
+        // Vision Revision 1 pyramidal optical flow + Force Frame Interpolation (`540p .ultra` lock & thermal override).
+        #expect(VisionFrameInterpolationBackend.visionOpticalFlowRevision == VNGenerateOpticalFlowRequestRevision1)
+        #expect(OpticalFlowQualityProfile.ultra.analysisLongEdge == 540)
+        #expect(
+            controller.activeProfile(
+                sourceFPS: 60,
+                phaseCount: 3,
+                superResolutionActive: true,
+                forceInterpolation: true,
+                thermalState: .serious
+            ) == .ultra
+        )
+        controller.recordCompletion(
+            elapsedMs: 42.0,
+            pairIntervalSeconds: 1.0 / 30.0,
+            sourceFPS: 30,
+            phaseCount: 1,
+            forceInterpolation: true,
+            thermalState: .serious
+        )
+        controller.recordDeadlineMiss(sourceFPS: 30, phaseCount: 1, forceInterpolation: true, thermalState: .serious)
+        #expect(controller.activeProfile(sourceFPS: 30, phaseCount: 1, forceInterpolation: true, thermalState: .serious) == .ultra)
+
+        // Force Frame Interpolation guardrails: `.serious` thermal & memoryPressure bypassed, `.critical` still blocked.
+        let normalConfig = VideoEnhancementConfiguration(frameInterpolationEnabled: true, forceFrameInterpolation: false)
+        let forceConfig = VideoEnhancementConfiguration(frameInterpolationEnabled: true, forceFrameInterpolation: true)
+        #expect(normalConfig.frameInterpolationBackend == .auto)
+        #expect(normalConfig.changeKind(from: forceConfig) == .shaderUniformOnly)
+        #expect(
+            VideoEnhancementGuardrails.commonBypassReason(
+                configuration: normalConfig, pixelBuffer: frame30.pixelBuffer, thermalState: .serious, memoryPressure: false
+            ) == "Thermal throttling"
+        )
+        #expect(
+            VideoEnhancementGuardrails.commonBypassReason(
+                configuration: forceConfig, pixelBuffer: frame30.pixelBuffer, thermalState: .serious, memoryPressure: true
+            ) == nil
+        )
+        #expect(
+            VideoEnhancementGuardrails.commonBypassReason(
+                configuration: forceConfig, pixelBuffer: frame30.pixelBuffer, thermalState: .critical, memoryPressure: false
+            ) == "Thermal throttling"
+        )
+
+        // Force Frame Interpolation pool sizing: expands lookahead lead to 0.45s and resists memoryPressure halving.
+        let forceSizing = VideoEnhancementPoolLimits.computeSizing(
+            sourceFPS: 30, outputFPS: 60, maxPhasesPerPair: 1, underMemoryPressure: true, forceFrameInterpolation: true
+        )
+        #expect(forceSizing.lead == VideoEnhancementPoolLimits.forceLead)
+        #expect(forceSizing.lead == 0.45)
+    }
+
+    @Test("Pure-Metal pyramidal optical flow warps moving NV12 frames accurately and protects hard scene cuts")
+    nonisolated func pureMetalOpticalFlowTracksMotionAndProtectsSceneCuts() async throws {
+        guard MTLCreateSystemDefaultDevice() != nil else { return }
+
+        let width = 320
+        let height = 180
+
+        func makeNV12Buffer(fillY: (Int, Int) -> UInt8) -> CVPixelBuffer? {
+            let attrs: [String: Any] = [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+            ]
+            var buffer: CVPixelBuffer?
+            guard CVPixelBufferCreate(
+                kCFAllocatorDefault, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                attrs as CFDictionary, &buffer
+            ) == kCVReturnSuccess, let buffer else { return nil }
+            CVBufferSetAttachment(
+                buffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate
+            )
+            guard CVPixelBufferLockBaseAddress(buffer, []) == kCVReturnSuccess else { return nil }
+            defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+            if let yBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 0)?.assumingMemoryBound(to: UInt8.self),
+               let uvBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 1)?.assumingMemoryBound(to: UInt8.self) {
+                let yStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
+                let uvStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1)
+                for row in 0..<height {
+                    for col in 0..<width {
+                        yBase[row * yStride + col] = fillY(col, row)
+                    }
+                }
+                for row in 0..<(height / 2) {
+                    for col in 0..<(width / 2) {
+                        uvBase[row * uvStride + col * 2] = 128
+                        uvBase[row * uvStride + col * 2 + 1] = 128
+                    }
+                }
+            }
+            return buffer
+        }
+
+        // Moving bright textured block (60x60) shifting +16 px right between Frame 0 and Frame 1.
+        func movingBlockY(x0: Int) -> (Int, Int) -> UInt8 {
+            return { col, row in
+                let inX = col >= x0 && col < x0 + 60
+                let inY = row >= 60 && row < 120
+                if inX && inY {
+                    let localX = col - x0
+                    let localY = row - 60
+                    let stripe = ((localX / 6 + localY / 6) % 2 == 0) ? 220 : 185
+                    return UInt8(stripe)
+                }
+                return 24
+            }
+        }
+
+        guard let prevBuffer = makeNV12Buffer(fillY: movingBlockY(x0: 100)),
+              let currBuffer = makeNV12Buffer(fillY: movingBlockY(x0: 116)),
+              let cutBuffer = makeNV12Buffer(fillY: { _, _ in 225 }),
+              let format = VisionInterpolationFormat(prevBuffer) else {
+            Issue.record("Failed to allocate NV12 optical flow test buffers")
+            return
+        }
+
+        let engine = try VisionInterpolationMetal(format: format)
+
+        // 0) Guard Vision request/handler forward-flow argument order so `previous` is ALWAYS the
+        //    handler source (t=0 anchor grid) and `current` is ALWAYS `targetedCVPixelBuffer` (t=1).
+        let flowInputs = VisionFrameInterpolationBackend.forwardFlowInputs(
+            previousAnalysis: prevBuffer,
+            currentAnalysis: currBuffer
+        )
+        #expect(flowInputs.handlerSource === prevBuffer)
+        #expect(flowInputs.requestTarget === currBuffer)
+
+        // 1) Motion tracking at phase = 0.5: block moves from [100..160) to [116..176),
+        //    so midpoint should center cleanly around [108..168) without ghosting at x=103 or x=172.
+        let warpedOutputs = try await engine.interpolate(
+            previous: prevBuffer,
+            current: currBuffer,
+            phases: [0.5],
+            profile: .high
+        )
+        #expect(warpedOutputs.count == 1)
+        if let mid = warpedOutputs.first {
+            #expect(CVPixelBufferLockBaseAddress(mid, .readOnly) == kCVReturnSuccess)
+            defer { CVPixelBufferUnlockBaseAddress(mid, .readOnly) }
+            if let yBase = CVPixelBufferGetBaseAddressOfPlane(mid, 0)?.assumingMemoryBound(to: UInt8.self) {
+                let yStride = CVPixelBufferGetBytesPerRowOfPlane(mid, 0)
+                let midRow = 90
+                // Inside midpoint block [108..168): bright (>150).
+                let centerLuma = Int(yBase[midRow * yStride + 138])
+                // Left of midpoint block (x=102, inside Frame 0 only): should be dark background (<70), not ghosted.
+                let leftTrailingLuma = Int(yBase[midRow * yStride + 102])
+                // Right of midpoint block (x=173, inside Frame 1 only): should be dark background (<70), not ghosted.
+                let rightLeadingLuma = Int(yBase[midRow * yStride + 173])
+                #expect(centerLuma > 150, "Expected bright warped midpoint center, got Y=\(centerLuma)")
+                #expect(leftTrailingLuma < 70, "Expected unghosted trailing edge at x=102, got Y=\(leftTrailingLuma)")
+                #expect(rightLeadingLuma < 70, "Expected unghosted leading edge at x=173, got Y=\(rightLeadingLuma)")
+            }
+        }
+
+        // 2) Hard scene cut (dark scene with block -> uniform bright Y=225): GPU scene-cut protection
+        //    must snap cleanly to nearest frame (curr at phase=0.5 -> Y≈225) instead of 50/50 blending (~125).
+        let cutOutputs = try await engine.interpolate(
+            previous: currBuffer,
+            current: cutBuffer,
+            phases: [0.5],
+            profile: .balanced
+        )
+        #expect(cutOutputs.count == 1)
+        if let cutMid = cutOutputs.first {
+            #expect(CVPixelBufferLockBaseAddress(cutMid, .readOnly) == kCVReturnSuccess)
+            defer { CVPixelBufferUnlockBaseAddress(cutMid, .readOnly) }
+            if let yBase = CVPixelBufferGetBaseAddressOfPlane(cutMid, 0)?.assumingMemoryBound(to: UInt8.self) {
+                let yStride = CVPixelBufferGetBytesPerRowOfPlane(cutMid, 0)
+                let sampleLuma = Int(yBase[30 * yStride + 40])
+                #expect(sampleLuma >= 210, "Hard scene cut should snap cleanly to Y≈225 without blending, got Y=\(sampleLuma)")
+            }
+        }
+
+        // 3) Chaos / exploding flow field guard: feed huge contradictory flow vectors and verify
+        //    synthesis never tears/explodes and snaps cleanly to nearest original frame.
+        var chaoticFlow: CVPixelBuffer?
+        #expect(CVPixelBufferCreate(
+            kCFAllocatorDefault, width, height, kCVPixelFormatType_TwoComponent32Float, nil, &chaoticFlow
+        ) == kCVReturnSuccess)
+        if let chaoticFlow {
+            #expect(CVPixelBufferLockBaseAddress(chaoticFlow, []) == kCVReturnSuccess)
+            if let fBase = CVPixelBufferGetBaseAddress(chaoticFlow)?.assumingMemoryBound(to: Float.self) {
+                let fStride = CVPixelBufferGetBytesPerRow(chaoticFlow) / 4
+                for r in 0..<height {
+                    for c in 0..<width {
+                        fBase[r * fStride + c * 2] = ((r + c).isMultiple(of: 2)) ? 65.0 : -65.0
+                        fBase[r * fStride + c * 2 + 1] = (r.isMultiple(of: 2)) ? 45.0 : -45.0
+                    }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(chaoticFlow, [])
+
+            let safeOutputs = try await engine.interpolate(
+                previous: prevBuffer,
+                current: currBuffer,
+                phases: [0.25],
+                profile: .high,
+                forwardFlowBuffer: chaoticFlow
+            )
+            #expect(safeOutputs.count == 1)
+            if let safeMid = safeOutputs.first {
+                #expect(CVPixelBufferLockBaseAddress(safeMid, .readOnly) == kCVReturnSuccess)
+                defer { CVPixelBufferUnlockBaseAddress(safeMid, .readOnly) }
+                if let yBase = CVPixelBufferGetBaseAddressOfPlane(safeMid, 0)?.assumingMemoryBound(to: UInt8.self) {
+                    let yStride = CVPixelBufferGetBytesPerRowOfPlane(safeMid, 0)
+                    // At phase=0.25 (< 0.5), chaotic flow snaps cleanly to `prevBuffer`:
+                    // x=104 (inside prev block [100..160)) stays bright (>170), x=170 (outside prev block) stays dark (24).
+                    #expect(Int(yBase[90 * yStride + 104]) > 170)
+                    #expect(Int(yBase[90 * yStride + 170]) == 24)
+                }
+            }
+        }
+
+        // 4) 10-bit PQ HDR (`x420` + BT.2020 + SMPTE_ST_2084_PQ + MasteringDisplayColorVolume):
+        //    native 10-bit synthesis preserves P010 MSB alignment (low 6 bits == 0) and HDR metadata.
+        func makeP010HDRBuffer(boxX: Int) -> CVPixelBuffer? {
+            let attrs: [String: Any] = [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+            ]
+            var buffer: CVPixelBuffer?
+            guard CVPixelBufferCreate(
+                kCFAllocatorDefault, width, height, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+                attrs as CFDictionary, &buffer
+            ) == kCVReturnSuccess, let buffer else { return nil }
+            CVBufferSetAttachment(buffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, .shouldPropagate)
+            CVBufferSetAttachment(buffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, .shouldPropagate)
+            CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, .shouldPropagate)
+            let mdcv = Data(repeating: 0x42, count: 24) as CFData
+            CVBufferSetAttachment(buffer, kCVImageBufferMasteringDisplayColorVolumeKey, mdcv, .shouldPropagate)
+
+            guard CVPixelBufferLockBaseAddress(buffer, []) == kCVReturnSuccess else { return nil }
+            defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+            if let yBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 0)?.assumingMemoryBound(to: UInt16.self),
+               let uvBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 1)?.assumingMemoryBound(to: UInt16.self) {
+                let yStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0) / 2
+                let uvStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1) / 2
+                for row in 0..<height {
+                    for col in 0..<width {
+                        let inBox = col >= boxX && col < boxX + 60 && row >= 60 && row < 120
+                        let code10: UInt16 = inBox ? (((col / 6 + row / 6) % 2 == 0) ? 880 : 740) : 96
+                        yBase[row * yStride + col] = code10 << 6
+                    }
+                }
+                for row in 0..<(height / 2) {
+                    for col in 0..<(width / 2) {
+                        uvBase[row * uvStride + col * 2] = 512 << 6
+                        uvBase[row * uvStride + col * 2 + 1] = 512 << 6
+                    }
+                }
+            }
+            return buffer
+        }
+
+        if let hdrPrev = makeP010HDRBuffer(boxX: 100),
+           let hdrCurr = makeP010HDRBuffer(boxX: 112),
+           let hdrFormat = VisionInterpolationFormat(hdrPrev) {
+            #expect(hdrFormat.is10Bit)
+            #expect(hdrFormat.isBT2020)
+            let hdrEngine = try VisionInterpolationMetal(format: hdrFormat)
+            let hdrOut = try await hdrEngine.interpolate(previous: hdrPrev, current: hdrCurr, phases: [0.5])
+            #expect(hdrOut.count == 1)
+            if let midHDR = hdrOut.first {
+                let transfer = CVBufferCopyAttachment(midHDR, kCVImageBufferTransferFunctionKey, nil)
+                let mdcv = CVBufferCopyAttachment(midHDR, kCVImageBufferMasteringDisplayColorVolumeKey, nil)
+                #expect(transfer != nil && CFEqual(transfer, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ))
+                #expect(mdcv != nil)
+                #expect(CVPixelBufferLockBaseAddress(midHDR, .readOnly) == kCVReturnSuccess)
+                defer { CVPixelBufferUnlockBaseAddress(midHDR, .readOnly) }
+                if let yBase = CVPixelBufferGetBaseAddressOfPlane(midHDR, 0)?.assumingMemoryBound(to: UInt16.self) {
+                    let yStride = CVPixelBufferGetBytesPerRowOfPlane(midHDR, 0) / 2
+                    let centerWord = yBase[90 * yStride + 136]
+                    #expect((centerWord & 0x003F) == 0, "Expected P010 low 6 bits to be zero, got \(centerWord)")
+                    #expect((centerWord >> 6) > 650, "Expected bright 10-bit HDR warped center, got \(centerWord >> 6)")
+                }
+            }
+        }
+
+        // 5) Multi-phase 120fps progression (`phases = [0.25, 0.5, 0.75]`): verify each phase shifts the
+        //    leading silhouette edge monotonically (proving distinct interpolated frames, not duplicates).
+        let multiPhaseOutputs = try await engine.interpolate(
+            previous: prevBuffer,
+            current: currBuffer,
+            phases: [0.25, 0.5, 0.75],
+            profile: .high
+        )
+        #expect(multiPhaseOutputs.count == 3)
+        if multiPhaseOutputs.count == 3 {
+            func leadingEdgeX(_ buffer: CVPixelBuffer) -> Int {
+                CVPixelBufferLockBaseAddress(buffer, .readOnly)
+                defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+                guard let yBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 0)?.assumingMemoryBound(to: UInt8.self) else {
+                    return -1
+                }
+                let yStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
+                var lastBrightX = 0
+                for col in 95..<185 where Int(yBase[90 * yStride + col]) > 120 {
+                    lastBrightX = col
+                }
+                return lastBrightX
+            }
+            let edge25 = leadingEdgeX(multiPhaseOutputs[0]) // expected ~163
+            let edge50 = leadingEdgeX(multiPhaseOutputs[1]) // expected ~167
+            let edge75 = leadingEdgeX(multiPhaseOutputs[2]) // expected ~171
+            #expect(edge25 >= 161 && edge25 <= 166, "Expected t=0.25 leading edge near 163, got \(edge25)")
+            #expect(edge50 >= 165 && edge50 <= 170, "Expected t=0.50 leading edge near 167, got \(edge50)")
+            #expect(edge75 >= 169 && edge75 <= 174, "Expected t=0.75 leading edge near 171, got \(edge75)")
+            #expect(edge25 < edge50 && edge50 < edge75, "Expected strictly advancing 120fps edges: \(edge25), \(edge50), \(edge75)")
+        }
+
+        // 6) Fast silhouette jump (+20 px) with +24 luma shading shift (simulating motion blur / lighting
+        //    variation): must still interpolate cleanly to midpoint (x=[90..150)) instead of snapping to `curr`.
+        if let fastPrev = makeNV12Buffer(fillY: { col, row in
+            (col >= 80 && col < 140 && row >= 60 && row < 120)
+                ? UInt8(((col - 80) / 6 + (row - 60) / 6) % 2 == 0 ? 196 : 168)
+                : 28
+        }), let fastCurr = makeNV12Buffer(fillY: { col, row in
+            (col >= 100 && col < 160 && row >= 60 && row < 120)
+                ? UInt8(((col - 100) / 6 + (row - 60) / 6) % 2 == 0 ? 222 : 194)
+                : 28
+        }) {
+            let fastMidOutputs = try await engine.interpolate(
+                previous: fastPrev,
+                current: fastCurr,
+                phases: [0.5],
+                profile: .high
+            )
+            if let fastMid = fastMidOutputs.first {
+                #expect(CVPixelBufferLockBaseAddress(fastMid, .readOnly) == kCVReturnSuccess)
+                defer { CVPixelBufferUnlockBaseAddress(fastMid, .readOnly) }
+                if let yBase = CVPixelBufferGetBaseAddressOfPlane(fastMid, 0)?.assumingMemoryBound(to: UInt8.self) {
+                    let yStride = CVPixelBufferGetBytesPerRowOfPlane(fastMid, 0)
+                    // At midpoint [90..150): x=94 MUST be bright (present in midpoint, absent in `fastCurr` [100..160)!),
+                    // and x=155 MUST be dark background (<75, present in `fastCurr` [100..160) but not yet reached at t=0.5!).
+                    let leadingMidLuma = Int(yBase[90 * yStride + 94])
+                    let unreachedCurrLuma = Int(yBase[90 * yStride + 155])
+                    #expect(leadingMidLuma > 150, "Expected fast+shaded block at midpoint x=94, got Y=\(leadingMidLuma)")
+                    #expect(unreachedCurrLuma < 75, "Expected x=155 not to duplicate fastCurr, got Y=\(unreachedCurrLuma)")
+                }
+            }
+        }
+
+        // 7) Stationary textured video content next to bled Vision motion halo + sub-pixel noise:
+        //    Feed a synthetic Vision flow field that bleeds +14 px horizontal motion across 40 px of
+        //    stationary textured background (`col < 96`) and adds 1.6 px drift elsewhere, with ±2 luma
+        //    codec quantization noise between frames. Stationary background bars MUST stay locked at
+        //    zero displacement while the genuinely moving block (`[100..160)` -> `[114..174)`) still warps.
+        func stationaryBarsWithMovingBlock(blockX: Int, codecJitter: Int) -> (Int, Int) -> UInt8 {
+            return { col, row in
+                if col >= blockX && col < blockX + 60 && row >= 60 && row < 120 {
+                    return UInt8(((col - blockX) / 6 + (row - 60) / 6) % 2 == 0 ? 220 : 184)
+                }
+                // Stationary textured background vertical features (moderate contrast 60 vs 92, NOT >0.22 subtitle contrast).
+                let bar = ((col / 5) % 2 == 0) ? 92 : 60
+                let noise = ((col + row) % 2 == 0) ? codecJitter : -codecJitter
+                return UInt8(clamping: bar + noise)
+            }
+        }
+        var bledHaloFlow: CVPixelBuffer?
+        #expect(CVPixelBufferCreate(
+            kCFAllocatorDefault, width, height, kCVPixelFormatType_TwoComponent32Float, nil, &bledHaloFlow
+        ) == kCVReturnSuccess)
+        if let haloPrev = makeNV12Buffer(fillY: stationaryBarsWithMovingBlock(blockX: 100, codecJitter: 0)),
+           let haloCurr = makeNV12Buffer(fillY: stationaryBarsWithMovingBlock(blockX: 114, codecJitter: 2)),
+           let bledHaloFlow {
+            #expect(CVPixelBufferLockBaseAddress(bledHaloFlow, []) == kCVReturnSuccess)
+            if let fBase = CVPixelBufferGetBaseAddress(bledHaloFlow)?.assumingMemoryBound(to: Float.self) {
+                let fStride = CVPixelBufferGetBytesPerRow(bledHaloFlow) / 4
+                for r in 0..<height {
+                    for c in 0..<width {
+                        // Bleed +14 px from moving block `[100..160)` all the way out to `[60..195)` (stationary bars!),
+                        // plus 1.6 px sub-pixel drift everywhere else.
+                        let inBledHalo = (c >= 60 && c < 195 && r >= 40 && r < 140)
+                        fBase[r * fStride + c * 2] = inBledHalo ? 14.0 : 1.6
+                        fBase[r * fStride + c * 2 + 1] = inBledHalo ? 2.0 : -1.2
+                    }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(bledHaloFlow, [])
+
+            let haloOutputs = try await engine.interpolate(
+                previous: haloPrev,
+                current: haloCurr,
+                phases: [0.5],
+                profile: .high,
+                forwardFlowBuffer: bledHaloFlow
+            )
+            if let haloMid = haloOutputs.first {
+                #expect(CVPixelBufferLockBaseAddress(haloMid, .readOnly) == kCVReturnSuccess)
+                #expect(CVPixelBufferLockBaseAddress(haloPrev, .readOnly) == kCVReturnSuccess)
+                defer {
+                    CVPixelBufferUnlockBaseAddress(haloPrev, .readOnly)
+                    CVPixelBufferUnlockBaseAddress(haloMid, .readOnly)
+                }
+                if let midY = CVPixelBufferGetBaseAddressOfPlane(haloMid, 0)?.assumingMemoryBound(to: UInt8.self),
+                   let refY = CVPixelBufferGetBaseAddressOfPlane(haloPrev, 0)?.assumingMemoryBound(to: UInt8.self) {
+                    let midStride = CVPixelBufferGetBytesPerRowOfPlane(haloMid, 0)
+                    let refStride = CVPixelBufferGetBytesPerRowOfPlane(haloPrev, 0)
+                    // Inside the bled halo (`x = 72..92`, right next to the moving block!), stationary bars (width 5 px,
+                    // so a +7 px midpoint shift would invert 92 <-> 60 by ~32 luma!) MUST stay locked within ±3 luma.
+                    for checkX in [32, 72, 77, 82, 87, 92] {
+                        let actual = Int(midY[90 * midStride + checkX])
+                        let expected = Int(refY[90 * refStride + checkX])
+                        #expect(
+                            abs(actual - expected) <= 4,
+                            "Stationary background at x=\(checkX) wobbled: got Y=\(actual), expected ~\(expected)"
+                        )
+                    }
+                    // Meanwhile the genuinely moving block (`[100..160)` -> `[114..174)`) still lands at midpoint `[107..167)`:
+                    // x=110 (bright block at midpoint, was stationary 92 in `haloCurr` `[114..174)`) MUST be >150!
+                    let movingMidLuma = Int(midY[90 * midStride + 110])
+                    #expect(movingMidLuma > 150, "Moving block next to locked background should still warp, got Y=\(movingMidLuma)")
+                }
+            }
+        }
+
+        // 8) Lazy 540p `.ultra` tier (Force Frame Interpolation mode) allocates and synthesizes cleanly.
+        let ultraOutputs = try await engine.interpolate(
+            previous: prevBuffer,
+            current: currBuffer,
+            phases: [0.5],
+            profile: .ultra
+        )
+        #expect(ultraOutputs.count == 1)
     }
 
     @Test("MetalNV12PixelConverter and NV12 GPU staging copy produce matching pixel data on synthetic IOSurface CVPixelBuffers")
@@ -1193,7 +1724,7 @@ struct PlayerArchitectureTests {
         let sr30 = VideoEnhancementPoolLimits.computeSizing(
             sourceFPS: 30, outputFPS: 30, maxPhasesPerPair: 0, underMemoryPressure: false
         )
-        #expect(sr30.lead == 0.24)
+        #expect(sr30.lead == 0.30)
         #expect(sr30.superResolutionFrames >= Int(ceil((sr30.lead + 0.10) * 30)))
         #expect(sr30.interpolationFrames(phaseCount: 1) >= Int(ceil((sr30.lead + 0.10) * 30)))
 
@@ -1201,7 +1732,7 @@ struct PlayerArchitectureTests {
         let srFi60 = VideoEnhancementPoolLimits.computeSizing(
             sourceFPS: 30, outputFPS: 60, maxPhasesPerPair: 1, underMemoryPressure: false
         )
-        #expect(srFi60.lead == 0.24)
+        #expect(srFi60.lead == 0.30)
         #expect(srFi60.superResolutionFrames >= Int(ceil((srFi60.lead + 0.10) * 60)) + 1)
         #expect(srFi60.interpolationFrames(phaseCount: 1) >= Int(ceil((srFi60.lead + 0.10) * 30)))
 
@@ -1209,7 +1740,7 @@ struct PlayerArchitectureTests {
         let srFi120 = VideoEnhancementPoolLimits.computeSizing(
             sourceFPS: 30, outputFPS: 120, maxPhasesPerPair: 3, underMemoryPressure: false
         )
-        #expect(srFi120.lead == 0.20)
+        #expect(srFi120.lead == 0.26)
         #expect(srFi120.superResolutionFrames >= Int(ceil((srFi120.lead + 0.10) * 120)) + 3)
         #expect(srFi120.interpolationFrames(phaseCount: 3) >= 3 * Int(ceil((srFi120.lead + 0.10) * 30)))
 
@@ -1217,7 +1748,7 @@ struct PlayerArchitectureTests {
         let pressure60 = VideoEnhancementPoolLimits.computeSizing(
             sourceFPS: 30, outputFPS: 60, maxPhasesPerPair: 1, underMemoryPressure: true
         )
-        #expect(pressure60.lead == 0.14)
+        #expect(pressure60.lead == 0.16)
         #expect(pressure60.lead < srFi60.lead)
         #expect(pressure60.superResolutionFrames < srFi60.superResolutionFrames)
         #expect(pressure60.interpolationFrames(phaseCount: 1) < srFi60.interpolationFrames(phaseCount: 1))
@@ -1225,7 +1756,7 @@ struct PlayerArchitectureTests {
         let pressure120 = VideoEnhancementPoolLimits.computeSizing(
             sourceFPS: 30, outputFPS: 120, maxPhasesPerPair: 3, underMemoryPressure: true
         )
-        #expect(pressure120.lead == 0.14)
+        #expect(pressure120.lead == 0.16)
         #expect(pressure120.superResolutionFrames < srFi120.superResolutionFrames)
         #expect(pressure120.interpolationFrames(phaseCount: 3) < srFi120.interpolationFrames(phaseCount: 3))
 
@@ -2019,5 +2550,556 @@ struct PlayerArchitectureTests {
             #expect(cover.backgroundColor == .clear)
             #expect(!cover.isOpaque)
         }
+    }
+
+    @Test("SmartCDN reachability evidence requires media verification and drops blacklisted hosts")
+    @MainActor
+    func smartCDNReachabilityEvidenceRequiresMediaVerification() {
+        let previousEnabled = SmartCDNSelector.isEnabled
+        SmartCDNSelector.isEnabled = true
+        defer { SmartCDNSelector.isEnabled = previousEnabled }
+
+        let selector = SmartCDNSelector()
+        let rejectedNode = SmartCDNSelector.NodeReport(
+            service: .cnTjCu0102,
+            host: "cn-tj-cu-01-02.bilivideo.com",
+            ip: "1.2.3.4",
+            isp: "联通",
+            province: "天津",
+            latencyMs: 18,
+            sameISP: true,
+            sameProvince: true
+        )
+        let healthyNode = SmartCDNSelector.NodeReport(
+            service: .cos,
+            host: "upos-sz-mirrorcos.bilivideo.com",
+            ip: "5.6.7.8",
+            isp: "联通",
+            province: "北京",
+            latencyMs: 32,
+            sameISP: true,
+            sameProvince: false
+        )
+        selector.installValidatedSweepReports([rejectedNode, healthyNode])
+
+        // Root-path sweep alone must NOT bypass media Range probing.
+        #expect(!selector.hasSessionReachabilityEvidence(for: "cn-tj-cu-01-02.bilivideo.com"))
+        #expect(!selector.hasSessionReachabilityEvidence(for: "upos-sz-mirrorcos.bilivideo.com"))
+
+        // Recording a real 200/206 media probe grants session reachability evidence.
+        selector.recordMediaReachable(host: "upos-sz-mirrorcos.bilivideo.com")
+        #expect(selector.hasSessionReachabilityEvidence(for: "upos-sz-mirrorcos.bilivideo.com"))
+
+        // Reporting a playback issue blacklists the host, revokes evidence, and advances best.
+        selector.reportPlaybackIssue(host: "cn-tj-cu-01-02.bilivideo.com", reason: "probe HTTP rejection")
+        #expect(selector.nodeForPlayback()?.host == "upos-sz-mirrorcos.bilivideo.com")
+
+        selector.reportPlaybackIssue(host: "upos-sz-mirrorcos.bilivideo.com", reason: "transport error")
+        #expect(!selector.hasSessionReachabilityEvidence(for: "upos-sz-mirrorcos.bilivideo.com"))
+        #expect(selector.nodeForPlayback() == nil)
+    }
+
+    @Test("Legacy CDN failover exclusion preserves failedHost after stop clears stats and identifies hard HTTP rejections")
+    @MainActor
+    func legacyCDNFailoverExclusionAndHardRejection() {
+        #expect(
+            PlayerViewModel.resolveLegacyExcludedHost(
+                failedHost: "UPOS-SZ-ESTGCOS.BILIVIDEO.COM",
+                cdnFallbackActive: true,
+                statsVideoHost: ""
+            ) == "upos-sz-estgcos.bilivideo.com"
+        )
+        #expect(
+            PlayerViewModel.resolveLegacyExcludedHost(
+                failedHost: nil,
+                cdnFallbackActive: true,
+                statsVideoHost: "upos-sz-mirrorcos.bilivideo.com"
+            ) == "upos-sz-mirrorcos.bilivideo.com"
+        )
+        #expect(
+            PlayerViewModel.resolveLegacyExcludedHost(
+                failedHost: nil,
+                cdnFallbackActive: false,
+                statsVideoHost: "upos-sz-mirrorcos.bilivideo.com"
+            ) == nil
+        )
+
+        let forbidden = StreamProbeOutcome(
+            host: "cn-tj-cu-01-02.bilivideo.com",
+            status: 403,
+            failure: StreamTransportFailure(stage: .probe, reason: .http(403), retryAfter: nil),
+            rejection: nil
+        )
+        let timeout = StreamProbeOutcome(
+            host: "upos-sz-mirrorbd.bilivideo.com",
+            status: nil,
+            failure: StreamTransportFailure(stage: .probe, reason: .url(URLError.timedOut.rawValue), retryAfter: nil),
+            rejection: nil
+        )
+        let serviceUnavailable = StreamProbeOutcome(
+            host: "upos-sz-mirrorcos.bilivideo.com",
+            status: 503,
+            failure: StreamTransportFailure(stage: .probe, reason: .http(503), retryAfter: nil),
+            rejection: nil
+        )
+        #expect(PlayerViewModel.isHardRejectedProbeOutcome(forbidden))
+        #expect(!PlayerViewModel.isHardRejectedProbeOutcome(timeout))
+        #expect(!PlayerViewModel.isHardRejectedProbeOutcome(serviceUnavailable))
+    }
+
+    @Test("AudioStreamSelection fallback candidates and proven video host rewrite rescue stalled audio")
+    func audioStreamFallbackCandidatesAndHostRewrite() throws {
+        let json = """
+        {
+          "duration": 72,
+          "video": [],
+          "audio": [
+            {
+              "id": 30232,
+              "base_url": "https://upos-sz-mirrorbd.bilivideo.com/upgcxcode/57/15/42117631557-1-30232.m4s?e=1",
+              "backup_url": ["https://upos-sz-mirrorbdb.bilivideo.com/upgcxcode/57/15/42117631557-1-30232.m4s?e=1"],
+              "bandwidth": 109451,
+              "codecs": "mp4a.40.2",
+              "mime_type": "audio/mp4"
+            },
+            {
+              "id": 30216,
+              "base_url": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/57/15/42117631557-1-30216.m4s?e=1",
+              "backup_url": [],
+              "bandwidth": 67377,
+              "codecs": "mp4a.40.2",
+              "mime_type": "audio/mp4"
+            },
+            {
+              "id": 30280,
+              "base_url": "https://upos-sz-estgoss.bilivideo.com/upgcxcode/57/15/42117631557-1-30280.m4s?e=1",
+              "backup_url": [],
+              "bandwidth": 145434,
+              "codecs": "mp4a.40.2",
+              "mime_type": "audio/mp4"
+            }
+          ]
+        }
+        """
+        let dash = try JSONDecoder().decode(PlayURLResult.DashInfo.self, from: Data(json.utf8))
+        let alternates = AudioStreamSelection.fallbackCandidates(
+            in: dash,
+            preference: .k132,
+            excludingID: 30232,
+            decodable: { _ in true }
+        )
+        #expect(alternates.map(\.id) == [30216, 30280])
+
+        let provenVideoURL = try #require(
+            URL(string: "https://upos-sz-mirrorcos.bilivideo.com/upgcxcode/57/15/42117631557-1-100022.m4s?e=1")
+        )
+        let primaryAudio = try #require(dash.audio?.first)
+        let rewritten = try #require(
+            AudioStreamSelection.rewriteStreamURL(primaryAudio.allURLs, toHostOf: provenVideoURL)
+        )
+        #expect(rewritten.host() == "upos-sz-mirrorcos.bilivideo.com")
+        #expect(rewritten.path == "/upgcxcode/57/15/42117631557-1-30232.m4s")
+        #expect(rewritten.query == "e=1")
+    }
+
+    @Test("DecoderRecoveryAdmission manual retry supersedes stuck in-flight tickets and stale contexts")
+    func manualRetrySupersedesStuckInFlightTicket() {
+        var admission = DecoderRecoveryAdmission()
+        var budget = RecoveryBudget()
+
+        let initialContext = DecoderRecoveryAdmission.Context(
+            owner: "video-BV1u6hn6sEi8",
+            ownerLeaseGeneration: 1,
+            backendGeneration: 1,
+            source: .vod(aid: 117315572075044, cid: 42117631557, quality: 64, source: "ugc")
+        )
+        admission.install(initialContext)
+
+        let first = admission.admit(
+            DecoderRecoveryAdmission.Request(
+                context: initialContext,
+                trigger: .runtimeFault,
+                position: 0,
+                fault: nil
+            ),
+            now: 100,
+            budget: &budget
+        )
+        guard case .admitted(let stuckToken) = first else {
+            Issue.record("Expected initial runtimeFault to be admitted")
+            return
+        }
+
+        // Context advanced (e.g., quality/backend generation changed) while previous ticket stayed in-flight.
+        let retryContext = DecoderRecoveryAdmission.Context(
+            owner: "video-BV1u6hn6sEi8",
+            ownerLeaseGeneration: 1,
+            backendGeneration: 2,
+            source: .vod(aid: 117315572075044, cid: 42117631557, quality: 32, source: "ugc")
+        )
+        let superseded = admission.prepareForManualRetry(context: retryContext, now: 101)
+        #expect(superseded == stuckToken)
+
+        let retryDecision = admission.admit(
+            DecoderRecoveryAdmission.Request(
+                context: retryContext,
+                trigger: .manualRetry,
+                position: 0,
+                fault: nil
+            ),
+            now: 101,
+            budget: &budget
+        )
+        if case .admitted(let retryToken) = retryDecision {
+            #expect(retryToken != stuckToken)
+        } else {
+            Issue.record("Expected manual retry to be admitted after superseding stuck ticket, got \(retryDecision)")
+        }
+    }
+
+    @Test("SampleBufferVideoRenderer restricts automatic inline PiP to active playing state")
+    @MainActor
+    func sampleBufferRendererDisablesAutomaticPiPWhenPausedOrEnded() {
+        let renderer = SampleBufferVideoRenderer()
+        defer { renderer.invalidate() }
+
+        #expect(!renderer.allowsAutomaticPiPFromInline)
+
+        renderer.updatePiPPlaybackState(currentTime: 12, duration: 72, isPlaying: true)
+        #expect(renderer.allowsAutomaticPiPFromInline)
+
+        renderer.updatePiPPlaybackState(currentTime: 12, duration: 72, isPlaying: false)
+        #expect(!renderer.allowsAutomaticPiPFromInline)
+
+        renderer.updatePiPPlaybackState(currentTime: 72, duration: 72, isPlaying: false)
+        #expect(!renderer.allowsAutomaticPiPFromInline)
+    }
+
+    @Test("ImagePreviewRasterPolicy and ImagePreviewMath scale dynamically from true original image dimensions")
+    func imagePreviewOriginalSizeScalingAndRasterPolicy() {
+        // 1) Bilibili @... suffix stripping for both hdslb.com and biliimg.com.
+        let hdslbThumb = URL(string: "https://i0.hdslb.com/bfs/new_dyn/abc123.jpg@512w_512h_1c.webp")!
+        let biliimgThumb = URL(string: "https://i1.biliimg.com/bfs/archive/xyz.png@640w.webp?foo=1")!
+        let externalURL = URL(string: "https://example.com/user@2x/photo.jpg")!
+        #expect(ImagePreviewRasterPolicy.originalURL(for: hdslbThumb).absoluteString == "https://i0.hdslb.com/bfs/new_dyn/abc123.jpg")
+        #expect(ImagePreviewRasterPolicy.originalURL(for: biliimgThumb).absoluteString == "https://i1.biliimg.com/bfs/archive/xyz.png?foo=1")
+        #expect(ImagePreviewRasterPolicy.originalURL(for: externalURL).absoluteString == externalURL.absoluteString)
+
+        // 2) Thumbnail URL scales by Retina displayScale.
+        let retinaThumb = ImagePreviewRasterPolicy.thumbnailURL(for: hdslbThumb, viewportWidth: 393, displayScale: 3)
+        #expect(retinaThumb.absoluteString.contains("@1179w.webp"))
+
+        let viewport = CGSize(width: 393, height: 852)
+        let scale: CGFloat = 3
+
+        // 3) 4K photo (4000x3000): decodes at full 4000px and double-tap reaches native 1:1 (~3.39x).
+        let photo4K = CGSize(width: 4000, height: 3000)
+        #expect(
+            ImagePreviewRasterPolicy.initialDecodePixelEdge(
+                originalPixelSize: photo4K, viewport: viewport, displayScale: scale, mode: .fitted
+            ) == 4000
+        )
+        let photoMetrics = ImagePreviewMath.zoomMetrics(
+            originalPixelSize: photo4K, viewport: viewport, displayScale: scale, mode: .fitted
+        )
+        #expect(abs(photoMetrics.nativePixelZoomScale - (4000.0 / (393.0 * 3.0))) < 0.05)
+        #expect(abs(photoMetrics.doubleTapZoomScale - photoMetrics.nativePixelZoomScale) < 0.05)
+        #expect(photoMetrics.maximumZoomScale > photoMetrics.nativePixelZoomScale * 1.5)
+
+        // 4) Ultra-wide panorama (6000x600): decodes at 6000px and allows zooming up to fill viewport height.
+        let pano = CGSize(width: 6000, height: 600)
+        #expect(
+            ImagePreviewRasterPolicy.initialDecodePixelEdge(
+                originalPixelSize: pano, viewport: viewport, displayScale: scale, mode: .fitted
+            ) == 6000
+        )
+        let panoMetrics = ImagePreviewMath.zoomMetrics(
+            originalPixelSize: pano, viewport: viewport, displayScale: scale, mode: .fitted
+        )
+        #expect(panoMetrics.maximumZoomScale >= 20)
+        #expect(panoMetrics.doubleTapZoomScale >= 5)
+
+        // 5) Tall comic (1080x15000) & tall screenshot (1080x2700): enter .reading mode at full pixel resolution.
+        let tallScreenshotReadsVertically = ImagePreviewRasterPolicy.readsVertically(
+            aspect: 1080.0 / 2700.0,
+            viewport: viewport
+        )
+        #expect(tallScreenshotReadsVertically)
+        #expect(
+            ImagePreviewRasterPolicy.initialDecodePixelEdge(
+                originalPixelSize: CGSize(width: 1080, height: 15000),
+                viewport: viewport,
+                displayScale: scale,
+                mode: .reading
+            ) == 15000
+        )
+
+        // 6) Small image (120x120): opens cleanly fitted to screen, max zoom capped sensibly at 2x (no 49x blowup).
+        let tinyMetrics = ImagePreviewMath.zoomMetrics(
+            originalPixelSize: CGSize(width: 120, height: 120), viewport: viewport, displayScale: scale, mode: .fitted
+        )
+        #expect(tinyMetrics.baseSize.width == 393)
+        #expect(tinyMetrics.maximumZoomScale == 2.0)
+
+        // 7) zoomRect clamps cleanly within contentSize.
+        let clamped = ImagePreviewMath.zoomRect(
+            at: CGPoint(x: 2, y: 2),
+            scale: 2.0,
+            viewport: viewport,
+            contentSize: CGSize(width: 393, height: 295)
+        )
+        #expect(clamped.origin.x >= 0)
+        #expect(clamped.origin.y >= 0)
+    }
+
+    @Test("Graduated settings bypass experimental master switch while HTTP/2 probe remains gated")
+    func experimentalSettingsGraduationMatrix() {
+        var disabledMaster = ExperimentalSettingsSnapshot()
+        disabledMaster.masterEnabled = false
+        disabledMaster.grants[.ambient] = true
+        disabledMaster.grants[.decoderPrewarm] = true
+        disabledMaster.grants[.aiCommentFilter] = true
+        disabledMaster.grants[.http2Probe] = true
+
+        #expect(disabledMaster.isAllowed(.equalizer))
+        #expect(disabledMaster.isAllowed(.multiConnection))
+        #expect(disabledMaster.isAllowed(.commentTools))
+        #expect(disabledMaster.isAllowed(.diagnostics))
+        #expect(disabledMaster.isAllowed(.videoEnhancement))
+        #expect(disabledMaster.isAllowed(.ambient))
+        #expect(disabledMaster.isAllowed(.decoderPrewarm))
+        #expect(disabledMaster.isAllowed(.aiCommentFilter))
+        #expect(!disabledMaster.isAllowed(.http2Probe))
+
+        disabledMaster.grants[.ambient] = false
+        disabledMaster.grants[.aiCommentFilter] = false
+        #expect(!disabledMaster.isAllowed(.ambient))
+        #expect(!disabledMaster.isAllowed(.aiCommentFilter))
+
+        disabledMaster.masterEnabled = true
+        #expect(disabledMaster.isAllowed(.http2Probe))
+    }
+
+    @Test("Playback ended auto-advance state and library row metrics stay bounded")
+    func playbackEndedAutoAdvanceAndLibraryMetrics() {
+        let state = PlayerEndedAutoAdvanceState(
+            totalSeconds: 3,
+            remainingSeconds: 1,
+            title: "Next Episode",
+            coverURL: nil,
+            authorName: "UP",
+            durationSeconds: 180
+        )
+        #expect(abs(state.progress - (2.0 / 3.0)) < 0.01)
+
+        let compactCover = LibraryRowMetrics.coverWidth(columnWidth: 361, isRegularWidth: false)
+        #expect(compactCover >= 128 && compactCover <= 140)
+        let padCover = LibraryRowMetrics.coverWidth(columnWidth: 520, isRegularWidth: true)
+        #expect(padCover <= LibraryRowMetrics.maximumCoverWidth)
+    }
+
+    @Test("RootDetailPresentationState releases projectionHeld immediately on edge-pop completion")
+    @MainActor
+    func rootDetailPresentationReleasesTouchImmediatelyOnEdgePop() {
+        let state = RootDetailPresentationState()
+        guard let nav = DetailNavigation(
+            stack: [.videoDetail(.bvid("BV1u6hn6sEi8"))],
+            tab: .home,
+            sidebarID: nil
+        ) else {
+            Issue.record("Expected valid DetailNavigation")
+            return
+        }
+        let openInput = RootDetailPresentationState.Input(
+            navigation: nav, navigationRevision: 1, accountRevision: 1, isEligible: true
+        )
+        let closedInput = RootDetailPresentationState.Input(
+            navigation: nil, navigationRevision: 2, accountRevision: 1, isEligible: true
+        )
+
+        state.reconcile(openInput, entryAnimation: nil, exitAnimation: nil, currentInput: { openInput })
+        #expect(state.isVisible)
+        #expect(state.projectionHeld)
+
+        state.markEdgePopCompleted(root: nav.root, generation: state.generation)
+        state.reconcile(
+            closedInput,
+            entryAnimation: nil,
+            exitAnimation: .easeOut(duration: 0.28),
+            currentInput: { closedInput }
+        )
+        #expect(!state.isVisible)
+        #expect(!state.projectionHeld)
+        #expect(state.navigation == nil)
+    }
+
+    @Test("CDNHostDisplay preserves full domain names and appends recognized cloud vendors")
+    func cdnHostDisplayFormatsFullDomainAndCloudVendors() {
+        let vendorExpectations: [(String, CDNCloudVendor)] = [
+            ("upos-sz-mirrorali.bilivideo.com", .alibaba),
+            ("upos-sz-mirroraliov.bilivideo.com", .alibaba),
+            ("upos-sz-estgoss.bilivideo.com", .alibaba),
+            ("upos-sz-mirrorcos.bilivideo.com", .tencent),
+            ("upos-sz-mirrorcoso1.bilivideo.com", .tencent),
+            ("upos-tf-all-tx.bilivideo.com", .tencent),
+            ("upos-sz-estgcos.bilivideo.com", .tencent),
+            ("upos-sz-mirrorhw.bilivideo.com", .huawei),
+            ("upos-sz-mirror08c.bilivideo.com", .huawei),
+            ("upos-sz-mirror08h.bilivideo.com", .huawei),
+            ("upos-sz-mirror08ct.bilivideo.com", .huawei),
+            ("upos-sz-estghw.bilivideo.com", .huawei),
+            ("upos-sz-upcdnbda2.bilivideo.com", .baidu),
+            ("upos-sz-mirrorbd.bilivideo.com", .baidu),
+            ("upos-sz-mirrorbos.bilivideo.com", .baidu),
+            ("upos-sz-mirrorzos.bilivideo.com", .ctyun),
+            ("upos-sz-mirrorks3.bilivideo.com", .kingsoft),
+            ("upos-sz-mirrorkodo.bilivideo.com", .qiniu),
+            ("upos-sz-upcdnws.bilivideo.com", .wangsu),
+            ("upos-hz-mirrorakam.akamaized.net", .akamai),
+            ("cn-hk-eq-01-01.bilivideo.com", .equinix),
+        ]
+
+        for (host, expectedVendor) in vendorExpectations {
+            #expect(CDNHostDisplay.vendor(for: host) == expectedVendor)
+            let formatted = CDNHostDisplay.formatted(host)
+            #expect(formatted == "\(host) (\(expectedVendor.localizedName))")
+            #expect(PlayerCDNSourceDisplay.formattedAuthority(host) == formatted)
+        }
+
+        // Uppercase and trailing dot normalization keeps the full domain intact.
+        #expect(
+            CDNHostDisplay.formatted("UPOS-SZ-MIRRORCOS.BILIVIDEO.COM.")
+                == "upos-sz-mirrorcos.bilivideo.com (\(CDNCloudVendor.tencent.localizedName))"
+        )
+
+        // ISP BCache, MCDN, and unknown node codes show full domain without empty parentheses.
+        let unrecognizedHosts = [
+            "cn-tj-cu-01-02.bilivideo.com",
+            "upos-sz-mirror14b.bilivideo.com",
+            "xy112x34x56x78xy.mcdn.bilivideo.cn",
+        ]
+        for host in unrecognizedHosts {
+            #expect(CDNHostDisplay.vendor(for: host) == nil)
+            #expect(CDNHostDisplay.formatted(host) == host)
+            #expect(!CDNHostDisplay.formatted(host).contains("("))
+        }
+    }
+
+    @Test("Danmaku area and speed presets map cleanly onto DanmakuRenderPreferences")
+    func danmakuAreaAndSpeedPresetsMapping() {
+        #expect(DanmakuAreaPreset.matching(0.25) == .quarter)
+        #expect(DanmakuAreaPreset.matching(0.50) == .half)
+        #expect(DanmakuAreaPreset.matching(0.75) == .threeQuarters)
+        #expect(DanmakuAreaPreset.matching(1.00) == .full)
+        #expect(DanmakuAreaPreset.matching(0.40) == nil)
+
+        #expect(DanmakuSpeedPreset.nearest(for: DanmakuRenderPreferences.defaultScrollLifetime) == .standard)
+        #expect(DanmakuSpeedPreset.nearest(for: 15.5) == .verySlow)
+        #expect(DanmakuSpeedPreset.nearest(for: 12.0) == .slow)
+        #expect(DanmakuSpeedPreset.nearest(for: 6.5) == .fast)
+        #expect(DanmakuSpeedPreset.nearest(for: 4.0) == .veryFast)
+    }
+
+    @Test("AudioTimelinePCMSupply synthetic silence advances clock and exhausts cleanly for silent videos")
+    func audioTimelineSyntheticSilenceClock() {
+        let supply = AudioTimelinePCMSupply(
+            defaultSampleRate: 48_000,
+            defaultChannels: 2,
+            timelineEpsilon: 0.000_5
+        )
+        supply.configureSyntheticSilence(enabled: true, startPTS: 10.0, duration: 10.5)
+        #expect(abs(supply.contentSeconds - 0.5) < 0.001)
+        #expect(supply.endPTS == 10.0)
+
+        var buffer = [Float](repeating: 1.0, count: 12_000 * 2)
+        let firstPull = buffer.withUnsafeMutableBufferPointer { ptr in
+            supply.pullContent(frameCount: 12_000, sampleRate: 48_000, channels: 2, into: ptr.baseAddress!)
+        }
+        #expect(firstPull.frames == 12_000)
+        #expect(buffer.allSatisfy { $0 == 0 })
+        #expect(abs((supply.endPTS ?? 0) - 10.25) < 0.001)
+
+        // Second pull hits the 10.5s duration ceiling and marks synthetic silence exhausted.
+        let secondPull = buffer.withUnsafeMutableBufferPointer { ptr in
+            supply.pullContent(frameCount: 20_000, sampleRate: 48_000, channels: 2, into: ptr.baseAddress!)
+        }
+        #expect(secondPull.frames == 12_000)
+        #expect(supply.contentSeconds == 0)
+
+        let thirdPull = buffer.withUnsafeMutableBufferPointer { ptr in
+            supply.pullContent(frameCount: 1_024, sampleRate: 48_000, channels: 2, into: ptr.baseAddress!)
+        }
+        #expect(thirdPull.frames == 0)
+    }
+
+    @Test("Dolby Vision codec classification and hardware-gated selectVideoStream fallback")
+    @MainActor
+    func dolbyVisionAndHardwareGatedStreamSelection() {
+        #expect(VideoHardwareCapabilities.codecType(codecs: "dvh1.05.06") == kCMVideoCodecType_DolbyVisionHEVC)
+        #expect(VideoHardwareCapabilities.codecType(codecs: "hev1.1.6.L93.B0") == kCMVideoCodecType_HEVC)
+        #expect(VideoHardwareCapabilities.codecType(codecs: "av01.0.08M.08") == kCMVideoCodecType_AV1)
+
+        let noAV1Snapshot = VideoHardwareCapabilities.Snapshot(
+            h264: true,
+            hevc: true,
+            av1: false,
+            dolbyVisionHEVC: false
+        )
+        #expect(!noAV1Snapshot.supports(codecs: "av01.0.08M.08"))
+        #expect(!noAV1Snapshot.supports(codecs: "dvh1.05.06"))
+        #expect(noAV1Snapshot.supports(codecs: "hev1.1.6.L93.B0"))
+        #expect(noAV1Snapshot.supports(codecs: "avc1.64001E"))
+
+        let makeStream = { (id: Int, codecs: String) -> PlayURLResult.DashInfo.DashStream in
+            PlayURLResult.DashInfo.DashStream(
+                id: id,
+                baseUrl: "https://upos-sz-mirrorcos.bilivideo.com/test.m4s",
+                backupUrl: nil,
+                bandwidth: 2_000_000,
+                codecs: codecs,
+                mimeType: "video/mp4"
+            )
+        }
+
+        let streams = [
+            makeStream(80, "av01.0.08M.08"),
+            makeStream(80, "hev1.1.6.L93.B0"),
+            makeStream(80, "avc1.640028"),
+        ]
+
+        let vm = PlayerViewModel.shared
+        let savedPref = PlayerPlaybackPreferences.preferredCodec
+        defer { PlayerPlaybackPreferences.preferredCodec = savedPref }
+
+        // Even if user prefers AV1, DemandPaced hardware requirement skips unsupported av01 and picks HEVC.
+        PlayerPlaybackPreferences.preferredCodec = .av1
+        let firstPick = vm.selectVideoStream(
+            from: streams,
+            quality: 80,
+            hardwareCapabilities: noAV1Snapshot,
+            requiresHardwareSupport: true,
+            rejectedCodecKeys: []
+        )
+        #expect(firstPick?.codecs == "hev1.1.6.L93.B0")
+
+        // Tier-1 fallback after HEVC fails skips rejected "hevc" and selects AVC (H.264).
+        let fallbackPick = vm.selectVideoStream(
+            from: streams,
+            quality: 80,
+            hardwareCapabilities: noAV1Snapshot,
+            requiresHardwareSupport: true,
+            rejectedCodecKeys: ["hevc"]
+        )
+        #expect(fallbackPick?.codecs == "avc1.640028")
+
+        // If a stream list is AV1-only on non-AV1 hardware, returns nil so Tier-2 VLC handoff engages.
+        let av1OnlyPick = vm.selectVideoStream(
+            from: [makeStream(127, "av01.0.13M.08")],
+            quality: 127,
+            hardwareCapabilities: noAV1Snapshot,
+            requiresHardwareSupport: true,
+            rejectedCodecKeys: []
+        )
+        #expect(av1OnlyPick == nil)
     }
 }

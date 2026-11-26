@@ -1,0 +1,88 @@
+name: Unit Tests
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths-ignore:
+      - '**/*.md'
+      - '.gitignore'
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths-ignore:
+      - '**/*.md'
+      - '.gitignore'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  SWIFTVLC_REPO: https://github.com/haikiseven/SwiftVLC.git
+  SWIFTVLC_SHA: 2bc7995c1fd0f22735f70e1b1584979f151b503a
+
+jobs:
+  unit-tests:
+    name: iOS Simulator Unit Tests
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout SwiftPili
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 20
+
+      - name: Print runner toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - name: Checkout pinned sibling SwiftVLC and apply patches
+        run: |
+          set -euo pipefail
+          SWIFTVLC_DIR="${GITHUB_WORKSPACE}/../SwiftVLC"
+          rm -rf "$SWIFTVLC_DIR"
+          mkdir -p "$SWIFTVLC_DIR"
+          git -C "$SWIFTVLC_DIR" init -q
+          git -C "$SWIFTVLC_DIR" remote add origin "$SWIFTVLC_REPO"
+          git -C "$SWIFTVLC_DIR" fetch --depth 1 origin "$SWIFTVLC_SHA"
+          git -C "$SWIFTVLC_DIR" checkout -q FETCH_HEAD
+          ./patches/apply.sh "$SWIFTVLC_DIR"
+          echo "SWIFTVLC_DIR=$SWIFTVLC_DIR" >> "$GITHUB_ENV"
+
+      - name: Fetch and verify prebuilt native XCFrameworks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/fetch-prebuilt-deps.sh --swiftvlc "$SWIFTVLC_DIR"
+
+      - name: Install XcodeGen and generate project
+        run: |
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+          fi
+          xcodegen generate
+
+      - name: Run iOS Simulator unit tests
+        run: |
+          set -euo pipefail
+          DEVICE="$(./scripts/pick-simulator.sh)"
+          echo "Using iOS Simulator: $DEVICE"
+          xcodebuild test \
+            -project SwiftPili.xcodeproj \
+            -scheme SwiftPili \
+            -destination "platform=iOS Simulator,name=$DEVICE" \
+            -derivedDataPath build/DerivedData-Tests \
+            -collect-test-diagnostics never \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO

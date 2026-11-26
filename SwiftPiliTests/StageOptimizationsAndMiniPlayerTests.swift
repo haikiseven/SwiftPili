@@ -1,8 +1,10 @@
 import CoreGraphics
+import CoreVideo
 import Foundation
 import os
 import SwiftUI
 import Testing
+import UIKit
 @testable import SwiftPili
 
 // MARK: - Stage 1: WBISigner & HomeFeedSnapshotStore
@@ -1444,5 +1446,650 @@ struct Stage3MiniPlayerNavigationAndStateTests {
         coordinator.goBack()
         #expect(!vm.isMiniPlayerActive)
         #expect(!vm.miniPlayer.retainsOwnerLease(disabledLease))
+    }
+
+    @Test("Natural playback end dismisses active mini-player, blocks re-entry on route pop, and keeps controls visible")
+    func playbackEndedDismissesMiniPlayerAndBlocksReEntry() {
+        let vm = PlayerViewModel.shared
+        let key = PlayerPlaybackPreferences.inAppMiniPlayerDefaultsKey
+        let originalPref = UserDefaults.standard.object(forKey: key)
+        let originalOrder = vm.playbackOrder
+
+        let cleanup = {
+            vm.miniPlayer.clearAll()
+            vm.miniPlayer.dockPosition = .bottomTrailing
+            vm.error = nil
+            vm.unavailability = nil
+            vm.terminalOpenFailure = false
+            vm.playbackOrder = originalOrder
+            vm.stop(reason: .ownerExit)
+            vm.ownerKey = ""
+            vm.activeSceneID = nil
+            vm.clearAllOutgoingRouteStills()
+            if let originalPref {
+                UserDefaults.standard.set(originalPref, forKey: key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
+        cleanup()
+        defer { cleanup() }
+
+        PlayerPlaybackPreferences.inAppMiniPlayerEnabled = true
+        vm.playbackOrder = .pauseAtEnd
+        let coordinator = AppCoordinator(playbackHookProvider: { vm })
+
+        let target = VideoRouteTarget(
+            videoID: .aid(9002),
+            preview: .init(title: "Ended Mini-Player Demo"),
+            zoomSourceID: UUID()
+        )
+        #expect(coordinator.navigateToVideo(target))
+        coordinator.settleVideoNavigation(target.videoID)
+
+        let miniLease = vm.claimOwnerLease(owner: "vod-detail-\(UUID().uuidString)")
+        _ = vm.claimSurfaceSlot(ownerLease: miniLease, role: .inline)
+        vm.mode = .vod
+        vm.currentAid = 9002
+        vm.currentCid = 900201
+        vm.currentSource = .ugc
+        vm.currentURL = URL(string: "https://example.com/ended-demo.m4s")
+        vm.duration = 72
+        vm.playbackTerminalState = .active
+        vm.playbackIntent = .playing
+        vm.isPlaying = true
+
+        // Enter mini-player while playing, then naturally reach playback end.
+        coordinator.goBack()
+        #expect(vm.isMiniPlayerActive)
+        vm.admitNaturalPlaybackEnd()
+        vm.settleTerminalPlaybackEndPresentation()
+        #expect(!vm.isMiniPlayerActive)
+        #expect(vm.ownerKey.isEmpty)
+
+        // Start another session on detail page, reach natural playback end, then pop route.
+        #expect(coordinator.navigateToVideo(target))
+        coordinator.settleVideoNavigation(target.videoID)
+        let endedLease = vm.claimOwnerLease(owner: "vod-detail-\(UUID().uuidString)")
+        _ = vm.claimSurfaceSlot(ownerLease: endedLease, role: .inline)
+        vm.mode = .vod
+        vm.currentAid = 9002
+        vm.currentCid = 900201
+        vm.currentSource = .ugc
+        vm.currentURL = URL(string: "https://example.com/ended-demo.m4s")
+        vm.duration = 72
+        vm.playbackTerminalState = .active
+        vm.playbackIntent = .playing
+        vm.isPlaying = true
+        vm.showControls = false
+
+        vm.admitNaturalPlaybackEnd()
+        vm.settleTerminalPlaybackEndPresentation()
+        #expect(vm.playbackEnded)
+        #expect(vm.showControls)
+        #expect(!vm.canEnterMiniPlayer(for: endedLease))
+
+        coordinator.goBack()
+        #expect(!vm.isMiniPlayerActive)
+        #expect(!vm.miniPlayer.retainsOwnerLease(endedLease))
+    }
+}
+
+// MARK: - Detail-to-Detail Transition Optimizations
+
+@MainActor
+private final class MockTransitionStillBackend: PlayerBackend {
+    var captureSourceHandler: (@MainActor () -> DisplayedFrameCaptureSource?)?
+    var fallbackFrameHandler: (@MainActor () -> UIImage?)?
+    var captureSourceCallCount = 0
+    var fallbackFrameCallCount = 0
+
+    var hasParkedSession = false
+    var isReadyToPlay = true
+    var isPlaying = true
+    var retainedPipelineHealth = RetainedPipelineHealth(backendGeneration: 1, state: .playingWithProducer)
+    var runtimeGeneration: UInt64 = 1
+    var pendingSeekTarget: TimeInterval?
+    var openedAtPosition: TimeInterval = 0
+    var currentTime: TimeInterval = 12
+    var duration: TimeInterval = 120
+    var playableTime: TimeInterval = 40
+    var bufferedContentAhead: TimeInterval? = 28
+    var bufferedPipelineAhead: TimeInterval? = 28
+    var videoDeliveryRunway: TimeInterval? = 28
+    var seekLaunchReserve: TimeInterval = 2
+    var playbackRate: Float = 1.0
+    var volume: Float = 1.0
+    var isMuted = false
+    var renderViewController: UIViewController?
+    var isPiPActive = false
+    var dynamicInfo: PlayerDynamicStats?
+    var onStateChanged: (@MainActor @Sendable (PlayerStateEvent) -> Void)?
+    var onTickWithGeneration: (@MainActor @Sendable (TimeInterval, TimeInterval, UInt64, StartupTrace.Token?) -> Void)?
+    var onBufferChanged: (@MainActor @Sendable (TimeInterval) -> Void)?
+
+    func load(
+        url _: URL, audioURL _: URL?, headers _: [String: String],
+        startPosition _: TimeInterval, playbackRate _: Float, hardwareDecode _: Bool,
+        networkCaching _: TimeInterval, maxBuffer _: TimeInterval,
+        preferNativeVideoToolbox _: Bool, alternateVideoURLs _: [URL],
+        alternateAudioURLs _: [URL], readAheadSeconds _: TimeInterval?,
+        multiConnectionPolicy _: MultiConnectionPolicy?, liveSource _: DemandLiveSource?
+    ) {}
+
+    func refreshMultiConnectionTelemetry() {}
+    func setMultiConnectionQuiet(_: MultiConnectionQuiet) {}
+    func stop() {}
+    func parkForReuse() -> Bool { false }
+    func setStartupTraceToken(_: StartupTrace.Token?) {}
+    func play() {}
+    func pause() {}
+    func seek(to _: TimeInterval, completion: (@MainActor @Sendable (Bool) -> Void)?) { completion?(true) }
+    func confirmRetainedLiveness(within _: TimeInterval) async -> Bool { true }
+    func setScaleMode(_: VideoScaleMode) {}
+    func startPiP() {}
+    func stopPiP() {}
+    func videoTracks() -> [PlayerTrackInfo] { [] }
+    func thumbnailAtCurrentTime() async -> UIImage? { nil }
+    func invalidateFrameStats() {}
+
+    func currentDisplayedFrameCaptureSource() -> DisplayedFrameCaptureSource? {
+        captureSourceCallCount += 1
+        return captureSourceHandler?()
+    }
+
+    func currentDisplayedFrameForTransition() -> UIImage? {
+        fallbackFrameCallCount += 1
+        return fallbackFrameHandler?()
+    }
+}
+
+@Suite("Detail-to-Detail Transition Optimizations", .serialized)
+@MainActor
+struct DetailToDetailTransitionOptimizationTests {
+    private static func makeSyntheticPixelBuffer(width: Int, height: Int) throws -> CVPixelBuffer {
+        var pixelBuffer: CVPixelBuffer?
+        let attributes: [CFString: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:] as [CFString: Any],
+        ]
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_32BGRA,
+            attributes as CFDictionary,
+            &pixelBuffer
+        )
+        #expect(status == kCVReturnSuccess)
+        let buffer = try #require(pixelBuffer)
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        if let baseAddress = CVPixelBufferGetBaseAddress(buffer) {
+            let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+            memset(baseAddress, 0x80, bytesPerRow * height)
+        }
+        return buffer
+    }
+
+    private static func makeSyntheticFallbackImage(width: Int = 120, height: Int = 68) -> UIImage {
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        return UIGraphicsImageRenderer(
+            size: CGSize(width: width, height: height),
+            format: format
+        ).image { context in
+            UIColor.systemTeal.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        }
+    }
+
+    private static func waitUntil(
+        timeoutMilliseconds: Int = 3000,
+        condition: @MainActor () -> Bool
+    ) async -> Bool {
+        let deadline = ContinuousClock.now + .milliseconds(timeoutMilliseconds)
+        while ContinuousClock.now < deadline {
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return condition()
+    }
+
+    @Test("Off-main parkOutgoingRouteStill returns owner synchronously and populates downscaled still asynchronously")
+    func offMainParkOutgoingRouteStillAsyncPopulateAndDownscale() async throws {
+        let vm = PlayerViewModel.shared
+        let savedBackend = vm.activeBackend
+        let savedOwner = vm.ownerKey
+        let mockBackend = MockTransitionStillBackend()
+        let pixelBuffer = try Self.makeSyntheticPixelBuffer(width: 1280, height: 720)
+        mockBackend.captureSourceHandler = {
+            DisplayedFrameCaptureSource(pixelBuffer: pixelBuffer, displayScale: 2)
+        }
+        mockBackend.fallbackFrameHandler = {
+            Self.makeSyntheticFallbackImage()
+        }
+
+        vm.clearAllOutgoingRouteStills()
+        vm.activeBackend = mockBackend
+        let owner = "vod-detail-async-\(UUID().uuidString)"
+        vm.ownerKey = owner
+        defer {
+            vm.clearAllOutgoingRouteStills()
+            vm.activeBackend = savedBackend
+            vm.ownerKey = savedOwner
+        }
+
+        let parkedOwner = vm.parkOutgoingRouteStill()
+        #expect(parkedOwner == owner)
+        #expect(mockBackend.captureSourceCallCount == 1)
+        #expect(mockBackend.fallbackFrameCallCount == 0)
+        // Must NOT synchronously rasterize on MainActor.
+        #expect(vm.outgoingRouteStill(for: owner) == nil)
+        #expect(vm.routeOwnership.outgoingRouteStillTasks[owner] != nil)
+
+        let populated = await Self.waitUntil {
+            vm.outgoingRouteStill(for: owner) != nil
+        }
+        #expect(populated)
+        let image = try #require(vm.outgoingRouteStill(for: owner))
+        #expect(image.scale == 2)
+        if let cgImage = image.cgImage {
+            #expect(max(cgImage.width, cgImage.height) <= 480)
+            #expect(cgImage.width == 480)
+            #expect(cgImage.height == 270)
+        } else {
+            Issue.record("Expected rendered outgoing still to carry a CGImage")
+        }
+        #expect(mockBackend.fallbackFrameCallCount == 0)
+
+        vm.clearOutgoingRouteStill(owner: owner)
+        #expect(vm.outgoingRouteStill(for: owner) == nil)
+        #expect(vm.routeOwnership.outgoingRouteStillTasks[owner] == nil)
+    }
+
+    @Test("Off-main parkOutgoingRouteStill respects clearOutgoingRouteStill and retireDepartedRouteStill cancellation")
+    func offMainParkOutgoingRouteStillClearAndRetireCancellation() async throws {
+        let vm = PlayerViewModel.shared
+        let savedBackend = vm.activeBackend
+        let savedOwner = vm.ownerKey
+        let mockBackend = MockTransitionStillBackend()
+        let pixelBuffer = try Self.makeSyntheticPixelBuffer(width: 1920, height: 1080)
+        mockBackend.captureSourceHandler = {
+            DisplayedFrameCaptureSource(pixelBuffer: pixelBuffer, displayScale: 3)
+        }
+
+        vm.clearAllOutgoingRouteStills()
+        vm.activeBackend = mockBackend
+        defer {
+            vm.clearAllOutgoingRouteStills()
+            vm.activeBackend = savedBackend
+            vm.ownerKey = savedOwner
+        }
+
+        // 1) Immediate clearOutgoingRouteStill cancels in-flight detached render before storing.
+        let clearedOwner = "vod-detail-clear-\(UUID().uuidString)"
+        vm.ownerKey = clearedOwner
+        #expect(vm.parkOutgoingRouteStill() == clearedOwner)
+        vm.clearOutgoingRouteStill(owner: clearedOwner)
+        try? await Task.sleep(for: .milliseconds(150))
+        #expect(vm.outgoingRouteStill(for: clearedOwner) == nil)
+        #expect(vm.routeOwnership.outgoingRouteStillTasks[clearedOwner] == nil)
+
+        // 2) Immediate retireDepartedRouteStill blocks departed owner from populating outgoingRouteStills.
+        let retiredOwner = "vod-detail-retire-\(UUID().uuidString)"
+        vm.ownerKey = retiredOwner
+        #expect(vm.parkOutgoingRouteStill() == retiredOwner)
+        vm.retireDepartedRouteStill(owner: retiredOwner)
+        let cleanedUp = await Self.waitUntil {
+            vm.routeOwnership.outgoingRouteStillTasks[retiredOwner] == nil
+        }
+        #expect(cleanedUp)
+        #expect(vm.outgoingRouteStill(for: retiredOwner) == nil)
+
+        // 3) Retiring an already-parked owner releases it on the next parkOutgoingRouteStill call.
+        let previousOwner = "vod-detail-prev-\(UUID().uuidString)"
+        vm.ownerKey = previousOwner
+        #expect(vm.parkOutgoingRouteStill() == previousOwner)
+        let prevPopulated = await Self.waitUntil {
+            vm.outgoingRouteStill(for: previousOwner) != nil
+        }
+        #expect(prevPopulated)
+        vm.retireDepartedRouteStill(owner: previousOwner)
+        #expect(vm.outgoingRouteStill(for: previousOwner) != nil)
+
+        let nextOwner = "vod-detail-next-\(UUID().uuidString)"
+        vm.ownerKey = nextOwner
+        #expect(vm.parkOutgoingRouteStill() == nextOwner)
+        #expect(vm.outgoingRouteStill(for: previousOwner) == nil)
+        vm.clearOutgoingRouteStill(owner: nextOwner)
+    }
+
+    @Test("parkOutgoingRouteStill falls back to currentDisplayedFrameForTransition when capture source is nil")
+    func parkOutgoingRouteStillFallbackWhenCaptureSourceIsNil() throws {
+        let vm = PlayerViewModel.shared
+        let savedBackend = vm.activeBackend
+        let savedOwner = vm.ownerKey
+        let mockBackend = MockTransitionStillBackend()
+        let fallbackImage = Self.makeSyntheticFallbackImage(width: 160, height: 90)
+        mockBackend.captureSourceHandler = { nil }
+        mockBackend.fallbackFrameHandler = { fallbackImage }
+
+        vm.clearAllOutgoingRouteStills()
+        vm.activeBackend = mockBackend
+        defer {
+            vm.clearAllOutgoingRouteStills()
+            vm.activeBackend = savedBackend
+            vm.ownerKey = savedOwner
+        }
+
+        // Empty owner returns nil without touching backend.
+        vm.ownerKey = ""
+        #expect(vm.parkOutgoingRouteStill() == nil)
+        #expect(mockBackend.captureSourceCallCount == 0)
+        #expect(mockBackend.fallbackFrameCallCount == 0)
+
+        // Nil capture source falls back synchronously to currentDisplayedFrameForTransition.
+        let owner = "vod-detail-fallback-\(UUID().uuidString)"
+        vm.ownerKey = owner
+        #expect(vm.parkOutgoingRouteStill() == owner)
+        #expect(mockBackend.captureSourceCallCount == 1)
+        #expect(mockBackend.fallbackFrameCallCount == 1)
+        let stored = try #require(vm.outgoingRouteStill(for: owner))
+        #expect(stored.size == fallbackImage.size)
+
+        // When both capture source and fallback frame are nil, any stale still is cleared.
+        mockBackend.fallbackFrameHandler = { nil }
+        #expect(vm.parkOutgoingRouteStill() == owner)
+        #expect(mockBackend.captureSourceCallCount == 2)
+        #expect(mockBackend.fallbackFrameCallCount == 2)
+        #expect(vm.outgoingRouteStill(for: owner) == nil)
+    }
+
+    @Test("DetailDepartureHeightFreezePolicy freezes compact height on departure and gates animations and related deferral")
+    func detailDepartureHeightFreezeAndRelatedDeferralPolicy() {
+        // Active compact route always reflects live computed height (ignoring stale frozen/cached values).
+        #expect(
+            DetailDepartureHeightFreezePolicy.resolvedHeight(
+                isWideLayout: false,
+                wideHeight: 500,
+                isActiveRoute: true,
+                frozenStateHeight: 420,
+                cachedActiveHeight: 380,
+                computedHeight: 292.5
+            ) == 292.5
+        )
+
+        // Inactive compact route prefers frozenStateHeight, then cachedActiveHeight, then computedHeight.
+        #expect(
+            DetailDepartureHeightFreezePolicy.resolvedHeight(
+                isWideLayout: false,
+                wideHeight: 500,
+                isActiveRoute: false,
+                frozenStateHeight: 520,
+                cachedActiveHeight: 480,
+                computedHeight: 220
+            ) == 520
+        )
+        #expect(
+            DetailDepartureHeightFreezePolicy.resolvedHeight(
+                isWideLayout: false,
+                wideHeight: 500,
+                isActiveRoute: false,
+                frozenStateHeight: nil,
+                cachedActiveHeight: 480,
+                computedHeight: 220
+            ) == 480
+        )
+        #expect(
+            DetailDepartureHeightFreezePolicy.resolvedHeight(
+                isWideLayout: false,
+                wideHeight: 500,
+                isActiveRoute: false,
+                frozenStateHeight: nil,
+                cachedActiveHeight: nil,
+                computedHeight: 220
+            ) == 220
+        )
+
+        // Wide layout always uses wideHeight even when inactive.
+        #expect(
+            DetailDepartureHeightFreezePolicy.resolvedHeight(
+                isWideLayout: true,
+                wideHeight: 500,
+                isActiveRoute: false,
+                frozenStateHeight: 420,
+                cachedActiveHeight: 380,
+                computedHeight: 220
+            ) == 500
+        )
+
+        // Inline height animations are permitted only while active, compact, and non-fullscreen.
+        #expect(
+            DetailDepartureHeightFreezePolicy.allowsInlineHeightAnimation(
+                isActiveRoute: true,
+                isWideLayout: false,
+                isFullscreenPresentationActive: false,
+                isFullscreen: false
+            )
+        )
+        #expect(
+            !DetailDepartureHeightFreezePolicy.allowsInlineHeightAnimation(
+                isActiveRoute: false,
+                isWideLayout: false,
+                isFullscreenPresentationActive: false,
+                isFullscreen: false
+            )
+        )
+        #expect(
+            !DetailDepartureHeightFreezePolicy.allowsInlineHeightAnimation(
+                isActiveRoute: true,
+                isWideLayout: true,
+                isFullscreenPresentationActive: false,
+                isFullscreen: false
+            )
+        )
+        #expect(
+            !DetailDepartureHeightFreezePolicy.allowsInlineHeightAnimation(
+                isActiveRoute: true,
+                isWideLayout: false,
+                isFullscreenPresentationActive: true,
+                isFullscreen: false
+            )
+        )
+        #expect(
+            !DetailDepartureHeightFreezePolicy.allowsInlineHeightAnimation(
+                isActiveRoute: true,
+                isWideLayout: false,
+                isFullscreenPresentationActive: false,
+                isFullscreen: true
+            )
+        )
+
+        // Related grid deferral applies only on compact routes with videos before transition settles.
+        #expect(
+            DetailDepartureHeightFreezePolicy.shouldDeferRelatedGrid(
+                isCompact: true,
+                hasVideos: true,
+                isTransitionSettled: false
+            )
+        )
+        #expect(
+            !DetailDepartureHeightFreezePolicy.shouldDeferRelatedGrid(
+                isCompact: true,
+                hasVideos: true,
+                isTransitionSettled: true
+            )
+        )
+        #expect(
+            !DetailDepartureHeightFreezePolicy.shouldDeferRelatedGrid(
+                isCompact: false,
+                hasVideos: true,
+                isTransitionSettled: false
+            )
+        )
+        #expect(
+            !DetailDepartureHeightFreezePolicy.shouldDeferRelatedGrid(
+                isCompact: true,
+                hasVideos: false,
+                isTransitionSettled: false
+            )
+        )
+    }
+
+    @Test("UGCSeasonInlineSelectionPolicy resolves same-aid parts, cross-aid zoom-free targets, and season queue sync")
+    func ugcSeasonInlineSelectionAndQueueSyncPolicy() throws {
+        let json = """
+        {
+          "aid": 5001,
+          "bvid": "BV1season0001",
+          "cid": 50011,
+          "title": "Season Ep 1",
+          "desc": "",
+          "pic": "https://example.com/ep1.jpg",
+          "duration": 300,
+          "pubdate": 1700000000,
+          "owner": { "mid": 9, "name": "SeriesUP", "face": "https://example.com/up.jpg" },
+          "stat": { "view": 100, "danmaku": 10, "reply": 5, "favorite": 4, "coin": 3, "share": 2, "like": 20 },
+          "pages": [
+            { "cid": 50011, "page": 1, "part": "Part 1", "duration": 150 },
+            { "cid": 50012, "page": 2, "part": "Part 2", "duration": 150 }
+          ],
+          "ugc_season": {
+            "id": 99,
+            "title": "Swift Series",
+            "sections": [
+              {
+                "id": 1,
+                "title": "Main",
+                "episodes": [
+                  { "id": 1, "aid": 5001, "bvid": "BV1season0001", "cid": 50011, "title": "Ep 1 P1" },
+                  { "id": 2, "aid": 5001, "bvid": "BV1season0001", "cid": 50012, "title": "Ep 1 P2" },
+                  {
+                    "id": 3,
+                    "aid": 5002,
+                    "bvid": "BV1season0002",
+                    "cid": 50021,
+                    "title": "Ep 2 Vertical",
+                    "arc": { "pic": "https://example.com/ep2.jpg", "duration": 95 },
+                    "page": {
+                      "cid": 50021,
+                      "page": 1,
+                      "part": "Main",
+                      "duration": 95,
+                      "dimension": { "width": 1080, "height": 1920, "rotate": 0 }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+        """
+
+        let info = try JSONDecoder().decode(VideoInfo.self, from: Data(json.utf8))
+        let season = try #require(info.ugcSeason)
+        let episodes = season.allEpisodes
+        #expect(episodes.count == 3)
+
+        // Same aid + same cid -> resume/replay current without pushing.
+        let samePartAction = UGCSeasonInlineSelectionPolicy.resolveSelection(
+            episode: episodes[0],
+            currentVideoInfo: info,
+            currentCid: 50011,
+            fallbackOwnerName: info.owner.name
+        )
+        if case .resumeOrReplayCurrent = samePartAction {
+            // Expected
+        } else {
+            Issue.record("Expected .resumeOrReplayCurrent for active episode, got \(samePartAction)")
+        }
+
+        // Same aid + different cid matching a page -> in-place part switch.
+        let siblingPartAction = UGCSeasonInlineSelectionPolicy.resolveSelection(
+            episode: episodes[1],
+            currentVideoInfo: info,
+            currentCid: 50011,
+            fallbackOwnerName: info.owner.name
+        )
+        if case .switchPart(let page) = siblingPartAction {
+            #expect(page.cid == 50012)
+            #expect(page.page == 2)
+        } else {
+            Issue.record("Expected .switchPart(P2), got \(siblingPartAction)")
+        }
+
+        // Different aid -> zoom-free inline switch preserving videoID, cid, cover, duration, and aspect hints.
+        let nextEpisodeAction = UGCSeasonInlineSelectionPolicy.resolveSelection(
+            episode: episodes[2],
+            currentVideoInfo: info,
+            currentCid: 50011,
+            fallbackOwnerName: info.owner.name
+        )
+        if case .switchVideoInline(let target, let preferredCid) = nextEpisodeAction {
+            #expect(target.videoID == .bvid("BV1season0002"))
+            #expect(target.zoomSourceID == nil)
+            #expect(target.preview.title == "Ep 2 Vertical")
+            #expect(target.preview.ownerName == "SeriesUP")
+            #expect(target.preview.durationSeconds == 95)
+            #expect(target.preview.isPortraitHint == true)
+            #expect(abs((target.preview.aspectRatioHint ?? 0) - (9.0 / 16.0)) < 0.01)
+            #expect(preferredCid == 50021)
+        } else {
+            Issue.record("Expected .switchVideoInline for episode 2, got \(nextEpisodeAction)")
+        }
+
+        // Active matching .ugcSeason queue syncs selection to target episode; unrelated queues stay untouched.
+        let seasonQueue = try #require(
+            PlaybackQueueContext.ugcSeason(
+                season,
+                info: info,
+                videoID: .bvid(info.bvid),
+                currentCid: 50011
+            )
+        )
+        let synced = try #require(
+            UGCSeasonInlineSelectionPolicy.syncedSeasonQueue(
+                existingQueue: seasonQueue,
+                seasonID: 99,
+                aid: 5002,
+                cid: 50021
+            )
+        )
+        #expect(synced.currentItem?.aid == 5002)
+        #expect(synced.currentItem?.cid == 50021)
+
+        // Already-selected episode produces nil (no redundant queue mutation).
+        #expect(
+            UGCSeasonInlineSelectionPolicy.syncedSeasonQueue(
+                existingQueue: synced,
+                seasonID: 99,
+                aid: 5002,
+                cid: 50021
+            ) == nil
+        )
+        // Different season ID or non-season queue is ignored.
+        #expect(
+            UGCSeasonInlineSelectionPolicy.syncedSeasonQueue(
+                existingQueue: seasonQueue,
+                seasonID: 777,
+                aid: 5002,
+                cid: 50021
+            ) == nil
+        )
+        let unrelatedQueue = PlaybackQueueContext(
+            kind: .playlist(name: "Watch Later"),
+            items: seasonQueue.items,
+            currentIndex: 0
+        )
+        #expect(
+            UGCSeasonInlineSelectionPolicy.syncedSeasonQueue(
+                existingQueue: unrelatedQueue,
+                seasonID: 99,
+                aid: 5002,
+                cid: 50021
+            ) == nil
+        )
     }
 }
