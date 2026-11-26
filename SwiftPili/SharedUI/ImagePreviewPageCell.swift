@@ -63,28 +63,44 @@ import UIKit
     var thumbTask: DownloadTask?
     var fullTask: DownloadTask?
     var metadataTask: Task<Void, Never>?
+    var originalPixelSize: CGSize?
     var resolvedAspect: CGFloat?
     var targetMetadataAspect: CGFloat?
     var hasAuthoritativeAspect = false
     var hasFullImage = false
+    var hasUpgradedForZoom = false
     var isShowingServerCroppedThumb = false
     var defersFullReveal = false
     var pendingFullReveal: PendingFullReveal?
     var thumbFailed = false
     var fullFailed = false
-    var lastRasterEdge: CGFloat = 0
+    var lastDecodedPixelEdge: CGFloat = 0
+    var lastRequestedPixelEdge: CGFloat = 0
     private var lastLayoutSize = CGSize.zero
 
     var canBeginInteractiveDismissal: Bool {
-        scrollView.zoomScale <= 1.02 && scrollView.contentOffset.y <= 2
+        scrollView.zoomScale <= scrollView.minimumZoomScale + 0.02 && scrollView.contentOffset.y <= 2
     }
 
     var currentDisplayedImage: UIImage? { imageView.image }
     var currentAspect: CGFloat? { resolvedAspect }
 
+    var effectiveDisplayScale: CGFloat {
+        let traitScale = traitCollection.displayScale
+        if traitScale.isFinite, traitScale > 0 { return traitScale }
+        if let sceneScale = window?.windowScene?.screen.scale, sceneScale.isFinite, sceneScale > 0 {
+            return sceneScale
+        }
+        return 2
+    }
+
     var currentDisplayMode: ImagePreviewDisplayMode {
         guard let currentURL else { return .fitted }
-        return ImagePreviewRasterPolicy.displayMode(url: currentURL, aspect: resolvedAspect)
+        return ImagePreviewRasterPolicy.displayMode(
+            url: currentURL,
+            aspect: resolvedAspect,
+            viewport: effectiveViewportSize
+        )
     }
 
     var scrollPanGestureRecognizer: UIPanGestureRecognizer { scrollView.panGestureRecognizer }
@@ -105,6 +121,9 @@ import UIKit
         setupScrollView()
         setupStatusViews()
         setupGestures()
+        registerForTraitChanges([UITraitDisplayScale.self]) { (cell: ImagePreviewPageCell, _) in
+            cell.updateZoomBoundsForCurrentMetrics()
+        }
     }
 
     @available(*, unavailable)
@@ -115,16 +134,19 @@ import UIKit
         cancelActiveLoads()
         currentURL = nil
         callbacks = nil
+        originalPixelSize = nil
         resolvedAspect = nil
         targetMetadataAspect = nil
         hasAuthoritativeAspect = false
         hasFullImage = false
+        hasUpgradedForZoom = false
         isShowingServerCroppedThumb = false
         defersFullReveal = false
         pendingFullReveal = nil
         thumbFailed = false
         fullFailed = false
-        lastRasterEdge = 0
+        lastDecodedPixelEdge = 0
+        lastRequestedPixelEdge = 0
         lastLayoutSize = .zero
         imageView.stopAnimating()
         imageView.layer.removeAllAnimations()
@@ -133,6 +155,8 @@ import UIKit
         imageView.image = nil
         imageView.isHidden = false
         scrollView.isReadingMode = false
+        scrollView.minimumZoomScale = 1.0
+        scrollView.maximumZoomScale = 3.0
         scrollView.zoomScale = 1.0
         scrollView.contentOffset = .zero
         spinner.stopAnimating()
@@ -158,29 +182,37 @@ import UIKit
         cancelActiveLoads()
         loadGeneration &+= 1
         let generation = loadGeneration
-        currentURL = url
+        let canonicalURL = ImagePreviewRasterPolicy.originalURL(for: url)
+        currentURL = canonicalURL
         pageIndex = index
         self.callbacks = callbacks
         hasFullImage = false
         hasAuthoritativeAspect = false
+        hasUpgradedForZoom = false
         isShowingServerCroppedThumb = seed.isServerCropped && seed.thumbnail != nil
         defersFullReveal = seed.deferFullReveal
         pendingFullReveal = nil
         thumbFailed = false
         fullFailed = false
-        lastRasterEdge = 0
+        lastDecodedPixelEdge = 0
+        lastRequestedPixelEdge = 0
         imageView.stopAnimating()
         imageView.layer.removeAllAnimations()
         imageView.contentMode = .scaleAspectFit
         imageView.isHidden = false
         errorButton.isHidden = true
+        scrollView.minimumZoomScale = 1.0
+        scrollView.maximumZoomScale = 3.0
         scrollView.zoomScale = 1.0
         scrollView.contentOffset = .zero
 
-        targetMetadataAspect = Self.validAspect(from: seed.pixelSize)
+        originalPixelSize = Self.validPixelSize(from: seed.pixelSize)
+        targetMetadataAspect = Self.validAspect(from: originalPixelSize)
         let thumbAspect = Self.validAspect(from: seed.thumbnail)
+        let viewportFrame = contentView.bounds.insetBy(dx: Self.horizontalInset, dy: 0)
+        let modeViewport: CGSize? = viewportFrame.isUsableImageRect ? viewportFrame.size : nil
         let targetMode = targetMetadataAspect.map {
-            ImagePreviewRasterPolicy.displayMode(url: url, aspect: $0)
+            ImagePreviewRasterPolicy.displayMode(url: canonicalURL, aspect: $0, viewport: modeViewport)
         } ?? .fitted
         if isShowingServerCroppedThumb, targetMode == .reading {
             resolvedAspect = thumbAspect ?? targetMetadataAspect
@@ -198,13 +230,14 @@ import UIKit
             spinner.startAnimating()
         }
 
-        let viewportFrame = contentView.bounds.insetBy(dx: Self.horizontalInset, dy: 0)
         if viewportFrame.isUsableImageRect {
             scrollView.frame = viewportFrame
             lastLayoutSize = viewportFrame.size
             layoutImageContent(resetZoom: true, animated: false)
+        } else {
+            updateZoomBoundsForCurrentMetrics()
         }
-        startLoading(url: url, generation: generation)
+        startLoading(url: canonicalURL, generation: generation)
     }
 
     func visibleImageFrame(in targetView: UIView) -> CGRect {
@@ -224,6 +257,27 @@ import UIKit
         return imageView.convert(imageView.bounds, to: targetView)
     }
 
+    @discardableResult
+    func updateZoomBoundsForCurrentMetrics() -> ImagePreviewZoomMetrics {
+        let metrics = ImagePreviewMath.zoomMetrics(
+            originalPixelSize: isShowingServerCroppedThumb ? nil : originalPixelSize,
+            aspect: resolvedAspect,
+            viewport: effectiveViewportSize,
+            displayScale: effectiveDisplayScale,
+            mode: currentDisplayMode
+        )
+        if abs(scrollView.minimumZoomScale - metrics.minimumZoomScale) > 0.001 {
+            scrollView.minimumZoomScale = metrics.minimumZoomScale
+        }
+        if abs(scrollView.maximumZoomScale - metrics.maximumZoomScale) > 0.001 {
+            scrollView.maximumZoomScale = metrics.maximumZoomScale
+            if scrollView.zoomScale > metrics.maximumZoomScale {
+                scrollView.zoomScale = metrics.maximumZoomScale
+            }
+        }
+        return metrics
+    }
+
     func layoutImageContent(
         resetZoom: Bool,
         animated: Bool,
@@ -234,16 +288,17 @@ import UIKit
             onComplete?()
             return
         }
-        if !resetZoom, scrollView.zoomScale > 1.02 {
+        let metrics = updateZoomBoundsForCurrentMetrics()
+        if !resetZoom, scrollView.zoomScale > scrollView.minimumZoomScale + 0.02 {
             onComplete?()
             return
         }
-        if resetZoom, scrollView.zoomScale != 1.0 {
-            scrollView.zoomScale = 1.0
+        if resetZoom, abs(scrollView.zoomScale - metrics.minimumZoomScale) > 0.001 {
+            scrollView.zoomScale = metrics.minimumZoomScale
         }
         let mode = currentDisplayMode
         scrollView.isReadingMode = mode == .reading
-        let baseSize = targetBaseSize(in: viewport, mode: mode)
+        let baseSize = metrics.baseSize
         let originX = baseSize.width < viewport.width ? (viewport.width - baseSize.width) / 2 : 0
         let originY: CGFloat = mode == .reading && baseSize.height > viewport.height
             ? 0
@@ -268,19 +323,14 @@ import UIKit
             onComplete?()
         }
     }
+}
 
-    private func targetBaseSize(in viewport: CGSize, mode: ImagePreviewDisplayMode) -> CGSize {
-        guard let aspect = resolvedAspect, aspect > 0 else { return viewport }
-        return mode == .reading
-            ? CGSize(width: viewport.width, height: viewport.width / aspect)
-            : ImagePreviewMath.fittedSize(in: viewport, aspect: aspect)
-    }
-
-    private func setupScrollView() {
+private extension ImagePreviewPageCell {
+    func setupScrollView() {
         scrollView.backgroundColor = .clear
         scrollView.delegate = self
         scrollView.minimumZoomScale = 1.0
-        scrollView.maximumZoomScale = 5.0
+        scrollView.maximumZoomScale = 3.0
         scrollView.bouncesZoom = true
         scrollView.showsHorizontalScrollIndicator = false
         scrollView.showsVerticalScrollIndicator = false
@@ -298,7 +348,7 @@ import UIKit
         scrollView.contentTargetView = imageView
     }
 
-    private func setupStatusViews() {
+    func setupStatusViews() {
         spinner.color = .white
         spinner.hidesWhenStopped = true
         contentView.addSubview(spinner)
@@ -317,7 +367,7 @@ import UIKit
         contentView.addSubview(errorButton)
     }
 
-    private func setupGestures() {
+    func setupGestures() {
         let doubleTap = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap(_:)))
         doubleTap.numberOfTapsRequired = 2
         scrollView.addGestureRecognizer(doubleTap)
@@ -330,12 +380,13 @@ import UIKit
         scrollView.addInteraction(UIContextMenuInteraction(delegate: self))
     }
 
-    @objc private func handleSingleTap() {
+    @objc func handleSingleTap() {
         callbacks?.onSingleTap()
     }
 
-    @objc private func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {
+    @objc func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {
         let animated = !UIAccessibility.isReduceMotionEnabled
+        let metrics = updateZoomBoundsForCurrentMetrics()
         if scrollView.zoomScale > scrollView.minimumZoomScale + 0.05 {
             scrollView.setZoomScale(scrollView.minimumZoomScale, animated: animated)
             return
@@ -345,13 +396,22 @@ import UIKit
             x: min(max(rawPoint.x, 0), imageView.bounds.width),
             y: min(max(rawPoint.y, 0), imageView.bounds.height)
         )
-        let rect = ImagePreviewMath.zoomRect(at: clampedPoint, scale: 2.5, viewport: scrollView.bounds.size)
+        let rect = ImagePreviewMath.zoomRect(
+            at: clampedPoint,
+            scale: metrics.doubleTapZoomScale,
+            viewport: scrollView.bounds.size,
+            contentSize: imageView.bounds.size
+        )
         scrollView.zoom(to: rect, animated: animated)
     }
 
-    @objc private func handleRetryTap() {
+    @objc func handleRetryTap() {
         guard let currentURL else { return }
         loadGeneration &+= 1
+        hasFullImage = false
+        hasUpgradedForZoom = false
+        lastDecodedPixelEdge = 0
+        lastRequestedPixelEdge = 0
         thumbFailed = false
         fullFailed = false
         errorButton.isHidden = true
@@ -367,6 +427,7 @@ extension ImagePreviewPageCell: UIScrollViewDelegate {
 
     func scrollViewDidZoom(_ scrollView: UIScrollView) {
         self.scrollView.centerContentViewIfNeeded()
+        upgradeResolutionForZoomIfNeeded()
     }
 }
 

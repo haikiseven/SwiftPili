@@ -257,7 +257,8 @@ private final class RecommendedTabCache {
                         coverURL: item.pic,
                         mobileCoverURL: item.mobileCoverURL,
                         ownerName: item.owner?.name ?? "",
-                        durationSeconds: item.duration ?? 0
+                        durationSeconds: item.duration ?? 0,
+                        aspectRatioHint: item.aspectRatioHint
                     )
                 )
             }
@@ -381,7 +382,9 @@ private final class PopularTabCache {
                         coverURL: item.pic,
                         mobileCoverURL: item.mobileCoverURL,
                         ownerName: item.owner.name,
-                        durationSeconds: item.duration
+                        durationSeconds: item.duration,
+                        isPortraitHint: item.dimension?.isPortrait,
+                        aspectRatioHint: item.dimension?.effectiveAspectRatio
                     )
                 )
             }
@@ -568,7 +571,9 @@ private final class RankingTabCache {
                         coverURL: item.pic,
                         mobileCoverURL: item.mobileCoverURL,
                         ownerName: item.owner?.name ?? "",
-                        durationSeconds: item.duration ?? 0
+                        durationSeconds: item.duration ?? 0,
+                        isPortraitHint: item.dimension?.isPortrait,
+                        aspectRatioHint: item.dimension?.effectiveAspectRatio
                     )
                 )
             }

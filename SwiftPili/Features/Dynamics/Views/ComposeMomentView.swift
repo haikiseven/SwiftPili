@@ -102,6 +102,6 @@ struct ComposeMomentView: View {
                 }
             }
         }
-        .appAdaptiveSheet(padSizing: .form)
+        .appAdaptiveSheet(compactDetents: [.large], padSizing: .form)
     }
 }

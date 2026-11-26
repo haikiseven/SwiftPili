@@ -35,6 +35,7 @@ final class RootDetailPresentationState {
         }
 
         if isVisible, self.navigation?.root == navigation.root, accountRevision == input.accountRevision {
+            committedNativePopGeneration = nil
             if self.navigation != navigation { self.navigation = navigation }
             return
         }
@@ -77,6 +78,26 @@ final class RootDetailPresentationState {
         guard isVisible, projectionHeld, self.generation == generation,
               navigation?.root == root else { return }
         committedNativePopGeneration = generation
+    }
+
+    func markEdgePopCompleted(
+        root: DetailRouteOccurrence,
+        generation: Int
+    ) {
+        guard isVisible, projectionHeld, self.generation == generation,
+              navigation?.root == root else { return }
+        committedNativePopGeneration = generation
+    }
+
+    func noteCoverDismissed(currentInput: Input) {
+        guard projectionHeld, !currentInput.requiresOuterHost else { return }
+        if isVisible {
+            guard committedNativePopGeneration == generation else { return }
+            beginExit(animation: nil, currentInput: { currentInput })
+            return
+        }
+        navigation = nil
+        projectionHeld = false
     }
 
     private func beginExit(animation: Animation?, currentInput: @escaping () -> Input) {

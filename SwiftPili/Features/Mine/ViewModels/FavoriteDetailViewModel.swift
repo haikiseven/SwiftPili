@@ -7,6 +7,22 @@ import SwiftUI
 final class FavoriteDetailViewModel {
     typealias Media = FavoriteContentResult.FavoriteMedia
 
+    enum SortOrder: String, CaseIterable, Identifiable, Sendable {
+        case recentlyAdded = "mtime"
+        case mostViewed = "view"
+        case newestPublished = "pubtime"
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .recentlyAdded: String(localized: "Recently Added")
+            case .mostViewed: String(localized: "Most Viewed")
+            case .newestPublished: String(localized: "Newest Published")
+            }
+        }
+    }
+
     enum ActionKind: Equatable {
         case save, copy, move, remove, watchLater
 
@@ -32,6 +48,7 @@ final class FavoriteDetailViewModel {
     private struct PageRequest: Equatable {
         let token: FeedLoadToken
         let keyword: String?
+        let order: SortOrder
         let page: Int
         let replaces: Bool
     }
@@ -41,6 +58,8 @@ final class FavoriteDetailViewModel {
     private let accountRevision: UInt64
     private(set) var items: [Media] = []
     private(set) var activeKeyword: String?
+    private(set) var sortOrder: SortOrder = .recentlyAdded
+    private(set) var reportedMediaCount: Int?
     private(set) var hasMore = true
     private(set) var hasLoaded = false
     private(set) var hasAttempted = false
@@ -82,6 +101,25 @@ final class FavoriteDetailViewModel {
 
     var canMutate: Bool { isCurrentAccount && (accountID.flatMap(Int.init) ?? 0) > 0 && activeActionID == nil }
     var canRetryLoading: Bool { failedRequest != nil && !isLoading }
+    var playableVideos: [Media] { items.filter(\.isPlayableVideo) }
+    var hasPlayableVideos: Bool { items.contains(where: \.isPlayableVideo) }
+
+    func makePlayAllEntries() -> [PlaylistQueueEntry] {
+        playableVideos.compactMap { item in
+            guard let target = favoriteRouteTarget(item) else { return nil }
+            return PlaylistQueueEntry(
+                aid: item.id,
+                bvid: item.bvid,
+                cid: nil,
+                title: item.title,
+                artist: item.upper?.name ?? "",
+                coverURL: item.cover?.isEmpty == false ? item.cover : nil,
+                duration: item.duration.map(TimeInterval.init),
+                isPortraitHint: nil,
+                routeTarget: target
+            )
+        }
+    }
 
     func actionError(for requestID: UUID) -> String? {
         actionFailureID == requestID ? actionError : nil
@@ -110,6 +148,17 @@ final class FavoriteDetailViewModel {
         loadWork = Task { await load(request) }
     }
 
+    func setSortOrder(_ order: SortOrder) {
+        guard !Task.isCancelled, isCurrentAccount, order != sortOrder else { return }
+        sortOrder = order
+        items = []
+        page = 1
+        hasMore = true
+        hasLoaded = false
+        let request = prepareReplacement()
+        loadWork = Task { await load(request) }
+    }
+
     func refresh() async {
         guard !Task.isCancelled, isCurrentAccount, mediaID > 0 else { return }
         await runLoad(prepareReplacement())
@@ -120,7 +169,13 @@ final class FavoriteDetailViewModel {
               failedRequest == nil, mediaID > 0,
               let token = admission.admit(kind: page == 1 ? .initial : .pagination, cursor: String(page))
         else { return }
-        let request = PageRequest(token: token, keyword: activeKeyword, page: page, replaces: page == 1)
+        let request = PageRequest(
+            token: token,
+            keyword: activeKeyword,
+            order: sortOrder,
+            page: page,
+            replaces: page == 1
+        )
         prepare(request)
         await runLoad(request)
     }
@@ -133,7 +188,7 @@ final class FavoriteDetailViewModel {
     func retry() async {
         guard !Task.isCancelled, isCurrentAccount, !isLoading else { return }
         guard let failedRequest else { await loadMore(); return }
-        guard failedRequest.keyword == activeKeyword else { return }
+        guard failedRequest.keyword == activeKeyword, failedRequest.order == sortOrder else { return }
         self.failedRequest = nil
         if failedRequest.replaces { await refresh() } else { await loadMore() }
     }
@@ -142,7 +197,13 @@ final class FavoriteDetailViewModel {
         loadWork?.cancel()
         loadWork = nil
         let token = admission.supersedeAndAdmit(kind: .refresh, cursor: "1")
-        let request = PageRequest(token: token, keyword: activeKeyword, page: 1, replaces: true)
+        let request = PageRequest(
+            token: token,
+            keyword: activeKeyword,
+            order: sortOrder,
+            page: 1,
+            replaces: true
+        )
         prepare(request)
         return request
     }
@@ -157,7 +218,7 @@ final class FavoriteDetailViewModel {
 
     private func isCurrent(_ request: PageRequest) -> Bool {
         isCurrentAccount && loadingRequest == request && admission.isCurrent(request.token)
-            && request.keyword == activeKeyword
+            && request.keyword == activeKeyword && request.order == sortOrder
     }
 
     private func runLoad(_ request: PageRequest) async {
@@ -193,7 +254,10 @@ final class FavoriteDetailViewModel {
         }
         do {
             let result = try await UserAPI.getFavoriteContent(
-                mediaId: mediaID, pn: request.page, keyword: request.keyword
+                mediaId: mediaID,
+                pn: request.page,
+                keyword: request.keyword,
+                order: request.order.rawValue
             )
             guard !Task.isCancelled, isCurrent(request) else {
                 wasCancelled = true
@@ -204,6 +268,9 @@ final class FavoriteDetailViewModel {
                 existing: request.replaces ? [] : items, incoming: incoming, id: \.resourceKey
             )
             folderInfo = result.info?.id == mediaID ? result.info : nil
+            if let count = folderInfo?.mediaCount {
+                reportedMediaCount = count
+            }
             hasMore = result.hasMore ?? false
             page = request.page + 1
             hasLoaded = true
@@ -264,11 +331,13 @@ private extension FavoriteDetailViewModel {
                     withTransaction(\.favoriteRemovalID, request.id) {
                         items.removeAll { $0.resourceKey == request.item.resourceKey }
                     }
+                    if let count = reportedMediaCount {
+                        reportedMediaCount = max(items.count, count - 1)
+                    }
                 }
-                page = 1
-                hasMore = true
-                let replacement = prepareReplacement()
-                await runLoad(replacement)
+                if items.isEmpty && hasMore {
+                    await loadMore()
+                }
             }
             return true
         } catch {

@@ -1,3 +1,4 @@
+import SwiftUI
 import UIKit
 
 @MainActor
@@ -16,14 +17,11 @@ final class UIKitFolderIconView: UIView {
     }
 
     private func setup() {
-        let accent = UIColor(AccentStore.shared.semanticAccent)
-        backgroundColor = accent.withAlphaComponent(0.14)
         layer.cornerRadius = size * 0.24
         layer.cornerCurve = .continuous
 
         iconView.translatesAutoresizingMaskIntoConstraints = false
         iconView.contentMode = .scaleAspectFit
-        iconView.tintColor = accent
         iconView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(weight: .medium)
         addSubview(iconView)
 
@@ -36,6 +34,20 @@ final class UIKitFolderIconView: UIView {
             iconView.widthAnchor.constraint(equalToConstant: iconSize),
             iconView.heightAnchor.constraint(equalToConstant: iconSize),
         ])
+        refreshAccent()
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil {
+            refreshAccent()
+        }
+    }
+
+    func refreshAccent() {
+        let accent = UIColor(AccentStore.shared.semanticAccent)
+        backgroundColor = accent.withAlphaComponent(0.14)
+        iconView.tintColor = accent
     }
 }
 
@@ -47,14 +59,22 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
         case seeMore
     }
 
+    private static let compactStatusHeight: CGFloat = 44
+
     private let headerButton = UIButton(type: .custom)
     private let folderIcon = UIKitFolderIconView(size: 28)
     private let titleLabel = UILabel()
+    private let privateIconView = UIImageView(image: UIImage(systemName: "lock.fill"))
     private let countLabel = UILabel()
     private let countPill = UIView()
     private let seeMoreLabel = UILabel()
     private let chevronView = UIImageView(image: UIImage(systemName: "chevron.right"))
-    private let emptyLabel = UILabel()
+    private let statusContainer = UIView()
+    private let statusStack = UIStackView()
+    private let statusIcon = UIImageView()
+    private let statusLabel = UILabel()
+    private let retryButton = UIButton(type: .system)
+
     private lazy var shelfLayout: UICollectionViewFlowLayout = {
         let layout = UICollectionViewFlowLayout()
         layout.scrollDirection = .horizontal
@@ -78,8 +98,8 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
     private var shelfHeightConstraint: NSLayoutConstraint?
     private var headerLeadingConstraint: NSLayoutConstraint?
     private var headerTrailingConstraint: NSLayoutConstraint?
-    private var emptyLeadingConstraint: NSLayoutConstraint?
-    private var emptyTrailingConstraint: NSLayoutConstraint?
+    private var statusLeadingConstraint: NSLayoutConstraint?
+    private var statusTrailingConstraint: NSLayoutConstraint?
 
     private var shelfItems: [ShelfItem] = []
     private var cardWidth: CGFloat = 128
@@ -87,6 +107,7 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
     private var coverPresentation = CoverPresentationStore.shared.presentation
     private var onOpenFolder: (() -> Void)?
     private var onSelectVideo: ((VideoRouteTarget) -> Void)?
+    private var onRetryPreview: (() -> Void)?
 
     private var previewRegistration:
         UICollectionView.CellRegistration<FavoriteShelfPreviewCell, FavoriteContentResult.FavoriteMedia>?
@@ -105,6 +126,7 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
     }
 
     private func setup() {
+        automaticallyUpdatesBackgroundConfiguration = false
         var background = UIBackgroundConfiguration.clear()
         background.backgroundColor = .clear
         backgroundConfiguration = background
@@ -118,6 +140,12 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
     private func setupHeader() {
         headerButton.translatesAutoresizingMaskIntoConstraints = false
         headerButton.addTarget(self, action: #selector(handleHeaderTap), for: .touchUpInside)
+        headerButton.addTarget(self, action: #selector(handleHeaderTouchDown), for: [.touchDown, .touchDragEnter])
+        headerButton.addTarget(
+            self,
+            action: #selector(handleHeaderTouchUp),
+            for: [.touchDragExit, .touchUpInside, .touchUpOutside, .touchCancel]
+        )
         contentView.addSubview(headerButton)
 
         let row = UIStackView()
@@ -134,12 +162,20 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
         titleLabel.adjustsFontForContentSizeCategory = true
         titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        privateIconView.tintColor = .secondaryLabel
+        privateIconView.contentMode = .scaleAspectFit
+        privateIconView.isHidden = true
+        privateIconView.setContentCompressionResistancePriority(.required, for: .horizontal)
+        privateIconView.setContentHuggingPriority(.required, for: .horizontal)
+
         countPill.backgroundColor = .tertiarySystemFill
         countPill.layer.cornerCurve = .continuous
         countLabel.translatesAutoresizingMaskIntoConstraints = false
         countLabel.textColor = .secondaryLabel
         countLabel.numberOfLines = 1
         countLabel.adjustsFontForContentSizeCategory = true
+        countLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        countLabel.setContentHuggingPriority(.required, for: .horizontal)
         countPill.addSubview(countLabel)
         NSLayoutConstraint.activate([
             countLabel.topAnchor.constraint(equalTo: countPill.topAnchor, constant: 2),
@@ -163,6 +199,7 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
 
         row.addArrangedSubview(folderIcon)
         row.addArrangedSubview(titleLabel)
+        row.addArrangedSubview(privateIconView)
         row.addArrangedSubview(countPill)
         row.addArrangedSubview(spacer)
         row.addArrangedSubview(seeMoreLabel)
@@ -180,13 +217,51 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
         shelfCollectionView.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(shelfCollectionView)
 
-        emptyLabel.translatesAutoresizingMaskIntoConstraints = false
-        emptyLabel.text = String(localized: "Empty Folder")
-        emptyLabel.textColor = .tertiaryLabel
-        emptyLabel.numberOfLines = 1
-        emptyLabel.adjustsFontForContentSizeCategory = true
-        emptyLabel.isHidden = true
-        contentView.addSubview(emptyLabel)
+        statusContainer.translatesAutoresizingMaskIntoConstraints = false
+        statusContainer.backgroundColor = .tertiarySystemFill
+        statusContainer.layer.cornerRadius = AppRadius.control
+        statusContainer.layer.cornerCurve = .continuous
+        statusContainer.isHidden = true
+        contentView.addSubview(statusContainer)
+
+        statusStack.translatesAutoresizingMaskIntoConstraints = false
+        statusStack.axis = .horizontal
+        statusStack.alignment = .center
+        statusStack.spacing = 8
+        statusContainer.addSubview(statusStack)
+
+        statusIcon.contentMode = .scaleAspectFit
+        statusIcon.tintColor = .tertiaryLabel
+        statusIcon.setContentCompressionResistancePriority(.required, for: .horizontal)
+        statusIcon.setContentHuggingPriority(.required, for: .horizontal)
+
+        statusLabel.textColor = .secondaryLabel
+        statusLabel.numberOfLines = 1
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.adjustsFontForContentSizeCategory = true
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let statusSpacer = UIView()
+        statusSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        var retryConfig = UIButton.Configuration.plain()
+        retryConfig.title = String(localized: "Retry")
+        retryConfig.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 10, bottom: 4, trailing: 10)
+        retryButton.configuration = retryConfig
+        retryButton.addTarget(self, action: #selector(handleRetryTap), for: .touchUpInside)
+        retryButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        retryButton.setContentHuggingPriority(.required, for: .horizontal)
+
+        statusStack.addArrangedSubview(statusIcon)
+        statusStack.addArrangedSubview(statusLabel)
+        statusStack.addArrangedSubview(statusSpacer)
+        statusStack.addArrangedSubview(retryButton)
+
+        NSLayoutConstraint.activate([
+            statusStack.leadingAnchor.constraint(equalTo: statusContainer.leadingAnchor, constant: 12),
+            statusStack.trailingAnchor.constraint(equalTo: statusContainer.trailingAnchor, constant: -8),
+            statusStack.centerYAnchor.constraint(equalTo: statusContainer.centerYAnchor),
+        ])
     }
 
     private func registerShelfCells() {
@@ -222,12 +297,12 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
         shelfHeightConstraint = shelfHeight
         let headerLeading = headerButton.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16)
         let headerTrailing = headerButton.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16)
-        let emptyLeading = emptyLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16)
-        let emptyTrailing = emptyLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -16)
+        let statusLeading = statusContainer.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16)
+        let statusTrailing = statusContainer.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16)
         headerLeadingConstraint = headerLeading
         headerTrailingConstraint = headerTrailing
-        emptyLeadingConstraint = emptyLeading
-        emptyTrailingConstraint = emptyTrailing
+        statusLeadingConstraint = statusLeading
+        statusTrailingConstraint = statusTrailing
 
         NSLayoutConstraint.activate([
             headerButton.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 12),
@@ -241,9 +316,10 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
             shelfCollectionView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -12),
             shelfHeight,
 
-            emptyLeading,
-            emptyTrailing,
-            emptyLabel.centerYAnchor.constraint(equalTo: shelfCollectionView.centerYAnchor),
+            statusLeading,
+            statusTrailing,
+            statusContainer.topAnchor.constraint(equalTo: shelfCollectionView.topAnchor),
+            statusContainer.bottomAnchor.constraint(equalTo: shelfCollectionView.bottomAnchor),
         ])
     }
 
@@ -252,19 +328,24 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
         containerWidth: CGFloat,
         coverPresentation: CoverPresentation,
         onOpenFolder: @escaping () -> Void,
-        onSelectVideo: @escaping (VideoRouteTarget) -> Void
+        onSelectVideo: @escaping (VideoRouteTarget) -> Void,
+        onRetryPreview: (() -> Void)? = nil
     ) {
         self.onOpenFolder = onOpenFolder
         self.onSelectVideo = onSelectVideo
+        self.onRetryPreview = onRetryPreview
         self.coverPresentation = coverPresentation
+
+        folderIcon.refreshAccent()
+        headerButton.alpha = 1.0
 
         let traits = traitCollection
         let resolvedWidth = containerWidth > 1 ? containerWidth : FeedWidth.fullContainerSeed
         let margin = FeedColumnPolicy.horizontalMargin(for: resolvedWidth)
         headerLeadingConstraint?.constant = margin
         headerTrailingConstraint?.constant = -margin
-        emptyLeadingConstraint?.constant = margin
-        emptyTrailingConstraint?.constant = -margin
+        statusLeadingConstraint?.constant = margin
+        statusTrailingConstraint?.constant = -margin
         shelfLayout.sectionInset = UIEdgeInsets(top: 0, left: margin, bottom: 0, right: margin)
 
         let availableShelfWidth = max(240, resolvedWidth - margin * 2)
@@ -282,7 +363,14 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
     private func configureHeaderLabels(row: FavoriteFolderRowData, traits: UITraitCollection) {
         titleLabel.text = row.folder.title
         titleLabel.font = UIKitFeedFont.systemFont(textStyle: .subheadline, weight: .semibold, traitCollection: traits)
-        headerButton.accessibilityLabel = "\(row.folder.title), \(String(localized: "See More"))"
+
+        let showsPrivate = row.folder.isPrivate
+        privateIconView.isHidden = !showsPrivate
+        if showsPrivate {
+            privateIconView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(
+                font: UIKitFeedFont.systemFont(textStyle: .caption2, weight: .semibold, traitCollection: traits)
+            )
+        }
 
         if let count = row.folder.mediaCount {
             countPill.isHidden = false
@@ -302,7 +390,16 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
         chevronView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(
             font: UIKitFeedFont.systemFont(textStyle: .caption2, weight: .semibold, traitCollection: traits)
         )
-        emptyLabel.font = UIKitFeedFont.systemFont(textStyle: .caption, traitCollection: traits)
+        statusLabel.font = UIKitFeedFont.systemFont(textStyle: .caption, traitCollection: traits)
+        statusIcon.preferredSymbolConfiguration = UIImage.SymbolConfiguration(
+            font: UIKitFeedFont.systemFont(textStyle: .caption, weight: .medium, traitCollection: traits)
+        )
+        retryButton.tintColor = UIColor(AccentStore.shared.semanticAccent)
+
+        var accessibilityParts = [row.folder.title]
+        if showsPrivate { accessibilityParts.append(String(localized: "Private")) }
+        accessibilityParts.append(String(localized: "See More"))
+        headerButton.accessibilityLabel = accessibilityParts.joined(separator: ", ")
     }
 
     private func configureShelfItems(row: FavoriteFolderRowData, traits: UITraitCollection) {
@@ -310,19 +407,34 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
         let metaFont = UIKitFeedFont.font(for: .cardMeta, traitCollection: traits)
         let cardTotalHeight = cardHeight + 5 + ceil(titleFont.lineHeight * 2) + 5 + ceil(metaFont.lineHeight) + 2
 
-        if !row.isPreviewLoaded {
-            emptyLabel.isHidden = true
+        if row.isPreviewFailed && row.previews.isEmpty {
+            statusContainer.isHidden = false
+            statusIcon.image = UIImage(systemName: "exclamationmark.triangle")
+            statusIcon.tintColor = .secondaryLabel
+            statusLabel.text = String(localized: "Failed to load preview")
+            statusLabel.textColor = .secondaryLabel
+            retryButton.isHidden = onRetryPreview == nil
+            shelfCollectionView.isHidden = true
+            shelfHeightConstraint?.constant = Self.compactStatusHeight
+            shelfItems = []
+        } else if !row.isPreviewLoaded {
+            statusContainer.isHidden = true
             shelfCollectionView.isHidden = false
             shelfCollectionView.isUserInteractionEnabled = false
             shelfHeightConstraint?.constant = cardTotalHeight
             shelfItems = (0..<3).map { .skeleton($0) }
         } else if row.previews.isEmpty {
-            emptyLabel.isHidden = false
+            statusContainer.isHidden = false
+            statusIcon.image = UIImage(systemName: "folder")
+            statusIcon.tintColor = .tertiaryLabel
+            statusLabel.text = String(localized: "Empty Folder")
+            statusLabel.textColor = .tertiaryLabel
+            retryButton.isHidden = true
             shelfCollectionView.isHidden = true
-            shelfHeightConstraint?.constant = cardHeight
+            shelfHeightConstraint?.constant = Self.compactStatusHeight
             shelfItems = []
         } else {
-            emptyLabel.isHidden = true
+            statusContainer.isHidden = true
             shelfCollectionView.isHidden = false
             shelfCollectionView.isUserInteractionEnabled = true
             shelfHeightConstraint?.constant = cardTotalHeight
@@ -338,11 +450,33 @@ final class FavoriteFolderShelfCell: UICollectionViewListCell {
         onOpenFolder?()
     }
 
+    @objc private func handleHeaderTouchDown() {
+        if UIAccessibility.isReduceMotionEnabled {
+            headerButton.alpha = 0.6
+        } else {
+            UIView.animate(withDuration: 0.1) { self.headerButton.alpha = 0.6 }
+        }
+    }
+
+    @objc private func handleHeaderTouchUp() {
+        if UIAccessibility.isReduceMotionEnabled {
+            headerButton.alpha = 1.0
+        } else {
+            UIView.animate(withDuration: 0.16) { self.headerButton.alpha = 1.0 }
+        }
+    }
+
+    @objc private func handleRetryTap() {
+        onRetryPreview?()
+    }
+
     override func prepareForReuse() {
         super.prepareForReuse()
         prefetchCoordinator.cancelAll()
         onOpenFolder = nil
         onSelectVideo = nil
+        onRetryPreview = nil
+        headerButton.alpha = 1.0
         shelfItems = []
         shelfCollectionView.setContentOffset(.zero, animated: false)
     }

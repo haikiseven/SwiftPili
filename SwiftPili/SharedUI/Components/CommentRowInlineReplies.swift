@@ -8,6 +8,8 @@ struct CommentInlineRepliesSection: View {
     var onViewThread: ((CommentResult.CommentItem) -> Void)?
     var onOpenReply: ((CommentResult.CommentItem, Int) -> Void)?
 
+    @State private var expandedFilteredIDs: Set<Int> = []
+
     @MainActor
     static func replyPreviews(
         for comment: CommentResult.CommentItem,
@@ -15,12 +17,17 @@ struct CommentInlineRepliesSection: View {
     ) -> ArraySlice<CommentResult.CommentItem> {
         let replies = comment.replies ?? []
         let engine = CommentAIFilterEngine.shared
-        guard engine.isEnabled, engine.config.mode == .hideCompletely else {
-            return replies.prefix(3)
-        }
+        let filterStore = LocalContentFilterStore.shared
+        let hideAI = engine.isEnabled && engine.config.mode == .hideCompletely
         var visible: [CommentResult.CommentItem] = []
         visible.reserveCapacity(min(3, replies.count))
-        for sub in replies where !engine.shouldHide(sub, upMid: upMid) {
+        for sub in replies {
+            if filterStore.shouldHideCommentCompletely(mid: sub.mid, content: sub.content.displayMessage) {
+                continue
+            }
+            if hideAI, engine.shouldHide(sub, upMid: upMid) {
+                continue
+            }
             visible.append(sub)
             if visible.count == 3 { break }
         }
@@ -75,13 +82,25 @@ struct CommentInlineRepliesSection: View {
 
     @ViewBuilder
     private func subReplyRow(_ sub: CommentResult.CommentItem) -> some View {
-        if BlocklistManager.shared.isBlocked(sub.mid) {
-            HStack(spacing: 5) {
-                Image(systemName: "eye.slash")
-                Text("Comment from a blocked user")
+        let filterStore = LocalContentFilterStore.shared
+        let matchedFilter = filterStore.matchComment(mid: sub.mid, content: sub.content.displayMessage) != nil
+        if matchedFilter, !expandedFilteredIDs.contains(sub.rpid) {
+            if filterStore.collapseFilteredComments {
+                HStack(spacing: 5) {
+                    Image(systemName: "eye.slash")
+                    Text("Locally filtered a comment, tap to view")
+                }
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    expandedFilteredIDs.insert(sub.rpid)
+                }
+            } else {
+                EmptyView()
             }
-            .font(.caption)
-            .foregroundStyle(.tertiary)
         } else if CommentAIFilterEngine.shared.config.mode == .autoCollapse,
                   let assessment = CommentAIFilterEngine.shared.assessment(for: sub, upMid: upMid),
                   assessment.matches(CommentAIFilterEngine.shared.config) {

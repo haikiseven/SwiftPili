@@ -65,38 +65,31 @@ struct CommentAIFilterRulesView: View {
     }
 
     private func dimensionsSection(rules: CommentAIFilterRuleSet) -> some View {
-        Section {
+        Section("Built-in Rules") {
             Toggle(isOn: ruleBinding(get: { $0.accountIdentityEnabled }, set: { $0.accountIdentityEnabled = $1 })) {
-                settingsLabel("Account Name & Bio Rules", symbol: "person.text.rectangle")
+                settingsLabel("Account & Bio", symbol: "person.text.rectangle")
             }
             .disabled(!canMutate)
 
             Toggle(isOn: ruleBinding(get: { $0.avatarBlueEnabled }, set: { $0.avatarBlueEnabled = $1 })) {
-                settingsLabel("Whale-Blue Avatar Detection", symbol: "photo.circle")
+                settingsLabel("Whale-Blue Avatar", symbol: "photo.circle")
             }
             .disabled(!canMutate)
 
             Toggle(isOn: ruleBinding(get: { $0.textPersonaEnabled }, set: { $0.textPersonaEnabled = $1 })) {
-                settingsLabel("AI Persona & Essay Rules", symbol: "text.bubble")
+                settingsLabel("AI Persona & Essays", symbol: "text.bubble")
             }
             .disabled(!canMutate)
 
             Toggle(isOn: ruleBinding(get: { $0.lowLevelBoostEnabled }, set: { $0.lowLevelBoostEnabled = $1 })) {
-                settingsLabel("Low-Level Account Boost", symbol: "arrow.up.right.circle")
+                settingsLabel("Low-Level Boost", symbol: "arrow.up.right.circle")
             }
             .disabled(!canMutate)
-        } header: {
-            Text("Built-in Detection Dimensions")
-        } footer: {
-            Text(
-                "Whale-blue avatar detection inspects a 32×32 local thumbnail of cached avatars "
-                + "to catch DeepSeek whale-style accounts without extra network requests."
-            )
         }
     }
 
     private func customAccountKeywordsSection(keywords: [String]) -> some View {
-        Section {
+        Section("Account Keywords") {
             HStack(spacing: AppSpacing.s) {
                 TextField("Add username or bio keyword", text: $newAccountKeyword)
                     .textInputAutocapitalization(.never)
@@ -118,18 +111,11 @@ struct CommentAIFilterRulesView: View {
                         .disabled(!canMutate)
                     }
             }
-        } header: {
-            Text("Custom Account Keywords")
-        } footer: {
-            Text(
-                "Comments whose author username or bio contains any keyword here are immediately flagged. "
-                + "Swipe left on a keyword to remove it."
-            )
         }
     }
 
     private func customContentKeywordsSection(keywords: [String]) -> some View {
-        Section {
+        Section("Comment Keywords") {
             HStack(spacing: AppSpacing.s) {
                 TextField("Add comment text keyword", text: $newContentKeyword)
                     .textInputAutocapitalization(.never)
@@ -151,13 +137,6 @@ struct CommentAIFilterRulesView: View {
                         .disabled(!canMutate)
                     }
             }
-        } header: {
-            Text("Custom Comment Keywords")
-        } footer: {
-            Text(
-                "Comments whose text contains any keyword here are immediately flagged. "
-                + "Swipe left on a keyword to remove it."
-            )
         }
     }
 

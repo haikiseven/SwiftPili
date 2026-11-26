@@ -17,6 +17,7 @@ enum DetailStageLayout {
     static let panelMaximumWidth: CGFloat = 440
     static let heroTopMargin: CGFloat = 16
     static let heroContentGap: CGFloat = 12
+    static let defaultHeroBarHeight: CGFloat = 96
 
     static func topMargin(for presentation: DetailStagePresentation) -> CGFloat {
         presentation == .hero ? heroTopMargin : outerMargin

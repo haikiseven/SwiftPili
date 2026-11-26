@@ -2,12 +2,79 @@ import SwiftData
 import SwiftUI
 import UIKit
 
+enum DownloadSortOption: String, CaseIterable, Identifiable, Sendable {
+    case recentlyAdded
+    case largestSize
+    case title
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .recentlyAdded: String(localized: "Recently Added")
+        case .largestSize: String(localized: "Largest Size")
+        case .title: String(localized: "Title")
+        }
+    }
+}
+
+struct DownloadSeriesGroup: Identifiable {
+    let id: String
+    let title: String
+    let subtitle: String?
+    let coverURL: String
+    let episodes: [DownloadedVideo]
+    let totalBytes: Int64
+    let latestAddedAt: Date
+    let brokenCount: Int
+    let isBangumiSeason: Bool
+}
+
+enum DownloadDisplayEntry: Identifiable {
+    case single(DownloadedVideo)
+    case series(DownloadSeriesGroup)
+
+    var id: String {
+        switch self {
+        case .single(let item): "single:\(item.id)"
+        case .series(let group): "series:\(group.id)"
+        }
+    }
+
+    var sortDate: Date {
+        switch self {
+        case .single(let item): item.addedAt
+        case .series(let group): group.latestAddedAt
+        }
+    }
+
+    var sortBytes: Int64 {
+        switch self {
+        case .single(let item): item.fileSizeBytes
+        case .series(let group): group.totalBytes
+        }
+    }
+
+    var sortTitle: String {
+        switch self {
+        case .single(let item): item.title
+        case .series(let group): group.title
+        }
+    }
+}
+
 struct DownloadsView: View {
     @Query(sort: \DownloadedVideo.addedAt, order: .reverse)
     var downloads: [DownloadedVideo]
     @Environment(AppCoordinator.self) private var coordinator
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var search = ""
+    @State private var sortOption: DownloadSortOption = .recentlyAdded
+    @State private var groupSeries = true
+    @State var expandedGroupIDs: Set<String> = []
+    @State private var showCleanMissingConfirm = false
+    @State var pendingGroupDelete: DownloadSeriesGroup?
+    @State private var notice: ToastMessage?
     @State private var invalidDownloadID: String?
     @State private var activeError: ActiveErrorPresentation?
     @State var brokenIDs: Set<String> = []
@@ -21,8 +88,8 @@ struct DownloadsView: View {
 
     static let gridHorizontalHalfGap: CGFloat = AppSpacing.m / 2
     static let gridVerticalHalfGap: CGFloat = AppSpacing.xs
-    static let trailingMenuTitleInset: CGFloat = 28
-    private static let maximumContentWidth: CGFloat = 1240
+    static let trailingMenuTitleInset: CGFloat = 36
+    private static let maximumContentWidth: CGFloat = LibraryRowMetrics.maximumContentWidth
 
     struct ExportPresentation: Identifiable {
         let id = UUID()
@@ -43,21 +110,182 @@ struct DownloadsView: View {
         let message: String
     }
 
+    private var usesSidebarLayout: Bool {
+        ShellNavigationPolicy.showsSidebar(
+            isPad: DeviceCapability.supportsPadDetailSplit,
+            isRegularWidth: sizeClass == .regular
+        )
+    }
+
     private var query: String {
         search.trimmingCharacters(in: .whitespaces)
     }
 
     private var filtered: [DownloadedVideo] {
         let trimmedQuery = query
-        guard !trimmedQuery.isEmpty else { return downloads }
-        return downloads.filter {
-            $0.title.localizedCaseInsensitiveContains(trimmedQuery)
-                || $0.ownerName.localizedCaseInsensitiveContains(trimmedQuery)
+        var result = downloads
+        if !trimmedQuery.isEmpty {
+            result = result.filter {
+                $0.title.localizedCaseInsensitiveContains(trimmedQuery)
+                    || $0.ownerName.localizedCaseInsensitiveContains(trimmedQuery)
+            }
+        }
+        switch sortOption {
+        case .recentlyAdded:
+            result.sort { $0.addedAt > $1.addedAt }
+        case .largestSize:
+            result.sort {
+                if $0.fileSizeBytes != $1.fileSizeBytes {
+                    return $0.fileSizeBytes > $1.fileSizeBytes
+                }
+                return $0.addedAt > $1.addedAt
+            }
+        case .title:
+            result.sort {
+                $0.title.localizedStandardCompare($1.title) == .orderedAscending
+            }
+        }
+        return result
+    }
+
+    private var hasAnyGroupableSeries: Bool {
+        let entries = Self.buildDisplayEntries(
+            from: downloads,
+            sort: .recentlyAdded,
+            brokenIDs: brokenIDs,
+            groupSeries: true
+        )
+        return entries.contains {
+            if case .series = $0 { return true }
+            return false
         }
     }
 
+    static func buildDisplayEntries(
+        from items: [DownloadedVideo],
+        sort: DownloadSortOption,
+        brokenIDs: Set<String>,
+        groupSeries: Bool
+    ) -> [DownloadDisplayEntry] {
+        guard groupSeries else {
+            return items.map { .single($0) }
+        }
+
+        var byBvid: [String: [DownloadedVideo]] = [:]
+        for item in items where !item.bvid.isEmpty && !item.bvid.hasPrefix("ep") {
+            byBvid[item.bvid, default: []].append(item)
+        }
+        let multiPartBvids = Set(byBvid.compactMap { $0.value.count > 1 ? $0.key : nil })
+
+        var bySeasonOwner: [String: [DownloadedVideo]] = [:]
+        for item in items where !multiPartBvids.contains(item.bvid) {
+            guard isBangumiEpisodeItem(item) else { continue }
+            bySeasonOwner[item.ownerName, default: []].append(item)
+        }
+        let multiEpisodeSeasons = Set(bySeasonOwner.compactMap { $0.value.count > 1 ? $0.key : nil })
+
+        var entries: [DownloadDisplayEntry] = []
+        var emittedMultiPart = Set<String>()
+        var emittedSeasons = Set<String>()
+
+        for item in items {
+            if multiPartBvids.contains(item.bvid) {
+                guard emittedMultiPart.insert(item.bvid).inserted,
+                      let groupItems = byBvid[item.bvid] else { continue }
+                let ordered = groupItems.sorted {
+                    $0.title.localizedStandardCompare($1.title) == .orderedAscending
+                }
+                let groupTitle = multiPartSeriesTitle(from: ordered)
+                let owner = ordered.first?.ownerName ?? ""
+                let group = DownloadSeriesGroup(
+                    id: "bvid:\(item.bvid)",
+                    title: groupTitle,
+                    subtitle: owner.isEmpty ? nil : owner,
+                    coverURL: ordered.first?.coverURL ?? item.coverURL,
+                    episodes: ordered,
+                    totalBytes: ordered.reduce(Int64(0)) { $0 + $1.fileSizeBytes },
+                    latestAddedAt: ordered.map(\.addedAt).max() ?? item.addedAt,
+                    brokenCount: ordered.reduce(0) { $0 + (brokenIDs.contains($1.id) ? 1 : 0) },
+                    isBangumiSeason: false
+                )
+                entries.append(.series(group))
+            } else if isBangumiEpisodeItem(item), multiEpisodeSeasons.contains(item.ownerName) {
+                guard emittedSeasons.insert(item.ownerName).inserted,
+                      let groupItems = bySeasonOwner[item.ownerName] else { continue }
+                let ordered = groupItems.sorted {
+                    $0.title.localizedStandardCompare($1.title) == .orderedAscending
+                }
+                let group = DownloadSeriesGroup(
+                    id: "season:\(item.ownerName)",
+                    title: item.ownerName,
+                    subtitle: nil,
+                    coverURL: ordered.first?.coverURL ?? item.coverURL,
+                    episodes: ordered,
+                    totalBytes: ordered.reduce(Int64(0)) { $0 + $1.fileSizeBytes },
+                    latestAddedAt: ordered.map(\.addedAt).max() ?? item.addedAt,
+                    brokenCount: ordered.reduce(0) { $0 + (brokenIDs.contains($1.id) ? 1 : 0) },
+                    isBangumiSeason: true
+                )
+                entries.append(.series(group))
+            } else {
+                entries.append(.single(item))
+            }
+        }
+
+        switch sort {
+        case .recentlyAdded:
+            entries.sort { $0.sortDate > $1.sortDate }
+        case .largestSize:
+            entries.sort {
+                if $0.sortBytes != $1.sortBytes {
+                    return $0.sortBytes > $1.sortBytes
+                }
+                return $0.sortDate > $1.sortDate
+            }
+        case .title:
+            entries.sort {
+                $0.sortTitle.localizedStandardCompare($1.sortTitle) == .orderedAscending
+            }
+        }
+        return entries
+    }
+
+    private static func isBangumiEpisodeItem(_ item: DownloadedVideo) -> Bool {
+        guard !item.ownerName.isEmpty else { return false }
+        return item.bvid.hasPrefix("ep") || item.title.hasPrefix("\(item.ownerName) - ")
+    }
+
+    private static func multiPartSeriesTitle(from episodes: [DownloadedVideo]) -> String {
+        guard let firstTitle = episodes.first?.title else { return "" }
+        if let range = firstTitle.range(of: " - P", options: .backwards) {
+            let prefix = firstTitle[..<range.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !prefix.isEmpty { return prefix }
+        }
+        if let range = firstTitle.range(of: " (P", options: .backwards) {
+            let prefix = firstTitle[..<range.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !prefix.isEmpty { return prefix }
+        }
+        return firstTitle
+    }
+
+    static func episodeShortTitle(for item: DownloadedVideo, in group: DownloadSeriesGroup) -> String {
+        let prefixWithDash = "\(group.title) - "
+        if item.title.hasPrefix(prefixWithDash) {
+            let suffix = String(item.title.dropFirst(prefixWithDash.count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !suffix.isEmpty { return suffix }
+        }
+        let prefixWithParen = "\(group.title) ("
+        if item.title.hasPrefix(prefixWithParen), item.title.hasSuffix(")") {
+            let inner = String(item.title.dropFirst(prefixWithParen.count).dropLast())
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !inner.isEmpty { return inner }
+        }
+        return item.title
+    }
+
     static func coverWidth(columnWidth: CGFloat?, isRegularWidth: Bool) -> CGFloat {
-        let cardWidth = columnWidth.map { max(0, $0 - Self.gridHorizontalHalfGap * 2) }
+        let cardWidth = columnWidth.map { max(0, $0 - Self.gridHorizontalHalfGap * 2 - AppSpacing.m * 2) }
         return LibraryRowMetrics.coverWidth(
             columnWidth: cardWidth,
             isRegularWidth: isRegularWidth
@@ -79,19 +307,50 @@ struct DownloadsView: View {
     var body: some View {
         let completed = filtered
         let currentQuery = query
-        let totalBytes = currentQuery.isEmpty
-            ? downloads.reduce(Int64(0)) { $0 + $1.fileSizeBytes }
-            : 0
+        let playable = completed.filter { !brokenIDs.contains($0.id) }
+        let entries = Self.buildDisplayEntries(
+            from: completed,
+            sort: sortOption,
+            brokenIDs: brokenIDs,
+            groupSeries: groupSeries
+        )
         return downloadsScrollContent(
             completed: completed,
-            query: currentQuery,
-            totalBytes: totalBytes
+            entries: entries,
+            query: currentQuery
         )
             .appAmbientBrowseBackground()
             .navigationTitle("Downloads")
             .navigationBarTitleDisplayMode(.inline)
             .searchable(text: $search, prompt: "Search downloads")
-            .modifier(DownloadsToolbarModifier())
+            .modifier(DownloadsToolbarModifier(
+                canPlayAll: !playable.isEmpty,
+                hasDownloads: !downloads.isEmpty,
+                hasGroupableSeries: hasAnyGroupableSeries,
+                brokenCount: brokenIDs.count,
+                sortOption: $sortOption,
+                groupSeries: $groupSeries,
+                onPlayAll: {
+                    if let first = playable.first {
+                        open(first, in: playable)
+                    }
+                },
+                onCleanMissing: {
+                    showCleanMissingConfirm = true
+                }
+            ))
+            .overlay(alignment: .bottom) {
+                if let notice {
+                    ToastView(message: notice)
+                        .padding()
+                }
+            }
+            .task(id: notice?.id) {
+                let noticeID = notice?.id
+                guard noticeID != nil else { return }
+                try? await Task.sleep(for: .seconds(2))
+                if !Task.isCancelled, notice?.id == noticeID { notice = nil }
+            }
             .alert(
                 "Download unavailable",
                 isPresented: Binding(
@@ -169,6 +428,34 @@ struct DownloadsView: View {
             ) {
                 Button("Cancel export and continue", role: .destructive) { settleMutation() }
                 Button("Keep export", role: .cancel) { mutationRequest = nil }
+            }
+            .confirmationDialog(
+                String(format: String(localized: "Remove %d downloads with missing files?"), brokenIDs.count),
+                isPresented: $showCleanMissingConfirm,
+                titleVisibility: .visible
+            ) {
+                Button("Clean Missing", role: .destructive) { cleanMissingFiles() }
+                Button("Cancel", role: .cancel) {}
+            }
+            .confirmationDialog(
+                String(
+                    format: String(localized: "Delete all %d episodes in “%@”?"),
+                    pendingGroupDelete?.episodes.count ?? 0,
+                    pendingGroupDelete?.title ?? ""
+                ),
+                isPresented: Binding(
+                    get: { pendingGroupDelete != nil },
+                    set: { if !$0 { pendingGroupDelete = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button("Delete All", role: .destructive) {
+                    if let group = pendingGroupDelete {
+                        deleteSeriesGroup(group)
+                    }
+                    pendingGroupDelete = nil
+                }
+                Button("Cancel", role: .cancel) { pendingGroupDelete = nil }
             }
             .task(id: downloads.map(\.fileSnapshot)) { await refreshMissingFiles() }
     }
@@ -310,24 +597,57 @@ struct DownloadsView: View {
               !Task.isCancelled, downloads.map(\.fileSnapshot) == snapshots else { return }
         brokenIDs = Set(snapshots.filter { !valid.contains($0) }.map(\.id))
     }
+
+    private func cleanMissingFiles() {
+        let brokenItems = downloads.filter { brokenIDs.contains($0.id) }
+        var removedCount = 0
+        for item in brokenItems {
+            if !exports.sourceIsLocked(downloadID: item.id), manager.delete(item) {
+                brokenIDs.remove(item.id)
+                removedCount += 1
+            }
+        }
+        if removedCount > 0 {
+            notice = ToastMessage(
+                text: String(format: String(localized: "Removed %d missing downloads"), removedCount),
+                style: .success
+            )
+        }
+    }
+
+    private func deleteSeriesGroup(_ group: DownloadSeriesGroup) {
+        var removedCount = 0
+        for item in group.episodes {
+            if !exports.sourceIsLocked(downloadID: item.id), manager.delete(item) {
+                brokenIDs.remove(item.id)
+                removedCount += 1
+            }
+        }
+        expandedGroupIDs.remove(group.id)
+        if removedCount > 0 {
+            notice = ToastMessage(text: String(localized: "Removed"), style: .success)
+        }
+    }
 }
 
 private extension DownloadsView {
     func downloadsScrollContent(
         completed: [DownloadedVideo],
-        query: String,
-        totalBytes: Int64
+        entries: [DownloadDisplayEntry],
+        query: String
     ) -> some View {
         let horizontalMargin = FeedColumnPolicy.horizontalMargin(for: containerWidth)
+        let hasVisibleActive = query.isEmpty
+            ? !manager.active.isEmpty
+            : manager.active.contains {
+                $0.title.localizedCaseInsensitiveContains(query)
+                    || $0.ownerName.localizedCaseInsensitiveContains(query)
+            }
+        let showsCompletedHeader = hasVisibleActive
+            || exports.activeJob != nil
+            || !exports.artifacts.isEmpty
         return ScrollView {
             VStack(alignment: .leading, spacing: AppSpacing.l) {
-                DownloadsStorageSummarySection(
-                    query: query,
-                    downloadedCount: downloads.count,
-                    totalBytes: totalBytes,
-                    brokenCount: brokenIDs.count,
-                    horizontalMargin: horizontalMargin
-                )
                 DownloadsExportSectionView(
                     horizontalMargin: horizontalMargin,
                     saveToFiles: presentSaveToFiles
@@ -342,14 +662,19 @@ private extension DownloadsView {
                     query: query,
                     hasCompleted: !completed.isEmpty
                 )
-                if !completed.isEmpty {
-                    completedSection(completed, horizontalMargin: horizontalMargin)
+                if !entries.isEmpty {
+                    completedSection(
+                        entries,
+                        allShown: completed,
+                        showsHeader: showsCompletedHeader,
+                        horizontalMargin: horizontalMargin
+                    )
                 }
             }
             .frame(maxWidth: Self.maximumContentWidth, alignment: .leading)
             .frame(maxWidth: .infinity)
             .padding(.vertical, AppSpacing.m)
-            .padding(.bottom, SettingsScaffoldingMetrics.floatingTabBarClearance)
+            .padding(.bottom, usesSidebarLayout ? 0 : SettingsScaffoldingMetrics.floatingTabBarClearance)
         }
         .measuringContentWidth(into: $containerWidth)
         .refreshable {
@@ -357,15 +682,27 @@ private extension DownloadsView {
         }
     }
 
-    func completedSection(_ completed: [DownloadedVideo], horizontalMargin: CGFloat) -> some View {
+    func completedSection(
+        _ entries: [DownloadDisplayEntry],
+        allShown: [DownloadedVideo],
+        showsHeader: Bool,
+        horizontalMargin: CGFloat
+    ) -> some View {
         VStack(alignment: .leading, spacing: AppSpacing.s) {
-            DownloadsSectionHeader(horizontalMargin: horizontalMargin) {
-                completedHeader(for: completed)
+            if showsHeader {
+                DownloadsSectionHeader(horizontalMargin: horizontalMargin) {
+                    Text("Downloaded")
+                }
             }
             LibraryRowLayout {
-                ForEach(completed) { item in
+                ForEach(entries) { entry in
                     RowCardColumnWidthReader { column in
-                        completedRow(item, in: completed, columnWidth: column)
+                        switch entry {
+                        case .single(let item):
+                            completedRow(item, in: allShown, columnWidth: column)
+                        case .series(let group):
+                            seriesGroupRow(group, columnWidth: column)
+                        }
                     }
                     .padding(.horizontal, Self.gridHorizontalHalfGap)
                     .padding(.vertical, Self.gridVerticalHalfGap)
@@ -373,17 +710,6 @@ private extension DownloadsView {
             }
             .padding(.horizontal, max(0, horizontalMargin - Self.gridHorizontalHalfGap))
             .padding(.vertical, -Self.gridVerticalHalfGap)
-        }
-    }
-
-    func completedHeader(for shown: [DownloadedVideo]) -> some View {
-        HStack {
-            Text("Downloaded")
-            Spacer()
-            if !query.isEmpty {
-                Text(String(format: String(localized: "%d videos"), shown.count))
-                    .monospacedDigit()
-            }
         }
     }
 }
@@ -403,21 +729,86 @@ private struct DownloadsSectionHeader<Content: View>: View {
 }
 
 private struct DownloadsToolbarModifier: ViewModifier {
+    let canPlayAll: Bool
+    let hasDownloads: Bool
+    let hasGroupableSeries: Bool
+    let brokenCount: Int
+    @Binding var sortOption: DownloadSortOption
+    @Binding var groupSeries: Bool
+    let onPlayAll: () -> Void
+    let onCleanMissing: () -> Void
     private let manager = DownloadManager.shared
 
     func body(content: Content) -> some View {
         let runningCount = manager.active.filter { !$0.phase.isResumable }.count
         let resumableCount = manager.active.filter { $0.phase.isResumable }.count
+        let hasActiveActions = runningCount > 0 || resumableCount > 0
+        let showsMoreMenu = hasDownloads || (runningCount > 0 && resumableCount > 0)
         content.toolbar {
-            if runningCount > 0 || resumableCount > 0 {
-                ToolbarItem(placement: .topBarTrailing) {
-                    if runningCount > 0, resumableCount > 0 {
-                        Menu {
-                            Button(action: pauseAllActive) {
-                                Label("Pause All", systemImage: "pause.fill")
+            if canPlayAll || hasDownloads || hasActiveActions {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    if canPlayAll {
+                        Button(action: onPlayAll) {
+                            HStack(spacing: 5) {
+                                Image(systemName: "play.fill")
+                                    .font(.caption.weight(.semibold))
+                                Text("Play All")
+                                    .font(.subheadline.weight(.medium))
                             }
-                            Button(action: resumeAllActive) {
-                                Label("Resume All", systemImage: "play.fill")
+                        }
+                        .accessibilityIdentifier("downloads.playAll")
+                    }
+                    if showsMoreMenu {
+                        Menu {
+                            if runningCount > 0 {
+                                Button(action: pauseAllActive) {
+                                    Label("Pause All", systemImage: "pause.fill")
+                                }
+                            }
+                            if resumableCount > 0 {
+                                Button(action: resumeAllActive) {
+                                    Label("Resume All", systemImage: "play.fill")
+                                }
+                            }
+                            if hasActiveActions, hasDownloads {
+                                Divider()
+                            }
+                            if hasDownloads {
+                                Menu {
+                                    ForEach(DownloadSortOption.allCases) { option in
+                                        Button {
+                                            sortOption = option
+                                        } label: {
+                                            if sortOption == option {
+                                                Label(option.label, systemImage: "checkmark")
+                                            } else {
+                                                Text(option.label)
+                                            }
+                                        }
+                                    }
+                                } label: {
+                                    Label("Sort", systemImage: "arrow.up.arrow.down")
+                                }
+                                if hasGroupableSeries {
+                                    Button {
+                                        withAnimation(.easeInOut(duration: 0.2)) {
+                                            groupSeries.toggle()
+                                        }
+                                    } label: {
+                                        Label(
+                                            groupSeries
+                                                ? LocalizedStringKey("Ungroup Series")
+                                                : LocalizedStringKey("Group by Series"),
+                                            systemImage: groupSeries ? "list.bullet" : "rectangle.stack"
+                                        )
+                                    }
+                                }
+                                if brokenCount > 0 {
+                                    Divider()
+                                    Button(role: .destructive, action: onCleanMissing) {
+                                        Label("Clean Missing", systemImage: "trash")
+                                    }
+                                }
                             }
                         } label: {
                             Image(systemName: "ellipsis.circle")
@@ -425,7 +816,7 @@ private struct DownloadsToolbarModifier: ViewModifier {
                         .accessibilityLabel(Text("Download actions"))
                     } else if runningCount > 0 {
                         Button("Pause All", action: pauseAllActive)
-                    } else {
+                    } else if resumableCount > 0 {
                         Button("Resume All", action: resumeAllActive)
                     }
                 }
@@ -444,29 +835,6 @@ private struct DownloadsToolbarModifier: ViewModifier {
     private func resumeAllActive() {
         for item in manager.active where item.phase.isResumable {
             manager.retry(id: item.id)
-        }
-    }
-}
-
-private struct DownloadsStorageSummarySection: View {
-    let query: String
-    let downloadedCount: Int
-    let totalBytes: Int64
-    let brokenCount: Int
-    var horizontalMargin: CGFloat = AppSpacing.l
-
-    private let manager = DownloadManager.shared
-
-    var body: some View {
-        let activeCount = query.isEmpty ? manager.active.count : 0
-        if query.isEmpty, downloadedCount > 0 || activeCount > 0 {
-            DownloadsStorageSummaryCard(
-                downloadedCount: downloadedCount,
-                totalStorageText: DownloadsView.byteString(totalBytes),
-                activeCount: activeCount,
-                brokenCount: brokenCount
-            )
-            .padding(.horizontal, horizontalMargin)
         }
     }
 }
@@ -514,17 +882,23 @@ private struct DownloadsEmptyStateView: View {
 
     var body: some View {
         if showsEmpty {
-            ContentUnavailableView(
-                query.isEmpty
-                    ? LocalizedStringKey("No Downloads")
-                    : LocalizedStringKey("No Matches"),
-                systemImage: "arrow.down.circle",
-                description: Text(query.isEmpty
-                    ? LocalizedStringKey("Videos you download for offline viewing appear here.")
-                    : LocalizedStringKey("No downloads match your search."))
-            )
-            .frame(maxWidth: .infinity)
-            .padding(.top, 48)
+            if !query.isEmpty {
+                ContentUnavailableView(
+                    LocalizedStringKey("No Matches"),
+                    systemImage: "magnifyingglass",
+                    description: Text(LocalizedStringKey("No downloads match your search."))
+                )
+                .frame(maxWidth: .infinity)
+                .padding(.top, 48)
+            } else {
+                ContentUnavailableView(
+                    LocalizedStringKey("No Downloads"),
+                    systemImage: "arrow.down.circle",
+                    description: Text(LocalizedStringKey("Videos you download for offline viewing appear here."))
+                )
+                .frame(maxWidth: .infinity)
+                .padding(.top, 48)
+            }
         }
     }
 }
@@ -586,10 +960,11 @@ private struct ActiveDownloadsSectionView: View {
             DownloadsView.downloadRowCover(
                 coverURL: item.coverURL,
                 width: width,
-                height: height
+                height: height,
+                durationSeconds: item.durationSeconds > 0 ? item.durationSeconds : nil
             )
 
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 5) {
                 Text(item.title)
                     .appFont(.libraryRowTitle)
                     .fontWeight(.medium)
@@ -597,6 +972,13 @@ private struct ActiveDownloadsSectionView: View {
                     .lineLimit(2)
                     .multilineTextAlignment(.leading)
                     .padding(.trailing, DownloadsView.trailingMenuTitleInset)
+
+                if !item.ownerName.isEmpty {
+                    Text(item.ownerName)
+                        .appFont(.libraryRowMeta)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
 
                 activeProgressContent(item)
 
@@ -765,20 +1147,42 @@ private struct ActiveDownloadsSectionView: View {
     }
 
     private func metadataLine(_ item: DownloadManager.ActiveDownload) -> some View {
-        HStack {
-            Text(downloadRowLeftSlot(fraction: item.fraction, phase: item.phase))
-                .monospacedDigit()
-            Spacer(minLength: AppSpacing.xs)
-            Text(downloadRowRightSlot(
-                fraction: item.fraction,
-                phase: item.phase,
-                formattedSpeed: formattedSpeed(item.speedBytesPerSecond)
-            ))
-                .monospacedDigit()
+        let byteText = byteProgressText(item)
+        return VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(downloadRowLeftSlot(fraction: item.fraction, phase: item.phase))
+                    .monospacedDigit()
+                Spacer(minLength: AppSpacing.xs)
+                Text(downloadRowRightSlot(
+                    fraction: item.fraction,
+                    phase: item.phase,
+                    formattedSpeed: formattedSpeed(item.speedBytesPerSecond)
+                ))
+                    .monospacedDigit()
+            }
+            .appFont(.libraryRowFooter)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+
+            if let byteText {
+                Text(verbatim: byteText)
+                    .appFont(.libraryRowFooter, monospacedDigit: true)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
         }
-        .appFont(.libraryRowFooter)
-        .foregroundStyle(.secondary)
-        .lineLimit(1)
+    }
+
+    private func byteProgressText(_ item: DownloadManager.ActiveDownload) -> String? {
+        let transferred = max(0, item.bytesTransferred)
+        if let expected = item.expectedBytes, expected > 0 {
+            let clamped = min(transferred, expected)
+            return "\(DownloadsView.byteString(clamped)) / \(DownloadsView.byteString(expected))"
+        }
+        if transferred > 0 {
+            return DownloadsView.byteString(transferred)
+        }
+        return nil
     }
 
     @ViewBuilder
@@ -831,152 +1235,5 @@ private struct ActiveDownloadsSectionView: View {
         let rounded = value.rounded()
         let readableBytes = rounded >= Double(Int64.max) ? Int64.max : Int64(rounded)
         return "\(DownloadsView.byteString(readableBytes))/s"
-    }
-}
-
-private struct DownloadsStorageSummaryCard: View {
-    let downloadedCount: Int
-    let totalStorageText: String
-    let activeCount: Int
-    let brokenCount: Int
-
-    @Environment(\.horizontalSizeClass) private var sizeClass
-    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
-
-    private var valueFont: Font {
-        sizeClass == .regular
-            ? .title3.weight(.semibold).monospacedDigit()
-            : .headline.weight(.semibold).monospacedDigit()
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: AppSpacing.m) {
-            metricsStrip
-
-            if brokenCount > 0 {
-                Divider()
-                missingFilesRow
-            }
-        }
-        .padding(.horizontal, AppSpacing.l)
-        .padding(.vertical, AppSpacing.m)
-        .appCardSurface(in: RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous))
-    }
-
-    @ViewBuilder
-    private var metricsStrip: some View {
-        if dynamicTypeSize >= .xxLarge {
-            stackedMetrics
-        } else {
-            ViewThatFits(in: .horizontal) {
-                horizontalMetrics
-                stackedMetrics
-            }
-        }
-    }
-
-    private var horizontalMetrics: some View {
-        HStack(spacing: 0) {
-            horizontalMetricItem(
-                title: "Downloaded",
-                value: downloadedCount.formatted(),
-                tint: .primary
-            )
-            metricDivider
-            horizontalMetricItem(
-                title: "Storage",
-                value: totalStorageText,
-                tint: .primary
-            )
-            if activeCount > 0 {
-                metricDivider
-                horizontalMetricItem(
-                    title: "Downloading",
-                    value: activeCount.formatted(),
-                    tint: .biliAccent
-                )
-            }
-        }
-    }
-
-    private var metricDivider: some View {
-        Divider()
-            .frame(height: 28)
-            .padding(.horizontal, AppSpacing.s)
-    }
-
-    private func horizontalMetricItem(
-        title: LocalizedStringKey,
-        value: String,
-        tint: Color
-    ) -> some View {
-        VStack(alignment: .center, spacing: 3) {
-            Text(verbatim: value)
-                .font(valueFont)
-                .foregroundStyle(tint)
-                .fixedSize(horizontal: true, vertical: false)
-            Text(title)
-                .appFont(.libraryRowMeta)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: true, vertical: false)
-        }
-        .frame(maxWidth: .infinity)
-        .accessibilityElement(children: .combine)
-    }
-
-    private var stackedMetrics: some View {
-        VStack(alignment: .leading, spacing: AppSpacing.s) {
-            stackedMetricRow(title: "Downloaded", value: downloadedCount.formatted(), tint: .primary)
-            Divider()
-            stackedMetricRow(title: "Storage", value: totalStorageText, tint: .primary)
-            if activeCount > 0 {
-                Divider()
-                stackedMetricRow(
-                    title: "Downloading",
-                    value: activeCount.formatted(),
-                    tint: .biliAccent
-                )
-            }
-        }
-    }
-
-    private func stackedMetricRow(
-        title: LocalizedStringKey,
-        value: String,
-        tint: Color
-    ) -> some View {
-        let stacksVertically = dynamicTypeSize.isAccessibilitySize
-        let layout: AnyLayout = stacksVertically
-            ? AnyLayout(VStackLayout(alignment: .leading, spacing: 2))
-            : AnyLayout(HStackLayout(alignment: .firstTextBaseline, spacing: AppSpacing.s))
-        return layout {
-            Text(title)
-                .appFont(.libraryRowMeta)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if !stacksVertically {
-                Spacer(minLength: AppSpacing.s)
-            }
-            Text(verbatim: value)
-                .font(valueFont)
-                .foregroundStyle(tint)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityElement(children: .combine)
-    }
-
-    private var missingFilesRow: some View {
-        HStack(alignment: .firstTextBaseline, spacing: AppSpacing.s) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.footnote)
-                .foregroundStyle(.red)
-                .accessibilityHidden(true)
-            Text(String(format: String(localized: "%d downloads have missing files"), brokenCount))
-                .appFont(.libraryRowMeta)
-                .foregroundStyle(.red)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-        }
     }
 }

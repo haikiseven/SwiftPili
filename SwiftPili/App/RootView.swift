@@ -66,7 +66,10 @@ struct RootView: View {
         rootShell
             .fullScreenCover(
                 isPresented: detailCoverPresented,
-                onDismiss: { retainedCoverRoot = nil },
+                onDismiss: {
+                    retainedCoverRoot = nil
+                    detailPresentation.noteCoverDismissed(currentInput: detailPresentationInput)
+                },
                 content: {
                     detailCover.modifier(
                         DetailCoverLinkModifier(coordinator: coordinator) { url, context in
@@ -80,6 +83,7 @@ struct RootView: View {
     @ViewBuilder
     private var detailCover: some View {
         if let root = detailPresentation.navigation?.root ?? retainedCoverRoot {
+            let coverGeneration = detailPresentation.generation
             let isAtRoot = detailPresentation.isVisible
                 && detailPresentation.navigation != nil
                 && detailCoverPath(root: root).wrappedValue.isEmpty
@@ -110,7 +114,17 @@ struct RootView: View {
                     isAtRoot: isAtRoot,
                     isBlocked: { PlayerViewModel.existingShared?.chrome.isFullscreen ?? false }
                 ) {
+                    detailPresentation.markEdgePopCompleted(
+                        root: root,
+                        generation: coverGeneration
+                    )
                     coordinator.goBack()
+                    detailPresentation.reconcile(
+                        detailPresentationInput,
+                        entryAnimation: nil,
+                        exitAnimation: nil,
+                        currentInput: { detailPresentationInput }
+                    )
                 }
                 .frame(width: 0, height: 0)
                 .allowsHitTesting(false)

@@ -77,6 +77,7 @@ final class DownloadManager {
     private var runningTasks: [String: Task<Void, Never>] = [:]
     private var queuedOrder: [String] = []
     private var queuedManifests: [String: DownloadManifest] = [:]
+    private var pgcEpisodeIDs: [String: Int] = [:]
     private var automaticResumeQueue = DownloadAutomaticResumeQueue()
     private var isBackgrounded = UIApplication.shared.applicationState == .background
     @ObservationIgnored
@@ -158,7 +159,7 @@ final class DownloadManager {
         return try? context?.fetch(descriptor).first
     }
 
-    func availableQualities(aid: Int, cid: Int) async throws -> [DownloadQualityOption] {
+    func availableQualities(aid: Int, cid: Int, epId: Int? = nil) async throws -> [DownloadQualityOption] {
         try Task.checkCancellation()
         let session = AuthManager.shared.sessionGeneration
         let key = DownloadQualityCacheKey(aid: aid, cid: cid, sessionGeneration: session)
@@ -174,7 +175,9 @@ final class DownloadManager {
         }
         let result: PlayURLResult
         do {
-            result = try await VideoAPI.getPlayURL(aid: aid, cid: cid, quality: 127, fnval: 4048)
+            result = try await Self.fetchDownloadPlayURL(
+                aid: aid, cid: cid, epId: epId, quality: 127, fnval: 4048
+            )
         } catch {
             guard !Task.isCancelled, AuthManager.shared.sessionGeneration == session else {
                 throw CancellationError()
@@ -298,13 +301,19 @@ final class DownloadManager {
         coverURL: String,
         ownerName: String,
         durationSeconds: Int,
-        quality: Int
+        quality: Int,
+        epId: Int? = nil
     ) async {
         let id = "\(bvid)_\(cid)"
         guard !DownloadExportCoordinator.shared.sourceIsLocked(downloadID: id) else { return }
         guard existing(bvid: bvid, cid: cid) == nil, !isActive(bvid: bvid, cid: cid) else {
             PlayerLog.log("[Download] duplicate start ignored id=\(id)")
             return
+        }
+        if let epId, epId > 0 {
+            pgcEpisodeIDs[id] = epId
+        } else {
+            pgcEpisodeIDs.removeValue(forKey: id)
         }
         var manifest = DownloadStore.readManifest(contentID: id)
         if let existingManifest = manifest, existingManifest.requestedQuality != quality {
@@ -372,6 +381,9 @@ final class DownloadManager {
 
         if let folder = try? DownloadStore.makeStagingDirectory(contentID: id) {
             try? DownloadStore.writeManifest(plan, folder: folder)
+            if let epId = pgcEpisodeIDs[id], epId > 0 {
+                DownloadStore.writePGCEpisodeID(epId, folder: folder)
+            }
         }
 
         let stagedBytes = DownloadStore.effectiveStagedBytes(
@@ -540,6 +552,11 @@ final class DownloadManager {
 
             let stagingFolder = try DownloadStore.makeStagingDirectory(contentID: id)
             try DownloadStore.writeManifest(manifest, folder: stagingFolder)
+            let epId = pgcEpisodeIDs[id] ?? DownloadStore.readPGCEpisodeID(folder: stagingFolder)
+            if let epId, epId > 0 {
+                pgcEpisodeIDs[id] = epId
+                DownloadStore.writePGCEpisodeID(epId, folder: stagingFolder)
+            }
             let created = Operation(
                 token: token,
                 stagingFolder: stagingFolder,
@@ -551,8 +568,8 @@ final class DownloadManager {
 
             let result: PlayURLResult
             do {
-                result = try await VideoAPI.getPlayURL(
-                    aid: manifest.aid, cid: manifest.cid,
+                result = try await Self.fetchDownloadPlayURL(
+                    aid: manifest.aid, cid: manifest.cid, epId: epId,
                     quality: manifest.requestedQuality, fnval: 4048
                 )
             } catch {
@@ -560,6 +577,9 @@ final class DownloadManager {
             }
             guard isCurrent(id: id, token: token) else { throw CancellationError() }
             guard let dash = result.dash else { throw DownloadError.noStream }
+            let resolvedDurationSeconds = manifest.durationSeconds > 0
+                ? manifest.durationSeconds
+                : max(0, dash.duration ?? 0)
 
             let requested = manifest.requestedQuality
             let video = dash.video.first(where: { $0.id == requested })
@@ -604,7 +624,7 @@ final class DownloadManager {
                 requiredStages: requiredStages,
                 videoBandwidth: video.bandwidth,
                 audioBandwidth: audio?.bandwidth,
-                durationSeconds: manifest.durationSeconds
+                durationSeconds: resolvedDurationSeconds
             )
             let storage = DownloadStoragePolicy.verdict(
                 availableBytes: DownloadStore.availableCapacityForImportantUsage(),
@@ -624,7 +644,7 @@ final class DownloadManager {
                     requiredStages: requiredStages,
                     videoBandwidth: video.bandwidth,
                     audioBandwidth: audio?.bandwidth,
-                    durationSeconds: manifest.durationSeconds
+                    durationSeconds: resolvedDurationSeconds
                 )
             )
             updateQuality(id: id, token: token, code: video.id)
@@ -665,6 +685,7 @@ final class DownloadManager {
                             networkPolicy: networkPolicy,
                             aid: aid,
                             cid: cid,
+                            epId: epId,
                             requestedQuality: requestedQuality,
                             resolvedVideoID: resolvedVideoID,
                             resolvedCodecs: resolvedCodecs
@@ -743,10 +764,20 @@ final class DownloadManager {
             ).values.reduce(0, +)
 
             updatePhase(id: id, token: token, .committing)
+            await Self.persistOfflineSidecars(
+                aid: manifest.aid,
+                cid: manifest.cid,
+                durationSeconds: resolvedDurationSeconds,
+                folder: stagingFolder,
+                networkPolicy: networkPolicy
+            )
+            guard isCurrent(id: id, token: token) else { throw CancellationError() }
+
             let finalFolder = try DownloadStore.commit(
                 stagingFolder: stagingFolder, contentID: id
             )
             DownloadStore.removeManifest(folder: finalFolder)
+            DownloadStore.removePGCEpisodeID(folder: finalFolder)
             let size = DownloadStore.folderSize(finalFolder)
             guard size > 0 else {
                 try? FileManager.default.removeItem(at: finalFolder)
@@ -760,7 +791,7 @@ final class DownloadManager {
             let record = DownloadedVideo(
                 aid: manifest.aid, bvid: manifest.bvid, cid: manifest.cid,
                 title: manifest.title, coverURL: manifest.coverURL,
-                ownerName: manifest.ownerName, durationSeconds: manifest.durationSeconds,
+                ownerName: manifest.ownerName, durationSeconds: resolvedDurationSeconds,
                 qualityCode: video.id,
                 qualityLabel: PlayerViewModel.qualityLabel(for: video.id),
                 codecs: video.codecs, folderName: id,
@@ -783,6 +814,7 @@ final class DownloadManager {
                 try? FileManager.default.removeItem(at: finalFolder)
                 throw CancellationError()
             }
+            pgcEpisodeIDs.removeValue(forKey: id)
             active.removeAll { $0.id == id }
             PlayerLog.log(
                 "[Download] completed id=\(id) qn=\(video.id) bytes=\(size) " +
@@ -829,6 +861,7 @@ final class DownloadManager {
         networkPolicy: DownloadNetworkPolicy,
         aid: Int,
         cid: Int,
+        epId: Int?,
         requestedQuality: Int,
         resolvedVideoID: Int,
         resolvedCodecs: String
@@ -881,8 +914,8 @@ final class DownloadManager {
             )
 
             let refreshURLs: @Sendable () async throws -> SegmentedRefreshedCandidates = { [weak self] in
-                let refreshedResult = try await VideoAPI.getPlayURL(
-                    aid: aid, cid: cid, quality: requestedQuality, fnval: 4048
+                let refreshedResult = try await Self.fetchDownloadPlayURL(
+                    aid: aid, cid: cid, epId: epId, quality: requestedQuality, fnval: 4048
                 )
                 guard let refreshedDash = refreshedResult.dash else {
                     throw DownloadError.noStream
@@ -1073,6 +1106,7 @@ final class DownloadManager {
         removeFromQueue(id: id)
         stopActiveExecution(id: id)
         automaticResumeQueue.revoke(id)
+        pgcEpisodeIDs.removeValue(forKey: id)
         active.removeAll { $0.id == id }
         DownloadStore.removeStaging(contentID: id)
         PlayerLog.log("[Download] user cancelled id=\(id)")
@@ -1607,6 +1641,219 @@ final class DownloadManager {
         return admitted
     }
 
+    // MARK: - PlayURL & Offline Sidecar Persistence
+
+    private nonisolated static func fetchDownloadPlayURL(
+        aid: Int,
+        cid: Int,
+        epId: Int?,
+        quality: Int,
+        fnval: Int
+    ) async throws -> PlayURLResult {
+        if let epId, epId > 0 {
+            return try await PGCAPI.getPlayURL(epId: epId, cid: cid, quality: quality, fnval: fnval)
+        }
+        return try await VideoAPI.getPlayURL(aid: aid, cid: cid, quality: quality, fnval: fnval)
+    }
+
+    nonisolated static func persistOfflineSidecars(
+        aid: Int,
+        cid: Int,
+        durationSeconds: Int,
+        folder: URL,
+        networkPolicy: DownloadNetworkPolicy
+    ) async {
+        guard !Task.isCancelled else { return }
+        async let subtitleCount = persistOfflineSubtitles(
+            aid: aid,
+            cid: cid,
+            folder: folder,
+            networkPolicy: networkPolicy
+        )
+        async let danmakuCount = persistOfflineDanmaku(
+            cid: cid,
+            durationSeconds: durationSeconds,
+            folder: folder
+        )
+        let (savedSubtitles, savedSegments) = await (subtitleCount, danmakuCount)
+        if savedSubtitles > 0 || savedSegments > 0 {
+            PlayerLog.log(
+                "[Download] sidecars persisted aid=\(aid) cid=\(cid) " +
+                    "subtitles=\(savedSubtitles) danmakuSegments=\(savedSegments)"
+            )
+        }
+    }
+
+    private nonisolated static func persistOfflineSubtitles(
+        aid: Int,
+        cid: Int,
+        folder: URL,
+        networkPolicy: DownloadNetworkPolicy
+    ) async -> Int {
+        guard !Task.isCancelled else { return 0 }
+        let info: PlayerV2Info
+        do {
+            info = try await VideoAPI.getPlayerInfo(aid: aid, cid: cid)
+        } catch {
+            if !error.isCancellation {
+                PlayerLog.log("[Download] subtitle info skipped aid=\(aid) cid=\(cid) error=\(error)")
+            }
+            return 0
+        }
+        guard !Task.isCancelled else { return 0 }
+        let items = info.subtitle?.subtitles ?? []
+        guard !items.isEmpty else { return 0 }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 8
+        config.timeoutIntervalForResource = 15
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        let session = URLSession(configuration: config)
+        defer { session.finishTasksAndInvalidate() }
+
+        var seenLans = Set<String>()
+        var usedFilenames = Set<String>()
+        var entries: [OfflineSubtitleTrackEntry] = []
+
+        for item in items {
+            guard !Task.isCancelled else { break }
+            guard let rawLan = item.lan?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !rawLan.isEmpty,
+                  seenLans.insert(rawLan).inserted,
+                  var rawURL = item.subtitleUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !rawURL.isEmpty else { continue }
+            if rawURL.hasPrefix("//") {
+                rawURL = "https:" + rawURL
+            } else if rawURL.hasPrefix("http://") {
+                rawURL = "https://" + rawURL.dropFirst("http://".count)
+            }
+            guard let url = URL(string: rawURL) else { continue }
+            var request = URLRequest(url: url, timeoutInterval: 8)
+            request.setValue(BiliAPIClient.defaultReferer, forHTTPHeaderField: "Referer")
+            request.setValue(BiliAPIClient.defaultUserAgent, forHTTPHeaderField: "User-Agent")
+            networkPolicy.apply(to: &request)
+
+            do {
+                let (data, response) = try await session.data(for: request)
+                if let http = response as? HTTPURLResponse,
+                   !(200...299).contains(http.statusCode) {
+                    continue
+                }
+                guard !data.isEmpty,
+                      (try? OfflineSubtitleSidecar.parseBilibiliSubtitleCues(from: data)) != nil else {
+                    continue
+                }
+                let filename = OfflineSubtitleSidecar.sanitizedFilename(
+                    for: rawLan,
+                    existingNames: usedFilenames
+                )
+                try OfflineSubtitleSidecar.saveSubtitleData(data, filename: filename, in: folder)
+                usedFilenames.insert(filename)
+                let doc = item.lanDoc?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let resolvedDoc = (doc?.isEmpty == false ? doc : nil) ?? rawLan
+                entries.append(
+                    OfflineSubtitleTrackEntry(
+                        lan: rawLan,
+                        lanDoc: resolvedDoc,
+                        filename: filename
+                    )
+                )
+            } catch {
+                if error is CancellationError { break }
+                PlayerLog.log("[Download] subtitle track skipped lan=\(rawLan) error=\(error)")
+            }
+        }
+
+        guard !entries.isEmpty else {
+            try? FileManager.default.removeItem(at: DownloadStore.subtitlesDirectory(in: folder))
+            return 0
+        }
+        do {
+            try OfflineSubtitleSidecar.saveManifest(entries, in: folder)
+            return entries.count
+        } catch {
+            PlayerLog.log("[Download] subtitle index write failed cid=\(cid) error=\(error)")
+            try? FileManager.default.removeItem(at: DownloadStore.subtitlesDirectory(in: folder))
+            return 0
+        }
+    }
+
+    private nonisolated static func persistOfflineDanmaku(
+        cid: Int,
+        durationSeconds: Int,
+        folder: URL
+    ) async -> Int {
+        guard !Task.isCancelled, cid > 0 else { return 0 }
+        var isServerClosed = false
+        if let metaResponse = try? await DanmakuAPI.metadata(oid: cid),
+           !Task.isCancelled,
+           DanmakuSegmentClassifier.classify(metaResponse) == .protobuf,
+           !metaResponse.body.isEmpty {
+            _ = try? OfflineDanmakuSidecar.saveMetadata(metaResponse.body, in: folder)
+            if let decoded = try? DanmakuMetadataDecoder.decode(metaResponse.body),
+               decoded.isClosed {
+                isServerClosed = true
+            }
+        }
+        guard !Task.isCancelled, !isServerClosed else { return 0 }
+
+        let totalSegments = OfflineDanmakuSidecar.segmentCount(durationSeconds: durationSeconds)
+        let maxConcurrency = 4
+        var savedCount = 0
+
+        await withTaskGroup(of: Bool.self) { group in
+            var nextIndex = 1
+            for _ in 0..<min(maxConcurrency, totalSegments) {
+                let idx = nextIndex
+                nextIndex += 1
+                group.addTask {
+                    await fetchAndSaveDanmakuSegment(oid: cid, segmentIndex: idx, folder: folder)
+                }
+            }
+            while let saved = await group.next() {
+                if saved { savedCount += 1 }
+                if !Task.isCancelled, nextIndex <= totalSegments {
+                    let idx = nextIndex
+                    nextIndex += 1
+                    group.addTask {
+                        await fetchAndSaveDanmakuSegment(oid: cid, segmentIndex: idx, folder: folder)
+                    }
+                }
+            }
+        }
+
+        if savedCount == 0 && !FileManager.default.fileExists(
+            atPath: DownloadStore.danmakuMetadataURL(in: folder).path
+        ) {
+            try? FileManager.default.removeItem(at: DownloadStore.danmakuDirectory(in: folder))
+        }
+        return savedCount
+    }
+
+    private nonisolated static func fetchAndSaveDanmakuSegment(
+        oid: Int,
+        segmentIndex: Int,
+        folder: URL
+    ) async -> Bool {
+        guard !Task.isCancelled else { return false }
+        do {
+            let response = try await DanmakuAPI.segment(oid: oid, segmentIndex: segmentIndex)
+            guard !Task.isCancelled,
+                  DanmakuSegmentClassifier.classify(response) == .protobuf,
+                  !response.body.isEmpty else {
+                return false
+            }
+            _ = try OfflineDanmakuSidecar.saveSegment(
+                response.body,
+                segmentIndex: segmentIndex,
+                in: folder
+            )
+            return true
+        } catch {
+            return false
+        }
+    }
+
     enum DownloadError: LocalizedError {
         case storeUnavailable
         case playURL(String)
@@ -1787,6 +2034,32 @@ extension DownloadStore {
 
     static func removeManifest(folder: URL) {
         try? FileManager.default.removeItem(at: manifestURL(folder: folder))
+    }
+
+    static func pgcEpisodeIDURL(folder: URL) -> URL {
+        folder.appendingPathComponent("pgc_ep_id.txt")
+    }
+
+    static func writePGCEpisodeID(_ epId: Int, folder: URL) {
+        guard epId > 0 else { return }
+        try? String(epId).data(using: .utf8)?.write(
+            to: pgcEpisodeIDURL(folder: folder),
+            options: .atomic
+        )
+    }
+
+    static func readPGCEpisodeID(folder: URL) -> Int? {
+        guard let data = try? Data(contentsOf: pgcEpisodeIDURL(folder: folder)),
+              let raw = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              let value = Int(raw), value > 0 else {
+            return nil
+        }
+        return value
+    }
+
+    static func removePGCEpisodeID(folder: URL) {
+        try? FileManager.default.removeItem(at: pgcEpisodeIDURL(folder: folder))
     }
 
     static func removeStaging(contentID: String) {

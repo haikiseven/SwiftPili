@@ -85,6 +85,7 @@ private struct ZoomSourceButtonBody<Label: View>: View {
     @State private var sourceID = UUID()
     @State private var isAnchored = false
     @Environment(\.navigationZoomNamespace) private var namespace
+    @AppMotion private var motion
 
     private struct StandDown: Hashable {
         let id: UUID
@@ -93,7 +94,7 @@ private struct ZoomSourceButtonBody<Label: View>: View {
     var body: some View {
         let button = Button {
             guard isCurrent() else { return }
-            let usesZoom = namespace != nil && !UIAccessibility.isReduceMotionEnabled
+            let usesZoom = namespace != nil && !motion.reducesGeometry
             open(usesZoom ? RouteZoomSource(id: sourceID) : .none)
         } label: {
             switch anchorMode {
@@ -167,10 +168,11 @@ private struct ZoomTransitionSource: ViewModifier {
     let id: AnyHashable
     let cornerRadius: CGFloat?
     @Environment(\.navigationZoomNamespace) private var namespace
+    @AppMotion private var motion
 
     @ViewBuilder
     func body(content: Content) -> some View {
-        if let namespace {
+        if let namespace, !motion.reducesGeometry {
             if let cornerRadius {
                 content.matchedTransitionSource(id: id, in: namespace) { source in
                     source
@@ -192,10 +194,11 @@ private struct ZoomDestination: ViewModifier {
     let sourceID: UUID?
     @Environment(\.navigationZoomNamespace) private var namespace
     @Environment(\.zoomDestinationSuppressed) private var suppressed
+    @AppMotion private var motion
 
     @ViewBuilder
     func body(content: Content) -> some View {
-        if let sourceID, let namespace, !suppressed {
+        if let sourceID, let namespace, !suppressed, !motion.reducesGeometry {
             content.navigationTransition(
                 .zoom(sourceID: AnyHashable(sourceID), in: namespace)
             )

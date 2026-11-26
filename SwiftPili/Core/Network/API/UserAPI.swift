@@ -37,6 +37,30 @@ enum UserAPI {
         )
     }
 
+    static func deleteHistoryItem(kid: Int, business: String = "archive") async throws(BiliError) -> EmptyResult {
+        guard let csrf = AuthManager.shared.biliJct else { throw .authRequired }
+        return try await BiliAPIClient.shared.request(
+            BiliEndpoint(
+                path: "/x/v2/history/delete",
+                method: .post,
+                params: ["kid": "\(business)_\(kid)", "csrf": csrf]
+            ),
+            type: EmptyResult.self
+        )
+    }
+
+    static func clearHistory() async throws(BiliError) -> EmptyResult {
+        guard let csrf = AuthManager.shared.biliJct else { throw .authRequired }
+        return try await BiliAPIClient.shared.request(
+            BiliEndpoint(
+                path: "/x/v2/history/clear",
+                method: .post,
+                params: ["csrf": csrf]
+            ),
+            type: EmptyResult.self
+        )
+    }
+
     static func getMyInfo() async throws(BiliError) -> UserInfo {
         try await BiliAPIClient.shared.request(BiliEndpoint(path: "/x/space/myinfo"), type: UserInfo.self)
     }
@@ -253,8 +277,26 @@ enum UserAPI {
         try await BiliAPIClient.shared.request(
             BiliEndpoint(
                 path: "/x/v3/fav/folder/created/list-all",
-                params: ["up_mid": String(mid), "type": "2"],
+                params: ["up_mid": String(mid), "type": "2"]
+            ),
+            type: FavoriteFolderResult.self
+        )
+    }
 
+    static func getCollectedFavoriteFolders(
+        upMid: Int,
+        pn: Int = 1,
+        ps: Int = 20
+    ) async throws(BiliError) -> FavoriteFolderResult {
+        try await BiliAPIClient.shared.request(
+            BiliEndpoint(
+                path: "/x/v3/fav/folder/collected/list",
+                params: [
+                    "up_mid": String(upMid),
+                    "pn": String(pn),
+                    "ps": String(ps),
+                    "platform": "web",
+                ]
             ),
             type: FavoriteFolderResult.self
         )
@@ -264,12 +306,14 @@ enum UserAPI {
         mediaId: Int,
         pn: Int = 1,
         ps: Int = 20,
-        keyword: String? = nil
+        keyword: String? = nil,
+        order: String = "mtime"
     ) async throws(BiliError) -> FavoriteContentResult {
         var params = [
             "media_id": String(mediaId),
             "pn": String(pn),
             "ps": String(ps),
+            "order": order,
             "platform": "web",
         ]
         if let keyword, !keyword.isEmpty {

@@ -1,11 +1,12 @@
 import SwiftUI
 
 struct SettingsView: View {
+    private let experiments = ExperimentalSettingsStore.shared
+
     @State private var wifiQuality = PlayerPlaybackPreferences.wifiQuality
     @State private var cellularQuality = PlayerPlaybackPreferences.cellularQuality
     @State private var wifiAudioQuality = PlayerPlaybackPreferences.wifiAudioQuality
     @State private var cellularAudioQuality = PlayerPlaybackPreferences.cellularAudioQuality
-    @State private var hardwareDecode = PlayerPlaybackPreferences.hardwareDecodeEnabled
     @State private var playbackOrder = PlayerViewModel.shared.playbackOrder
     @State private var cacheSize = "…"
     @State private var showClearConfirm = false
@@ -15,17 +16,20 @@ struct SettingsView: View {
     @State private var backgroundAudio = PlayerPlaybackPreferences.backgroundAudioEnabled
     @State private var pictureInPicture = PlayerPlaybackPreferences.pictureInPictureEnabled
     @State private var inAppMiniPlayer = PlayerPlaybackPreferences.inAppMiniPlayerEnabled
+    @State private var portraitVideoMode = PlayerPlaybackPreferences.portraitVideoMode
+    @State private var resumePlayback = PlayerPlaybackPreferences.resumePlayback
+    @State private var animeSkipIntroOutro = PlayerPlaybackPreferences.animeSkipIntroOutro
     @AppStorage(AppearanceMode.storageKey) private var appearanceRaw = AppearanceMode.system.rawValue
     @AppStorage(HomeLayoutMode.storageKey) private var homeLayoutRaw = HomeLayoutMode.grid.rawValue
     @State private var coverAspect = CoverAspect.current
     @State private var coverDisplay = CoverDisplayMode.current
     @AppStorage(DanmakuFeatureGate.defaultsKey) private var danmakuEnabled = false
     @AppStorage(DetailStagePreferences.startsInStageKey) private var detailStartsInStage = false
-    @AppStorage("show_network_speed") private var showNetworkSpeed = false
     @AppStorage("show_comment_ornaments") private var showCommentOrnaments = false
     @AppStorage(ClipboardLinkDetector.settingsKey) private var clipboardLinkDetection = false
     @State private var smartCDNEnabled = SmartCDNSelector.isEnabled
     @State private var currentCDNLabel = CDNService.current.label
+    @State private var preferredCodec = PlayerPlaybackPreferences.preferredCodec
     @State private var showSetupWizard = false
 
     var body: some View {
@@ -43,15 +47,30 @@ struct SettingsView: View {
         .accentContentBoundary()
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
-        .sheet(isPresented: $showSetupWizard) {
+        .sheet(isPresented: $showSetupWizard, onDismiss: reloadSettingsState) {
             SetupWizardView()
         }
-        .onAppear {
-            smartCDNEnabled = SmartCDNSelector.isEnabled
-            currentCDNLabel = CDNService.current.label
-            inAppMiniPlayer = PlayerPlaybackPreferences.inAppMiniPlayerEnabled
-        }
+        .onAppear(perform: reloadSettingsState)
         .task { await refreshCacheSize() }
+    }
+
+    private func reloadSettingsState() {
+        wifiQuality = PlayerPlaybackPreferences.wifiQuality
+        cellularQuality = PlayerPlaybackPreferences.cellularQuality
+        wifiAudioQuality = PlayerPlaybackPreferences.wifiAudioQuality
+        cellularAudioQuality = PlayerPlaybackPreferences.cellularAudioQuality
+        playbackOrder = PlayerViewModel.shared.playbackOrder
+        backgroundAudio = PlayerPlaybackPreferences.backgroundAudioEnabled
+        pictureInPicture = PlayerPlaybackPreferences.pictureInPictureEnabled
+        inAppMiniPlayer = PlayerPlaybackPreferences.inAppMiniPlayerEnabled
+        portraitVideoMode = PlayerPlaybackPreferences.portraitVideoMode
+        resumePlayback = PlayerPlaybackPreferences.resumePlayback
+        animeSkipIntroOutro = PlayerPlaybackPreferences.animeSkipIntroOutro
+        coverAspect = CoverAspect.current
+        coverDisplay = CoverDisplayMode.current
+        smartCDNEnabled = SmartCDNSelector.isEnabled
+        currentCDNLabel = CDNService.current.label
+        preferredCodec = PlayerPlaybackPreferences.preferredCodec
     }
 
     private func refreshCacheSize() async {
@@ -96,6 +115,13 @@ private extension SettingsView {
                 }
             }
 
+            Toggle(isOn: Binding(
+                get: { experiments.ambientModeEnabled },
+                set: { _ = experiments.setAmbientModeEnabled($0) }
+            )) {
+                settingsLabel("Ambient Mode", symbol: "sun.haze")
+            }
+
             Picker(selection: $homeLayoutRaw) {
                 ForEach(HomeLayoutMode.allCases) { mode in
                     Text(mode.label).tag(mode.rawValue)
@@ -109,13 +135,8 @@ private extension SettingsView {
                     Text("Hero First").tag(false)
                     Text("Direct Stage").tag(true)
                 } label: {
-                    settingsLabel("iPad Landscape Detail Layout", symbol: "rectangle.split.2x1")
+                    settingsLabel("iPad Detail Layout", symbol: "rectangle.split.2x1")
                 }
-                Text(detailStartsInStage
-                    ? "Video and comments appear side by side as soon as a page opens."
-                    : "Pages open with a large preview; scroll down to reveal comments.")
-                    .appFont(.rowMeta)
-                    .foregroundStyle(.secondary)
             }
 
             Picker(selection: Binding(
@@ -183,7 +204,17 @@ private extension SettingsView {
                 LabeledContent {
                     Text(danmakuEnabled ? "On" : "Off")
                 } label: {
-                    settingsLabel("Danmaku", symbol: "text.bubble")
+                    settingsLabel("Danmaku", symbol: "bubble.left.and.text.bubble.right")
+                }
+            }
+
+            NavigationLink {
+                SubtitleSettingsView()
+            } label: {
+                LabeledContent {
+                    Text(subtitleStatusSummary)
+                } label: {
+                    settingsLabel("Subtitles", symbol: "captions.bubble")
                 }
             }
 
@@ -194,6 +225,16 @@ private extension SettingsView {
                     Text(SponsorBlockManager.shared.isEnabled ? "On" : "Off")
                 } label: {
                     settingsLabel("SponsorBlock", symbol: "shield.lefthalf.filled")
+                }
+            }
+
+            NavigationLink {
+                SettingsEqualizerView()
+            } label: {
+                LabeledContent {
+                    Text(PlayerEqualizerDisplay.summary(for: PlayerViewModel.shared.equalizerConfiguration))
+                } label: {
+                    settingsLabel("Equalizer", symbol: "slider.vertical.3")
                 }
             }
 
@@ -238,6 +279,20 @@ private extension SettingsView {
             }
 
             Picker(selection: Binding(
+                get: { portraitVideoMode },
+                set: { newValue in
+                    portraitVideoMode = newValue
+                    PlayerPlaybackPreferences.portraitVideoMode = newValue
+                }
+            )) {
+                ForEach(PortraitVideoPresentationMode.allCases) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            } label: {
+                settingsLabel("Portrait Video Mode", symbol: "rectangle.portrait.arrowtriangle.2.outward")
+            }
+
+            Picker(selection: Binding(
                 get: { playbackOrder },
                 set: { newValue in
                     playbackOrder = newValue
@@ -251,24 +306,74 @@ private extension SettingsView {
                 settingsLabel("When Playback Ends", symbol: "repeat")
             }
 
-            Toggle(isOn: $showNetworkSpeed) {
-                settingsLabel("Show Network Speed", symbol: "speedometer")
+            Toggle(isOn: Binding(
+                get: { resumePlayback },
+                set: { newValue in
+                    resumePlayback = newValue
+                    PlayerPlaybackPreferences.resumePlayback = newValue
+                }
+            )) {
+                settingsLabel("Resume Last Position", symbol: "clock.arrow.circlepath")
             }
 
             Toggle(isOn: Binding(
-                get: { hardwareDecode },
+                get: { animeSkipIntroOutro },
                 set: { newValue in
-                    hardwareDecode = newValue
-                    PlayerPlaybackPreferences.hardwareDecodeEnabled = newValue
+                    animeSkipIntroOutro = newValue
+                    PlayerPlaybackPreferences.animeSkipIntroOutro = newValue
                 }
             )) {
-                settingsLabel("Hardware Decoding", symbol: "cpu")
+                settingsLabel("Skip Anime Intro & Outro", symbol: "forward.frame")
             }
         }
     }
 
     var browsingSection: some View {
         Section("Browsing & Community") {
+            NavigationLink {
+                LocalContentFilterSettingsView()
+            } label: {
+                let filterStore = LocalContentFilterStore.shared
+                LabeledContent {
+                    if !filterStore.isEnabled {
+                        Text("Off")
+                    } else if filterStore.activeRuleCount > 0 {
+                        Text(verbatim: "\(filterStore.activeRuleCount)")
+                            .monospacedDigit()
+                    } else {
+                        Text("On")
+                    }
+                } label: {
+                    settingsLabel("Local Content Filter", symbol: "line.3.horizontal.decrease.circle")
+                }
+            }
+
+            NavigationLink {
+                CommentAIFilterSettingsView()
+            } label: {
+                LabeledContent {
+                    Text(aiCommentFilterSummary)
+                } label: {
+                    settingsLabel("AI Comment Filter", symbol: "sparkle.magnifyingglass")
+                }
+            }
+
+            Toggle(isOn: Binding(
+                get: { experiments.autoVerifyEnabled },
+                set: { _ = experiments.setAutoVerifyEnabled($0) }
+            )) {
+                settingsLabel("Verify Posted Comments", symbol: "text.badge.checkmark")
+            }
+            .disabled(experiments.storageError != nil)
+
+            if let commentToolsAccess = experiments.captureAccess(.commentTools) {
+                NavigationLink {
+                    CommentCheckView(access: commentToolsAccess)
+                } label: {
+                    settingsLabel("Comment Check", symbol: "eye.trianglebadge.exclamationmark")
+                }
+            }
+
             Toggle(isOn: $showCommentOrnaments) {
                 settingsLabel("Show Comment Ornaments", symbol: "sparkles")
             }
@@ -295,13 +400,13 @@ private extension SettingsView {
             }
 
             Toggle(isOn: $clipboardLinkDetection) {
-                settingsLabel("Automatically Detect Bilibili Links from Clipboard", symbol: "doc.on.clipboard")
+                settingsLabel("Clipboard Link Detection", symbol: "doc.on.clipboard")
             }
         }
     }
 
     var storageSection: some View {
-        Section {
+        Section("Downloads & Storage") {
             Toggle(isOn: $multiConnectionDownloads) {
                 settingsLabel("Multi-Connection Downloads", symbol: "arrow.triangle.branch")
             }
@@ -352,10 +457,6 @@ private extension SettingsView {
                     }
                 }
             }
-        } header: {
-            Text("Downloads & Storage")
-        } footer: {
-            Text("Downloads use parallel CDN connections on Wi-Fi for faster speeds and automatically limit concurrency on cellular.")
         }
     }
 
@@ -365,11 +466,8 @@ private extension SettingsView {
                 AdvancedSettingsView()
             } label: {
                 LabeledContent {
-                    if smartCDNEnabled {
-                        Text("Smart CDN")
-                    } else {
-                        Text(currentCDNLabel)
-                    }
+                    Text(advancedSettingsSummary)
+                        .lineLimit(1)
                 } label: {
                     settingsLabel("Advanced Settings", symbol: "slider.horizontal.3")
                 }
@@ -379,7 +477,7 @@ private extension SettingsView {
                 ExperimentalSettingsView()
             } label: {
                 LabeledContent {
-                    Text(ExperimentalSettingsStore.shared.snapshot.masterEnabled ? "On" : "Off")
+                    Text(experiments.snapshot.masterEnabled ? "On" : "Off")
                 } label: {
                     settingsLabel("Experimental Features", symbol: "flask")
                 }
@@ -456,6 +554,43 @@ private extension SettingsView {
                 settingsLabel(title, symbol: icon)
             }
         }
+    }
+
+    var subtitleStatusSummary: LocalizedStringKey {
+        SubtitleStylePreferences.shared.hasAutoSubtitleBehaviorEnabled ? "Auto" : "Manual"
+    }
+
+    var aiCommentFilterSummary: String {
+        guard experiments.isAllowed(.aiCommentFilter) else {
+            return String(localized: "Off")
+        }
+        let config = experiments.commentAIFilter
+        if config.rules.customThresholdOverride != nil {
+            return "\(config.mode.localizedTitle) \(config.effectiveThreshold)%"
+        }
+        return config.sensitivity.localizedTitle
+    }
+
+    var advancedSettingsSummary: String {
+        var parts: [String] = [
+            smartCDNEnabled ? String(localized: "Smart CDN") : currentCDNLabel
+        ]
+        let srMode = experiments.videoEnhancementDefaultSRMode
+        let frcEnabled = experiments.videoEnhancementDefaultFrameInterpolation
+        switch (srMode, frcEnabled) {
+        case (.off, false):
+            break
+        case (.off, true):
+            parts.append(String(localized: "FRC"))
+        case (_, false):
+            parts.append(srMode.shortLabel)
+        case (_, true):
+            parts.append("\(srMode.shortLabel) + \(String(localized: "FRC"))")
+        }
+        if preferredCodec != .auto {
+            parts.append(preferredCodec.shortLabel)
+        }
+        return parts.joined(separator: ", ")
     }
 
     func settingsLabel(_ title: LocalizedStringKey, symbol: String) -> some View {

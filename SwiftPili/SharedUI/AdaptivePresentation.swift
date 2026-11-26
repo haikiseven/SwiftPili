@@ -8,7 +8,7 @@ enum AppAdaptiveSheetSizing {
 
 extension View {
     func appAdaptiveSheet(
-        compactDetents: Set<PresentationDetent> = [.medium, .large],
+        compactDetents: Set<PresentationDetent>? = nil,
         padSizing: AppAdaptiveSheetSizing = .form,
         dragIndicator: Visibility = .visible
     ) -> some View {
@@ -21,7 +21,7 @@ extension View {
 }
 
 private struct AppAdaptiveSheetModifier: ViewModifier {
-    let compactDetents: Set<PresentationDetent>
+    let compactDetents: Set<PresentationDetent>?
     let padSizing: AppAdaptiveSheetSizing
     let dragIndicator: Visibility
 
@@ -34,6 +34,18 @@ private struct AppAdaptiveSheetModifier: ViewModifier {
             ? (AppWindowMetrics.current?.traitCollection.horizontalSizeClass ?? .unspecified)
             : windowHorizontalSizeClass
         return effective == .regular
+    }
+
+    private var resolvedCompactDetents: Set<PresentationDetent> {
+        if let compactDetents {
+            return compactDetents
+        }
+        switch padSizing {
+        case .form:
+            return [.medium]
+        case .page:
+            return [.large]
+        }
     }
 
     @ViewBuilder
@@ -68,7 +80,7 @@ private struct AppAdaptiveSheetModifier: ViewModifier {
             }
         } else {
             content
-                .presentationDetents(compactDetents)
+                .presentationDetents(resolvedCompactDetents)
                 .presentationDragIndicator(dragIndicator)
         }
     }

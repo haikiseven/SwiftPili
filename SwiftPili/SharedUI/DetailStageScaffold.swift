@@ -41,12 +41,17 @@ struct DetailStageState: Equatable, Sendable {
 final class DetailStageController {
     private(set) var state: DetailStageState
     var heroBarHeight: CGFloat = 0
+    var minimumHeroBarReserveHeight: CGFloat = DetailStageLayout.defaultHeroBarHeight
 
     init(initialPresentation: DetailStagePresentation = DetailStagePreferences.initialPresentation) {
         state = DetailStageState(initialPresentation: initialPresentation)
     }
 
     var presentation: DetailStagePresentation { state.presentation }
+
+    private var effectiveHeroBarHeight: CGFloat {
+        heroBarHeight > 0 ? heroBarHeight : minimumHeroBarReserveHeight
+    }
 
     func showsHeroBar(isWideLayout: Bool) -> Bool {
         isWideLayout && presentation == .hero
@@ -56,15 +61,31 @@ final class DetailStageController {
         containerWidth: CGFloat,
         containerHeight: CGFloat
     ) -> DetailStageLayout.Geometry {
-        DetailStageLayout.geometry(
+        let reservedBarHeight = effectiveHeroBarHeight
+        return DetailStageLayout.geometry(
             for: presentation,
             containerSize: CGSize(width: containerWidth, height: containerHeight),
-            heroReserve: heroBarHeight > 0 ? heroBarHeight + DetailStageLayout.heroContentGap : 0
+            heroReserve: reservedBarHeight > 0 ? reservedBarHeight + DetailStageLayout.heroContentGap : 0
         )
     }
 
-    func updateHeroBarHeight(_ height: CGFloat) {
-        if height.isFinite, height > 0, abs(height - heroBarHeight) >= 1 {
+    static var heroBarHeightSpring: Animation {
+        .spring(duration: 0.34, bounce: 0.08)
+    }
+
+    func updateHeroBarHeight(
+        _ height: CGFloat,
+        motion: AppMotionPreferences? = nil
+    ) {
+        guard height.isFinite, height > 0, abs(height - heroBarHeight) >= 1 else { return }
+        let previousEffective = effectiveHeroBarHeight
+        let effectiveMotion = motion ?? AppMotionPreferences.current
+        if abs(height - previousEffective) >= 1,
+           let animation = effectiveMotion.animation(normal: Self.heroBarHeightSpring) {
+            withAnimation(animation) {
+                heroBarHeight = height
+            }
+        } else {
             heroBarHeight = height
         }
     }
@@ -111,29 +132,57 @@ struct DetailPinnedFadeMask: View {
 }
 
 struct CinematicStageColumn<Content: View>: View {
+    @AppMotion private var motion
     let topInset: CGFloat
     let fadeGap: CGFloat
     let bottomSpacer: CGFloat
+    let scrollToTopTrigger: Int
     let onOffset: (CGFloat) -> Void
-    @ViewBuilder var content: () -> Content
+    let content: () -> Content
+
+    init(
+        topInset: CGFloat,
+        fadeGap: CGFloat,
+        bottomSpacer: CGFloat,
+        scrollToTopTrigger: Int = 0,
+        onOffset: @escaping (CGFloat) -> Void,
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        self.topInset = topInset
+        self.fadeGap = fadeGap
+        self.bottomSpacer = bottomSpacer
+        self.scrollToTopTrigger = scrollToTopTrigger
+        self.onOffset = onOffset
+        self.content = content
+    }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 0) {
-                content()
-                Color.clear.frame(height: bottomSpacer)
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    Color.clear
+                        .frame(height: 0)
+                        .id("detail-stage-column-top")
+                    content()
+                    Color.clear.frame(height: bottomSpacer)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .safeAreaPadding(.top, topInset)
+            .scrollBounceBehavior(.always, axes: .vertical)
+            .scrollIndicators(.hidden)
+            .onScrollGeometryChange(for: CGFloat.self) { geometry in
+                geometry.contentOffset.y + geometry.contentInsets.top
+            } action: { _, offset in
+                onOffset(offset)
+            }
+            .onChange(of: scrollToTopTrigger) { _, _ in
+                withAnimation(motion.animation(normal: .easeInOut(duration: 0.28))) {
+                    proxy.scrollTo("detail-stage-column-top", anchor: .top)
+                }
+            }
+            .mask { DetailPinnedFadeMask(topInset: topInset, gap: fadeGap) }
         }
-        .safeAreaPadding(.top, topInset)
-        .scrollBounceBehavior(.always, axes: .vertical)
-        .scrollIndicators(.hidden)
-        .onScrollGeometryChange(for: CGFloat.self) { geometry in
-            geometry.contentOffset.y + geometry.contentInsets.top
-        } action: { _, offset in
-            onOffset(offset)
-        }
-        .mask { DetailPinnedFadeMask(topInset: topInset, gap: fadeGap) }
     }
 }
 

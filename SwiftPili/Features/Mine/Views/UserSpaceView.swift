@@ -272,6 +272,7 @@ struct UserSpaceView: View {
 
     private var isOwnProfile: Bool { AuthManager.shared.dedeUserID.flatMap(Int.init) == mid }
     private var showsRelationControls: Bool { AuthManager.shared.isLoggedIn && !relation.isLoading && !isOwnProfile }
+    private var isLocallyBlocked: Bool { LocalContentFilterStore.shared.isUPBlockedLocally(mid) }
 
     var body: some View {
         Group {
@@ -290,11 +291,11 @@ struct UserSpaceView: View {
         .navigationTitle(showsInlineTitle ? (viewModel.userInfo?.name ?? "") : "")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar { if !viewModel.headerLoadFailed { ToolbarItem(placement: .topBarTrailing) { moreMenu } } }
-        .confirmationDialog("Block this user?", isPresented: $showBlockConfirm, titleVisibility: .visible) {
-            Button("Block User", role: .destructive) { relation.setBlocked(true, mid: mid) }
+        .confirmationDialog("Add this user to your Bilibili blacklist?", isPresented: $showBlockConfirm, titleVisibility: .visible) {
+            Button("Add to Bilibili Blacklist", role: .destructive) { relation.setBlocked(true, mid: mid) }
                 .disabled(BlocklistManager.shared.isMutating(mid: mid))
         } message: {
-            Text("Blocking unfollows them and collapses their comments across the app.")
+            Text("Adding to your Bilibili account blacklist unfollows them on Bilibili and filters their content across the app.")
         }
         .task(id: UserSpaceViewModel.LoadIdentity.capture(mid: mid)) {
             await viewModel.loadIfNeeded(identity: .capture(mid: mid))
@@ -314,7 +315,7 @@ struct UserSpaceView: View {
         }
     }
     private var headerIdentityKey: String {
-        "\(mid):\(viewModel.userInfo != nil):\(showsRelationControls):\(relation.isBlocked):\(relation.isFollowing)"
+        "\(mid):\(viewModel.userInfo != nil):\(showsRelationControls):\(relation.isBlocked):\(relation.isFollowing):\(isLocallyBlocked)"
     }
     private var moreMenu: some View {
         Menu {
@@ -326,15 +327,32 @@ struct UserSpaceView: View {
                     Label("Copy UID", systemImage: "doc.on.doc")
                 }
             }
+            if !isOwnProfile {
+                Section("Local Filter") {
+                    if isLocallyBlocked {
+                        Button {
+                            toggleLocalBlock(blocked: false)
+                        } label: {
+                            Label("Unblock Locally", systemImage: "person.crop.circle.badge.checkmark")
+                        }
+                    } else {
+                        Button(role: .destructive) {
+                            toggleLocalBlock(blocked: true)
+                        } label: {
+                            Label("Locally Block This UP", systemImage: "person.slash")
+                        }
+                    }
+                }
+            }
             if AuthManager.shared.isLoggedIn, !isOwnProfile {
-                Section {
+                Section("Bilibili Account") {
                     if relation.isBlocked {
                         Button { relation.setBlocked(false, mid: mid) } label: {
-                            Label("Unblock User", systemImage: "hand.raised.slash")
+                            Label("Remove from Bilibili Blacklist", systemImage: "hand.raised.slash")
                         }.disabled(BlocklistManager.shared.isMutating(mid: mid))
                     } else {
                         Button(role: .destructive) { showBlockConfirm = true } label: {
-                            Label("Block User", systemImage: "hand.raised")
+                            Label("Add to Bilibili Blacklist", systemImage: "hand.raised")
                         }.disabled(BlocklistManager.shared.isMutating(mid: mid))
                     }
                 }
@@ -342,6 +360,32 @@ struct UserSpaceView: View {
         } label: { Image(systemName: "ellipsis") }
             .tint(Color.primary)
             .accessibilityLabel(Text("More"))
+    }
+
+    private func toggleLocalBlock(blocked: Bool) {
+        let store = LocalContentFilterStore.shared
+        let rawName = viewModel.userInfo?.name.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let displayName = rawName.isEmpty ? "UID \(mid)" : rawName
+        let face = viewModel.userInfo?.face
+        let targetMid = mid
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        if blocked {
+            store.blockUP(mid: targetMid, name: displayName, face: face)
+            ContentFilterUndoToastCenter.shared.show(
+                message: String(format: String(localized: "Locally blocked UP \"%@\""), displayName),
+                systemImage: "person.slash"
+            ) {
+                store.unblockUP(mid: targetMid)
+            }
+        } else {
+            store.unblockUP(mid: targetMid)
+            ContentFilterUndoToastCenter.shared.show(
+                message: String(format: String(localized: "Unblocked UP \"%@\" locally"), displayName),
+                systemImage: "person.crop.circle.badge.checkmark"
+            ) {
+                store.blockUP(mid: targetMid, name: displayName, face: face)
+            }
+        }
     }
 }
 
@@ -385,7 +429,9 @@ private extension UserSpaceView {
         UserSpaceHostedHeaderView(
             mid: mid, viewModel: viewModel, relation: relation,
             showsRelationControls: showsRelationControls,
+            isLocallyBlocked: !isOwnProfile && isLocallyBlocked,
             horizontalInset: horizontalInset,
+            onUnblockLocally: { toggleLocalBlock(blocked: false) },
             openFollowing: { coordinator.navigate(to: .following(mid: mid)) },
             openFollowers: { coordinator.navigate(to: .followers(mid: mid)) }
         )
@@ -451,13 +497,16 @@ private struct UserSpaceHostedHeaderView: View {
     @Bindable var viewModel: UserSpaceViewModel
     let relation: UserSpaceRelationModel
     let showsRelationControls: Bool
+    let isLocallyBlocked: Bool
     let horizontalInset: CGFloat
+    let onUnblockLocally: () -> Void
     let openFollowing, openFollowers: () -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: AppSpacing.m) {
             UserSpaceProfileHeader(
                 mid: mid, userInfo: viewModel.userInfo, showsRelationControls: showsRelationControls,
-                isBlockedUser: relation.isBlocked, isFollowing: relation.isFollowing,
+                isBlockedUser: relation.isBlocked, isLocallyBlocked: isLocallyBlocked,
+                isFollowing: relation.isFollowing,
                 followInFlight: relation.isFollowingInFlight || BlocklistManager.shared.isMutating(mid: mid),
                 blockInFlight: BlocklistManager.shared.isMutating(mid: mid), accentColor: .biliAccent,
                 following: viewModel.relationStat?.following ?? viewModel.userInfo?.cardFollowing,
@@ -467,6 +516,7 @@ private struct UserSpaceHostedHeaderView: View {
                 horizontalPadding: horizontalInset,
                 onToggleFollow: { relation.toggleFollow(mid: mid) },
                 onUnblock: { relation.setBlocked(false, mid: mid) },
+                onUnblockLocally: onUnblockLocally,
                 openFollowing: openFollowing, openFollowers: openFollowers
             )
             UserSpaceTabSelector(

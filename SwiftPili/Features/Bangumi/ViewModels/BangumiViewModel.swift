@@ -67,17 +67,64 @@ final class BangumiViewModel {
     private var loadedSeasonId: Int?
     private var episodePlaybackRequestSerial: UInt64 = 0
 
+    static func matchingReturnEpisode(
+        in episodes: [PGCSeasonInfo.Episode],
+        for pending: PendingMiniPlayerReturnVOD
+    ) -> PGCSeasonInfo.Episode? {
+        if case .pgc(let epId) = pending.source,
+           let byEpId = episodes.first(where: { $0.id == epId }) {
+            return byEpId
+        }
+        return episodes.first(where: { $0.aid == pending.aid && $0.cid == pending.cid })
+    }
+
     func load(seasonId: Int) async {
         guard !Task.isCancelled else { return }
         let owner = PlayerViewModel.pgcOwner(seasonId)
         if isLiveReactivation(seasonId: seasonId, owner: owner) {
             let player = PlayerViewModel.shared
+            if let selectedEpisodeId,
+               let episode = season?.episodes?.first(where: { $0.id == selectedEpisodeId }),
+               let aid = episode.aid,
+               let cid = episode.cid {
+                _ = player.consumeMiniPlayerReturnIfLiveVOD(
+                    aid: aid,
+                    cid: cid,
+                    bvid: episode.bvid,
+                    source: .pgc(epId: selectedEpisodeId),
+                    quality: nil,
+                    ownerLease: playerLease,
+                    startupTraceToken: nil,
+                    mediaResetID: nil,
+                    recoveryCoverIdentity: nil,
+                    cdnSwitchID: nil,
+                    streamRetryID: nil
+                )
+                installBangumiPlaybackQueue(currentEpisode: episode)
+            }
             PlayerLog.log(
                 "[BangumiVM] re-activation is a no-op — already live " +
                 "sid=\(selectedEpisodeId ?? 0) aid=\(currentEpisodeAid ?? 0) " +
                 "cid=\(player.currentCid ?? 0) " +
                 "t=\(String(format: "%.1f", player.mediaTime))s owner=\(owner)"
             )
+            return
+        }
+        if loadedSeasonId == seasonId,
+           let existingEpisodes = season?.episodes,
+           error == nil,
+           let lease = playerLease,
+           PlayerViewModel.shared.isCurrentOwner(lease),
+           let pendingReturn = PlayerViewModel.shared.pendingMiniPlayerReturnVOD(
+               forSeasonId: seasonId,
+               ownerLease: lease
+           ),
+           let matchingEpisode = Self.matchingReturnEpisode(in: existingEpisodes, for: pendingReturn) {
+            PlayerLog.log(
+                "[BangumiVM] mini-player return advanced to \(matchingEpisode.indexLabel) " +
+                "(epId=\(matchingEpisode.id) aid=\(pendingReturn.aid) cid=\(pendingReturn.cid))"
+            )
+            await play(episode: matchingEpisode)
             return
         }
         episodePlaybackRequestSerial &+= 1
@@ -102,6 +149,20 @@ final class BangumiViewModel {
                 StartupTrace.abort("no-playable-episode", token: traceToken)
                 return
             }
+
+            if let pendingReturn = PlayerViewModel.shared.pendingMiniPlayerReturnVOD(
+                forSeasonId: seasonId,
+                ownerLease: lease
+            ),
+               let matchingEpisode = Self.matchingReturnEpisode(in: episodes, for: pendingReturn) {
+                PlayerLog.log(
+                    "[BangumiVM] mini-player return matched \(matchingEpisode.indexLabel) " +
+                    "(epId=\(matchingEpisode.id) aid=\(pendingReturn.aid) cid=\(pendingReturn.cid))"
+                )
+                await play(episode: matchingEpisode)
+                return
+            }
+
             let cloudSeconds = info.userStatus?.progress?.lastTime.map(TimeInterval.init)
             let laterMatch: PGCSeasonInfo.Episode? = {
                 guard PlayerViewModel.resumePlayback,
@@ -226,28 +287,44 @@ final class BangumiViewModel {
 
         loadInitialComments(from: commentSource)
 
-        let resumeLookup = await PlayerViewModel.serverResumePoint(
+        let isLiveMiniPlayerReturn = PlayerViewModel.shared.matchesLiveMiniPlayerReturnVOD(
             aid: aid,
             cid: cid,
+            source: .pgc(epId: episode.id),
             ownerLease: lease
         )
-        guard admitsEpisodePlayback(
-            requestSerial: requestSerial,
-            departures: departures,
-            lease: lease
-        ) else { return }
-        guard case .load(let resumeAt) = resumeLookup.loadDecision(
-            cloudFallbackSeconds: cloudFallbackSeconds
-        ) else {
-            if let token = startupTraceToken {
-                StartupTrace.abort("resume-lookup-cancelled", token: token)
+        let resumeAt: TimeInterval?
+        if isLiveMiniPlayerReturn {
+            PlayerLog.log(
+                "[BangumiVM] skipping serverResumePoint for live mini-player return " +
+                "ep=\(episode.id) aid=\(aid) cid=\(cid)"
+            )
+            resumeAt = nil
+        } else {
+            let resumeLookup = await PlayerViewModel.serverResumePoint(
+                aid: aid,
+                cid: cid,
+                ownerLease: lease
+            )
+            guard admitsEpisodePlayback(
+                requestSerial: requestSerial,
+                departures: departures,
+                lease: lease
+            ) else { return }
+            guard case .load(let resolvedResumeAt) = resumeLookup.loadDecision(
+                cloudFallbackSeconds: cloudFallbackSeconds
+            ) else {
+                if let token = startupTraceToken {
+                    StartupTrace.abort("resume-lookup-cancelled", token: token)
+                }
+                PlayerLog.log("[BangumiVM] episode load aborted — resume lookup cancelled aid=\(aid) cid=\(cid)")
+                return
             }
-            PlayerLog.log("[BangumiVM] episode load aborted — resume lookup cancelled aid=\(aid) cid=\(cid)")
-            return
-        }
-        guard !Task.isCancelled else { return }
-        if resumeLookup == .noHistory, let fallback = resumeAt {
-            PlayerLog.log("[BangumiVM] using season-progress last_time as resume point: \(Int(fallback))s")
+            guard !Task.isCancelled else { return }
+            if resumeLookup == .noHistory, let fallback = resolvedResumeAt {
+                PlayerLog.log("[BangumiVM] using season-progress last_time as resume point: \(Int(fallback))s")
+            }
+            resumeAt = resolvedResumeAt
         }
 
         SponsorBlockManager.shared.clear()
@@ -278,20 +355,7 @@ final class BangumiViewModel {
         ) else { return }
 
         PlayerViewModel.shared.pgcSeasonContext = (sid: seasonId, type: season?.type)
-
-        let episodes = season?.episodes ?? []
-        let index = episodes.firstIndex(where: { $0.id == episode.id })
-        let hasPrevious = (index ?? 0) > 0
-        let hasNext = index.map { $0 + 1 < episodes.count } ?? false
-        PlayerViewModel.shared.onPreviousEpisode = hasPrevious
-            ? { [weak self] in Task { await self?.playAdjacentEpisode(offset: -1) } }
-            : nil
-        PlayerViewModel.shared.onNextEpisode = hasNext
-            ? { [weak self] in Task { await self?.playAdjacentEpisode(offset: 1) } }
-            : nil
-        PlayerViewModel.shared.onPlaybackEnded = hasNext
-            ? { [weak self] in Task { await self?.playAdjacentEpisode(offset: 1) } }
-            : nil
+        installBangumiPlaybackQueue(currentEpisode: episode)
 
         var segments: [(label: String, start: Double, end: Double)] = []
         if let op = episode.skip?.op, let s = op.start, let e = op.end, e > s {
@@ -408,9 +472,41 @@ final class BangumiViewModel {
         )
     }
 
+    private func installBangumiPlaybackQueue(currentEpisode: PGCSeasonInfo.Episode) {
+        guard let season,
+              let queue = PlaybackQueueContext.bangumiSeason(
+                  season,
+                  seasonId: seasonId,
+                  currentEpisodeId: currentEpisode.id
+              ) else {
+            PlayerViewModel.shared.setPlaybackQueue(nil)
+            return
+        }
+        PlayerViewModel.shared.setPlaybackQueue(queue) { [weak self] offset in
+            guard let self, self.canPlayAdjacentEpisode(offset: offset) else { return false }
+            Task { @MainActor [weak self] in
+                await self?.playAdjacentEpisode(offset: offset)
+            }
+            return true
+        }
+    }
+
+    private func playableEpisodes() -> [PGCSeasonInfo.Episode] {
+        (season?.episodes ?? []).filter { $0.aid != nil && $0.cid != nil }
+    }
+
+    private func canPlayAdjacentEpisode(offset: Int) -> Bool {
+        let episodes = playableEpisodes()
+        guard let index = episodes.firstIndex(where: { $0.id == selectedEpisodeId }),
+              episodes.indices.contains(index + offset) else {
+            return false
+        }
+        return true
+    }
+
     func playAdjacentEpisode(offset: Int) async {
-        guard let episodes = season?.episodes,
-              let index = episodes.firstIndex(where: { $0.id == selectedEpisodeId }),
+        let episodes = playableEpisodes()
+        guard let index = episodes.firstIndex(where: { $0.id == selectedEpisodeId }),
               episodes.indices.contains(index + offset)
         else { return }
         let target = episodes[index + offset]

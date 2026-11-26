@@ -39,7 +39,7 @@ struct DownloadExportSheet: View {
                     } header: {
                         Text("File")
                     } footer: {
-                        Text("MP4 · Save to Photos, Files, or Share after export finishes.")
+                        Text("MP4 — Save to Photos, Files, or Share after export finishes.")
                     }
 
                     if loading {

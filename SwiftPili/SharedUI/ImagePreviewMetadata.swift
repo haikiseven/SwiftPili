@@ -21,12 +21,22 @@ enum ImagePreviewMetadata {
            let image = cache.retrieveImageInMemoryCache(forKey: key, options: originalOptions) {
             return pixelDimensions(of: image)
         }
-        guard type == .disk || type == .memory else { return nil }
-        let fileExtension = options.forcedExtension
-        return await Task.detached(priority: .userInitiated) { () -> CGSize? in
-            guard let data = try? cache.diskStorage.value(forKey: key, forcedExtension: fileExtension) else {
-                return nil
+        if type == .disk || type == .memory {
+            let fileExtension = options.forcedExtension
+            let diskSize = await Task.detached(priority: .userInitiated) { () -> CGSize? in
+                guard let data = try? cache.diskStorage.value(forKey: key, forcedExtension: fileExtension) else {
+                    return nil
+                }
+                return headerSize(data)
+            }.value
+            if let diskSize {
+                return diskSize
             }
+        }
+        guard !Task.isCancelled, result.cacheType == .none, result.metrics != nil else { return nil }
+        let dataProvider = result.data
+        return await Task.detached(priority: .userInitiated) { () -> CGSize? in
+            guard let data = dataProvider() else { return nil }
             return headerSize(data)
         }.value
     }
@@ -43,7 +53,7 @@ enum ImagePreviewMetadata {
         return (5...8).contains(orientation) ? CGSize(width: size.height, height: size.width) : size
     }
 
-    private static func pixelDimensions(of image: UIImage) -> CGSize? {
+    nonisolated static func pixelDimensions(of image: UIImage) -> CGSize? {
         let width = image.size.width * image.scale
         let height = image.size.height * image.scale
         guard width.isFinite, height.isFinite, width > 0, height > 0 else { return nil }

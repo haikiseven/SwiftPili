@@ -7,6 +7,7 @@ struct CommentRowView: View {
     let comment: CommentResult.CommentItem
     var upMid: Int?
     var showsInlineReplies = true
+    var bypassContentFilter = false
     var onReply: ((CommentResult.CommentItem) -> Void)?
     var onViewThread: ((CommentResult.CommentItem) -> Void)?
     var onOpenReply: ((CommentResult.CommentItem, Int) -> Void)?
@@ -29,7 +30,8 @@ struct CommentRowView: View {
     }
 
     var body: some View {
-        BlockedCollapsible(mid: comment.mid, uname: comment.member.uname) {
+        let _ = actionState.syncReplyHandler(onReply)
+        ContentFilterCommentRowContainer(comment: comment, bypass: bypassContentFilter) {
             CommentAIFilterRowContainer(comment: comment, upMid: upMid) { aiAssessment, onInspectAI in
                 commentBody(aiAssessment: aiAssessment, onInspectAI: onInspectAI)
             }
@@ -65,7 +67,7 @@ struct CommentRowView: View {
                     detectTimestamps: true
                 )
                 .lineSpacing(2)
-                .commentContextActions(comment, state: actionState, onDelete: onDelete)
+                .commentContextActions(comment, state: actionState, onReply: onReply, onDelete: onDelete)
                 .modifier(TapToReply(action: onReply.map { act in { act(comment) } }))
                 .padding(.top, 1)
                 .padding(.bottom, 2)
@@ -110,7 +112,8 @@ struct CommentRowView: View {
 
     private var actionRow: some View {
         HStack(spacing: 20) {
-            CommentLikeButton(comment: comment)
+            CommentLikeButton(comment: comment, state: actionState)
+            CommentDislikeButton(comment: comment, state: actionState)
             if let onReply {
                 CommentReplyActionButton {
                     onReply(comment)

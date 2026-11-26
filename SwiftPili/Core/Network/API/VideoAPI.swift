@@ -60,13 +60,18 @@ enum VideoAPI {
     }
 
     static func getPlayerInfo(aid: Int, cid: Int) async throws(BiliError) -> PlayerV2Info {
-        try await BiliAPIClient.shared.request(
+        let info = try await BiliAPIClient.shared.request(
             BiliEndpoint(
                 path: "/x/player/wbi/v2",
                 params: ["aid": String(aid), "cid": String(cid)]
             ),
             type: PlayerV2Info.self
         )
+        let chapters = VideoChapter.from(viewPoints: info.viewPoints)
+        Task { @MainActor in
+            PlayerChapterStore.shared.record(chapters, aid: aid, cid: cid)
+        }
+        return info
     }
 
     static func getTags(aid: Int, cid: Int? = nil) async throws(BiliError) -> [VideoTag] {
@@ -101,6 +106,19 @@ enum VideoAPI {
 
             ),
             type: LikeResult.self
+        )
+    }
+
+    static func likeTriple(aid: Int) async throws(BiliError) -> TripleLikeResult {
+        guard let csrf = AuthManager.shared.biliJct else { throw .authRequired }
+        return try await BiliAPIClient.shared.request(
+            BiliEndpoint(
+                path: "/x/web-interface/archive/like/triple",
+                method: .post,
+                params: ["aid": String(aid), "csrf": csrf],
+                headers: ["Referer": "https://www.bilibili.com/video/av\(aid)/"]
+            ),
+            type: TripleLikeResult.self
         )
     }
 

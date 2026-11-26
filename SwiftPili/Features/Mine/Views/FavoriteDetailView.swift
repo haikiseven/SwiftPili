@@ -39,20 +39,14 @@ private struct FavoriteDetailContent: View {
         model.items.isEmpty && (model.isLoading || !model.hasAttempted)
     }
 
-    private var headerInfoText: String? {
-        guard !model.items.isEmpty else { return nil }
-        if let keyword = model.activeKeyword {
-            return "\(title) — “\(keyword)”"
-        }
-        return title
-    }
-
-    private var rowItems: [MineLibraryRowItem] {
+    private var sections: [MineLibraryRowSection] {
+        guard !model.items.isEmpty else { return [] }
         let menuRevision = model.ownsFolder ? 1 : 0
         let isMenuEnabled = model.activeActionID == nil
-        return model.items.map { item in
+        let cardItems = model.items.map { item in
             let hasMenu = hasItemMenu(item)
-            return MineLibraryRowItem(
+            let canRemove = model.actionRequest(.remove, item: item) != nil
+            return MineLibraryCardItem(
                 id: .string(item.resourceKey),
                 title: item.title,
                 sources: VideoCoverSources(widescreen: item.cover ?? ""),
@@ -60,14 +54,20 @@ private struct FavoriteDetailContent: View {
                 subtitle: item.upper?.name,
                 footer: .stats(play: item.cntInfo?.play, danmaku: item.cntInfo?.danmaku),
                 isSelectable: item.isPlayableVideo,
+                isUnavailable: !item.isPlayableVideo,
+                statusBadge: item.isPlayableVideo ? nil : String(localized: "Unavailable"),
+                statusBadgeStyle: .warning,
                 hasTrailingMenu: hasMenu,
                 trailingMenuAccessibilityLabel: hasMenu
                     ? String(localized: "More actions for \(item.title)")
                     : nil,
                 isTrailingMenuEnabled: isMenuEnabled,
-                menuRevision: menuRevision
+                menuRevision: menuRevision,
+                allowsSwipeDelete: canRemove,
+                swipeDeleteTitle: String(localized: "Remove")
             )
         }
+        return [MineLibraryRowSection(id: "favorites", title: nil, items: cardItems)]
     }
 
     private var footerState: MineFeedFooterState {
@@ -87,9 +87,8 @@ private struct FavoriteDetailContent: View {
     var body: some View {
         let generation = model.publishedGeneration
         let placeholderLabel = String(format: String(localized: "Loading %@"), title)
-        MineLibraryRowFeedView(
-            items: rowItems,
-            headerTitle: headerInfoText,
+        MineLibrarySectionedFeedView(
+            sections: sections,
             placeholderCount: showsInitialPlaceholder ? 6 : 0,
             placeholderLabel: placeholderLabel,
             footerState: footerState,
@@ -116,11 +115,63 @@ private struct FavoriteDetailContent: View {
                     return nil
                 }
                 return makeItemMenu(for: item, sourceView: sourceView)
+            },
+            makeContextMenu: { id in
+                guard model.activeActionID == nil,
+                      case .string(let key) = id,
+                      let item = model.items.first(where: { $0.resourceKey == key }) else {
+                    return nil
+                }
+                return makeItemMenu(for: item, sourceView: nil)
+            },
+            onSwipeDelete: { id in
+                guard case .string(let key) = id,
+                      let item = model.items.first(where: { $0.resourceKey == key }),
+                      let request = model.actionRequest(.remove, item: item) else {
+                    return
+                }
+                model.startAction(request)
             }
         )
         .appAmbientBrowseBackground()
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Menu {
+                    ForEach(FavoriteDetailViewModel.SortOrder.allCases) { order in
+                        Button {
+                            model.setSortOrder(order)
+                        } label: {
+                            if model.sortOrder == order {
+                                Label(order.label, systemImage: "checkmark")
+                            } else {
+                                Text(order.label)
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: "arrow.up.arrow.down")
+                }
+                .disabled(model.activeActionID != nil)
+                .accessibilityLabel(Text("Sort"))
+
+                if model.hasPlayableVideos {
+                    Button {
+                        playAll()
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: "play.fill")
+                                .font(.caption.weight(.semibold))
+                            Text("Play All")
+                                .font(.subheadline.weight(.medium))
+                        }
+                    }
+                    .disabled(model.activeActionID != nil)
+                    .accessibilityIdentifier("favoriteDetail.playAll")
+                }
+            }
+        }
         .searchable(text: $searchText)
         .onSubmit(of: .search) { model.search(searchText) }
         .onChange(of: searchText) {
@@ -274,6 +325,21 @@ private struct FavoriteDetailContent: View {
     @MainActor
     private func presentShareSheet(url: URL, sourceView: UIView?) {
         ActivitySharePresenter.present(items: [url], sourceView: sourceView)
+    }
+
+    private func playAll() {
+        let entries = model.makePlayAllEntries()
+        guard !entries.isEmpty else { return }
+        let playlistName: String = if let keyword = model.activeKeyword {
+            "\(title) (\(keyword))"
+        } else {
+            title
+        }
+        _ = PlaylistQueueLauncher.shared.launch(
+            playlistName: playlistName,
+            entries: entries,
+            coordinator: coordinator
+        )
     }
 }
 

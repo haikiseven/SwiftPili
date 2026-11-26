@@ -27,6 +27,12 @@ final class HomeViewModel {
     private var recommendationRefresh: FeedLoadToken?
     @ObservationIgnored
     private var pendingRecommendationLoad = false
+    @ObservationIgnored
+    private var rawRecommendationFeed = RecommendationFeed()
+    @ObservationIgnored
+    private var rawPopularItems: [VideoCard] = []
+    @ObservationIgnored
+    private var rawRankingItems: [RankingResult.RankItem] = []
     private static let refreshCardLimit = 13
     private static let refreshRequestLimit = 3
 
@@ -48,9 +54,15 @@ final class HomeViewModel {
         if !cached.isEmpty {
             let hydrated = RecommendationFeed.hydrated(from: cached)
             if !hydrated.items.isEmpty {
-                self.recommendationFeed = hydrated
-                self.isShowingCachedSnapshot = true
+                Self.recordRecommendMetadata(hydrated.items)
+                self.rawRecommendationFeed = hydrated
+                let visible = hydrated.items.filter { !Self.shouldHideRecommendItem($0) }
+                self.recommendationFeed = RecommendationFeed.hydrated(from: visible)
+                self.isShowingCachedSnapshot = !visible.isEmpty
             }
+        }
+        LocalContentFilterStore.shared.addObserver(self) { viewModel in
+            viewModel.reapplyContentFilters()
         }
     }
     var popularItems: [VideoCard] = [] {
@@ -186,8 +198,13 @@ final class HomeViewModel {
                 outcome = .superseded
                 return
             }
+            let rawIncoming = result.item ?? []
+            Self.recordRecommendMetadata(rawIncoming)
+            let filteredIncoming = rawIncoming.filter { !Self.shouldHideRecommendItem($0) }
+            let baseRaw = replacingSnapshot ? RecommendationFeed() : rawRecommendationFeed
             let baseFeed = replacingSnapshot ? RecommendationFeed() : recommendationFeed
-            let prepared = try await baseFeed.appendingPage(result.item ?? [])
+            let preparedRaw = try await baseRaw.appendingPage(rawIncoming)
+            let prepared = try await baseFeed.appendingPage(filteredIncoming)
             try Task.checkCancellation()
             guard isCurrent(key, token: token) else {
                 outcome = .superseded
@@ -195,12 +212,16 @@ final class HomeViewModel {
             }
             if replacingSnapshot {
                 isShowingCachedSnapshot = false
+                if !preparedRaw.items.isEmpty {
+                    rawRecommendationFeed = preparedRaw
+                }
                 if !prepared.items.isEmpty {
                     recommendationFeed = prepared
                     freshIdx = max(freshIdx, requestedFreshIdx + 1)
                     persistRecommendationSnapshot()
                 }
             } else {
+                rawRecommendationFeed = preparedRaw
                 recommendationFeed = prepared
                 freshIdx = max(freshIdx, requestedFreshIdx + 1)
                 if requestedFreshIdx == 1 {
@@ -264,9 +285,12 @@ final class HomeViewModel {
                 outcome = .superseded
                 return
             }
+            let incomingPopular = result.list ?? []
+            Self.recordPopularMetadata(incomingPopular)
             FeedCollectionPolicy.appendDeduplicated(
-                to: &popularItems, incoming: result.list ?? [], id: \.id
+                to: &rawPopularItems, incoming: incomingPopular, id: \.id
             )
+            popularItems = rawPopularItems.filter { !Self.shouldHidePopularItem($0) }
             noMorePopular = result.noMore ?? false
             popularPage = max(popularPage, requestedPage + 1)
             if wasEmpty, !popularItems.isEmpty {
@@ -318,7 +342,10 @@ final class HomeViewModel {
                 outcome = .superseded
                 return
             }
-            popularItems = FeedCollectionPolicy.replaceDeduplicated(result.list ?? [], id: \.id)
+            let incomingPopular = result.list ?? []
+            Self.recordPopularMetadata(incomingPopular)
+            rawPopularItems = FeedCollectionPolicy.replaceDeduplicated(incomingPopular, id: \.id)
+            popularItems = rawPopularItems.filter { !Self.shouldHidePopularItem($0) }
             noMorePopular = result.noMore ?? false
             popularPage = 2
             if wasEmpty, !popularItems.isEmpty {
@@ -370,7 +397,10 @@ final class HomeViewModel {
                 outcome = .superseded
                 return
             }
-            rankingItems = FeedCollectionPolicy.replaceDeduplicated(result.list ?? [], id: \.id)
+            let incomingRanking = result.list ?? []
+            Self.recordRankingMetadata(incomingRanking)
+            rawRankingItems = FeedCollectionPolicy.replaceDeduplicated(incomingRanking, id: \.id)
+            rankingItems = rawRankingItems.filter { !Self.shouldHideRankingItem($0) }
             if wasEmpty, !rankingItems.isEmpty {
                 FeedPerformanceSignposts.firstContent(.home, generation: token.generation, count: rankingItems.count)
             }
@@ -624,12 +654,14 @@ final class HomeViewModel {
                 outcome = .success
                 return .unchanged
             }
+            let preparedRaw = try await rawRecommendationFeed.prepending(batch.items)
             let prepared = try await recommendationFeed.prepending(batch.items)
             try Task.checkCancellation()
             guard isCurrent(key, token: token) else {
                 outcome = .superseded
                 return .unchanged
             }
+            rawRecommendationFeed = preparedRaw.feed
             recommendationFeed = prepared.feed
             isShowingCachedSnapshot = false
             freshIdx = max(freshIdx, batch.lastRequestIndex + 1)
@@ -667,8 +699,10 @@ final class HomeViewModel {
             guard isCurrent(.recommended, token: token) else { return nil }
             lastRequestIndex = index
             let rawItems = result.item ?? []
+            Self.recordRecommendMetadata(rawItems)
+            let visibleRawItems = rawItems.filter { !Self.shouldHideRecommendItem($0) }
             let accepted = try await recommendationFeed.newItems(
-                from: rawItems, excluding: candidates, limit: Self.refreshCardLimit - candidates.count
+                from: visibleRawItems, excluding: candidates, limit: Self.refreshCardLimit - candidates.count
             )
             try Task.checkCancellation()
             guard isCurrent(.recommended, token: token) else { return nil }
@@ -836,5 +870,95 @@ final class HomeViewModel {
             generation: policy.generation,
             count: policy.duplicateSuppressionCount
         )
+    }
+
+    func reapplyContentFilters() {
+        if !rawRecommendationFeed.items.isEmpty {
+            let visibleRecommended = rawRecommendationFeed.items.filter { !Self.shouldHideRecommendItem($0) }
+            if visibleRecommended.map(\.id) != recommendationFeed.items.map(\.id) {
+                recommendationFeed = RecommendationFeed.hydrated(from: visibleRecommended)
+            }
+        }
+        if !rawPopularItems.isEmpty {
+            let visiblePopular = rawPopularItems.filter { !Self.shouldHidePopularItem($0) }
+            if visiblePopular.map(\.id) != popularItems.map(\.id) {
+                popularItems = visiblePopular
+            }
+        }
+        if !rawRankingItems.isEmpty {
+            let visibleRanking = rawRankingItems.filter { !Self.shouldHideRankingItem($0) }
+            if visibleRanking.map(\.id) != rankingItems.map(\.id) {
+                rankingItems = visibleRanking
+            }
+        }
+    }
+
+    private static func shouldHideRecommendItem(_ item: RecommendResult.RecommendItem) -> Bool {
+        LocalContentFilterStore.shared.shouldHideVideo(
+            aid: item.id,
+            bvid: item.bvid,
+            mid: item.owner?.mid,
+            title: item.title
+        )
+    }
+
+    private static func shouldHidePopularItem(_ item: VideoCard) -> Bool {
+        LocalContentFilterStore.shared.shouldHideVideo(
+            aid: item.aid,
+            bvid: item.bvid,
+            mid: item.owner.mid,
+            title: item.title
+        )
+    }
+
+    private static func shouldHideRankingItem(_ item: RankingResult.RankItem) -> Bool {
+        LocalContentFilterStore.shared.shouldHideVideo(
+            aid: item.aid,
+            bvid: item.bvid,
+            mid: item.owner?.mid,
+            title: item.title
+        )
+    }
+
+    private static func recordRecommendMetadata(_ items: [RecommendResult.RecommendItem]) {
+        let registry = VideoCardFilterMetadataStore.shared
+        for item in items {
+            registry.record(VideoCardFilterMetadata(
+                aid: item.id,
+                bvid: item.bvid,
+                title: item.title,
+                ownerMid: item.owner?.mid,
+                ownerName: item.owner?.name ?? "",
+                ownerFace: item.owner?.face
+            ))
+        }
+    }
+
+    private static func recordPopularMetadata(_ items: [VideoCard]) {
+        let registry = VideoCardFilterMetadataStore.shared
+        for item in items {
+            registry.record(VideoCardFilterMetadata(
+                aid: item.aid,
+                bvid: item.bvid,
+                title: item.title,
+                ownerMid: item.owner.mid,
+                ownerName: item.owner.name,
+                ownerFace: item.owner.face
+            ))
+        }
+    }
+
+    private static func recordRankingMetadata(_ items: [RankingResult.RankItem]) {
+        let registry = VideoCardFilterMetadataStore.shared
+        for item in items {
+            registry.record(VideoCardFilterMetadata(
+                aid: item.aid,
+                bvid: item.bvid,
+                title: item.title,
+                ownerMid: item.owner?.mid,
+                ownerName: item.owner?.name ?? "",
+                ownerFace: item.owner?.face
+            ))
+        }
     }
 }

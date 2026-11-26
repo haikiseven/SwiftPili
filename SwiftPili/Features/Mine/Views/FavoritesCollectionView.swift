@@ -5,7 +5,9 @@ struct FavoriteFolderRowData: Identifiable, Equatable {
     let folder: FavoriteFolderResult.FavoriteFolder
     let previews: [FavoriteContentResult.FavoriteMedia]
     let isPreviewLoaded: Bool
+    let isPreviewFailed: Bool
     let needsPreview: Bool
+    let isOwned: Bool
 
     var id: Int { folder.id }
 
@@ -13,19 +15,27 @@ struct FavoriteFolderRowData: Identifiable, Equatable {
         folder: FavoriteFolderResult.FavoriteFolder,
         previews: [FavoriteContentResult.FavoriteMedia],
         isPreviewLoaded: Bool,
-        needsPreview: Bool? = nil
+        isPreviewFailed: Bool = false,
+        needsPreview: Bool? = nil,
+        isOwned: Bool = true
     ) {
         self.folder = folder
         self.previews = previews
         self.isPreviewLoaded = isPreviewLoaded
-        self.needsPreview = needsPreview ?? !isPreviewLoaded
+        self.isPreviewFailed = isPreviewFailed
+        self.needsPreview = needsPreview ?? (!isPreviewLoaded && !isPreviewFailed)
+        self.isOwned = isOwned
     }
 
     func hasVisualDifference(from other: Self) -> Bool {
         folder.id != other.folder.id
             || folder.title != other.folder.title
             || folder.mediaCount != other.folder.mediaCount
+            || folder.attr != other.folder.attr
+            || folder.upper?.name != other.folder.upper?.name
             || isPreviewLoaded != other.isPreviewLoaded
+            || isPreviewFailed != other.isPreviewFailed
+            || isOwned != other.isOwned
             || previews.map(\.resourceKey) != other.previews.map(\.resourceKey)
     }
 
@@ -43,6 +53,8 @@ struct FavoritesCollectionView: View {
     var previewGeneration: UInt64 = 0
     var onRefresh: (@MainActor () async -> Bool)?
     let onNeedPreview: (Int) -> Void
+    var onRetryPreview: ((Int) -> Void)?
+    var onNearEnd: (() -> Void)?
     let onOpenFolder: (Int, String) -> Void
     let onSelectVideo: (VideoRouteTarget) -> Void
     let onRequestDelete: (FavoriteFolderResult.FavoriteFolder) -> Void
@@ -56,6 +68,8 @@ struct FavoritesCollectionView: View {
             previewGeneration: previewGeneration,
             coverPresentation: CoverPresentationStore.shared.presentation,
             onNeedPreview: onNeedPreview,
+            onRetryPreview: onRetryPreview,
+            onNearEnd: onNearEnd,
             onOpenFolder: onOpenFolder,
             onSelectVideo: onSelectVideo,
             onRequestDelete: onRequestDelete
@@ -77,6 +91,8 @@ private struct FavoritesCollectionConfig {
     let previewGeneration: UInt64
     let coverPresentation: CoverPresentation
     let onNeedPreview: (Int) -> Void
+    let onRetryPreview: ((Int) -> Void)?
+    let onNearEnd: (() -> Void)?
     let onOpenFolder: (Int, String) -> Void
     let onSelectVideo: (VideoRouteTarget) -> Void
     let onRequestDelete: (FavoriteFolderResult.FavoriteFolder) -> Void
@@ -94,10 +110,16 @@ private enum FavoritesCellKey: Hashable, Sendable {
 
 @MainActor
 private final class FavoritesCollectionViewController: UIKitBaseCollectionViewController {
+    private struct PaginationKey: Hashable {
+        let count: Int
+        let lastID: Int?
+    }
+
     private var dataSource: UICollectionViewDiffableDataSource<FavoritesSectionKey, FavoritesCellKey>?
     private var currentSections: [FavoritesSectionKey] = []
     private var rows: [FavoriteFolderRowData] = []
     private var rowByID: [Int: FavoriteFolderRowData] = [:]
+    private var rowIndexByID: [Int: Int] = [:]
     private var placeholderCount = 0
     private var placeholderLabel = ""
     private var isMutating = false
@@ -105,6 +127,8 @@ private final class FavoritesCollectionViewController: UIKitBaseCollectionViewCo
     private var coverPresentation = CoverPresentationStore.shared.presentation
 
     private var onNeedPreview: (Int) -> Void = { _ in }
+    private var onRetryPreview: ((Int) -> Void)?
+    private var onNearEnd: (() -> Void)?
     private var onOpenFolder: (Int, String) -> Void = { _, _ in }
     private var onSelectVideo: (VideoRouteTarget) -> Void = { _ in }
     private var onRequestDelete: (FavoriteFolderResult.FavoriteFolder) -> Void = { _ in }
@@ -115,28 +139,27 @@ private final class FavoritesCollectionViewController: UIKitBaseCollectionViewCo
 
     override func makeCollectionLayout() -> UICollectionViewLayout {
         UICollectionViewCompositionalLayout { [weak self] sectionIndex, layoutEnvironment in
-            var listConfig = UICollectionLayoutListConfiguration(appearance: .plain)
-            listConfig.backgroundColor = .clear
-            listConfig.showsSeparators = true
-            listConfig.trailingSwipeActionsConfigurationProvider = { [weak self] indexPath in
-                self?.trailingSwipeActions(at: indexPath)
-            }
-            let section = NSCollectionLayoutSection.list(using: listConfig, layoutEnvironment: layoutEnvironment)
             let isSkeleton = if let self, sectionIndex < self.currentSections.count {
                 self.currentSections[sectionIndex] == .skeletons
             } else {
                 false
             }
+            var listConfig = UICollectionLayoutListConfiguration(appearance: .plain)
+            listConfig.backgroundColor = .clear
+            listConfig.showsSeparators = !isSkeleton
+            if !isSkeleton {
+                listConfig.trailingSwipeActionsConfigurationProvider = { [weak self] indexPath in
+                    self?.trailingSwipeActions(at: indexPath)
+                }
+            }
+            let section = NSCollectionLayoutSection.list(using: listConfig, layoutEnvironment: layoutEnvironment)
             if isSkeleton {
-                let inset = FeedColumnPolicy.horizontalMargin(
-                    for: layoutEnvironment.container.effectiveContentSize.width
-                )
-                section.interGroupSpacing = AppSpacing.m
+                section.interGroupSpacing = AppSpacing.s
                 section.contentInsets = NSDirectionalEdgeInsets(
-                    top: AppSpacing.m,
-                    leading: inset,
+                    top: AppSpacing.xs,
+                    leading: 0,
                     bottom: AppSpacing.m,
-                    trailing: inset
+                    trailing: 0
                 )
             }
             return section
@@ -174,15 +197,27 @@ private final class FavoritesCollectionViewController: UIKitBaseCollectionViewCo
     override func willDisplayItem(at indexPath: IndexPath) {
         guard let key = dataSource?.itemIdentifier(for: indexPath),
               case .folder(let folderID) = key,
-              let row = rowByID[folderID],
-              row.needsPreview || !row.isPreviewLoaded else {
+              let row = rowByID[folderID] else {
             return
         }
-        onNeedPreview(folderID)
+        if row.needsPreview {
+            onNeedPreview(folderID)
+        }
+        if let onNearEnd, let index = rowIndexByID[folderID] {
+            let pageKey = PaginationKey(count: rows.count, lastID: rows.last?.id)
+            triggerNearEndPaginationIfNeeded(
+                index: index,
+                totalCount: rows.count,
+                key: pageKey,
+                action: onNearEnd
+            )
+        }
     }
 
     func update(_ config: FavoritesCollectionConfig) {
         onNeedPreview = config.onNeedPreview
+        onRetryPreview = config.onRetryPreview
+        onNearEnd = config.onNearEnd
         onOpenFolder = config.onOpenFolder
         onSelectVideo = config.onSelectVideo
         onRequestDelete = config.onRequestDelete
@@ -196,13 +231,21 @@ private final class FavoritesCollectionViewController: UIKitBaseCollectionViewCo
 
         guard rowsChanged || placeholderChanged || presentationChanged || generationChanged else { return }
 
+        let previousCount = rows.count
         let previousByID = rowByID
+        let wasSkeleton = rows.isEmpty && placeholderCount > 0
         rows = config.rows
         rowByID = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
+        rowIndexByID = Dictionary(uniqueKeysWithValues: rows.enumerated().map { ($0.element.id, $0.offset) })
         placeholderCount = config.placeholderCount
         placeholderLabel = config.placeholderLabel
         previewGeneration = config.previewGeneration
         coverPresentation = config.coverPresentation
+        let isSkeletonNow = rows.isEmpty && placeholderCount > 0
+
+        if rows.count != previousCount {
+            resetPaginationGate()
+        }
 
         if isViewLoaded {
             var reconfigure: [FavoritesCellKey] = []
@@ -218,6 +261,9 @@ private final class FavoritesCollectionViewController: UIKitBaseCollectionViewCo
                 }
             }
             applySnapshot(reconfigureKeys: reconfigure, reconfigureAll: presentationChanged)
+            if wasSkeleton != isSkeletonNow {
+                collectionView.collectionViewLayout.invalidateLayout()
+            }
         }
     }
 
@@ -225,7 +271,9 @@ private final class FavoritesCollectionViewController: UIKitBaseCollectionViewCo
         guard !isMutating,
               let key = dataSource?.itemIdentifier(for: indexPath),
               case .folder(let folderID) = key,
-              let row = rowByID[folderID] else {
+              let row = rowByID[folderID],
+              row.isOwned,
+              !row.folder.isDefault else {
             return nil
         }
         let deleteAction = UIContextualAction(
@@ -252,6 +300,9 @@ private final class FavoritesCollectionViewController: UIKitBaseCollectionViewCo
                     },
                     onSelectVideo: { [weak self] target in
                         self?.onSelectVideo(target)
+                    },
+                    onRetryPreview: { [weak self] in
+                        self?.onRetryPreview?(row.folder.id)
                     }
                 )
             }
@@ -260,6 +311,8 @@ private final class FavoritesCollectionViewController: UIKitBaseCollectionViewCo
             handler: { [weak self] cell, _, index in
                 guard let self else { return }
                 cell.configure(
+                    containerWidth: collectionView.bounds.width,
+                    coverPresentation: coverPresentation,
                     accessibilityLabel: index == 0 && !placeholderLabel.isEmpty ? placeholderLabel : nil
                 )
             }
@@ -326,7 +379,7 @@ private final class FavoritesCollectionViewController: UIKitBaseCollectionViewCo
             guard let key = dataSource.itemIdentifier(for: indexPath),
                   case .folder(let folderID) = key,
                   let row = rowByID[folderID],
-                  row.needsPreview || !row.isPreviewLoaded else {
+                  row.needsPreview else {
                 continue
             }
             onNeedPreview(folderID)
@@ -346,7 +399,14 @@ private final class FavoritesCollectionViewController: UIKitBaseCollectionViewCo
 private final class FavoriteFolderSkeletonCell: UICollectionViewListCell {
     private let iconShape = UIView()
     private let titleShape = UIView()
-    private let subtitleShape = UIView()
+    private let countShape = UIView()
+    private let trailingShape = UIView()
+    private let shelfClipContainer = UIView()
+    private let cardsStack = UIStackView()
+    private var cardColumns: [SkeletonCardView] = []
+    private var headerLeadingConstraint: NSLayoutConstraint?
+    private var headerTrailingConstraint: NSLayoutConstraint?
+    private var cardsLeadingConstraint: NSLayoutConstraint?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -359,14 +419,12 @@ private final class FavoriteFolderSkeletonCell: UICollectionViewListCell {
 
     private func setup() {
         isUserInteractionEnabled = false
-        var background = UIBackgroundConfiguration.clear()
-        background.backgroundColor = UIColor(AppFill.card)
-        background.cornerRadius = AppRadius.panel
-        backgroundConfiguration = background
+        automaticallyUpdatesBackgroundConfiguration = false
+        backgroundConfiguration = .clear()
 
         iconShape.translatesAutoresizingMaskIntoConstraints = false
         iconShape.backgroundColor = .secondarySystemFill
-        iconShape.layer.cornerRadius = AppRadius.control
+        iconShape.layer.cornerRadius = 7
         iconShape.layer.cornerCurve = .continuous
         contentView.addSubview(iconShape)
 
@@ -376,32 +434,160 @@ private final class FavoriteFolderSkeletonCell: UICollectionViewListCell {
         titleShape.layer.cornerCurve = .continuous
         contentView.addSubview(titleShape)
 
-        subtitleShape.translatesAutoresizingMaskIntoConstraints = false
-        subtitleShape.backgroundColor = .secondarySystemFill
-        subtitleShape.alpha = 0.65
-        subtitleShape.layer.cornerRadius = AppRadius.badge
-        subtitleShape.layer.cornerCurve = .continuous
-        contentView.addSubview(subtitleShape)
+        countShape.translatesAutoresizingMaskIntoConstraints = false
+        countShape.backgroundColor = .tertiarySystemFill
+        countShape.layer.cornerRadius = 9
+        countShape.layer.cornerCurve = .continuous
+        contentView.addSubview(countShape)
+
+        trailingShape.translatesAutoresizingMaskIntoConstraints = false
+        trailingShape.backgroundColor = .tertiarySystemFill
+        trailingShape.layer.cornerRadius = AppRadius.badge
+        trailingShape.layer.cornerCurve = .continuous
+        contentView.addSubview(trailingShape)
+
+        shelfClipContainer.translatesAutoresizingMaskIntoConstraints = false
+        shelfClipContainer.clipsToBounds = true
+        contentView.addSubview(shelfClipContainer)
+
+        cardsStack.translatesAutoresizingMaskIntoConstraints = false
+        cardsStack.axis = .horizontal
+        cardsStack.alignment = .top
+        cardsStack.spacing = 10
+        shelfClipContainer.addSubview(cardsStack)
+
+        for _ in 0..<4 {
+            let card = SkeletonCardView()
+            cardColumns.append(card)
+            cardsStack.addArrangedSubview(card)
+        }
+
+        let headerLeading = iconShape.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16)
+        let headerTrailing = trailingShape.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16)
+        let cardsLeading = cardsStack.leadingAnchor.constraint(equalTo: shelfClipContainer.leadingAnchor, constant: 16)
+        headerLeadingConstraint = headerLeading
+        headerTrailingConstraint = headerTrailing
+        cardsLeadingConstraint = cardsLeading
 
         NSLayoutConstraint.activate([
-            iconShape.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
+            headerLeading,
             iconShape.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 12),
-            iconShape.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -12),
-            iconShape.widthAnchor.constraint(equalToConstant: 44),
-            iconShape.heightAnchor.constraint(equalToConstant: 44),
-            titleShape.leadingAnchor.constraint(equalTo: iconShape.trailingAnchor, constant: 12),
-            titleShape.topAnchor.constraint(equalTo: iconShape.topAnchor, constant: 6),
-            titleShape.widthAnchor.constraint(equalToConstant: 148),
+            iconShape.widthAnchor.constraint(equalToConstant: 28),
+            iconShape.heightAnchor.constraint(equalToConstant: 28),
+
+            titleShape.leadingAnchor.constraint(equalTo: iconShape.trailingAnchor, constant: 8),
+            titleShape.centerYAnchor.constraint(equalTo: iconShape.centerYAnchor),
+            titleShape.widthAnchor.constraint(equalToConstant: 118),
             titleShape.heightAnchor.constraint(equalToConstant: 14),
-            subtitleShape.leadingAnchor.constraint(equalTo: titleShape.leadingAnchor),
-            subtitleShape.topAnchor.constraint(equalTo: titleShape.bottomAnchor, constant: 6),
-            subtitleShape.widthAnchor.constraint(equalToConstant: 88),
-            subtitleShape.heightAnchor.constraint(equalToConstant: 11),
+
+            countShape.leadingAnchor.constraint(equalTo: titleShape.trailingAnchor, constant: 8),
+            countShape.centerYAnchor.constraint(equalTo: iconShape.centerYAnchor),
+            countShape.widthAnchor.constraint(equalToConstant: 28),
+            countShape.heightAnchor.constraint(equalToConstant: 18),
+
+            headerTrailing,
+            trailingShape.centerYAnchor.constraint(equalTo: iconShape.centerYAnchor),
+            trailingShape.widthAnchor.constraint(equalToConstant: 52),
+            trailingShape.heightAnchor.constraint(equalToConstant: 12),
+
+            shelfClipContainer.topAnchor.constraint(equalTo: iconShape.bottomAnchor, constant: 10),
+            shelfClipContainer.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            shelfClipContainer.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            shelfClipContainer.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -12),
+
+            cardsLeading,
+            cardsStack.topAnchor.constraint(equalTo: shelfClipContainer.topAnchor),
+            cardsStack.bottomAnchor.constraint(equalTo: shelfClipContainer.bottomAnchor),
         ])
     }
 
-    func configure(accessibilityLabel: String?) {
+    func configure(
+        containerWidth: CGFloat,
+        coverPresentation: CoverPresentation,
+        accessibilityLabel: String?
+    ) {
+        let resolvedWidth = containerWidth > 1 ? containerWidth : FeedWidth.fullContainerSeed
+        let margin = FeedColumnPolicy.horizontalMargin(for: resolvedWidth)
+        headerLeadingConstraint?.constant = margin
+        headerTrailingConstraint?.constant = -margin
+        cardsLeadingConstraint?.constant = margin
+
+        let availableShelfWidth = max(240, resolvedWidth - margin * 2)
+        let cardWidth = FeedColumnPolicy.shelfCardWidth(availableWidth: availableShelfWidth)
+        let cardHeight = coverPresentation.height(forWidth: cardWidth)
+        for card in cardColumns {
+            card.configure(width: cardWidth, coverHeight: cardHeight)
+        }
+
         isAccessibilityElement = accessibilityLabel != nil
         self.accessibilityLabel = accessibilityLabel
+    }
+
+    @MainActor
+    private final class SkeletonCardView: UIView {
+        private let coverShape = UIView()
+        private let titleOne = UIView()
+        private let titleTwo = UIView()
+        private let metaShape = UIView()
+        private var widthConstraint: NSLayoutConstraint?
+        private var coverHeightConstraint: NSLayoutConstraint?
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            setup()
+        }
+
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
+
+        private func setup() {
+            translatesAutoresizingMaskIntoConstraints = false
+            coverShape.translatesAutoresizingMaskIntoConstraints = false
+            coverShape.backgroundColor = .secondarySystemFill
+            coverShape.layer.cornerRadius = AppRadius.thumbnail
+            coverShape.layer.cornerCurve = .continuous
+            addSubview(coverShape)
+
+            for shape in [titleOne, titleTwo, metaShape] {
+                shape.translatesAutoresizingMaskIntoConstraints = false
+                shape.backgroundColor = .secondarySystemFill
+                shape.layer.cornerRadius = AppRadius.badge
+                shape.layer.cornerCurve = .continuous
+                addSubview(shape)
+            }
+            metaShape.alpha = 0.65
+
+            let w = widthAnchor.constraint(equalToConstant: 136)
+            let h = coverShape.heightAnchor.constraint(equalToConstant: 78)
+            widthConstraint = w
+            coverHeightConstraint = h
+
+            NSLayoutConstraint.activate([
+                w,
+                coverShape.topAnchor.constraint(equalTo: topAnchor),
+                coverShape.leadingAnchor.constraint(equalTo: leadingAnchor),
+                coverShape.trailingAnchor.constraint(equalTo: trailingAnchor),
+                h,
+                titleOne.topAnchor.constraint(equalTo: coverShape.bottomAnchor, constant: 7),
+                titleOne.leadingAnchor.constraint(equalTo: leadingAnchor),
+                titleOne.widthAnchor.constraint(equalTo: widthAnchor, multiplier: 0.88),
+                titleOne.heightAnchor.constraint(equalToConstant: 11),
+                titleTwo.topAnchor.constraint(equalTo: titleOne.bottomAnchor, constant: 4),
+                titleTwo.leadingAnchor.constraint(equalTo: leadingAnchor),
+                titleTwo.widthAnchor.constraint(equalTo: widthAnchor, multiplier: 0.56),
+                titleTwo.heightAnchor.constraint(equalToConstant: 11),
+                metaShape.topAnchor.constraint(equalTo: titleTwo.bottomAnchor, constant: 7),
+                metaShape.leadingAnchor.constraint(equalTo: leadingAnchor),
+                metaShape.widthAnchor.constraint(equalTo: widthAnchor, multiplier: 0.42),
+                metaShape.heightAnchor.constraint(equalToConstant: 10),
+                metaShape.bottomAnchor.constraint(equalTo: bottomAnchor),
+            ])
+        }
+
+        func configure(width: CGFloat, coverHeight: CGFloat) {
+            widthConstraint?.constant = max(1, width)
+            coverHeightConstraint?.constant = max(1, coverHeight)
+        }
     }
 }

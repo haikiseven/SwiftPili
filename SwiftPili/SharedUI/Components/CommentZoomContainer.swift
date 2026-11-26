@@ -107,20 +107,88 @@ struct CommentZoomRegion: UIViewRepresentable {
 }
 
 struct CommentZoomContainer<Destination: View>: View {
-    @AppMotion private var motion
-    @Environment(\.self) private var environment
-    @Environment(\.colorScheme) private var colorScheme
+    @State private var hasMountedHost = false
+
     let presentation: CommentZoomPresentation
-    let destination: Destination
+    let destination: () -> Destination
     let onPresentationChanged: (Bool) -> Void
-    var allowsInteractiveDismissal = true
-    var onDismissed: () -> Void = {}
+    let allowsInteractiveDismissal: Bool
+    let onDismissed: () -> Void
+
+    init(
+        presentation: CommentZoomPresentation,
+        @ViewBuilder destination: @escaping () -> Destination,
+        onPresentationChanged: @escaping (Bool) -> Void,
+        allowsInteractiveDismissal: Bool = true,
+        onDismissed: @escaping () -> Void = {}
+    ) {
+        self.presentation = presentation
+        self.destination = destination
+        self.onPresentationChanged = onPresentationChanged
+        self.allowsInteractiveDismissal = allowsInteractiveDismissal
+        self.onDismissed = onDismissed
+    }
+
+    var body: some View {
+        let isPresented = presentation.isPresented
+        Group {
+            if hasMountedHost || isPresented {
+                CommentZoomMountedHost(
+                    presentation: presentation,
+                    isPresented: isPresented,
+                    destination: destination,
+                    onPresentationChanged: onPresentationChanged,
+                    allowsInteractiveDismissal: allowsInteractiveDismissal,
+                    onDismissed: onDismissed
+                )
+            } else {
+                Color.clear
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
+        .onChange(of: isPresented, initial: true) { _, presented in
+            if presented && !hasMountedHost {
+                hasMountedHost = true
+            }
+        }
+    }
+}
+
+private struct CommentZoomMountedHost<Destination: View>: View {
+    @AppMotion private var motion
+    @Environment(AppCoordinator.self) private var coordinator: AppCoordinator?
+    @Environment(\.appNoticeCenter) private var noticeCenter
+    @Environment(\.appSceneID) private var appSceneID
+    @Environment(\.appSurface) private var appSurface
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.contentLinkContext) private var contentLinkContext
+    @Environment(\.openURL) private var openURL
+
+    let presentation: CommentZoomPresentation
+    let isPresented: Bool
+    let destination: () -> Destination
+    let onPresentationChanged: (Bool) -> Void
+    let allowsInteractiveDismissal: Bool
+    let onDismissed: () -> Void
 
     var body: some View {
         CommentDrawerPresenter(
             presentation: presentation,
-            isPresented: presentation.isPresented,
-            rootView: CommentDrawerRoot(environment: environment, destination: destination),
+            isPresented: isPresented,
+            rootViewBuilder: {
+                CommentDrawerRoot(
+                    coordinator: coordinator,
+                    noticeCenter: noticeCenter,
+                    appSceneID: appSceneID,
+                    appSurface: appSurface,
+                    colorScheme: colorScheme,
+                    contentLinkContext: contentLinkContext,
+                    openURL: openURL,
+                    destination: destination()
+                )
+            },
             allowsInteractiveDismissal: allowsInteractiveDismissal,
             reducesMotion: motion.reducesGeometry,
             interfaceStyle: colorScheme == .dark ? .dark : .light,
@@ -132,14 +200,27 @@ struct CommentZoomContainer<Destination: View>: View {
 }
 
 struct CommentDrawerRoot<Destination: View>: View {
-    let environment: EnvironmentValues
+    let coordinator: AppCoordinator?
+    let noticeCenter: AppNoticeCenter?
+    let appSceneID: UUID?
+    let appSurface: AppSurface
+    let colorScheme: ColorScheme
+    let contentLinkContext: ContentLinkContext?
+    let openURL: OpenURLAction
     let destination: Destination
 
     var body: some View {
         destination
             .appNoticeOverlay(bottomPadding: 64)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .environment(\.self, environment)
+            .environment(coordinator)
+            .environment(noticeCenter)
+            .environment(\.appNoticeCenter, noticeCenter)
+            .environment(\.appSceneID, appSceneID)
+            .environment(\.appSurface, appSurface)
+            .environment(\.colorScheme, colorScheme)
+            .environment(\.contentLinkContext, contentLinkContext)
+            .environment(\.openURL, openURL)
     }
 }
 

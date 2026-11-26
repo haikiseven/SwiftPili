@@ -470,14 +470,18 @@ final class AppCoordinator {
     }
 
     private func append(_ route: Route) {
+        let resolvedRoute: Route
         if activePlayerDestination != nil {
             routePlayer?.parkOutgoingRouteStill()
+            resolvedRoute = route.withoutZoom
+        } else {
+            resolvedRoute = route
         }
         if let row = selectedSidebarRow {
-            sidebarRowStacks[row.id, default: []].append(route)
+            sidebarRowStacks[row.id, default: []].append(resolvedRoute)
             return
         }
-        tabStacks[selectedTab, default: []].append(route)
+        tabStacks[selectedTab, default: []].append(resolvedRoute)
     }
 
     @discardableResult

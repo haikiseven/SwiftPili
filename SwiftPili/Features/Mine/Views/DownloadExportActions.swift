@@ -72,24 +72,288 @@ extension DownloadsView {
     }
 
     private func completedMetadataFooter(_ item: DownloadedVideo) -> some View {
-        HStack(spacing: 6) {
+        let isBroken = brokenIDs.contains(item.id)
+        let primaryMeta = HStack(spacing: 6) {
             qualityBadge(item.qualityLabel)
                 .fixedSize()
             Text(byteString(item.fileSizeBytes))
                 .monospacedDigit()
                 .lineLimit(1)
-            if brokenIDs.contains(item.id) {
-                HStack(spacing: 3) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .accessibilityHidden(true)
-                    Text("Missing files")
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        let missingTag = HStack(spacing: 3) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .accessibilityHidden(true)
+            Text("Missing files")
+        }
+        .foregroundStyle(.red)
+        .lineLimit(1)
+        .fixedSize(horizontal: true, vertical: false)
+
+        return Group {
+            if isBroken {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 6) {
+                        primaryMeta
+                        missingTag
+                    }
+                    VStack(alignment: .leading, spacing: 3) {
+                        primaryMeta
+                        missingTag
+                    }
                 }
-                .foregroundStyle(.red)
-                .lineLimit(1)
+            } else {
+                primaryMeta
             }
         }
         .appFont(.libraryRowMeta)
         .foregroundStyle(.secondary)
+    }
+
+    func seriesGroupRow(
+        _ group: DownloadSeriesGroup,
+        columnWidth: CGFloat?
+    ) -> some View {
+        let isExpanded = expandedGroupIDs.contains(group.id)
+        let shape = RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
+        return VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    if isExpanded {
+                        expandedGroupIDs.remove(group.id)
+                    } else {
+                        expandedGroupIDs.insert(group.id)
+                    }
+                }
+            } label: {
+                seriesGroupHeaderCard(group, isExpanded: isExpanded, columnWidth: columnWidth)
+            }
+            .buttonStyle(.plain)
+            .overlay(alignment: .topTrailing) {
+                rowMenuButton {
+                    seriesGroupActions(group, isExpanded: isExpanded)
+                }
+            }
+            .contextMenu {
+                seriesGroupActions(group, isExpanded: isExpanded)
+            }
+
+            if isExpanded {
+                Divider()
+                    .padding(.horizontal, AppSpacing.m)
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(group.episodes.enumerated()), id: \.element.id) { index, episode in
+                        if index > 0 {
+                            Divider()
+                                .padding(.leading, AppSpacing.m)
+                        }
+                        seriesEpisodeRow(episode, in: group)
+                    }
+                }
+                .padding(.vertical, AppSpacing.xs)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .appCardSurface(in: shape)
+        .contentShape(.contextMenuPreview, shape)
+    }
+
+    private func seriesGroupHeaderCard(
+        _ group: DownloadSeriesGroup,
+        isExpanded: Bool,
+        columnWidth: CGFloat?
+    ) -> some View {
+        let width = coverWidth(columnWidth: columnWidth)
+        let height = coverHeight(for: width)
+        let episodeCountText = String(format: String(localized: "%d episodes"), group.episodes.count)
+        let metaText: String = if let subtitle = group.subtitle, !subtitle.isEmpty {
+            "\(subtitle) - \(episodeCountText)"
+        } else {
+            episodeCountText
+        }
+
+        return HStack(alignment: .top, spacing: RowGeometry.coverToTextSpacing) {
+            ZStack(alignment: .topLeading) {
+                RoundedRectangle(cornerRadius: AppRadius.thumbnail, style: .continuous)
+                    .fill(AppFill.inset)
+                    .frame(width: max(0, width - 12), height: height)
+                    .offset(x: 6, y: -4)
+
+                downloadRowCover(
+                    coverURL: group.coverURL,
+                    width: width,
+                    height: height
+                )
+
+                HStack(spacing: 3) {
+                    Image(systemName: "rectangle.stack.fill")
+                        .font(.system(size: 9, weight: .semibold))
+                        .accessibilityHidden(true)
+                    Text(verbatim: "\(group.episodes.count)")
+                        .appFont(.overlayBadge, monospacedDigit: true)
+                        .fontWeight(.semibold)
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(
+                    .black.opacity(0.74),
+                    in: RoundedRectangle(cornerRadius: AppRadius.badge, style: .continuous)
+                )
+                .padding(5)
+            }
+            .padding(.top, 4)
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text(group.title)
+                    .appFont(.libraryRowTitle)
+                    .fontWeight(.medium)
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .padding(.trailing, Self.trailingMenuTitleInset)
+
+                Spacer(minLength: 2)
+
+                Text(metaText)
+                    .appFont(.libraryRowMeta)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                HStack(spacing: 6) {
+                    Text(byteString(group.totalBytes))
+                        .monospacedDigit()
+                        .lineLimit(1)
+                    if group.brokenCount > 0 {
+                        HStack(spacing: 2) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .accessibilityHidden(true)
+                            Text(verbatim: "\(group.brokenCount)")
+                                .monospacedDigit()
+                        }
+                        .foregroundStyle(.red)
+                    }
+                    Spacer(minLength: 4)
+                    Image(systemName: "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                }
+                .appFont(.libraryRowMeta)
+                .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, minHeight: height + 4, alignment: .leading)
+        }
+        .padding(AppSpacing.m)
+        .contentShape(Rectangle())
+    }
+
+    private func seriesEpisodeRow(
+        _ episode: DownloadedVideo,
+        in group: DownloadSeriesGroup
+    ) -> some View {
+        let isBroken = brokenIDs.contains(episode.id)
+        let shortTitle = Self.episodeShortTitle(for: episode, in: group)
+        return HStack(alignment: .center, spacing: AppSpacing.s) {
+            Button {
+                open(episode, in: group.episodes)
+            } label: {
+                HStack(alignment: .top, spacing: AppSpacing.s) {
+                    Image(systemName: isBroken ? "exclamationmark.triangle.fill" : "play.circle.fill")
+                        .font(.callout)
+                        .foregroundStyle(isBroken ? Color.red : Color.biliAccent)
+                        .padding(.top, 2)
+                        .accessibilityHidden(true)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(shortTitle)
+                            .appFont(.libraryRowMeta)
+                            .fontWeight(.medium)
+                            .foregroundStyle(isBroken ? .secondary : .primary)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.leading)
+
+                        HStack(spacing: 6) {
+                            qualityBadge(episode.qualityLabel)
+                                .fixedSize()
+                            if episode.durationSeconds > 0 {
+                                Text(FormatUtils.duration(episode.durationSeconds))
+                                    .monospacedDigit()
+                                    .lineLimit(1)
+                            }
+                            Text(byteString(episode.fileSizeBytes))
+                                .monospacedDigit()
+                                .lineLimit(1)
+                            if isBroken {
+                                Text("Missing files")
+                                    .foregroundStyle(.red)
+                                    .lineLimit(1)
+                            }
+                        }
+                        .appFont(.libraryRowFooter)
+                        .foregroundStyle(.secondary)
+
+                        if let fraction = episode.watchedFraction {
+                            ProgressView(value: min(max(fraction, 0), 1))
+                                .tint(.biliAccent)
+                                .frame(maxWidth: 140)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(.vertical, AppSpacing.s)
+                .padding(.leading, AppSpacing.m)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            Menu {
+                completedActions(episode, in: group.episodes)
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 40, height: 40)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.trailing, AppSpacing.xs)
+            .accessibilityLabel(Text("Download actions"))
+        }
+        .contextMenu {
+            completedActions(episode, in: group.episodes)
+        }
+    }
+
+    @ViewBuilder
+    private func seriesGroupActions(_ group: DownloadSeriesGroup, isExpanded: Bool) -> some View {
+        let playable = group.episodes.filter { !brokenIDs.contains($0.id) }
+        if let first = playable.first {
+            Button {
+                open(first, in: playable)
+            } label: {
+                Label("Play All", systemImage: "play.fill")
+            }
+        }
+        Button {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                if isExpanded {
+                    expandedGroupIDs.remove(group.id)
+                } else {
+                    expandedGroupIDs.insert(group.id)
+                }
+            }
+        } label: {
+            Label(
+                isExpanded ? LocalizedStringKey("Collapse") : LocalizedStringKey("Expand"),
+                systemImage: isExpanded ? "chevron.up" : "chevron.down"
+            )
+        }
+        Button(role: .destructive) {
+            pendingGroupDelete = group
+        } label: {
+            Label("Delete All", systemImage: "trash")
+        }
     }
 
     func presentExport(_ item: DownloadedVideo) {

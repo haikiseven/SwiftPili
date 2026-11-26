@@ -394,7 +394,7 @@ private extension CommentComposerBar {
                 }
             )
             .id(mentionPickerAccount.id)
-            .appAdaptiveSheet(compactDetents: [.medium, .large], padSizing: .form)
+            .appAdaptiveSheet(compactDetents: [.medium], padSizing: .form)
         }
     }
 

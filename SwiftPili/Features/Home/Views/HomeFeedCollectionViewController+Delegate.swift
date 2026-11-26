@@ -27,6 +27,31 @@ extension HomeFeedCollectionViewController {
         )
     }
 
+    @objc func collectionView(
+        _ collectionView: UICollectionView,
+        contextMenuConfigurationForItemsAt indexPaths: [IndexPath],
+        point: CGPoint
+    ) -> UIContextMenuConfiguration? {
+        guard let indexPath = indexPaths.first,
+              let itemID = itemIdentifier(at: indexPath),
+              let item = itemByID[itemID] else {
+            return nil
+        }
+        let aid = item.resolvedAID
+        let bvid = item.resolvedBVID
+        let metadata = VideoCardFilterMetadataStore.shared.lookup(aid: aid, bvid: bvid)
+        let resolvedName = item.ownerName.isEmpty ? (metadata?.ownerName ?? "") : item.ownerName
+        let target = VideoCardContextMenuTarget(
+            aid: aid ?? metadata?.aid,
+            bvid: bvid ?? metadata?.bvid,
+            title: item.title,
+            ownerMid: item.ownerMid ?? metadata?.ownerMid,
+            ownerName: resolvedName,
+            ownerFace: item.ownerFace ?? metadata?.ownerFace
+        )
+        return VideoCardContextMenuBuilder.configuration(for: target)
+    }
+
     private func itemIdentifier(at indexPath: IndexPath) -> HomeFeedItemIdentifier? {
         guard let cellKey = dataSource?.itemIdentifier(for: indexPath) else { return nil }
         switch cellKey {

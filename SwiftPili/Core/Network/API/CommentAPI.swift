@@ -98,6 +98,27 @@ enum CommentAPI {
         )
     }
 
+    static func hateComment(
+        oid: Int,
+        type: Int,
+        rpid: Int,
+        hate: Bool
+    ) async throws(BiliError) -> EmptyResult {
+        guard let csrf = AuthManager.shared.biliJct else { throw .authRequired }
+        return try await BiliAPIClient.shared.request(
+            BiliEndpoint(
+                path: "/x/v2/reply/hate",
+                method: .post,
+                params: [
+                    "oid": String(oid), "type": String(type),
+                    "rpid": String(rpid), "action": hate ? "1" : "0",
+                    "csrf": csrf,
+                ]
+            ),
+            type: EmptyResult.self
+        )
+    }
+
     static let reportReasons: [(code: Int, label: String)] = [
         (1, String(localized: "Spam")),
         (2, String(localized: "Pornography")),

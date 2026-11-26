@@ -1,7 +1,143 @@
+import SwiftUI
 import UIKit
 
+struct MineLibraryCardItem: Identifiable, Equatable {
+    let id: MineRowID
+    let title: String
+    let sources: VideoCoverSources
+    let duration: Int
+    let subtitle: String?
+    let footer: UIKitRowVideoCell.FooterMode
+    let watchProgress: Double?
+    let isSelectable: Bool
+    let isUnavailable: Bool
+    let statusBadge: String?
+    let statusBadgeStyle: UIKitRowVideoCell.StatusBadgeStyle
+    let hasTrailingMenu: Bool
+    let trailingMenuAccessibilityLabel: String?
+    let isTrailingMenuEnabled: Bool
+    let menuRevision: Int
+    let allowsSwipeDelete: Bool
+    let swipeDeleteTitle: String?
+
+    init(
+        id: MineRowID,
+        title: String,
+        sources: VideoCoverSources,
+        duration: Int,
+        subtitle: String?,
+        footer: UIKitRowVideoCell.FooterMode = .none,
+        watchProgress: Double? = nil,
+        isSelectable: Bool = true,
+        isUnavailable: Bool? = nil,
+        statusBadge: String? = nil,
+        statusBadgeStyle: UIKitRowVideoCell.StatusBadgeStyle = .neutral,
+        hasTrailingMenu: Bool = false,
+        trailingMenuAccessibilityLabel: String? = nil,
+        isTrailingMenuEnabled: Bool = true,
+        menuRevision: Int = 0,
+        allowsSwipeDelete: Bool = false,
+        swipeDeleteTitle: String? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.sources = sources
+        self.duration = duration
+        self.subtitle = subtitle
+        self.footer = footer
+        self.watchProgress = watchProgress
+        self.isSelectable = isSelectable
+        self.isUnavailable = isUnavailable ?? !isSelectable
+        self.statusBadge = statusBadge
+        self.statusBadgeStyle = statusBadgeStyle
+        self.hasTrailingMenu = hasTrailingMenu
+        self.trailingMenuAccessibilityLabel = trailingMenuAccessibilityLabel
+        self.isTrailingMenuEnabled = isTrailingMenuEnabled
+        self.menuRevision = menuRevision
+        self.allowsSwipeDelete = allowsSwipeDelete
+        self.swipeDeleteTitle = swipeDeleteTitle
+    }
+
+    init(rowItem: MineLibraryRowItem) {
+        self.init(
+            id: rowItem.id,
+            title: rowItem.title,
+            sources: rowItem.sources,
+            duration: rowItem.duration,
+            subtitle: rowItem.subtitle,
+            footer: rowItem.footer,
+            watchProgress: rowItem.watchProgress,
+            isSelectable: rowItem.isSelectable,
+            isUnavailable: !rowItem.isSelectable,
+            statusBadge: rowItem.isSelectable ? nil : String(localized: "Unavailable"),
+            statusBadgeStyle: .warning,
+            hasTrailingMenu: rowItem.hasTrailingMenu,
+            trailingMenuAccessibilityLabel: rowItem.trailingMenuAccessibilityLabel,
+            isTrailingMenuEnabled: rowItem.isTrailingMenuEnabled,
+            menuRevision: rowItem.menuRevision
+        )
+    }
+}
+
+struct MineLibraryRowSection: Identifiable, Equatable {
+    let id: String
+    let title: String?
+    let items: [MineLibraryCardItem]
+}
+
+@MainActor
+struct MineLibrarySectionedFeedConfig {
+    let sections: [MineLibraryRowSection]
+    let placeholderCount: Int
+    let placeholderLabel: String
+    let footerState: MineFeedFooterState
+    let coverPresentation: CoverPresentation
+    let onNearEndAppear: (() -> Void)?
+    let onFooterAction: (() -> Void)?
+    let onSelectItem: (MineRowID) -> Void
+    let makeTrailingMenu: ((MineRowID, UIView?) -> UIMenu?)?
+    let makeContextMenu: ((MineRowID) -> UIMenu?)?
+    let onSwipeDelete: ((MineRowID) -> Void)?
+}
+
+struct MineLibrarySectionedFeedView: View {
+    let sections: [MineLibraryRowSection]
+    var placeholderCount: Int = 0
+    var placeholderLabel: String = ""
+    var footerState: MineFeedFooterState = .none
+    var onRefresh: (@MainActor () async -> Bool)?
+    var onNearEndAppear: (() -> Void)?
+    var onFooterAction: (() -> Void)?
+    let onSelectItem: (MineRowID) -> Void
+    var makeTrailingMenu: ((MineRowID, UIView?) -> UIMenu?)?
+    var makeContextMenu: ((MineRowID) -> UIMenu?)?
+    var onSwipeDelete: ((MineRowID) -> Void)?
+
+    var body: some View {
+        let coverPresentation = CoverPresentationStore.shared.presentation
+        let config = MineLibrarySectionedFeedConfig(
+            sections: sections,
+            placeholderCount: placeholderCount,
+            placeholderLabel: placeholderLabel,
+            footerState: footerState,
+            coverPresentation: coverPresentation,
+            onNearEndAppear: onNearEndAppear,
+            onFooterAction: onFooterAction,
+            onSelectItem: onSelectItem,
+            makeTrailingMenu: makeTrailingMenu,
+            makeContextMenu: makeContextMenu,
+            onSwipeDelete: onSwipeDelete
+        )
+        UIKitCollectionHost(
+            onRefresh: onRefresh,
+            makeController: { MineLibraryRowFeedController() },
+            updateController: { controller in controller.updateSectioned(config) }
+        )
+    }
+}
+
 private enum MineRowSectionKey: Hashable, Sendable {
-    case items
+    case section(String)
     case skeletons
 }
 
@@ -11,7 +147,7 @@ private enum MineRowCellKey: Hashable, Sendable {
 }
 
 private struct MineRowRegistrations {
-    let row: UICollectionView.CellRegistration<UIKitRowVideoCell, MineLibraryRowItem>
+    let row: UICollectionView.CellRegistration<UIKitRowVideoCell, MineLibraryCardItem>
     let skeleton: UICollectionView.CellRegistration<UIKitRowSkeletonCell, Int>
     let header: UICollectionView.SupplementaryRegistration<UIKitFeedSectionHeaderView>
     let footer: UICollectionView.SupplementaryRegistration<MineFeedFooterView>
@@ -27,10 +163,12 @@ final class MineLibraryRowFeedController: UIKitBaseCollectionViewController,
 
     private var dataSource: UICollectionViewDiffableDataSource<MineRowSectionKey, MineRowCellKey>?
     private var currentSections: [MineRowSectionKey] = []
-    private var items: [MineLibraryRowItem] = []
-    private var itemByID: [MineRowID: MineLibraryRowItem] = [:]
+    private var sections: [MineLibraryRowSection] = []
+    private var sectionTitleByID: [String: String] = [:]
+    private var flatItems: [MineLibraryCardItem] = []
+    private var itemByID: [MineRowID: MineLibraryCardItem] = [:]
     private var itemIndexByID: [MineRowID: Int] = [:]
-    private var headerTitle: String?
+    private var anyItemAllowsSwipeDelete = false
     private var placeholderCount = 0
     private var placeholderLabel = ""
     private var footerState: MineFeedFooterState = .none
@@ -41,13 +179,27 @@ final class MineLibraryRowFeedController: UIKitBaseCollectionViewController,
     private var onSelectItem: (MineRowID) -> Void = { _ in }
     private var makeTrailingMenu: ((MineRowID, UIView?) -> UIMenu?)?
     private var makeContextMenu: ((MineRowID) -> UIMenu?)?
+    private var onSwipeDelete: ((MineRowID) -> Void)?
     private var geometryTask: Task<Void, Never>?
+
+    private static func resolvedInsets(
+        for totalWidth: CGFloat
+    ) -> (contentWidth: CGFloat, horizontalInset: CGFloat) {
+        let safeWidth = totalWidth > 1 ? totalWidth : FeedWidth.fullContainerSeed
+        let baseMargin = FeedColumnPolicy.horizontalMargin(for: safeWidth)
+        let natural = max(1, safeWidth - baseMargin * 2)
+        let contentWidth = min(natural, LibraryRowMetrics.maximumContentWidth)
+        let horizontalInset = max(baseMargin, ((safeWidth - contentWidth) / 2).rounded(.down))
+        return (contentWidth, horizontalInset)
+    }
 
     override var layoutHorizontalInset: CGFloat {
         let width = isViewLoaded && collectionView.bounds.width > 1
             ? collectionView.bounds.width
+                - collectionView.safeAreaInsets.left
+                - collectionView.safeAreaInsets.right
             : FeedWidth.fullContainerSeed
-        return FeedColumnPolicy.horizontalMargin(for: width)
+        return Self.resolvedInsets(for: width).horizontalInset
     }
 
     private var activeColumnCount: Int {
@@ -66,13 +218,24 @@ final class MineLibraryRowFeedController: UIKitBaseCollectionViewController,
         UICollectionViewCompositionalLayout { [weak self] sectionIndex, environment in
             guard let self, sectionIndex < currentSections.count else { return nil }
             let effectiveWidth = environment.container.effectiveContentSize.width
-            let margin = FeedColumnPolicy.horizontalMargin(for: effectiveWidth)
-            let contentWidth = max(1, effectiveWidth - margin * 2)
+            let metrics = Self.resolvedInsets(for: effectiveWidth)
+            let sectionKey = currentSections[sectionIndex]
+            let isSkeleton = sectionKey == .skeletons
+            let hasHeader: Bool = switch sectionKey {
+            case .section(let id): sectionTitleByID[id] != nil
+            case .skeletons: false
+            }
+            let isLastItemSection = !isSkeleton && sectionIndex == currentSections.count - 1
+            let hasFooter = isLastItemSection && footerState != .none
             return makeRowSection(
-                contentWidth: contentWidth,
-                horizontalInset: margin,
-                traitCollection: environment.traitCollection,
-                isSkeleton: currentSections[sectionIndex] == .skeletons
+                contentWidth: metrics.contentWidth,
+                horizontalInset: metrics.horizontalInset,
+                layoutEnvironment: environment,
+                isSkeleton: isSkeleton,
+                hasHeader: hasHeader,
+                hasFooter: hasFooter,
+                isFirstSection: sectionIndex == 0,
+                isLastSection: sectionIndex == currentSections.count - 1
             )
         }
     }
@@ -105,49 +268,96 @@ final class MineLibraryRowFeedController: UIKitBaseCollectionViewController,
     }
 
     func update(_ config: MineLibraryRowFeedConfig) {
+        let cardItems = config.items.map(MineLibraryCardItem.init(rowItem:))
+        let wrappedSections: [MineLibraryRowSection] = cardItems.isEmpty
+            ? []
+            : [MineLibraryRowSection(id: "items", title: config.headerTitle, items: cardItems)]
+        updateSectioned(MineLibrarySectionedFeedConfig(
+            sections: wrappedSections,
+            placeholderCount: config.placeholderCount,
+            placeholderLabel: config.placeholderLabel,
+            footerState: config.footerState,
+            coverPresentation: config.coverPresentation,
+            onNearEndAppear: config.onNearEndAppear,
+            onFooterAction: config.onFooterAction,
+            onSelectItem: config.onSelectItem,
+            makeTrailingMenu: config.makeTrailingMenu,
+            makeContextMenu: config.makeContextMenu,
+            onSwipeDelete: nil
+        ))
+    }
+
+    func updateSectioned(_ config: MineLibrarySectionedFeedConfig) {
         onNearEndAppear = config.onNearEndAppear
         onFooterAction = config.onFooterAction
         onSelectItem = config.onSelectItem
         makeTrailingMenu = config.makeTrailingMenu
         makeContextMenu = config.makeContextMenu
+        let swipeHandlerChanged = (config.onSwipeDelete != nil) != (onSwipeDelete != nil)
+        onSwipeDelete = config.onSwipeDelete
 
-        let itemsChanged = config.items != items
-        let headerChanged = config.headerTitle != headerTitle
+        let nonEmptySections = config.sections.filter { !$0.items.isEmpty }
+        let sectionsChanged = nonEmptySections != sections
         let placeholderChanged = config.placeholderCount != placeholderCount
             || config.placeholderLabel != placeholderLabel
         let footerChanged = config.footerState != footerState
         let presentationChanged = config.coverPresentation != coverPresentation
 
-        guard itemsChanged || headerChanged || placeholderChanged || footerChanged || presentationChanged else {
+        guard sectionsChanged || placeholderChanged || footerChanged || presentationChanged || swipeHandlerChanged else {
             return
         }
 
-        let previousCount = items.count
+        let previousCount = flatItems.count
         let previousByID = itemByID
-        let hadHeader = headerTitle != nil && !items.isEmpty
-        let hadFooter = footerState != .none && !items.isEmpty
+        let previousTitles = sectionTitleByID
+        let previousSwipeAllowed = anyItemAllowsSwipeDelete
+        let hadFooter = footerState != .none && !flatItems.isEmpty
 
-        items = config.items
-        itemByID = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
-        itemIndexByID = Dictionary(uniqueKeysWithValues: items.enumerated().map { ($0.element.id, $0.offset) })
-        headerTitle = config.headerTitle
+        sections = nonEmptySections
+        var nextTitleByID: [String: String] = [:]
+        var nextFlat: [MineLibraryCardItem] = []
+        var nextByID: [MineRowID: MineLibraryCardItem] = [:]
+        var nextIndexByID: [MineRowID: Int] = [:]
+        var nextSwipeAllowed = false
+
+        for section in nonEmptySections {
+            if let title = section.title, !title.isEmpty {
+                nextTitleByID[section.id] = title
+            }
+            for item in section.items where nextByID[item.id] == nil {
+                nextIndexByID[item.id] = nextFlat.count
+                nextFlat.append(item)
+                nextByID[item.id] = item
+                if item.allowsSwipeDelete {
+                    nextSwipeAllowed = true
+                }
+            }
+        }
+
+        sectionTitleByID = nextTitleByID
+        flatItems = nextFlat
+        itemByID = nextByID
+        itemIndexByID = nextIndexByID
+        anyItemAllowsSwipeDelete = nextSwipeAllowed
         placeholderCount = config.placeholderCount
         placeholderLabel = config.placeholderLabel
         footerState = config.footerState
         coverPresentation = config.coverPresentation
 
-        if items.count != previousCount {
+        if flatItems.count != previousCount {
             resetPaginationGate()
         }
 
-        let hasHeader = headerTitle != nil && !items.isEmpty
-        let hasFooter = footerState != .none && !items.isEmpty
-        let boundaryChanged = hadHeader != hasHeader || hadFooter != hasFooter
+        let hasFooter = footerState != .none && !flatItems.isEmpty
+        let headerPresenceChanged = Set(previousTitles.keys) != Set(nextTitleByID.keys)
+        let headerTextChanged = previousTitles != nextTitleByID
+        let swipeLayoutChanged = swipeHandlerChanged || previousSwipeAllowed != nextSwipeAllowed
+        let boundaryChanged = headerPresenceChanged || (hadFooter != hasFooter) || swipeLayoutChanged
 
         if isViewLoaded {
             var reconfigureIDs: [MineRowCellKey] = []
             if !presentationChanged {
-                for item in items where previousByID[item.id] != item {
+                for item in flatItems where previousByID[item.id] != item {
                     reconfigureIDs.append(.item(item.id))
                 }
             }
@@ -155,8 +365,8 @@ final class MineLibraryRowFeedController: UIKitBaseCollectionViewController,
             if boundaryChanged || presentationChanged {
                 collectionView.collectionViewLayout.invalidateLayout()
             }
-            if headerChanged, hasHeader {
-                updateVisibleHeader()
+            if headerTextChanged {
+                updateVisibleHeaders()
             }
             if footerChanged, hasFooter {
                 updateVisibleFooter()
@@ -189,10 +399,10 @@ final class MineLibraryRowFeedController: UIKitBaseCollectionViewController,
               let index = itemIndexByID[item.id] else {
             return
         }
-        let key = PaginationKey(count: items.count, lastID: items.last?.id)
+        let key = PaginationKey(count: flatItems.count, lastID: flatItems.last?.id)
         triggerNearEndPaginationIfNeeded(
             index: index,
-            totalCount: items.count,
+            totalCount: flatItems.count,
             key: key,
             action: onNearEndAppear
         )
@@ -230,10 +440,27 @@ final class MineLibraryRowFeedController: UIKitBaseCollectionViewController,
 }
 
 private extension MineLibraryRowFeedController {
+    func trailingSwipeActions(at indexPath: IndexPath) -> UISwipeActionsConfiguration? {
+        guard let onSwipeDelete,
+              let item = rowItem(at: indexPath),
+              item.allowsSwipeDelete else {
+            return nil
+        }
+        let title = item.swipeDeleteTitle ?? String(localized: "Delete")
+        let action = UIContextualAction(style: .destructive, title: title) { _, _, completion in
+            onSwipeDelete(item.id)
+            completion(true)
+        }
+        action.image = UIImage(systemName: "trash")
+        let configuration = UISwipeActionsConfiguration(actions: [action])
+        configuration.performsFirstActionWithFullSwipe = true
+        return configuration
+    }
+
     func makeRegistrations() -> MineRowRegistrations {
         let row = UICollectionView.CellRegistration<
             UIKitRowVideoCell,
-            MineLibraryRowItem
+            MineLibraryCardItem
         > { [weak self] cell, _, item in
             guard let self else { return }
             let menu = item.hasTrailingMenu ? makeTrailingMenu?(item.id, cell) : nil
@@ -245,6 +472,9 @@ private extension MineLibraryRowFeedController {
                 subtitle: .text(item.subtitle),
                 footer: item.footer,
                 watchProgress: item.watchProgress,
+                isUnavailable: item.isUnavailable,
+                statusBadge: item.statusBadge,
+                statusBadgeStyle: item.statusBadgeStyle,
                 trailingMenu: menu,
                 trailingMenuAccessibilityLabel: item.trailingMenuAccessibilityLabel,
                 isTrailingMenuEnabled: item.isTrailingMenuEnabled,
@@ -263,13 +493,17 @@ private extension MineLibraryRowFeedController {
         }
         let header = UICollectionView.SupplementaryRegistration<UIKitFeedSectionHeaderView>(
             elementKind: UICollectionView.elementKindSectionHeader
-        ) { [weak self] view, _, _ in
-            guard let self, let title = headerTitle else { return }
+        ) { [weak self] view, _, indexPath in
+            guard let self,
+                  indexPath.section < currentSections.count,
+                  case .section(let sectionID) = currentSections[indexPath.section],
+                  let title = sectionTitleByID[sectionID] else { return }
+            let isMultiSection = sections.count > 1
             view.configure(
                 title: title,
                 showsDivider: false,
-                textStyle: .footnote,
-                weight: .medium,
+                textStyle: isMultiSection ? .subheadline : .footnote,
+                weight: isMultiSection ? .semibold : .medium,
                 color: .secondaryLabel
             )
         }
@@ -313,20 +547,49 @@ private extension MineLibraryRowFeedController {
     func makeRowSection(
         contentWidth: CGFloat,
         horizontalInset: CGFloat,
-        traitCollection: UITraitCollection,
-        isSkeleton: Bool
+        layoutEnvironment: any NSCollectionLayoutEnvironment,
+        isSkeleton: Bool,
+        hasHeader: Bool,
+        hasFooter: Bool,
+        isFirstSection: Bool,
+        isLastSection: Bool
     ) -> NSCollectionLayoutSection {
         let count = max(1, FeedColumnPolicy.columnCount(.videoRow, availableWidth: contentWidth))
+        let topInset = isFirstSection ? UIKitFeedLayoutMetrics.topInset : AppSpacing.xs
+        let bottomInset = isLastSection ? UIKitFeedLayoutMetrics.bottomInset : AppSpacing.s
+
+        let usesSwipeList = !isSkeleton && count == 1 && onSwipeDelete != nil && anyItemAllowsSwipeDelete
+        if usesSwipeList {
+            var listConfig = UICollectionLayoutListConfiguration(appearance: .plain)
+            listConfig.backgroundColor = .clear
+            listConfig.showsSeparators = false
+            listConfig.headerMode = hasHeader ? .supplementary : .none
+            listConfig.footerMode = hasFooter ? .supplementary : .none
+            listConfig.headerTopPadding = 0
+            listConfig.trailingSwipeActionsConfigurationProvider = { [weak self] indexPath in
+                self?.trailingSwipeActions(at: indexPath)
+            }
+            let section = NSCollectionLayoutSection.list(using: listConfig, layoutEnvironment: layoutEnvironment)
+            section.interGroupSpacing = UIKitFeedLayoutMetrics.listRowSpacing
+            section.contentInsets = NSDirectionalEdgeInsets(
+                top: topInset,
+                leading: horizontalInset,
+                bottom: bottomInset,
+                trailing: horizontalInset
+            )
+            return section
+        }
+
         let colWidth = FeedColumnPolicy.columnWidth(
             availableWidth: contentWidth,
             count: count,
             spacing: UIKitFeedLayoutMetrics.gridColumnSpacing
         )
-        let isRegular = traitCollection.horizontalSizeClass == .regular
+        let isRegular = layoutEnvironment.traitCollection.horizontalSizeClass == .regular
         let coverHeight = coverPresentation.height(
             forWidth: LibraryRowMetrics.coverWidth(columnWidth: colWidth, isRegularWidth: isRegular)
         )
-        let estimatedHeight = max(64, coverHeight)
+        let estimatedHeight = max(84, coverHeight)
 
         let itemSize = NSCollectionLayoutSize(
             widthDimension: .fractionalWidth(1.0 / CGFloat(count)),
@@ -347,14 +610,14 @@ private extension MineLibraryRowFeedController {
         let section = NSCollectionLayoutSection(group: group)
         section.interGroupSpacing = UIKitFeedLayoutMetrics.listRowSpacing
         section.contentInsets = NSDirectionalEdgeInsets(
-            top: UIKitFeedLayoutMetrics.topInset,
+            top: topInset,
             leading: horizontalInset,
-            bottom: UIKitFeedLayoutMetrics.bottomInset,
+            bottom: bottomInset,
             trailing: horizontalInset
         )
 
         var supplementaries: [NSCollectionLayoutBoundarySupplementaryItem] = []
-        if !isSkeleton, headerTitle != nil {
+        if hasHeader {
             let headerSize = NSCollectionLayoutSize(
                 widthDimension: .fractionalWidth(1.0),
                 heightDimension: .estimated(32)
@@ -365,7 +628,7 @@ private extension MineLibraryRowFeedController {
                 alignment: .top
             ))
         }
-        if !isSkeleton, footerState != .none {
+        if hasFooter {
             let footerSize = NSCollectionLayoutSize(
                 widthDimension: .fractionalWidth(1.0),
                 heightDimension: .estimated(64)
@@ -384,14 +647,23 @@ private extension MineLibraryRowFeedController {
         guard let dataSource else { return }
         var snapshot = NSDiffableDataSourceSnapshot<MineRowSectionKey, MineRowCellKey>()
 
-        if items.isEmpty {
+        if flatItems.isEmpty {
             if placeholderCount > 0 {
                 snapshot.appendSections([.skeletons])
                 snapshot.appendItems((0..<placeholderCount).map { .skeleton($0) }, toSection: .skeletons)
             }
         } else {
-            snapshot.appendSections([.items])
-            snapshot.appendItems(items.map { .item($0.id) }, toSection: .items)
+            var seen = Set<MineRowID>()
+            for section in sections {
+                let uniqueIDs = section.items.compactMap { item -> MineRowCellKey? in
+                    guard seen.insert(item.id).inserted else { return nil }
+                    return .item(item.id)
+                }
+                guard !uniqueIDs.isEmpty else { continue }
+                let key = MineRowSectionKey.section(section.id)
+                snapshot.appendSections([key])
+                snapshot.appendItems(uniqueIDs, toSection: key)
+            }
         }
 
         if reconfigureAll {
@@ -407,24 +679,30 @@ private extension MineLibraryRowFeedController {
         dataSource.apply(snapshot, animatingDifferences: false)
     }
 
-    func updateVisibleHeader() {
-        let indexPath = IndexPath(item: 0, section: 0)
-        if let header = collectionView.supplementaryView(
-            forElementKind: UICollectionView.elementKindSectionHeader,
-            at: indexPath
-        ) as? UIKitFeedSectionHeaderView, let title = headerTitle {
-            header.configure(
-                title: title,
-                showsDivider: false,
-                textStyle: .footnote,
-                weight: .medium,
-                color: .secondaryLabel
-            )
+    func updateVisibleHeaders() {
+        let isMultiSection = sections.count > 1
+        for (index, key) in currentSections.enumerated() {
+            guard case .section(let sectionID) = key,
+                  let title = sectionTitleByID[sectionID] else { continue }
+            let indexPath = IndexPath(item: 0, section: index)
+            if let header = collectionView.supplementaryView(
+                forElementKind: UICollectionView.elementKindSectionHeader,
+                at: indexPath
+            ) as? UIKitFeedSectionHeaderView {
+                header.configure(
+                    title: title,
+                    showsDivider: false,
+                    textStyle: isMultiSection ? .subheadline : .footnote,
+                    weight: isMultiSection ? .semibold : .medium,
+                    color: .secondaryLabel
+                )
+            }
         }
     }
 
     func updateVisibleFooter() {
-        let indexPath = IndexPath(item: 0, section: 0)
+        guard !currentSections.isEmpty else { return }
+        let indexPath = IndexPath(item: 0, section: currentSections.count - 1)
         if let footer = collectionView.supplementaryView(
             forElementKind: UICollectionView.elementKindSectionFooter,
             at: indexPath
@@ -444,7 +722,7 @@ private extension MineLibraryRowFeedController {
         }
     }
 
-    func rowItem(at indexPath: IndexPath) -> MineLibraryRowItem? {
+    func rowItem(at indexPath: IndexPath) -> MineLibraryCardItem? {
         guard let key = dataSource?.itemIdentifier(for: indexPath),
               case .item(let id) = key else { return nil }
         return itemByID[id]

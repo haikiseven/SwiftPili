@@ -69,10 +69,11 @@ enum ImagePreviewSavePayload: Sendable {
 
     func save(url: URL) {
         guard let attempt = saveState.begin() else { return }
+        let targetURL = ImagePreviewRasterPolicy.originalURL(for: url)
         onSaveStateChange?(saveState.status)
         Task { [weak self] in
             do {
-                let image = try await KingfisherManager.shared.retrieveImage(with: url).image
+                let image = try await KingfisherManager.shared.retrieveImage(with: targetURL).image
                 try await Self.writeToPhotoLibrary(image)
                 if let self, self.saveState.finish(succeeded: true, for: attempt) {
                     self.onSaveStateChange?(self.saveState.status)
@@ -91,9 +92,10 @@ enum ImagePreviewSavePayload: Sendable {
     }
 
     func copy(url: URL, fallbackImage: UIImage?) {
+        let targetURL = ImagePreviewRasterPolicy.originalURL(for: url)
         Task { [weak self] in
             let image: UIImage?
-            if let loaded = try? await KingfisherManager.shared.retrieveImage(with: url).image {
+            if let loaded = try? await KingfisherManager.shared.retrieveImage(with: targetURL).image {
                 image = loaded
             } else {
                 image = fallbackImage
@@ -110,13 +112,14 @@ enum ImagePreviewSavePayload: Sendable {
     }
 
     func shareItems(for url: URL, fallbackImage: UIImage?) async -> [Any] {
+        let targetURL = ImagePreviewRasterPolicy.originalURL(for: url)
         let image: UIImage?
-        if let loaded = try? await KingfisherManager.shared.retrieveImage(with: url).image {
+        if let loaded = try? await KingfisherManager.shared.retrieveImage(with: targetURL).image {
             image = loaded
         } else {
             image = fallbackImage
         }
-        guard let image else { return [url] }
+        guard let image else { return [targetURL] }
         switch ImagePreviewSavePayload(image: image) {
         case .encodedGIF(let data): return [data]
         case .stillImage(let still): return [still]

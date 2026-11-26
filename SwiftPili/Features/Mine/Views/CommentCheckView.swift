@@ -24,10 +24,7 @@ struct CommentCheckView: View {
                         .foregroundStyle(.secondary)
                 }
             } footer: {
-                Text("""
-                Posts once, then checks anonymous public visibility. \
-                A missing result is not a moderation verdict.
-                """)
+                Text("Checks anonymous public visibility after posting.")
             }
 
             Section {

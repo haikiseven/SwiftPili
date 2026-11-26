@@ -48,8 +48,6 @@ struct CommentAIFilterAllowlistView: View {
                     }
                 } header: {
                     Text("\(authors.count) Whitelisted Authors")
-                } footer: {
-                    Text("Swipe left on an author to remove them from the local whitelist.")
                 }
 
                 Section {

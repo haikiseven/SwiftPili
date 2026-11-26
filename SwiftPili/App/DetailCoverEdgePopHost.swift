@@ -155,7 +155,13 @@ struct DetailCoverEdgePopHost: UIViewRepresentable {
                 let shouldPop = translation > max(Self.popTranslationThreshold, width * 0.22)
                     || velocity > Self.popVelocityThreshold
                 if shouldPop {
-                    finishHorizontalPop(on: targetView, width: width, isRTL: isRTL)
+                    finishHorizontalPop(
+                        on: targetView,
+                        width: width,
+                        clampedTranslation: max(0, translation),
+                        velocity: velocity,
+                        isRTL: isRTL
+                    )
                 } else {
                     cancelDrag(on: targetView, animated: true)
                 }
@@ -177,12 +183,23 @@ struct DetailCoverEdgePopHost: UIViewRepresentable {
             view.layer.shadowOffset = CGSize(width: -4, height: 0)
         }
 
-        private func finishHorizontalPop(on view: UIView, width: CGFloat, isRTL: Bool) {
+        private func finishHorizontalPop(
+            on view: UIView,
+            width: CGFloat,
+            clampedTranslation: CGFloat,
+            velocity: CGFloat,
+            isRTL: Bool
+        ) {
             isDragging = false
             isFinishingPop = true
             let exitX = isRTL ? -width : width
             let complete: @MainActor () -> Void = { [weak self, weak view] in
-                guard let self else { return }
+                guard let self, self.isFinishingPop else { return }
+                guard self.isAtRoot else {
+                    self.isFinishingPop = false
+                    if let view { self.restoreVisualState(on: view) }
+                    return
+                }
                 view?.isHidden = true
                 var transaction = Transaction()
                 transaction.disablesAnimations = true
@@ -196,8 +213,13 @@ struct DetailCoverEdgePopHost: UIViewRepresentable {
                 complete()
                 return
             }
+            let remaining = max(0, width - clampedTranslation)
+            let baseDuration: TimeInterval = 0.22
+            let velocityDuration = velocity > 0 ? TimeInterval(remaining / velocity) : baseDuration
+            let distanceDuration = baseDuration * TimeInterval(remaining / max(width, 1)) + 0.04
+            let duration = max(0.08, min(baseDuration, min(velocityDuration, distanceDuration)))
             UIView.animate(
-                withDuration: 0.22,
+                withDuration: duration,
                 delay: 0,
                 options: [.curveEaseOut, .beginFromCurrentState]
             ) {
@@ -232,6 +254,7 @@ struct DetailCoverEdgePopHost: UIViewRepresentable {
 
         private func restoreVisualState(on view: UIView) {
             view.transform = .identity
+            view.isHidden = false
             view.layer.shadowOpacity = savedShadowOpacity
             view.layer.shadowRadius = savedShadowRadius
             view.layer.shadowOffset = savedShadowOffset

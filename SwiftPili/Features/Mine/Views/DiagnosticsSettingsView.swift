@@ -7,30 +7,32 @@ struct DiagnosticsSettingsView: View {
     var body: some View {
         let access = experiments.captureAccess(.diagnostics)
         List {
-            Section("Reports") {
-                NavigationLink {
-                    HangReportView()
-                } label: {
-                    settingsLabel("View App Reports", symbol: "exclamationmark.triangle")
-                }
-            }
-            #if DEBUG
-            playbackOverrides(access: access)
-            #endif
-            Section("Playback Diagnostics") {
-                Toggle(isOn: Binding(
-                    get: { debugLogging },
-                    set: {
-                        guard canMutate(access) else { return }
-                        PlayerLog.setEnabled($0)
+            Group {
+                Section("Reports") {
+                    NavigationLink {
+                        HangReportView()
+                    } label: {
+                        settingsLabel("View App Reports", symbol: "exclamationmark.triangle")
                     }
-                )) {
-                    settingsLabel("Debug Logging", symbol: "waveform.path.ecg")
                 }
-                .disabled(!canMutate(access))
+                #if DEBUG
+                playbackOverrides(access: access)
+                #endif
+                Section("Playback Diagnostics") {
+                    Toggle(isOn: Binding(
+                        get: { debugLogging },
+                        set: {
+                            guard canMutate(access) else { return }
+                            _ = experiments.setDebugLoggingEnabled($0)
+                        }
+                    )) {
+                        settingsLabel("Debug Logging", symbol: "waveform.path.ecg")
+                    }
+                    .disabled(!canMutate(access))
+                }
             }
+            .listRowBackground(AppFill.card)
         }
-        .listRowBackground(AppFill.card)
         .readableFormWidth()
         .accentContentBoundary()
         .navigationTitle("Diagnostic Tools")

@@ -31,18 +31,26 @@ struct FavoritesView: View {
         )
         FavoritesCollectionView(
             rows: viewModel.folderRows,
-            placeholderCount: viewModel.showsInitialPlaceholder ? 6 : 0,
+            placeholderCount: viewModel.showsInitialPlaceholder ? 4 : 0,
             placeholderLabel: placeholderLabel,
             isMutating: viewModel.isMutating,
             previewGeneration: viewModel.previewGeneration,
             onRefresh: {
                 viewModel.bind(authManager: authManager, accountManager: accountManager)
-                await viewModel.refreshAll()
+                await viewModel.refreshActiveTab()
                 return false
             },
             onNeedPreview: { folderID in
                 viewModel.bind(authManager: authManager, accountManager: accountManager)
                 viewModel.loadPreviewIfNeeded(for: folderID)
+            },
+            onRetryPreview: { folderID in
+                viewModel.bind(authManager: authManager, accountManager: accountManager)
+                viewModel.retryPreview(for: folderID)
+            },
+            onNearEnd: {
+                viewModel.bind(authManager: authManager, accountManager: accountManager)
+                Task { await viewModel.loadMoreCollectedIfNeeded() }
             },
             onOpenFolder: { folderID, title in
                 coordinator.navigate(to: .favoriteDetail(folderID, title))
@@ -51,9 +59,27 @@ struct FavoritesView: View {
                 coordinator.navigateToVideo(target)
             },
             onRequestDelete: { folder in
+                guard !folder.isDefault else { return }
                 pendingDelete = folder
             }
         )
+        .safeAreaInset(edge: .top, spacing: 0) {
+            Picker("", selection: $viewModel.selectedTab) {
+                ForEach(FavoritesViewModel.FolderTab.allCases) { tab in
+                    Text(tab.title).tag(tab)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 480)
+            .padding(.horizontal, AppSpacing.l)
+            .padding(.vertical, AppSpacing.s)
+            .frame(maxWidth: .infinity)
+            .background(.bar)
+            .overlay(alignment: .bottom) {
+                Divider()
+            }
+        }
         .appAmbientBrowseBackground()
         .navigationTitle("Favorites")
         .navigationBarTitleDisplayMode(.inline)
@@ -125,13 +151,40 @@ struct FavoritesView: View {
             Text(viewModel.errorText ?? "")
         }
         .overlay {
-            if !viewModel.showsInitialPlaceholder, viewModel.folders.isEmpty {
-                ContentUnavailableView("No Favorites", systemImage: "star.slash")
+            if !viewModel.showsInitialPlaceholder, viewModel.activeFolders.isEmpty {
+                if let error = viewModel.activeLoadError {
+                    ContentUnavailableView {
+                        Label("Load Failed", systemImage: "exclamationmark.triangle")
+                    } description: {
+                        Text(error)
+                    } actions: {
+                        Button("Retry") {
+                            Task {
+                                viewModel.bind(authManager: authManager, accountManager: accountManager)
+                                await viewModel.retryActiveTab()
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                } else if viewModel.selectedTab == .collected {
+                    ContentUnavailableView(
+                        "No Subscribed Folders",
+                        systemImage: "folder.badge.plus",
+                        description: Text("Favorite folders you subscribe to will appear here.")
+                    )
+                } else {
+                    ContentUnavailableView("No Favorites", systemImage: "star.slash")
+                }
             }
         }
         .task {
             viewModel.bind(authManager: authManager, accountManager: accountManager)
             await viewModel.loadInitial()
+        }
+        .task(id: viewModel.selectedTab) {
+            guard viewModel.selectedTab == .collected else { return }
+            viewModel.bind(authManager: authManager, accountManager: accountManager)
+            await viewModel.loadCollectedIfNeeded()
         }
     }
 }
@@ -186,6 +239,11 @@ struct FavoriteFolderPreviewRow: View {
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
+                    if folder.isPrivate {
+                        Image(systemName: "lock.fill")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
                     if let count = folder.mediaCount {
                         Text(verbatim: "\(count)")
                             .font(.caption.weight(.medium))
@@ -232,11 +290,38 @@ struct FavoriteFolderPreviewRow: View {
                 .disabled(true)
                 .allowsHitTesting(false)
                 .accessibilityHidden(true)
+            } else if viewModel.previews.isEmpty, viewModel.loadFailed {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Failed to load preview")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 8)
+                    Button("Retry") {
+                        Task {
+                            await viewModel.retry(folderID: folder.id, onPreviewsLoaded: onPreviewsLoaded)
+                        }
+                    }
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(Color.biliAccent)
+                }
+                .padding(.horizontal, 12)
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .background(AppFill.inset, in: RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous))
             } else if viewModel.previews.isEmpty {
-                Text("Empty Folder")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .frame(height: cardHeight)
+                HStack(spacing: 8) {
+                    Image(systemName: "folder")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                    Text("Empty Folder")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(.horizontal, 12)
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .background(AppFill.inset, in: RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous))
             } else {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(alignment: .top, spacing: 10) {
@@ -280,12 +365,29 @@ struct FavoriteFolderPreviewRow: View {
     }
 
     private func previewCard(_ item: FavoriteContentResult.FavoriteMedia) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
+        let isPlayable = item.isPlayableVideo
+        return VStack(alignment: .leading, spacing: 5) {
             VideoCoverImage(
                 sources: VideoCoverSources(widescreen: item.cover ?? ""),
                 width: cardWidth
             )
+            .opacity(isPlayable ? 1.0 : 0.58)
             .videoCoverFrame(cornerRadius: AppRadius.thumbnail)
+            .overlay(alignment: .topLeading) {
+                if !isPlayable {
+                    Text("Unavailable")
+                        .appFont(.overlayBadge)
+                        .fontWeight(.medium)
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(
+                            Color.red.opacity(0.84),
+                            in: RoundedRectangle(cornerRadius: AppRadius.badge, style: .continuous)
+                        )
+                        .padding(4)
+                }
+            }
             .overlay(alignment: .bottomTrailing) {
                 if let duration = item.duration, duration > 0 {
                     Text(FormatUtils.duration(duration))
@@ -305,6 +407,7 @@ struct FavoriteFolderPreviewRow: View {
                 .appFont(.shelfCardTitle)
                 .fontWeight(.medium)
                 .foregroundStyle(.primary)
+                .opacity(isPlayable ? 1.0 : 0.58)
                 .lineLimit(2, reservesSpace: true)
                 .multilineTextAlignment(.leading)
                 .frame(width: cardWidth, alignment: .leading)
@@ -314,6 +417,7 @@ struct FavoriteFolderPreviewRow: View {
                     .lineLimit(1)
                     .appFont(.cardMeta)
                     .foregroundStyle(.secondary)
+                    .opacity(isPlayable ? 1.0 : 0.58)
                     .frame(width: cardWidth, alignment: .leading)
             }
         }

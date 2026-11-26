@@ -98,16 +98,24 @@ final class DynamicsViewModel {
     let interactions = MomentInteractionStore(logTag: "DynamicsVM")
 
     private struct CachedFeed {
+        var rawItems: [DynamicFeedResult.DynamicItem]
         var items: [DynamicFeedResult.DynamicItem]
         var offset: String?
         var hasMore: Bool
         var hasLoaded: Bool
     }
 
+    @ObservationIgnored private var rawItems: [DynamicFeedResult.DynamicItem] = []
     @ObservationIgnored private var offset: String?
     @ObservationIgnored private var hasMore = true
     @ObservationIgnored private var admission = FeedLoadAdmission()
     @ObservationIgnored private var cachedFeeds: [DynamicFeedSelection: CachedFeed] = [:]
+
+    init() {
+        LocalContentFilterStore.shared.addObserver(self) { viewModel in
+            viewModel.reapplyContentFilters()
+        }
+    }
 
     func load() async {
         guard let requestedAccountMID = activeFeedAccountMID() else { return }
@@ -234,6 +242,7 @@ final class DynamicsViewModel {
         guard newSelection != selection else { return }
         if hasLoaded {
             cachedFeeds[selection] = CachedFeed(
+                rawItems: rawItems,
                 items: items,
                 offset: offset,
                 hasMore: hasMore,
@@ -245,12 +254,14 @@ final class DynamicsViewModel {
         selection = newSelection
         errorMessage = nil
         if let cached = cachedFeeds[newSelection] {
-            items = cached.items
+            rawItems = cached.rawItems
+            items = cached.rawItems.filter { !Self.shouldHideDynamic($0) }
             offset = cached.offset
             hasMore = cached.hasMore
             hasLoaded = cached.hasLoaded
             return
         }
+        rawItems = []
         items = []
         hasLoaded = false
         offset = nil
@@ -258,9 +269,20 @@ final class DynamicsViewModel {
         Task { await refresh() }
     }
 
+    func reapplyContentFilters() {
+        guard !rawItems.isEmpty else { return }
+        let filtered = rawItems.filter { !Self.shouldHideDynamic($0) }
+        guard filtered.map(Self.stableItemID) != items.map(Self.stableItemID) else { return }
+        items = filtered
+        if var cached = cachedFeeds[selection] {
+            cached.items = filtered
+            cachedFeeds[selection] = cached
+        }
+    }
+
     func displayedItems(for target: DynamicFeedSelection) -> [DynamicFeedResult.DynamicItem] {
         if target == selection { return items }
-        return cachedFeeds[target]?.items ?? []
+        return (cachedFeeds[target]?.rawItems ?? []).filter { !Self.shouldHideDynamic($0) }
     }
 
     func displayedHasLoaded(for target: DynamicFeedSelection) -> Bool {
@@ -410,20 +432,23 @@ private extension DynamicsViewModel {
         guard isCurrentFeedRequest(request) else { return false }
 
         if replacing {
-            items = FeedCollectionPolicy.replaceDeduplicated(result.items ?? [], id: Self.stableItemID)
+            rawItems = FeedCollectionPolicy.replaceDeduplicated(result.items ?? [], id: Self.stableItemID)
+            items = rawItems.filter { !Self.shouldHideDynamic($0) }
             interactions.reset()
         } else {
             FeedCollectionPolicy.appendDeduplicated(
-                to: &items,
+                to: &rawItems,
                 incoming: result.items ?? [],
                 id: Self.stableItemID
             )
+            items = rawItems.filter { !Self.shouldHideDynamic($0) }
         }
         offset = result.offset
         hasMore = result.hasMore ?? false
         hasLoaded = true
         errorMessage = nil
         cachedFeeds[request.selection] = CachedFeed(
+            rawItems: rawItems,
             items: items,
             offset: offset,
             hasMore: hasMore,
@@ -474,5 +499,44 @@ private extension DynamicsViewModel {
         if isLoading != currentIsLoading {
             isLoading = currentIsLoading
         }
+    }
+
+    static func shouldHideDynamic(_ item: DynamicFeedResult.DynamicItem) -> Bool {
+        if matchesDynamicPayload(item) {
+            return true
+        }
+        if let orig = item.orig?.item, matchesDynamicPayload(orig) {
+            return true
+        }
+        return false
+    }
+
+    private static func matchesDynamicPayload(_ item: DynamicFeedResult.DynamicItem) -> Bool {
+        let mid = item.modules?.moduleAuthor?.mid
+        let major = item.modules?.moduleDynamic?.major
+        let archive = major?.archive
+        let aid = archive?.aid.flatMap(Int.init) ?? major?.ugcSeason?.aid
+        let bvid = archive?.bvid
+        let titleParts: [String] = [
+            archive?.title,
+            major?.opus?.title,
+            major?.article?.title,
+            major?.ugcSeason?.title,
+            major?.pgc?.title,
+            item.modules?.moduleDynamic?.desc?.text,
+            major?.opus?.summary?.text,
+        ].compactMap { raw in
+            guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+                return nil
+            }
+            return trimmed
+        }
+        let combinedText = titleParts.isEmpty ? nil : titleParts.joined(separator: "\n")
+        return LocalContentFilterStore.shared.shouldHideVideo(
+            aid: aid,
+            bvid: bvid,
+            mid: mid,
+            title: combinedText
+        )
     }
 }

@@ -4,7 +4,7 @@ import UIKit
 struct CommentDrawerPresenter<Destination: View>: UIViewControllerRepresentable {
     let presentation: CommentZoomPresentation
     let isPresented: Bool
-    let rootView: CommentDrawerRoot<Destination>
+    let rootViewBuilder: () -> CommentDrawerRoot<Destination>
     let allowsInteractiveDismissal: Bool
     let reducesMotion: Bool
     let interfaceStyle: UIUserInterfaceStyle
@@ -91,11 +91,18 @@ final class CommentDrawerViewController<Destination: View>: UIViewController,
             new.presentation.attach(self)
         }
         host?.view.overrideUserInterfaceStyle = new.interfaceStyle
-        pendingRoot = new.rootView
+        if new.isPresented || isShown {
+            pendingRoot = new.rootViewBuilder()
+        } else {
+            pendingRoot = nil
+        }
         let previous = lastPresented
         lastPresented = new.isPresented
         if previous == nil {
-            if new.isPresented { present() }
+            if new.isPresented {
+                new.onPresentationChanged(true)
+                present()
+            }
             return
         }
         if previous != new.isPresented {
@@ -113,6 +120,7 @@ final class CommentDrawerViewController<Destination: View>: UIViewController,
 
     func teardown() {
         transitionToken &+= 1
+        pendingRoot = nil
         cancelPendingAction()
         attachedPresentation?.detach(self)
         attachedPresentation = nil
@@ -235,6 +243,7 @@ final class CommentDrawerViewController<Destination: View>: UIViewController,
         ) { [weak self] in
             guard let self, let host = self.host, lastPresented == false else { return }
             isAnimating = false
+            pendingRoot = nil
             scrimView.alpha = 0
             scrimView.isHidden = true
             host.view.isHidden = true

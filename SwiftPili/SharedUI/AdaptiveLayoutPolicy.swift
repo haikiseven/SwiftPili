@@ -164,15 +164,23 @@ enum RowCardMetrics {
 }
 
 enum LibraryRowMetrics {
-    static let maximumCoverWidth: CGFloat = 140
-    static let coverFraction: CGFloat = 0.33
+    static let compactCoverWidth: CGFloat = 134
+    static let maximumCoverWidth: CGFloat = 160
+    static let coverFraction: CGFloat = 0.36
+    static let maximumContentWidth: CGFloat = 1240
 
     static func coverWidth(columnWidth: CGFloat?, isRegularWidth: Bool) -> CGFloat {
-        guard isRegularWidth else { return 110 }
+        guard isRegularWidth else {
+            if let columnWidth, columnWidth.isFinite, columnWidth > 0 {
+                return min(compactCoverWidth, (columnWidth * 0.44).rounded(.down))
+            }
+            return compactCoverWidth
+        }
         guard let columnWidth, columnWidth.isFinite, columnWidth > 0 else {
             return maximumCoverWidth
         }
-        return min(columnWidth * coverFraction, maximumCoverWidth)
+        let minRegular = min(compactCoverWidth, (columnWidth * 0.44).rounded(.down))
+        return min(max(columnWidth * coverFraction, minRegular), maximumCoverWidth)
     }
 
     static func textWidth(columnWidth: CGFloat, isRegularWidth: Bool) -> CGFloat {
@@ -295,6 +303,10 @@ enum AppMotionPolicy {
 
 enum DetailPlayerGeometry {
     static let headerBottomInset: CGFloat = 4
+    static let minPeekHeight: CGFloat = 136
+    static let maxUltrawideAspect: CGFloat = 2.4
+    static let minPortraitAspect: CGFloat = 0.45
+    static let portraitFullscreenThresholdAspect: CGFloat = 0.85
 
     static func headerBottomInset(isFullscreen: Bool) -> CGFloat {
         isFullscreen ? 0 : headerBottomInset
@@ -307,6 +319,100 @@ enum DetailPlayerGeometry {
         isFullscreen: Bool
     ) -> CGFloat {
         max(0, videoHeight) + headerBottomInset(isFullscreen: isFullscreen)
+    }
+
+    static func normalizedAspect(_ aspect: CGFloat?) -> CGFloat? {
+        guard let aspect, aspect.isFinite, aspect >= 0.15, aspect <= 5.0 else {
+            return nil
+        }
+        return aspect
+    }
+
+    static func isPortraitAspect(_ aspect: CGFloat?, fallback: Bool = false) -> Bool {
+        if let normalized = normalizedAspect(aspect) {
+            return normalized < portraitFullscreenThresholdAspect
+        }
+        return fallback
+    }
+
+    private static func resolvedInlineWidth(
+        containerWidth: CGFloat,
+        primaryColumnWidth: CGFloat?
+    ) -> CGFloat {
+        let base = containerWidth.isFinite ? max(0, containerWidth) : 0
+        guard let primaryColumnWidth else { return base }
+        guard primaryColumnWidth.isFinite else { return 0 }
+        return min(base, max(0, primaryColumnWidth))
+    }
+
+    static func expandedVideoHeight(
+        containerWidth: CGFloat,
+        primaryColumnWidth: CGFloat? = nil,
+        containerHeight: CGFloat = 0,
+        topSafeArea: CGFloat = 0,
+        videoAspectRatio: CGFloat?,
+        isPortraitFallback: Bool = false
+    ) -> CGFloat {
+        let width = resolvedInlineWidth(
+            containerWidth: containerWidth,
+            primaryColumnWidth: primaryColumnWidth
+        )
+        guard width > 0 else { return 0 }
+
+        let rawAspect = normalizedAspect(videoAspectRatio)
+            ?? (isPortraitFallback ? (9.0 / 16.0) : (16.0 / 9.0))
+        if rawAspect >= 0.75 {
+            return width / min(rawAspect, maxUltrawideAspect)
+        }
+
+        let natural = width / max(rawAspect, minPortraitAspect)
+        let safeTop = topSafeArea.isFinite ? max(0, topSafeArea) : 0
+        let maxCap: CGFloat = if containerHeight.isFinite, containerHeight > 240 {
+            max(width / 0.75, containerHeight - safeTop - minPeekHeight)
+        } else {
+            natural
+        }
+        return min(natural, maxCap)
+    }
+
+    static func dynamicInlineVideoHeight(
+        containerWidth: CGFloat,
+        primaryColumnWidth: CGFloat? = nil,
+        containerHeight: CGFloat = 0,
+        topSafeArea: CGFloat = 0,
+        videoAspectRatio: CGFloat?,
+        isPortraitFallback: Bool = false,
+        scrollOffset: CGFloat = 0,
+        isManuallyCondensed: Bool = false,
+        isManualLockActive: Bool = false
+    ) -> CGFloat {
+        let width = resolvedInlineWidth(
+            containerWidth: containerWidth,
+            primaryColumnWidth: primaryColumnWidth
+        )
+        guard width > 0 else { return 0 }
+
+        let expanded = expandedVideoHeight(
+            containerWidth: containerWidth,
+            primaryColumnWidth: primaryColumnWidth,
+            containerHeight: containerHeight,
+            topSafeArea: topSafeArea,
+            videoAspectRatio: videoAspectRatio,
+            isPortraitFallback: isPortraitFallback
+        )
+        let compact = width / (16.0 / 9.0)
+        if isManualLockActive {
+            return isManuallyCondensed ? min(expanded, compact) : expanded
+        }
+        if expanded <= compact + 1 {
+            return expanded
+        }
+        let progress = PortraitVODCondensationPolicy.condensationProgress(
+            scrollOffset: scrollOffset,
+            expandedHeight: expanded,
+            compactHeight: compact
+        )
+        return expanded - progress * (expanded - compact)
     }
 
     static func videoHeight(

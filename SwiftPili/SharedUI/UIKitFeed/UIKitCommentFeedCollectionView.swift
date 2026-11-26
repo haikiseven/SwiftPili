@@ -42,6 +42,10 @@ struct CommentFeedEnvironmentSnapshot: Equatable {
     var contentLinkDefersToParent: Bool = false
     var navigationZoomNamespace: Namespace.ID?
     var contentLinkStateKey: ContentLinkStateKey?
+    var contentFilterRevision: UInt64 = 0
+    var collapseFilteredComments: Bool = false
+    var cloudBlocklistEnabled: Bool = true
+    var cloudBlocklistCount: Int = 0
 }
 
 @MainActor
@@ -218,7 +222,9 @@ struct UIKitCommentFeedCollectionView: View {
     }
 
     private var feedEnvironment: CommentFeedEnvironment {
-        CommentFeedEnvironment(
+        let filterStore = LocalContentFilterStore.shared
+        let blocklist = BlocklistManager.shared
+        return CommentFeedEnvironment(
             snapshot: CommentFeedEnvironmentSnapshot(
                 colorScheme: colorScheme,
                 dynamicTypeSize: dynamicTypeSize,
@@ -232,7 +238,11 @@ struct UIKitCommentFeedCollectionView: View {
                 accessibilityReduceTransparency: accessibilityReduceTransparency,
                 contentLinkDefersToParent: contentLinkDefersToParent,
                 navigationZoomNamespace: navigationZoomNamespace,
-                contentLinkStateKey: contentLinkContext?.stateKey
+                contentLinkStateKey: contentLinkContext?.stateKey,
+                contentFilterRevision: filterStore.revision,
+                collapseFilteredComments: filterStore.collapseFilteredComments,
+                cloudBlocklistEnabled: blocklist.isEnabled,
+                cloudBlocklistCount: blocklist.blockedMids.count
             ),
             rawEnvironment: rawEnvironment,
             coordinator: coordinator,
@@ -242,9 +252,28 @@ struct UIKitCommentFeedCollectionView: View {
         )
     }
 
+    private var effectiveConfig: UIKitCommentFeedConfiguration {
+        let filterStore = LocalContentFilterStore.shared
+        _ = filterStore.revision
+        _ = filterStore.collapseFilteredComments
+        _ = BlocklistManager.shared.isEnabled
+        _ = BlocklistManager.shared.blockedMids
+        let filteredItems = config.items.filter { item in
+            guard let comment = item.comment else { return true }
+            return !filterStore.shouldHideCommentCompletely(
+                mid: comment.mid,
+                content: comment.content.displayMessage
+            )
+        }
+        guard filteredItems.count != config.items.count else { return config }
+        var copy = config
+        copy.items = filteredItems
+        return copy
+    }
+
     private func representable(bottomInset: CGFloat) -> UIKitCommentFeedRepresentable {
         UIKitCommentFeedRepresentable(
-            config: config,
+            config: effectiveConfig,
             environment: feedEnvironment,
             externalBottomSafeAreaInset: bottomInset
         )

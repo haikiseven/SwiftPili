@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 // MARK: - Video
@@ -16,12 +17,15 @@ struct VideoInfo: Decodable, Sendable {
     let owner: VideoOwner
     var stat: VideoStat
     let pages: [VideoPage]?
+    let staff: [StaffMember]?
+    let ugcSeason: UGCSeason?
     let descV2: [DescV2Node]?
     let descLinks: [String: URL]
 
     enum CodingKeys: String, CodingKey {
         case aid, bvid, cid, title, desc, pic, duration, pubdate
-        case copyright, dimension, owner, stat, pages
+        case copyright, dimension, owner, stat, pages, staff
+        case ugcSeason = "ugc_season"
         case descV2 = "desc_v2"
     }
 
@@ -40,6 +44,8 @@ struct VideoInfo: Decodable, Sendable {
         owner = try container.decode(VideoOwner.self, forKey: .owner)
         stat = try container.decode(VideoStat.self, forKey: .stat)
         pages = try container.decodeIfPresent([VideoPage].self, forKey: .pages)
+        staff = (try? container.decodeIfPresent([StaffMember].self, forKey: .staff)) ?? nil
+        ugcSeason = (try? container.decodeIfPresent(UGCSeason.self, forKey: .ugcSeason)) ?? nil
         descV2 = try container.decodeIfPresent([DescV2Node].self, forKey: .descV2)
         descLinks = Self.prepareDescLinks(desc: desc, descV2: descV2)
     }
@@ -139,6 +145,9 @@ struct VideoInfo: Decodable, Sendable {
                 }
             }
         }
+        for (token, url) in EmoteText.timestampLinks(in: desc) where out[token] == nil {
+            out[token] = url
+        }
         return out
     }
 
@@ -149,6 +158,15 @@ struct VideoInfo: Decodable, Sendable {
 
         var isPortrait: Bool {
             rotate == 1 ? width > height : height > width
+        }
+
+        var effectiveAspectRatio: CGFloat? {
+            let effectiveWidth = rotate == 1 ? height : width
+            let effectiveHeight = rotate == 1 ? width : height
+            guard effectiveWidth > 0, effectiveHeight > 0 else { return nil }
+            let ratio = CGFloat(effectiveWidth) / CGFloat(effectiveHeight)
+            guard ratio.isFinite, ratio >= 0.15, ratio <= 5.0 else { return nil }
+            return ratio
         }
     }
 
@@ -174,6 +192,197 @@ struct VideoInfo: Decodable, Sendable {
         let part: String
         let duration: Int
         let dimension: Dimension?
+    }
+
+    struct StaffMember: Decodable, Sendable, Identifiable, Equatable {
+        let mid: Int
+        let title: String
+        let name: String
+        let face: String
+        let vip: VipInfo?
+        let official: OfficialInfo?
+        let follower: Int?
+
+        var id: Int { mid }
+
+        struct VipInfo: Decodable, Sendable, Equatable {
+            let type: Int?
+            let status: Int?
+            let label: VipLabel?
+
+            var isActive: Bool { status == 1 }
+
+            struct VipLabel: Decodable, Sendable, Equatable {
+                let text: String?
+            }
+        }
+
+        struct OfficialInfo: Decodable, Sendable, Equatable {
+            let role: Int?
+            let title: String?
+            let desc: String?
+            let type: Int?
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case mid, title, name, face, vip, official, follower
+        }
+
+        init(
+            mid: Int,
+            title: String,
+            name: String,
+            face: String,
+            vip: VipInfo? = nil,
+            official: OfficialInfo? = nil,
+            follower: Int? = nil
+        ) {
+            self.mid = mid
+            self.title = title
+            self.name = name
+            self.face = face
+            self.vip = vip
+            self.official = official
+            self.follower = follower
+        }
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            mid = try container.decode(Int.self, forKey: .mid)
+            title = (try? container.decode(String.self, forKey: .title)) ?? ""
+            name = (try? container.decode(String.self, forKey: .name)) ?? ""
+            face = (try? container.decode(String.self, forKey: .face)) ?? ""
+            vip = (try? container.decodeIfPresent(VipInfo.self, forKey: .vip)) ?? nil
+            official = (try? container.decodeIfPresent(OfficialInfo.self, forKey: .official)) ?? nil
+            follower = (try? container.decodeIfPresent(Int.self, forKey: .follower)) ?? nil
+        }
+    }
+
+    struct UGCSeason: Decodable, Sendable, Identifiable {
+        let id: Int
+        let title: String
+        let cover: String?
+        let intro: String?
+        let epCount: Int?
+        let sections: [Section]?
+
+        var allEpisodes: [Episode] {
+            (sections ?? []).flatMap { $0.episodes ?? [] }
+        }
+
+        var totalEpisodeCount: Int {
+            let flattened = allEpisodes.count
+            if let epCount, epCount > 0 { return max(epCount, flattened) }
+            return flattened
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case id, title, cover, intro, sections
+            case epCount = "ep_count"
+        }
+
+        struct Section: Decodable, Sendable, Identifiable {
+            let id: Int
+            let title: String
+            let episodes: [Episode]?
+
+            enum CodingKeys: String, CodingKey {
+                case id, title, episodes
+            }
+
+            init(id: Int, title: String, episodes: [Episode]?) {
+                self.id = id
+                self.title = title
+                self.episodes = episodes
+            }
+
+            init(from decoder: any Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                id = (try? container.decode(Int.self, forKey: .id)) ?? 0
+                title = (try? container.decode(String.self, forKey: .title)) ?? ""
+                episodes = (try? container.decodeIfPresent([Episode].self, forKey: .episodes)) ?? nil
+            }
+        }
+
+        struct Episode: Decodable, Sendable, Identifiable {
+            let id: Int
+            let aid: Int
+            let bvid: String?
+            let cid: Int
+            let title: String
+            let arc: Archive?
+            let page: VideoPage?
+
+            var displayTitle: String {
+                let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return trimmed }
+                return arc?.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            }
+
+            var durationSeconds: Int? {
+                arc?.duration ?? page?.duration
+            }
+
+            var coverURL: String? {
+                arc?.pic
+            }
+
+            var videoID: VideoID {
+                if let bvid, !bvid.isEmpty { return .bvid(bvid) }
+                return .aid(aid)
+            }
+
+            struct Archive: Decodable, Sendable {
+                let pic: String?
+                let title: String?
+                let duration: Int?
+                let pubdate: Int?
+                let stat: Stat?
+
+                struct Stat: Decodable, Sendable {
+                    let view: Int?
+                    let danmaku: Int?
+                    let reply: Int?
+                    let favorite: Int?
+                    let coin: Int?
+                    let share: Int?
+                    let like: Int?
+                }
+            }
+
+            enum CodingKeys: String, CodingKey {
+                case id, aid, bvid, cid, title, arc, page
+            }
+
+            init(
+                id: Int,
+                aid: Int,
+                bvid: String? = nil,
+                cid: Int,
+                title: String,
+                arc: Archive? = nil,
+                page: VideoPage? = nil
+            ) {
+                self.id = id
+                self.aid = aid
+                self.bvid = bvid
+                self.cid = cid
+                self.title = title
+                self.arc = arc
+                self.page = page
+            }
+
+            init(from decoder: any Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                id = (try? container.decode(Int.self, forKey: .id)) ?? 0
+                aid = (try? container.decode(Int.self, forKey: .aid)) ?? 0
+                bvid = (try? container.decodeIfPresent(String.self, forKey: .bvid)) ?? nil
+                cid = (try? container.decode(Int.self, forKey: .cid)) ?? 0
+                title = (try? container.decode(String.self, forKey: .title)) ?? ""
+                arc = (try? container.decodeIfPresent(Archive.self, forKey: .arc)) ?? nil
+                page = (try? container.decodeIfPresent(VideoPage.self, forKey: .page)) ?? nil
+            }
+        }
     }
 }
 
@@ -212,16 +421,20 @@ struct PlayerV2Info: Decodable, Sendable {
         let from: Double?
         let to: Double?
         let imgURL: String?
+        let content: String?
 
-        init(from: Double?, to: Double?, imgURL: String?) {
+        init(from: Double?, to: Double?, imgURL: String?, content: String? = nil) {
             self.from = from
             self.to = to
             self.imgURL = imgURL
+            self.content = content
         }
 
         private enum CodingKeys: String, CodingKey {
             case from
             case to
+            case content
+            case title
             case fromTime = "from_time"
             case toTime = "to_time"
             case imgURL = "imgUrl"
@@ -235,6 +448,7 @@ struct PlayerV2Info: Decodable, Sendable {
                 from = nil
                 to = nil
                 imgURL = nil
+                content = nil
                 return
             }
             from = Self.decodeDouble(
@@ -249,6 +463,11 @@ struct PlayerV2Info: Decodable, Sendable {
                 in: container,
                 keys: [.imgURL, .imgURLSnake, .imageURL, .imageURLSnake]
             )
+            let rawContent = Self.decodeString(
+                in: container,
+                keys: [.content, .title]
+            )?.trimmingCharacters(in: .whitespacesAndNewlines)
+            content = rawContent.flatMap { $0.isEmpty ? nil : $0 }
         }
 
         private static func decodeDouble(
@@ -283,15 +502,90 @@ struct PlayerV2Info: Decodable, Sendable {
     struct SubtitleBox: Decodable, Sendable {
         let subtitles: [SubtitleItem]?
 
-        struct SubtitleItem: Decodable, Sendable {
+        struct SubtitleItem: Decodable, Sendable, Equatable {
+            let id: Int64?
+            let idStr: String?
             let lan: String?
             let lanDoc: String?
             let subtitleUrl: String?
+            let aiType: Int?
+            let aiStatus: Int?
+
+            var isAIGenerated: Bool {
+                (aiType ?? 0) > 0 || (lan?.hasPrefix("ai-") == true)
+            }
+
+            var displayTitle: String {
+                let trimmed = lanDoc?.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let trimmed, !trimmed.isEmpty {
+                    return trimmed
+                }
+                return lan ?? "?"
+            }
+
+            var menuDisplayTitle: String {
+                let base = displayTitle
+                if isAIGenerated, !base.localizedCaseInsensitiveContains("AI") {
+                    return "\(base) (AI)"
+                }
+                return base
+            }
+
+            init(
+                lan: String?,
+                lanDoc: String?,
+                subtitleUrl: String?,
+                id: Int64? = nil,
+                idStr: String? = nil,
+                aiType: Int? = nil,
+                aiStatus: Int? = nil
+            ) {
+                self.id = id
+                self.idStr = idStr
+                self.lan = lan
+                self.lanDoc = lanDoc
+                self.subtitleUrl = subtitleUrl
+                self.aiType = aiType
+                self.aiStatus = aiStatus
+            }
 
             enum CodingKeys: String, CodingKey {
+                case id
+                case idStr = "id_str"
                 case lan
                 case lanDoc = "lan_doc"
                 case subtitleUrl = "subtitle_url"
+                case subtitleUrlV2 = "subtitle_url_v2"
+                case aiType = "ai_type"
+                case aiStatus = "ai_status"
+            }
+
+            init(from decoder: any Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                if let decodedID = try? container.decodeIfPresent(Int64.self, forKey: .id) {
+                    id = decodedID
+                } else if let decodedIDString = try? container.decodeIfPresent(String.self, forKey: .id),
+                          let parsedID = Int64(decodedIDString) {
+                    id = parsedID
+                } else {
+                    id = nil
+                }
+                idStr = try? container.decodeIfPresent(String.self, forKey: .idStr)
+                lan = try container.decodeIfPresent(String.self, forKey: .lan)
+                lanDoc = try container.decodeIfPresent(String.self, forKey: .lanDoc)
+                let primaryURL = (try? container.decodeIfPresent(String.self, forKey: .subtitleUrl))?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let fallbackURL = (try? container.decodeIfPresent(String.self, forKey: .subtitleUrlV2))?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if let primaryURL, !primaryURL.isEmpty {
+                    subtitleUrl = primaryURL
+                } else if let fallbackURL, !fallbackURL.isEmpty {
+                    subtitleUrl = fallbackURL
+                } else {
+                    subtitleUrl = nil
+                }
+                aiType = try? container.decodeIfPresent(Int.self, forKey: .aiType)
+                aiStatus = try? container.decodeIfPresent(Int.self, forKey: .aiStatus)
             }
         }
     }
@@ -343,6 +637,7 @@ struct VideoCard: Decodable, Sendable, Identifiable {
     let pic: String
     let cover43: String?
     let duration: Int
+    let dimension: VideoInfo.Dimension?
     let owner: VideoInfo.VideoOwner
     let stat: VideoInfo.VideoStat
 
@@ -922,6 +1217,10 @@ struct RecommendResult: Decodable, Sendable {
             MobileCoverSelection.firstUsable(pic4By3, cover43)
         }
 
+        var aspectRatioHint: CGFloat? {
+            BiliAspectRatioURIParser.parseAspectRatio(from: uri)
+        }
+
         enum CodingKeys: String, CodingKey {
             case id, bvid, title, pic, duration, owner, stat, cover43
             case pic4By3 = "pic_4_3"
@@ -1173,6 +1472,12 @@ struct HistoryResult: Decodable, Sendable {
     let cursor: HistoryCursor?
 
     struct HistoryItem: Decodable, Sendable, Identifiable {
+        struct HistoryEntry: Decodable, Sendable {
+            let oid: Int?
+            let bvid: String?
+            let business: String?
+        }
+
         let kid: Int
         let title: String
         let cover: String
@@ -1182,11 +1487,28 @@ struct HistoryResult: Decodable, Sendable {
         let progress: Int
         let duration: Int
         let badge: String?
+        let history: HistoryEntry?
 
         var id: Int { kid }
 
+        var bvid: String? {
+            guard let value = history?.bvid, !value.isEmpty else { return nil }
+            return value
+        }
+
+        var historyBusiness: String {
+            let value = history?.business?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return value.isEmpty ? "archive" : value
+        }
+
+        var isWatched: Bool {
+            if progress == -1 { return true }
+            guard duration > 0, progress > 0 else { return false }
+            return duration > 5 ? progress >= duration - 5 : progress >= duration
+        }
+
         enum CodingKeys: String, CodingKey {
-            case kid, title, cover, progress, duration, badge
+            case kid, title, cover, progress, duration, badge, history
             case authorName = "author_name"
             case authorMid = "author_mid"
             case viewAt = "view_at"
@@ -1231,24 +1553,62 @@ struct WatchLaterResult: Decodable, Sendable {
         let duration: Int?
         let owner: VideoInfo.VideoOwner?
         let stat: VideoInfo.VideoStat?
+        let progress: Int?
+        let state: Int?
 
         var id: Int { aid }
+
+        var isWatched: Bool {
+            guard let progress else { return false }
+            if progress == -1 { return true }
+            guard let duration, duration > 0, progress > 0 else { return false }
+            return duration > 5 ? progress >= duration - 5 : progress >= duration
+        }
+
+        var watchProgressFraction: Double? {
+            guard let progress, progress != 0, let duration, duration > 0 else { return nil }
+            return FormatUtils.historyProgressFraction(progress: progress, duration: duration)
+        }
+
+        var isUnavailable: Bool {
+            if let state, state < 0 { return true }
+            return false
+        }
     }
 }
 
 struct FavoriteFolderResult: Decodable, Sendable {
     let list: [FavoriteFolder]?
     let count: Int?
+    let hasMore: Bool?
 
     struct FavoriteFolder: Decodable, Sendable, Identifiable {
         let id: Int
         let title: String
         let mediaCount: Int?
+        let attr: Int?
+        let mid: Int?
+        let cover: String?
+        let upper: FavoriteContentResult.FavoriteMedia.Upper?
+
+        var isPrivate: Bool {
+            ((attr ?? 0) & 1) == 1
+        }
+
+        var isDefault: Bool {
+            guard let attr else { return false }
+            return ((attr >> 1) & 1) == 0
+        }
 
         enum CodingKeys: String, CodingKey {
-            case id, title
+            case id, title, attr, mid, cover, upper
             case mediaCount = "media_count"
         }
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case list, count
+        case hasMore = "has_more"
     }
 }
 
@@ -1261,6 +1621,14 @@ struct FavoriteContentResult: Decodable, Sendable {
         let id: Int?
         let mid: Int?
         let attr: Int?
+        let title: String?
+        let mediaCount: Int?
+        let intro: String?
+
+        enum CodingKeys: String, CodingKey {
+            case id, mid, attr, title, intro
+            case mediaCount = "media_count"
+        }
     }
 
     struct FavoriteMedia: Decodable, Sendable, Identifiable {
@@ -3065,6 +3433,13 @@ extension Array where Element == CommentResult.CommentItem {
 
 struct LikeResult: Decodable, Sendable {}
 
+struct TripleLikeResult: Decodable, Sendable, Equatable {
+    let like: Bool?
+    let coin: Bool?
+    let fav: Bool?
+    let multiply: Int?
+}
+
 struct CoinResult: Decodable, Sendable {
     let like: Bool?
 }
@@ -4072,6 +4447,7 @@ struct RankingResult: Decodable, Sendable {
         let pic: String
         let cover43: String?
         let duration: Int?
+        let dimension: VideoInfo.Dimension?
         let owner: VideoInfo.VideoOwner?
         let stat: VideoInfo.VideoStat?
         let score: Int?

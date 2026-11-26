@@ -23,6 +23,7 @@ final class SearchViewModel {
 
     fileprivate struct CachedFeed {
         let allBuckets: [AllSearchBucket]
+        let rawResults: [PreparedResult]
         let results: [PreparedResult]
         let preparedBuckets: [SearchAllBucketData]
         let preparedItems: [SearchResultItemData]
@@ -67,11 +68,15 @@ final class SearchViewModel {
     @ObservationIgnored private var suggestionQueryID: UInt64 = 0
     @ObservationIgnored private var tabCache: [CacheKey: CachedFeed] = [:]
     @ObservationIgnored private var tabCacheOrder: [CacheKey] = []
+    @ObservationIgnored private var rawResults: [PreparedResult] = []
     private static let maxCachedFeeds = 24
 
     init(initialType: SearchType = .all) {
         self.initialType = initialType
         selectedType = initialType
+        LocalContentFilterStore.shared.addObserver(self) { viewModel in
+            viewModel.reapplyContentFilters()
+        }
     }
 
     func loadHotWords() async {
@@ -239,10 +244,20 @@ final class SearchViewModel {
         admission.supersede()
         resultGeneration = admission.generation
         clearSuggestions()
-        submittedQuery = nil; keyword = ""; allBuckets = []; results = []
+        submittedQuery = nil; keyword = ""; allBuckets = []; rawResults = []; results = []
         preparedBuckets = []; preparedItems = []; snapshotRevision &+= 1
         page = 1; reachedEnd = false; isSearching = false; selectedType = initialType
         videoOrder = .totalrank; duration = .all; userOrder = .defaultOrder; articleOrder = .totalrank
+    }
+
+    func reapplyContentFilters() {
+        guard let query = submittedQuery, query.type == .all || query.type == .video else { return }
+        let filtered = rawResults.filter { !Self.shouldHideVideoResult($0) }
+        guard filtered.map(\.id) != results.map(\.id) else { return }
+        results = filtered
+        preparedItems = filtered.map { Self.makeResultData($0, type: query.type) }
+        snapshotRevision &+= 1
+        storeCache(for: query)
     }
 }
 
@@ -390,9 +405,15 @@ private extension SearchViewModel {
             let hadContent = hasResults
             submittedQuery = query
             allBuckets = cached.allBuckets
-            results = cached.results
+            rawResults = cached.rawResults
+            let filteredResults = (query.type == .all || query.type == .video)
+                ? cached.rawResults.filter { !Self.shouldHideVideoResult($0) }
+                : cached.results
+            results = filteredResults
             preparedBuckets = cached.preparedBuckets
-            preparedItems = cached.preparedItems
+            preparedItems = (query.type == .all || query.type == .video)
+                ? filteredResults.map { Self.makeResultData($0, type: query.type) }
+                : cached.preparedItems
             snapshotRevision &+= 1
             page = cached.page
             reachedEnd = cached.reachedEnd
@@ -416,6 +437,7 @@ private extension SearchViewModel {
         page = 1
         reachedEnd = false
         allBuckets = []
+        rawResults = []
         results = []
         preparedBuckets = []
         preparedItems = []
@@ -441,11 +463,13 @@ private extension SearchViewModel {
         let extracted = extractAllBuckets(from: allResult.result ?? [])
         if let hadContent = request.initialHadContent {
             let builtBuckets = buildAllBuckets(from: extracted.byKind, tlist: allResult.topTlist ?? [:])
-            let dedupedVideos = FeedCollectionPolicy.replaceDeduplicated(extracted.videos, id: \.id)
+            let dedupedRawVideos = FeedCollectionPolicy.replaceDeduplicated(extracted.videos, id: \.id)
+            let visibleVideos = dedupedRawVideos.filter { !Self.shouldHideVideoResult($0) }
             allBuckets = builtBuckets
-            results = dedupedVideos
+            rawResults = dedupedRawVideos
+            results = visibleVideos
             preparedBuckets = builtBuckets.map(Self.makeBucketData)
-            preparedItems = dedupedVideos.map { Self.makeResultData($0, type: request.query.type) }
+            preparedItems = visibleVideos.map { Self.makeResultData($0, type: request.query.type) }
             snapshotRevision &+= 1
             page = 2
             reachedEnd = extracted.videos.isEmpty
@@ -457,8 +481,10 @@ private extension SearchViewModel {
             }
             PlayerLog.log("[Search] type=all → \(builtBuckets.count) buckets, \(results.count) videos")
         } else {
+            FeedCollectionPolicy.appendDeduplicated(to: &rawResults, incoming: extracted.videos, id: \.id)
+            let visibleIncoming = extracted.videos.filter { !Self.shouldHideVideoResult($0) }
             let previousCount = results.count
-            FeedCollectionPolicy.appendDeduplicated(to: &results, incoming: extracted.videos, id: \.id)
+            FeedCollectionPolicy.appendDeduplicated(to: &results, incoming: visibleIncoming, id: \.id)
             if results.count > previousCount {
                 preparedItems.append(contentsOf: results[previousCount...].map {
                     Self.makeResultData($0, type: request.query.type)
@@ -513,12 +539,15 @@ private extension SearchViewModel {
 
     func publish(_ result: SearchResult, for request: PreparedRequest) {
         let incoming = (result.result ?? []).map { PreparedResult(item: $0) }
+        let filtersVideo = request.query.type == .all || request.query.type == .video
         if let hadContent = request.initialHadContent {
-            let deduped = FeedCollectionPolicy.replaceDeduplicated(incoming, id: \.id)
+            let dedupedRaw = FeedCollectionPolicy.replaceDeduplicated(incoming, id: \.id)
+            let visible = filtersVideo ? dedupedRaw.filter { !Self.shouldHideVideoResult($0) } : dedupedRaw
             allBuckets = []
-            results = deduped
+            rawResults = dedupedRaw
+            results = visible
             preparedBuckets = []
-            preparedItems = deduped.map { Self.makeResultData($0, type: request.query.type) }
+            preparedItems = visible.map { Self.makeResultData($0, type: request.query.type) }
             snapshotRevision &+= 1
             page = 2
             reachedEnd = incoming.isEmpty
@@ -529,8 +558,10 @@ private extension SearchViewModel {
             }
             PlayerLog.log("[Search] type=\(request.query.type.rawValue) → \(results.count) results")
         } else {
+            FeedCollectionPolicy.appendDeduplicated(to: &rawResults, incoming: incoming, id: \.id)
+            let visibleIncoming = filtersVideo ? incoming.filter { !Self.shouldHideVideoResult($0) } : incoming
             let previousCount = results.count
-            FeedCollectionPolicy.appendDeduplicated(to: &results, incoming: incoming, id: \.id)
+            FeedCollectionPolicy.appendDeduplicated(to: &results, incoming: visibleIncoming, id: \.id)
             if results.count > previousCount {
                 preparedItems.append(contentsOf: results[previousCount...].map {
                     Self.makeResultData($0, type: request.query.type)
@@ -546,6 +577,7 @@ private extension SearchViewModel {
         let key = CacheKey(query: query)
         tabCache[key] = CachedFeed(
             allBuckets: allBuckets,
+            rawResults: rawResults,
             results: results,
             preparedBuckets: preparedBuckets,
             preparedItems: preparedItems,
@@ -557,6 +589,16 @@ private extension SearchViewModel {
         while tabCacheOrder.count > Self.maxCachedFeeds {
             tabCache.removeValue(forKey: tabCacheOrder.removeFirst())
         }
+    }
+
+    static func shouldHideVideoResult(_ prepared: PreparedResult) -> Bool {
+        let item = prepared.item
+        return LocalContentFilterStore.shared.shouldHideVideo(
+            aid: item.aid,
+            bvid: item.bvid,
+            mid: item.mid,
+            title: prepared.displayTitle
+        )
     }
 
     func syncEligibleSuggestions() {
@@ -587,6 +629,7 @@ private extension SearchViewModel {
         switch type {
         case .all, .video:
             let cover = fixScheme(item.pic)
+            let ownerFace = item.uface.map(fixScheme)
             kind = .video(.init(
                 title: result.displayTitle,
                 sources: VideoCoverSources(widescreen: cover),
@@ -596,7 +639,11 @@ private extension SearchViewModel {
                 routeTarget: .make(
                     bvid: item.bvid, aid: item.aid, title: result.displayTitle,
                     coverURL: cover, ownerName: item.author ?? "", durationSeconds: result.durationSeconds
-                )
+                ),
+                aid: item.aid,
+                bvid: item.bvid,
+                ownerMid: item.mid,
+                ownerFace: ownerFace?.isEmpty == false ? ownerFace : nil
             ))
         case .bangumi:
             kind = .bangumi(.init(

@@ -177,5 +177,14 @@ extension RootView {
         .tabViewSidebarHeader {
             accountHeader(selection: selection)
         }
+        .contentFilterUndoToastOverlay(bottomPadding: undoToastBottomPadding)
+    }
+
+    private var undoToastBottomPadding: CGFloat {
+        if showsSidebar {
+            return 24
+        }
+        let hasAccessory = coordinator.clipboardSuggestion != nil || DownloadManager.shared.hasInFlightDownloads
+        return hasAccessory ? 128 : 74
     }
 }

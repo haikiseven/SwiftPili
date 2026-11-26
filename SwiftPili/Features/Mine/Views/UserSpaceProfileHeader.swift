@@ -5,6 +5,7 @@ struct UserSpaceProfileHeader: View {
     let userInfo: UserInfo?
     let showsRelationControls: Bool
     let isBlockedUser: Bool
+    var isLocallyBlocked: Bool = false
     let isFollowing: Bool
     let followInFlight: Bool
     let blockInFlight: Bool
@@ -17,6 +18,7 @@ struct UserSpaceProfileHeader: View {
     var horizontalPadding: CGFloat = AppSpacing.l
     let onToggleFollow: () -> Void
     let onUnblock: () -> Void
+    var onUnblockLocally: (() -> Void)?
     let openFollowing: () -> Void
     let openFollowers: () -> Void
 
@@ -37,6 +39,10 @@ struct UserSpaceProfileHeader: View {
 
             if showsRelationControls, isBlockedUser {
                 blockedBanner
+            }
+
+            if isLocallyBlocked {
+                locallyBlockedBanner
             }
 
             UserSpaceStatsBar(
@@ -182,7 +188,7 @@ struct UserSpaceProfileHeader: View {
         HStack(spacing: AppSpacing.m) {
             HStack(spacing: 6) {
                 Image(systemName: "hand.raised.fill")
-                Text("You've blocked this user")
+                Text("In your Bilibili account blacklist")
             }
             .font(.footnote.weight(.medium))
             .foregroundStyle(.red)
@@ -190,7 +196,7 @@ struct UserSpaceProfileHeader: View {
             Spacer(minLength: AppSpacing.s)
 
             Button(action: onUnblock) {
-                Text("Unblock User")
+                Text("Remove from Bilibili Blacklist")
                     .appFont(.controlLabel)
                     .fontWeight(.semibold)
                     .foregroundStyle(.red)
@@ -209,6 +215,42 @@ struct UserSpaceProfileHeader: View {
         .overlay(
             RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
                 .strokeBorder(Color.red.opacity(0.20), lineWidth: AppStroke.hairlineWidth)
+                .allowsHitTesting(false)
+        )
+    }
+
+    private var locallyBlockedBanner: some View {
+        HStack(spacing: AppSpacing.m) {
+            HStack(spacing: 6) {
+                Image(systemName: "person.slash.fill")
+                Text("Locally blocked on this device")
+            }
+            .font(.footnote.weight(.medium))
+            .foregroundStyle(.orange)
+
+            Spacer(minLength: AppSpacing.s)
+
+            if let onUnblockLocally {
+                Button(action: onUnblockLocally) {
+                    Text("Unblock Locally")
+                        .appFont(.controlLabel)
+                        .fontWeight(.semibold)
+                        .foregroundStyle(.orange)
+                        .padding(.horizontal, AppSpacing.m)
+                        .padding(.vertical, 6)
+                        .background(AppFill.inset, in: Capsule())
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.appControl)
+            }
+        }
+        .padding(.horizontal, AppSpacing.m)
+        .padding(.vertical, AppSpacing.xs)
+        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
+                .strokeBorder(Color.orange.opacity(0.22), lineWidth: AppStroke.hairlineWidth)
                 .allowsHitTesting(false)
         )
     }

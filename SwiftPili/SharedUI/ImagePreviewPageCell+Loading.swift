@@ -13,10 +13,11 @@ extension ImagePreviewPageCell {
     }
 
     func startLoading(url: URL, generation: UInt64) {
-        if ImagePreviewRasterPolicy.isGIF(url) {
-            loadGIF(url: url, generation: generation)
+        let canonicalURL = ImagePreviewRasterPolicy.originalURL(for: url)
+        if ImagePreviewRasterPolicy.isGIF(canonicalURL) {
+            loadGIF(url: canonicalURL, generation: generation)
         } else {
-            loadStill(url: url, generation: generation)
+            loadStill(url: canonicalURL, generation: generation)
         }
     }
 
@@ -29,17 +30,52 @@ extension ImagePreviewPageCell {
         )
     }
 
-    static func validAspect(from size: CGSize?) -> CGFloat? {
+    func upgradeResolutionForZoomIfNeeded() {
+        guard hasFullImage,
+              !hasUpgradedForZoom,
+              let url = currentURL,
+              !ImagePreviewRasterPolicy.isGIF(url),
+              let originalPixels = originalPixelSize else { return }
+        let originalMaxEdge = max(originalPixels.width, originalPixels.height)
+        guard lastDecodedPixelEdge > 0, lastDecodedPixelEdge < originalMaxEdge * 0.99 else { return }
+
+        let baseMax = max(imageView.bounds.width, imageView.bounds.height)
+        guard baseMax.isFinite, baseMax > 0 else { return }
+        let displayedMaxEdgePx = baseMax * scrollView.zoomScale * effectiveDisplayScale
+        guard displayedMaxEdgePx > lastDecodedPixelEdge * 1.1 else { return }
+
+        let targetEdge = ImagePreviewRasterPolicy.zoomedDecodePixelEdge(originalPixelSize: originalPixels)
+        guard targetEdge > lastDecodedPixelEdge * 1.05,
+              targetEdge > lastRequestedPixelEdge * 1.05 else { return }
+
+        hasUpgradedForZoom = true
+        requestFullStill(
+            url: url,
+            pixelEdge: targetEdge,
+            generation: loadGeneration,
+            isResolutionUpgrade: true
+        )
+    }
+
+    static func validPixelSize(from size: CGSize?) -> CGSize? {
         guard let size, size.width.isFinite, size.height.isFinite,
               size.width > 0, size.height > 0 else { return nil }
+        return size
+    }
+
+    static func validPixelSize(from image: UIImage?) -> CGSize? {
+        guard let image else { return nil }
+        return ImagePreviewMetadata.pixelDimensions(of: image)
+    }
+
+    static func validAspect(from size: CGSize?) -> CGFloat? {
+        guard let size = validPixelSize(from: size) else { return nil }
         let ratio = size.width / size.height
         return ratio.isFinite && ratio > 0 ? ratio : nil
     }
 
     static func validAspect(from image: UIImage?) -> CGFloat? {
-        guard let image else { return nil }
-        let size = CGSize(width: image.size.width * image.scale, height: image.size.height * image.scale)
-        return validAspect(from: size)
+        validAspect(from: validPixelSize(from: image))
     }
 }
 
@@ -56,9 +92,15 @@ private extension ImagePreviewPageCell {
                     self.spinner.stopAnimating()
                     self.errorButton.isHidden = true
                     self.imageView.alpha = 1
-                    if let aspect = Self.validAspect(from: value.image) {
-                        self.applyAspect(aspect, authoritative: true, animated: false)
+                    if let gifPixels = Self.validPixelSize(from: value.image) {
+                        self.originalPixelSize = gifPixels
+                        self.lastDecodedPixelEdge = max(gifPixels.width, gifPixels.height)
+                        if let aspect = Self.validAspect(from: gifPixels) {
+                            self.targetMetadataAspect = aspect
+                            self.applyAspect(aspect, authoritative: true, animated: false)
+                        }
                     }
+                    self.updateZoomBoundsForCurrentMetrics()
                 case .failure:
                     self.fullFailed = true
                     self.spinner.stopAnimating()
@@ -70,16 +112,29 @@ private extension ImagePreviewPageCell {
 
     func loadStill(url: URL, generation: UInt64) {
         let viewport = effectiveViewportSize
+        let displayScale = effectiveDisplayScale
         let requestAspect = targetMetadataAspect ?? resolvedAspect
-        let mode = ImagePreviewRasterPolicy.displayMode(url: url, aspect: requestAspect)
-        let target = mode == .reading
-            ? ImagePreviewRasterPolicy.readingTarget(width: viewport.width, aspect: requestAspect)
-            : ImagePreviewRasterPolicy.zoomTarget(size: viewport, aspect: requestAspect)
-        lastRasterEdge = ImagePreviewRasterPolicy.canonicalEdge(target: target)
+        let mode = ImagePreviewRasterPolicy.displayMode(url: url, aspect: requestAspect, viewport: viewport)
+        let initialPixelEdge = ImagePreviewRasterPolicy.initialDecodePixelEdge(
+            originalPixelSize: originalPixelSize,
+            aspect: requestAspect,
+            viewport: viewport,
+            displayScale: displayScale,
+            mode: mode
+        )
+        lastRequestedPixelEdge = initialPixelEdge
 
-        let thumbURL = ImagePreviewRasterPolicy.thumbnailURL(for: url, viewportWidth: viewport.width)
+        let thumbURL = ImagePreviewRasterPolicy.thumbnailURL(
+            for: url,
+            viewportWidth: viewport.width,
+            displayScale: displayScale
+        )
         if thumbURL != url, imageView.image == nil {
-            let thumbOpts = ImagePreviewRasterPolicy.stillOptions(target: target, cacheOriginal: false)
+            let thumbOpts = ImagePreviewRasterPolicy.stillOptions(
+                pixelEdge: initialPixelEdge,
+                displayScale: displayScale,
+                cacheOriginal: false
+            )
             thumbTask = KingfisherManager.shared.retrieveImage(with: thumbURL, options: thumbOpts) { [weak self] res in
                 Task { @MainActor [weak self] in
                     guard let self, self.loadGeneration == generation, !self.hasFullImage else { return }
@@ -98,17 +153,32 @@ private extension ImagePreviewPageCell {
         } else {
             thumbFailed = true
         }
-        requestFullStill(url: url, target: target, generation: generation)
+        requestFullStill(url: url, pixelEdge: initialPixelEdge, generation: generation)
     }
 
-    func requestFullStill(url: URL, target: CGSize, generation: UInt64) {
-        let options = ImagePreviewRasterPolicy.stillOptions(target: target, cacheOriginal: true)
+    func requestFullStill(
+        url: URL,
+        pixelEdge: CGFloat,
+        generation: UInt64,
+        isResolutionUpgrade: Bool = false
+    ) {
+        let displayScale = effectiveDisplayScale
+        let options = ImagePreviewRasterPolicy.stillOptions(
+            pixelEdge: pixelEdge,
+            displayScale: displayScale,
+            cacheOriginal: true
+        )
         let parsed = KingfisherParsedOptionsInfo(options)
+        lastRequestedPixelEdge = max(lastRequestedPixelEdge, pixelEdge)
         fullTask = KingfisherManager.shared.retrieveImage(with: url, options: options) { [weak self] res in
             Task { @MainActor [weak self] in
                 guard let self, self.loadGeneration == generation else { return }
                 switch res {
                 case .success(let value):
+                    if isResolutionUpgrade {
+                        self.commitResolutionUpgrade(value, generation: generation)
+                        return
+                    }
                     if self.defersFullReveal, self.isShowingServerCroppedThumb {
                         self.pendingFullReveal = PendingFullReveal(
                             generation: generation, result: value, options: parsed, url: url
@@ -117,6 +187,7 @@ private extension ImagePreviewPageCell {
                     }
                     self.commitFullStillResult(value, options: parsed, url: url, generation: generation)
                 case .failure:
+                    guard !isResolutionUpgrade else { return }
                     self.fullFailed = true
                     self.updateFailureVisibility()
                 }
@@ -133,6 +204,9 @@ private extension ImagePreviewPageCell {
         isShowingServerCroppedThumb = false
         spinner.stopAnimating()
         errorButton.isHidden = true
+        if let decodedPixels = Self.validPixelSize(from: value.image) {
+            lastDecodedPixelEdge = max(lastDecodedPixelEdge, max(decodedPixels.width, decodedPixels.height))
+        }
 
         let newAspect = targetMetadataAspect ?? Self.validAspect(from: value.image)
         let aspectDiffers = newAspect.flatMap { next in
@@ -167,7 +241,18 @@ private extension ImagePreviewPageCell {
             imageView.image = value.image
             imageView.alpha = 1
         }
+        updateZoomBoundsForCurrentMetrics()
         resolveOriginalMetadata(result: value, options: options, url: url, generation: generation)
+    }
+
+    func commitResolutionUpgrade(_ value: RetrieveImageResult, generation: UInt64) {
+        guard loadGeneration == generation else { return }
+        if let decodedPixels = Self.validPixelSize(from: value.image) {
+            lastDecodedPixelEdge = max(lastDecodedPixelEdge, max(decodedPixels.width, decodedPixels.height))
+        }
+        imageView.image = value.image
+        imageView.alpha = 1
+        upgradeResolutionForZoomIfNeeded()
     }
 
     func installInitialImage(_ image: UIImage) {
@@ -191,19 +276,41 @@ private extension ImagePreviewPageCell {
         metadataTask = Task { [weak self] in
             let originalSize = await ImagePreviewMetadata.originalSize(result: result, options: options)
             guard !Task.isCancelled, let self, self.loadGeneration == generation else { return }
-            let aspect = Self.validAspect(from: originalSize) ?? Self.validAspect(from: result.image)
-            guard let aspect else { return }
+            let resolvedPixels = Self.validPixelSize(from: originalSize)
+                ?? self.originalPixelSize
+                ?? Self.validPixelSize(from: result.image)
+            guard let resolvedPixels, let aspect = Self.validAspect(from: resolvedPixels) else { return }
+
+            self.originalPixelSize = resolvedPixels
             self.targetMetadataAspect = aspect
             self.applyAspect(aspect, authoritative: true, animated: true)
-            let mode = ImagePreviewRasterPolicy.displayMode(url: url, aspect: aspect)
-            guard mode == .reading else { return }
-            let readingTarget = ImagePreviewRasterPolicy.readingTarget(
-                width: self.effectiveViewportSize.width, aspect: aspect
+            self.updateZoomBoundsForCurrentMetrics()
+
+            let viewport = self.effectiveViewportSize
+            let mode = ImagePreviewRasterPolicy.displayMode(url: url, aspect: aspect, viewport: viewport)
+            let desiredInitialEdge = ImagePreviewRasterPolicy.initialDecodePixelEdge(
+                originalPixelSize: resolvedPixels,
+                aspect: aspect,
+                viewport: viewport,
+                displayScale: self.effectiveDisplayScale,
+                mode: mode
             )
-            let neededEdge = ImagePreviewRasterPolicy.canonicalEdge(target: readingTarget)
-            if neededEdge > self.lastRasterEdge * 1.15 {
-                self.lastRasterEdge = neededEdge
-                self.requestFullStill(url: url, target: readingTarget, generation: generation)
+            let originalMaxEdge = max(resolvedPixels.width, resolvedPixels.height)
+            let decodedMaxEdge = max(
+                self.lastDecodedPixelEdge,
+                Self.validPixelSize(from: result.image).map { max($0.width, $0.height) } ?? 0
+            )
+            if desiredInitialEdge > decodedMaxEdge * 1.05,
+               desiredInitialEdge > self.lastRequestedPixelEdge * 1.05,
+               decodedMaxEdge < originalMaxEdge * 0.99 {
+                self.requestFullStill(
+                    url: url,
+                    pixelEdge: desiredInitialEdge,
+                    generation: generation,
+                    isResolutionUpgrade: true
+                )
+            } else {
+                self.upgradeResolutionForZoomIfNeeded()
             }
         }
     }
@@ -225,7 +332,8 @@ private extension ImagePreviewPageCell {
             onComplete?()
             return
         }
-        let preserveUserPose = scrollView.zoomScale > 1.02 || scrollView.contentOffset.y > 4
+        let preserveUserPose = scrollView.zoomScale > scrollView.minimumZoomScale + 0.02
+            || scrollView.contentOffset.y > 4
         layoutImageContent(
             resetZoom: !preserveUserPose,
             animated: animated && !preserveUserPose,

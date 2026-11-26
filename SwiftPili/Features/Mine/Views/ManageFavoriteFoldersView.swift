@@ -26,12 +26,18 @@ struct ManageFavoriteFoldersView: View {
                     Task { await sort(ids: ids) }
                 },
                 onRequestDelete: { folder in
+                    guard !folder.isDefault else { return }
                     pendingDelete = folder
                 }
             )
             .readableFormWidth(.ambientBrowse)
             .navigationTitle("Manage Folders")
             .navigationBarTitleDisplayMode(.inline)
+            .overlay {
+                if folders.isEmpty {
+                    ContentUnavailableView("No Folders", systemImage: "folder")
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("Done") { dismiss() }
@@ -89,6 +95,7 @@ struct ManageFavoriteFoldersView: View {
     }
 
     private func delete(_ folder: FavoriteFolderResult.FavoriteFolder) {
+        guard !folder.isDefault else { return }
         run {
             try await UserAPI.deleteFavoriteFolder(mediaId: folder.id)
         }
@@ -98,7 +105,7 @@ struct ManageFavoriteFoldersView: View {
         do {
             try await UserAPI.sortFavoriteFolders(orderedIds: ids)
         } catch {
-            errorText = "\(error)"
+            errorText = error.localizedDescription
             await resync()
         }
     }
@@ -109,7 +116,7 @@ struct ManageFavoriteFoldersView: View {
             do {
                 try await mutation()
             } catch {
-                errorText = "\(error)"
+                errorText = error.localizedDescription
             }
             await resync()
             isWorking = false
@@ -169,7 +176,8 @@ private final class ManageFavoriteFoldersController: UIKitBaseCollectionViewCont
         config.trailingSwipeActionsConfigurationProvider = { [weak self] indexPath in
             guard let self, !isDisabled,
                   let id = dataSource?.itemIdentifier(for: indexPath),
-                  let folder = folderByID[id] else {
+                  let folder = folderByID[id],
+                  !folder.isDefault else {
                 return nil
             }
             let action = UIContextualAction(
@@ -200,8 +208,8 @@ private final class ManageFavoriteFoldersController: UIKitBaseCollectionViewCont
         isDisabled = config.isDisabled
         collectionView.isUserInteractionEnabled = !config.isDisabled
 
-        let changed = config.folders.map { "\($0.id):\($0.title):\($0.mediaCount ?? -1)" }
-            != folders.map { "\($0.id):\($0.title):\($0.mediaCount ?? -1)" }
+        let changed = config.folders.map { "\($0.id):\($0.title):\($0.mediaCount ?? -1):\($0.attr ?? -1)" }
+            != folders.map { "\($0.id):\($0.title):\($0.mediaCount ?? -1):\($0.attr ?? -1)" }
         guard changed else { return }
 
         folders = config.folders
@@ -252,6 +260,9 @@ private final class ManageFavoriteFoldersController: UIKitBaseCollectionViewCont
 private final class ManageFolderListCell: UICollectionViewListCell {
     private let folderIcon = UIKitFolderIconView(size: 24)
     private let titleLabel = UILabel()
+    private let privateIconView = UIImageView(image: UIImage(systemName: "lock.fill"))
+    private let defaultPill = UIView()
+    private let defaultLabel = UILabel()
     private let countLabel = UILabel()
 
     override init(frame: CGRect) {
@@ -272,7 +283,7 @@ private final class ManageFolderListCell: UICollectionViewListCell {
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.axis = .horizontal
         stack.alignment = .center
-        stack.spacing = 10
+        stack.spacing = 8
         contentView.addSubview(stack)
 
         titleLabel.numberOfLines = 1
@@ -280,6 +291,33 @@ private final class ManageFolderListCell: UICollectionViewListCell {
         titleLabel.textColor = .label
         titleLabel.adjustsFontForContentSizeCategory = true
         titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        privateIconView.tintColor = .secondaryLabel
+        privateIconView.contentMode = .scaleAspectFit
+        privateIconView.isHidden = true
+        privateIconView.setContentCompressionResistancePriority(.required, for: .horizontal)
+        privateIconView.setContentHuggingPriority(.required, for: .horizontal)
+
+        defaultPill.backgroundColor = .tertiarySystemFill
+        defaultPill.layer.cornerCurve = .continuous
+        defaultPill.isHidden = true
+        defaultLabel.translatesAutoresizingMaskIntoConstraints = false
+        defaultLabel.text = String(localized: "Default")
+        defaultLabel.textColor = .secondaryLabel
+        defaultLabel.numberOfLines = 1
+        defaultLabel.adjustsFontForContentSizeCategory = true
+        defaultLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        defaultLabel.setContentHuggingPriority(.required, for: .horizontal)
+        defaultPill.addSubview(defaultLabel)
+        NSLayoutConstraint.activate([
+            defaultLabel.topAnchor.constraint(equalTo: defaultPill.topAnchor, constant: 2),
+            defaultLabel.bottomAnchor.constraint(equalTo: defaultPill.bottomAnchor, constant: -2),
+            defaultLabel.leadingAnchor.constraint(equalTo: defaultPill.leadingAnchor, constant: 6),
+            defaultLabel.trailingAnchor.constraint(equalTo: defaultPill.trailingAnchor, constant: -6),
+        ])
+
+        let spacer = UIView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         countLabel.numberOfLines = 1
         countLabel.textColor = .tertiaryLabel
@@ -289,6 +327,9 @@ private final class ManageFolderListCell: UICollectionViewListCell {
 
         stack.addArrangedSubview(folderIcon)
         stack.addArrangedSubview(titleLabel)
+        stack.addArrangedSubview(privateIconView)
+        stack.addArrangedSubview(defaultPill)
+        stack.addArrangedSubview(spacer)
         stack.addArrangedSubview(countLabel)
 
         NSLayoutConstraint.activate([
@@ -302,8 +343,23 @@ private final class ManageFolderListCell: UICollectionViewListCell {
 
     func configure(folder: FavoriteFolderResult.FavoriteFolder) {
         let traits = traitCollection
+        folderIcon.refreshAccent()
         titleLabel.text = folder.title
         titleLabel.font = UIKitFeedFont.systemFont(textStyle: .body, traitCollection: traits)
+
+        privateIconView.isHidden = !folder.isPrivate
+        if folder.isPrivate {
+            privateIconView.preferredSymbolConfiguration = UIImage.SymbolConfiguration(
+                font: UIKitFeedFont.systemFont(textStyle: .caption2, weight: .semibold, traitCollection: traits)
+            )
+        }
+
+        defaultPill.isHidden = !folder.isDefault
+        if folder.isDefault {
+            defaultLabel.font = UIKitFeedFont.systemFont(textStyle: .caption2, weight: .medium, traitCollection: traits)
+            defaultPill.layer.cornerRadius = ceil(defaultLabel.font.lineHeight + 4) / 2
+        }
+
         if let count = folder.mediaCount {
             countLabel.isHidden = false
             countLabel.text = "\(count)"

@@ -487,6 +487,7 @@ private struct LinkAwareTapModifier: ViewModifier {
             .environment(\.linkAwareTapScope, scope)
             .environment(\.openURL, OpenURLAction { url in
                 scope.claimFromDescendant()
+                if EmoteText.handleSeekURL(url) { return .handled }
                 openURL(url)
                 return .handled
             })
@@ -649,6 +650,8 @@ struct EmoteText: View {
 
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.displayScale) private var displayScale
+    @Environment(\.openURL) private var openURL
+    @Environment(\.linkAwareTapScope) private var linkAwareTapScope
     @State private var rendered: Text?
     @State private var fallbackMemo = EmoteTextFallbackMemo()
     @State private var residentMemo = EmoteTextResidentMemo<RenderKey>()
@@ -748,6 +751,14 @@ struct EmoteText: View {
                 text.fixedSize(horizontal: false, vertical: true)
             }
         }
+        .environment(\.openURL, OpenURLAction { url in
+            if Self.handleSeekURL(url) {
+                linkAwareTapScope?.claimFromDescendant()
+                return .handled
+            }
+            openURL(url)
+            return .handled
+        })
         .task(id: key) {
             guard !Task.isCancelled else { return }
             guard !inputs.emotes.isEmpty else {
@@ -895,7 +906,7 @@ struct EmoteText: View {
     }
 
     nonisolated private static let timestampRegex = try? NSRegularExpression(
-        pattern: "(?<![0-9:])([0-9]{1,2}):([0-5][0-9])(?::([0-5][0-9]))?(?![0-9:])"
+        pattern: "(?<![A-Za-z0-9:.])(?:([0-9]{1,2}):([0-5][0-9]):([0-5][0-9])|([0-5]?[0-9]):([0-5][0-9]))(?![A-Za-z0-9:]|\\.[0-9])"
     )
 
     nonisolated private static let timestampCache = OSAllocatedUnfairLock(
@@ -922,16 +933,18 @@ struct EmoteText: View {
         let ns = text as NSString
         for match in regex.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
             let token = ns.substring(with: match.range)
-            let first = Int(ns.substring(with: match.range(at: 1))) ?? 0
-            let second = Int(ns.substring(with: match.range(at: 2))) ?? 0
             let seconds: Int
-            if match.range(at: 3).location != NSNotFound {
-                let third = Int(ns.substring(with: match.range(at: 3))) ?? 0
-                seconds = first * 3600 + second * 60 + third
+            if match.range(at: 1).location != NSNotFound {
+                let hours = Int(ns.substring(with: match.range(at: 1))) ?? 0
+                let minutes = Int(ns.substring(with: match.range(at: 2))) ?? 0
+                let secs = Int(ns.substring(with: match.range(at: 3))) ?? 0
+                seconds = hours * 3600 + minutes * 60 + secs
             } else {
-                seconds = first * 60 + second
+                let minutes = Int(ns.substring(with: match.range(at: 4))) ?? 0
+                let secs = Int(ns.substring(with: match.range(at: 5))) ?? 0
+                seconds = minutes * 60 + secs
             }
-            found[token] = URL(string: "swiftpili://seek/\(seconds)")
+            found[token] = URL(string: "swiftpili://seek?t=\(seconds)")
         }
         let links = found
         timestampCache.withLock {
@@ -939,6 +952,48 @@ struct EmoteText: View {
             $0[text] = links
         }
         return links
+    }
+
+    nonisolated static func seekSeconds(from url: URL) -> TimeInterval? {
+        guard url.scheme?.lowercased() == "swiftpili",
+              url.host()?.lowercased() == "seek" else { return nil }
+        if let rawQuery = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .first(where: { $0.name == "t" })?
+            .value,
+           let seconds = Double(rawQuery),
+           seconds.isFinite,
+           seconds >= 0 {
+            return seconds
+        }
+        let last = url.lastPathComponent
+        if !last.isEmpty, last != "/",
+           let seconds = Double(last),
+           seconds.isFinite,
+           seconds >= 0 {
+            return seconds
+        }
+        return nil
+    }
+
+    @MainActor
+    @discardableResult
+    static func handleSeekURL(_ url: URL) -> Bool {
+        guard let seconds = seekSeconds(from: url) else { return false }
+        if let player = PlayerViewModel.existingShared,
+           player.mode.isSeekable,
+           player.currentURL != nil,
+           player.duration <= 0 || seconds <= player.duration {
+            PlayerLog.log("[Player] timestamp tapped → seek \(Int(seconds))s")
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            player.seek(to: seconds)
+            if !player.isPlaying {
+                player.play()
+            }
+        } else {
+            PlayerLog.log("[Player] timestamp ignored (no seekable playback or out of range)")
+        }
+        return true
     }
 
     struct LinkRun: Equatable, Sendable {

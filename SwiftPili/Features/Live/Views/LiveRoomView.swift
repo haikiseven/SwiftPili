@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 
 struct LiveRoomView: View {
+    @AppMotion private var motion
     let roomID: Int
     @State private var routePosition: PlayerRoutePosition?
 
@@ -111,9 +112,13 @@ struct LiveRoomView: View {
                 isRoomOffline: isRoomOffline
             ).playerSize.height
         }
-        return DetailPlayerGeometry.videoHeight(
-            containerWidth: containerWidth, primaryColumnWidth: nil,
-            isPortraitContent: pageIsPortraitContent, isCondensed: playerShapeIsCurrent && player.inlineCondensed
+        return DetailPlayerGeometry.expandedVideoHeight(
+            containerWidth: containerWidth,
+            primaryColumnWidth: nil,
+            containerHeight: boxHeight,
+            topSafeArea: keyWindowSafeAreaInsets?.top ?? 0,
+            videoAspectRatio: playerShapeIsCurrent ? player.videoAspectRatio : nil,
+            isPortraitFallback: pageIsPortraitContent
         )
     }
 
@@ -384,6 +389,14 @@ struct LiveRoomView: View {
         let chatHeight = max(minimumChatHeight, companionViewport - companionReservation)
         let minimumCompanionHeight = companionReservation + minimumChatHeight
         let needsOuterScroll = !isImmersive && playerHeight + minimumCompanionHeight > viewportHeight
+        let liveAspectKey = (playerShapeIsCurrent ? DetailPlayerGeometry.normalizedAspect(player.videoAspectRatio) : nil)
+            .map { Int(($0 * 100).rounded()) }
+        let liveAspectAnimation: Animation? = (!isImmersive
+            && !usesWideCompanionLayout
+            && !player.isFullscreenPresentationActive
+            && !player.isFullscreen)
+            ? motion.animation(normal: .snappy(duration: 0.22))
+            : nil
         return ScrollView(needsOuterScroll ? .vertical : []) {
             VStack(alignment: .leading, spacing: 0) {
                 ScrollView([]) {
@@ -441,6 +454,7 @@ struct LiveRoomView: View {
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
         .scrollIndicators(.hidden)
+        .animation(liveAspectAnimation, value: liveAspectKey)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 

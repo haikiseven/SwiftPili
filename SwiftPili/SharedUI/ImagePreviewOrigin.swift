@@ -44,9 +44,15 @@ import UIKit
         url: URL,
         tileImage: UIImage?,
         viewportSize: CGSize,
-        pixelSize: CGSize?
+        pixelSize: CGSize?,
+        displayScale: CGFloat? = nil
     ) -> (image: UIImage?, isServerCropped: Bool) {
-        if let cachedFull = cachedUncroppedImage(for: url, viewportSize: viewportSize, pixelSize: pixelSize) {
+        if let cachedFull = cachedUncroppedImage(
+            for: url,
+            viewportSize: viewportSize,
+            pixelSize: pixelSize,
+            displayScale: displayScale
+        ) {
             return (cachedFull, false)
         }
         guard let tileImage else { return (nil, false) }
@@ -54,25 +60,62 @@ import UIKit
     }
 
     static func cachedUncroppedImage(
-        for url: URL, viewportSize: CGSize, pixelSize: CGSize?
+        for url: URL,
+        viewportSize: CGSize,
+        pixelSize: CGSize?,
+        displayScale: CGFloat? = nil
     ) -> UIImage? {
         let cache = KingfisherManager.shared.cache
-        let aspect = validAspect(from: pixelSize)
-        let mode = ImagePreviewRasterPolicy.displayMode(url: url, aspect: aspect)
-        let target = mode == .reading
-            ? ImagePreviewRasterPolicy.readingTarget(width: viewportSize.width, aspect: aspect)
-            : ImagePreviewRasterPolicy.zoomTarget(size: viewportSize, aspect: aspect)
-        let processedOpts = KingfisherParsedOptionsInfo([
-            .processor(ImagePreviewRasterPolicy.fullProcessor(target: target))
-        ])
-        if let processed = cache.retrieveImageInMemoryCache(forKey: url.cacheKey, options: processedOpts) {
+        let canonicalURL = ImagePreviewRasterPolicy.originalURL(for: url)
+        let scale = resolvedDisplayScale(displayScale)
+        let validPixels = validSize(pixelSize)
+        let aspect = validAspect(from: validPixels)
+        let mode = ImagePreviewRasterPolicy.displayMode(
+            url: canonicalURL,
+            aspect: aspect,
+            viewport: viewportSize
+        )
+        let pixelEdge = ImagePreviewRasterPolicy.initialDecodePixelEdge(
+            originalPixelSize: validPixels,
+            aspect: aspect,
+            viewport: viewportSize,
+            displayScale: scale,
+            mode: mode
+        )
+        if let validPixels {
+            let zoomedEdge = ImagePreviewRasterPolicy.zoomedDecodePixelEdge(originalPixelSize: validPixels)
+            if zoomedEdge > pixelEdge * 1.05 {
+                let zoomedOpts = KingfisherParsedOptionsInfo(
+                    ImagePreviewRasterPolicy.stillOptions(
+                        pixelEdge: zoomedEdge,
+                        displayScale: scale,
+                        cacheOriginal: false
+                    )
+                )
+                if let zoomed = cache.retrieveImageInMemoryCache(forKey: canonicalURL.cacheKey, options: zoomedOpts) {
+                    return zoomed
+                }
+            }
+        }
+        let processedOpts = KingfisherParsedOptionsInfo(
+            ImagePreviewRasterPolicy.stillOptions(
+                pixelEdge: pixelEdge,
+                displayScale: scale,
+                cacheOriginal: false
+            )
+        )
+        if let processed = cache.retrieveImageInMemoryCache(forKey: canonicalURL.cacheKey, options: processedOpts) {
             return processed
         }
-        if let original = cache.retrieveImageInMemoryCache(forKey: url.cacheKey) {
+        if let original = cache.retrieveImageInMemoryCache(forKey: canonicalURL.cacheKey) {
             return original
         }
-        let thumbURL = ImagePreviewRasterPolicy.thumbnailURL(for: url, viewportWidth: viewportSize.width)
-        if thumbURL != url,
+        let thumbURL = ImagePreviewRasterPolicy.thumbnailURL(
+            for: canonicalURL,
+            viewportWidth: viewportSize.width,
+            displayScale: scale
+        )
+        if thumbURL != canonicalURL,
            let thumb = cache.retrieveImageInMemoryCache(forKey: thumbURL.cacheKey, options: processedOpts)
             ?? cache.retrieveImageInMemoryCache(forKey: thumbURL.cacheKey) {
             return thumb
@@ -82,16 +125,35 @@ import UIKit
 
     static func detectsServerCrop(tileImage: UIImage, pixelSize: CGSize?) -> Bool {
         guard let fullAspect = validAspect(from: pixelSize),
-              let thumbAspect = validAspect(from: CGSize(
-                width: tileImage.size.width * tileImage.scale,
-                height: tileImage.size.height * tileImage.scale
-              )) else { return false }
+              let thumbAspect = validAspect(from: ImagePreviewMetadata.pixelDimensions(of: tileImage)) else {
+            return false
+        }
         return abs(thumbAspect / fullAspect - 1) > 0.05
     }
 
-    private static func validAspect(from size: CGSize?) -> CGFloat? {
+    private static func resolvedDisplayScale(_ displayScale: CGFloat?) -> CGFloat {
+        if let displayScale, displayScale.isFinite, displayScale > 0 {
+            return displayScale
+        }
+        if let window = AppWindowMetrics.current {
+            let traitScale = window.traitCollection.displayScale
+            if traitScale.isFinite, traitScale > 0 { return traitScale }
+            if let sceneScale = window.windowScene?.screen.scale, sceneScale.isFinite, sceneScale > 0 {
+                return sceneScale
+            }
+        }
+        let currentScale = UITraitCollection.current.displayScale
+        return currentScale.isFinite && currentScale > 0 ? currentScale : 2
+    }
+
+    private static func validSize(_ size: CGSize?) -> CGSize? {
         guard let size, size.width.isFinite, size.height.isFinite,
               size.width > 0, size.height > 0 else { return nil }
+        return size
+    }
+
+    private static func validAspect(from size: CGSize?) -> CGFloat? {
+        guard let size = validSize(size) else { return nil }
         let ratio = size.width / size.height
         return ratio.isFinite && ratio > 0 ? ratio : nil
     }
@@ -166,11 +228,15 @@ import UIKit
         let radius = (anchor.cornerRadius * scale).isFinite ? max(0, anchor.cornerRadius * scale) : 0
         let pixels = validPixelSize(anchor.pixelSize)
         let recorded = loadedThumbnails[index].flatMap { $0.url == urls[index] ? $0.image : nil }
+        let windowScale: CGFloat? = window.traitCollection.displayScale > 0
+            ? window.traitCollection.displayScale
+            : window.windowScene?.screen.scale
         let resolved = ImagePreviewMemoryLookup.resolveOpeningImage(
             url: urls[index],
             tileImage: recorded,
             viewportSize: window.bounds.size,
-            pixelSize: pixels
+            pixelSize: pixels,
+            displayScale: windowScale
         )
         return ImagePreviewSourceSnapshot(
             frameInWindow: rects.frame,

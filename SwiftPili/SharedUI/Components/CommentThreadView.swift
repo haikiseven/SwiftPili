@@ -61,6 +61,9 @@ struct CommentThreadView: View {
         accentedBody.accentContentBoundary()
             .contentLinks()
             .appNoticeOverlay(bottomPadding: 64)
+            .contentFilterUndoToastOverlay(
+                bottomPadding: (AuthManager.shared.isLoggedIn && oid > 0 && !thread.commentsClosed) ? 92 : 24
+            )
     }
 
     @ViewBuilder
@@ -68,7 +71,21 @@ struct CommentThreadView: View {
         let composer = composerCapture
         let listReceipt = thread.listReceipt
         let headerItems = threadHeaderItems(composer: composer)
-        let visibleReplies = CommentAIFilterEngine.shared.visibleComments(from: thread.replies, upMid: upMid)
+        let filterStore = LocalContentFilterStore.shared
+        let _ = (
+            filterStore.revision,
+            filterStore.collapseFilteredComments,
+            BlocklistManager.shared.isEnabled,
+            BlocklistManager.shared.blockedMids.count
+        )
+        let visibleReplies = CommentAIFilterEngine.shared
+            .visibleComments(from: thread.replies, upMid: upMid)
+            .filter {
+                !filterStore.shouldHideCommentCompletely(
+                    mid: $0.mid,
+                    content: $0.content.displayMessage
+                )
+            }
         let replyItems = visibleReplies.map { reply in
             UIKitCommentFeedItem(
                 comment: reply,
@@ -486,6 +503,7 @@ private struct CommentThreadRootRow: View {
             comment: comment,
             upMid: upMid,
             showsInlineReplies: false,
+            bypassContentFilter: true,
             onReply: onReply,
             onImageTap: onImageTap,
             onAvatarTap: onAvatarTap
@@ -506,8 +524,14 @@ private struct CommentThreadReplyRow: View {
 
     @State private var actionState = CommentActionState()
 
+    private var replyAction: ((CommentResult.CommentItem) -> Void)? {
+        guard AuthManager.shared.isLoggedIn, !commentsClosed, let onBeginReply else { return nil }
+        return { _ in onBeginReply() }
+    }
+
     var body: some View {
-        BlockedCollapsible(mid: reply.mid, uname: reply.member.uname) {
+        let _ = actionState.syncReplyHandler(replyAction)
+        ContentFilterCommentRowContainer(comment: reply) {
             CommentAIFilterRowContainer(comment: reply, upMid: upMid) { aiAssessment, onInspectAI in
                 rowBody(aiAssessment: aiAssessment, onInspectAI: onInspectAI)
             }
@@ -555,7 +579,8 @@ private struct CommentThreadReplyRow: View {
                 }
 
                 HStack(spacing: 20) {
-                    CommentLikeButton(comment: reply)
+                    CommentLikeButton(comment: reply, state: actionState)
+                    CommentDislikeButton(comment: reply, state: actionState)
                     if AuthManager.shared.isLoggedIn, !commentsClosed, let onBeginReply {
                         CommentReplyActionButton(action: onBeginReply)
                     }
@@ -563,7 +588,7 @@ private struct CommentThreadReplyRow: View {
                 }
             }
         }
-        .commentContextActions(reply, state: actionState, onDelete: onDelete)
+        .commentContextActions(reply, state: actionState, onReply: replyAction, onDelete: onDelete)
     }
 }
 

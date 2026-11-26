@@ -13,6 +13,8 @@ struct HomeFeedCollectionView<Item: Identifiable>: View {
     let viewCount: (Item) -> Int
     var rank: (Item) -> Int? = { _ in nil }
     let routeTarget: (Item) -> VideoRouteTarget?
+    var ownerMid: (Item) -> Int? = { _ in nil }
+    var ownerFace: (Item) -> String? = { _ in nil }
     var fixedLayoutMode: HomeLayoutMode?
     var placeholderCount = 0
     var placeholderLabel = ""
@@ -78,7 +80,9 @@ struct HomeFeedCollectionView<Item: Identifiable>: View {
             ownerName: ownerName(item),
             viewCount: viewCount(item),
             rank: rank(item),
-            routeTarget: routeTarget(item)
+            routeTarget: routeTarget(item),
+            ownerMid: ownerMid(item),
+            ownerFace: ownerFace(item)
         )
     }
 }

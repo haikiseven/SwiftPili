@@ -355,8 +355,9 @@ struct LiveRoomInfoBarView: View {
                             textStyle: AnyShapeStyle(HierarchicalShapeStyle.secondary),
                             separatorStyle: AnyShapeStyle(HierarchicalShapeStyle.tertiary)
                         )
-                        Text("·")
-                            .foregroundStyle(.tertiary)
+                        Divider()
+                            .frame(height: 10)
+                            .accessibilityHidden(true)
                     }
                     HStack(spacing: 4) {
                         Image(systemName: "eye")

@@ -35,6 +35,34 @@ struct SearchResultItemData: Identifiable, Equatable, Sendable {
         let author: String
         let playCount: Int
         let routeTarget: VideoRouteTarget?
+        var aid: Int?
+        var bvid: String?
+        var ownerMid: Int?
+        var ownerFace: String?
+
+        init(
+            title: String,
+            sources: VideoCoverSources,
+            durationSeconds: Int,
+            author: String,
+            playCount: Int,
+            routeTarget: VideoRouteTarget?,
+            aid: Int? = nil,
+            bvid: String? = nil,
+            ownerMid: Int? = nil,
+            ownerFace: String? = nil
+        ) {
+            self.title = title
+            self.sources = sources
+            self.durationSeconds = durationSeconds
+            self.author = author
+            self.playCount = playCount
+            self.routeTarget = routeTarget
+            self.aid = aid
+            self.bvid = bvid
+            self.ownerMid = ownerMid
+            self.ownerFace = ownerFace
+        }
     }
 
     struct BangumiPayload: Equatable, Sendable {
@@ -305,6 +333,37 @@ final class SearchResultsCollectionViewController: UIKitBaseCollectionViewContro
     override func didSelectItem(at indexPath: IndexPath) {
         guard let actions, actions.isCurrentResult(generation), let item = item(at: indexPath) else { return }
         routeSelection(for: item.kind, actions: actions)
+    }
+
+    @objc func collectionView(
+        _ collectionView: UICollectionView,
+        contextMenuConfigurationForItemsAt indexPaths: [IndexPath],
+        point: CGPoint
+    ) -> UIContextMenuConfiguration? {
+        guard let indexPath = indexPaths.first,
+              let item = item(at: indexPath),
+              case .video(let payload) = item.kind else {
+            return nil
+        }
+        let resolvedAID: Int? = {
+            if let aid = payload.aid, aid > 0 { return aid }
+            if case .aid(let aid) = payload.routeTarget?.videoID, aid > 0 { return aid }
+            return nil
+        }()
+        let resolvedBVID: String? = {
+            if let bvid = payload.bvid, !bvid.isEmpty { return bvid }
+            if case .bvid(let bvid) = payload.routeTarget?.videoID, !bvid.isEmpty { return bvid }
+            return nil
+        }()
+        let target = VideoCardContextMenuTarget(
+            aid: resolvedAID,
+            bvid: resolvedBVID,
+            title: payload.title,
+            ownerMid: payload.ownerMid,
+            ownerName: payload.author,
+            ownerFace: payload.ownerFace
+        )
+        return VideoCardContextMenuBuilder.configuration(for: target)
     }
 
     private func routeSelection(for kind: SearchResultItemData.Kind, actions: SearchResultsActions) {

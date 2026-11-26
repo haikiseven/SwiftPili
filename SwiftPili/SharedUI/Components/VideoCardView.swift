@@ -99,21 +99,33 @@ struct VideoNavigationButton<Label: View>: View {
     let target: VideoRouteTarget?
     var isCurrent: () -> Bool = { true }
     var anchorMode: ZoomSourceBindingMode = .childAnchor
+    var usesZoomTransition = true
     @ViewBuilder var label: () -> Label
     @Environment(AppCoordinator.self) private var coordinator
 
     var body: some View {
-        ZoomSourceButton(
-            id: target?.videoID,
-            isEnabled: target != nil,
-            anchorMode: anchorMode,
-            isCurrent: isCurrent,
-            open: { zoom in
-                guard let target else { return }
-                coordinator.navigateToVideo(zoom.id.map(target.opening(from:)) ?? target)
-            },
-            label: label
-        )
+        if usesZoomTransition {
+            ZoomSourceButton(
+                id: target?.videoID,
+                isEnabled: target != nil,
+                anchorMode: anchorMode,
+                isCurrent: isCurrent,
+                open: { zoom in
+                    guard let target else { return }
+                    coordinator.navigateToVideo(zoom.id.map(target.opening(from:)) ?? target)
+                },
+                label: label
+            )
+        } else {
+            Button {
+                guard isCurrent(), let target else { return }
+                coordinator.navigateToVideo(target.withoutZoom)
+            } label: {
+                label()
+            }
+            .buttonStyle(.plain)
+            .disabled(target == nil)
+        }
     }
 }
 

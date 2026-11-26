@@ -50,47 +50,62 @@ struct CinematicBackdrop: View {
                                     .frame(width: proxy.size.width, height: envelope.height)
                                     .clipped()
                             }
-                            .mask(
-                                    LinearGradient(
-                                        stops: [
-                                            .init(color: .white.opacity(0.76), location: 0.0),
-                                            .init(
-                                                color: .white.opacity(0.96),
-                                                location: envelope.playerTopFraction
-                                            ),
-                                            .init(
-                                                color: .white.opacity(0.92),
-                                                location: envelope.playerBottomFraction
-                                            ),
-                                            .init(
-                                                color: .white.opacity(0.46),
-                                                location: envelope.midBleedFraction
-                                            ),
-                                            .init(color: .white.opacity(0.14), location: 0.88),
-                                            .init(color: .clear, location: 1.0)
-                                        ],
-                                        startPoint: .top,
-                                        endPoint: .bottom
+                            .mask {
+                                Canvas { context, size in
+                                    let rect = CGRect(origin: .zero, size: size)
+                                    let path = Path(rect)
+                                    context.fill(
+                                        path,
+                                        with: .linearGradient(
+                                            Gradient(stops: [
+                                                .init(color: .white.opacity(0.76), location: 0.0),
+                                                .init(
+                                                    color: .white.opacity(0.96),
+                                                    location: envelope.playerTopFraction
+                                                ),
+                                                .init(
+                                                    color: .white.opacity(0.92),
+                                                    location: envelope.playerBottomFraction
+                                                ),
+                                                .init(
+                                                    color: .white.opacity(0.46),
+                                                    location: envelope.midBleedFraction
+                                                ),
+                                                .init(color: .white.opacity(0.14), location: 0.88),
+                                                .init(color: .clear, location: 1.0)
+                                            ]),
+                                            startPoint: CGPoint(x: size.width * 0.5, y: 0),
+                                            endPoint: CGPoint(x: size.width * 0.5, y: size.height)
+                                        )
                                     )
-                                )
-                                .mask(
-                                    RadialGradient(
-                                        stops: [
-                                            .init(color: .white, location: 0.0),
-                                            .init(color: .white.opacity(0.92), location: 0.62),
-                                            .init(color: .white.opacity(0.48), location: 0.88),
-                                            .init(color: .clear, location: 1.0)
-                                        ],
-                                        center: UnitPoint(x: 0.5, y: envelope.playerCenterFraction),
-                                        startRadius: 12,
-                                        endRadius: max(proxy.size.width * 0.78, envelope.height * 0.65)
+                                    context.blendMode = .destinationIn
+                                    context.fill(
+                                        path,
+                                        with: .radialGradient(
+                                            Gradient(stops: [
+                                                .init(color: .white, location: 0.0),
+                                                .init(color: .white.opacity(0.92), location: 0.62),
+                                                .init(color: .white.opacity(0.48), location: 0.88),
+                                                .init(color: .clear, location: 1.0)
+                                            ]),
+                                            center: CGPoint(
+                                                x: size.width * 0.5,
+                                                y: size.height * envelope.playerCenterFraction
+                                            ),
+                                            startRadius: 12,
+                                            endRadius: max(size.width * 0.78, size.height * 0.65)
+                                        )
                                     )
-                                )
-                                .opacity(PlayerAmbientPolicy.unifiedOpacity(isIncreasedContrast: contrast == .increased))
-                                .transition(.opacity)
+                                }
+                            }
+                            .opacity(PlayerAmbientPolicy.unifiedOpacity(isIncreasedContrast: contrast == .increased))
+                            .transition(.opacity)
                         }
                     }
-                    .animation(reduceMotion ? nil : .easeInOut(duration: 0.45), value: sourceForDisplay != nil)
+                    .animation(
+                        (reduceMotion || !isRouteActive) ? nil : .easeInOut(duration: 0.45),
+                        value: sourceForDisplay != nil
+                    )
                     .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
                     .clipped()
                 }

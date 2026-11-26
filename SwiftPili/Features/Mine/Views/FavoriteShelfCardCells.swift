@@ -3,6 +3,7 @@ import UIKit
 @MainActor
 final class FavoriteShelfPreviewCell: UICollectionViewCell {
     private let coverBox = UIKitCoverBoxView()
+    private let unavailableBadge = UIKitMediaBadgeView(horizontalPadding: 5, verticalPadding: 2)
     private let durationBadge = UIKitDurationBadge(horizontalPadding: 5, verticalPadding: 2)
     private let titleSlotView = UIView()
     private let titleLabel = UILabel()
@@ -26,6 +27,10 @@ final class FavoriteShelfPreviewCell: UICollectionViewCell {
         coverBox.translatesAutoresizingMaskIntoConstraints = false
         coverBox.configureStyle(cornerRadius: AppRadius.thumbnail, scrim: .cardBottom, showsBorder: true)
         contentView.addSubview(coverBox)
+
+        unavailableBadge.translatesAutoresizingMaskIntoConstraints = false
+        unavailableBadge.isHidden = true
+        coverBox.addSubview(unavailableBadge)
 
         durationBadge.translatesAutoresizingMaskIntoConstraints = false
         coverBox.addSubview(durationBadge)
@@ -57,6 +62,9 @@ final class FavoriteShelfPreviewCell: UICollectionViewCell {
             coverBox.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             coverBox.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
             coverH,
+            unavailableBadge.topAnchor.constraint(equalTo: coverBox.topAnchor, constant: 4),
+            unavailableBadge.leadingAnchor.constraint(equalTo: coverBox.leadingAnchor, constant: 4),
+            unavailableBadge.trailingAnchor.constraint(lessThanOrEqualTo: coverBox.trailingAnchor, constant: -4),
             durationBadge.trailingAnchor.constraint(equalTo: coverBox.trailingAnchor, constant: -4),
             durationBadge.bottomAnchor.constraint(equalTo: coverBox.bottomAnchor, constant: -4),
             titleSlotView.topAnchor.constraint(equalTo: coverBox.bottomAnchor, constant: 5),
@@ -107,13 +115,36 @@ final class FavoriteShelfPreviewCell: UICollectionViewCell {
         authorLabel.text = upper
         authorLabel.font = UIKitFeedFont.font(for: .cardMeta, traitCollection: traits)
 
-        contentView.alpha = item.isPlayableVideo ? 1.0 : 0.6
-        accessibilityLabel = upper.isEmpty ? item.title : "\(item.title), \(upper)"
+        let isPlayable = item.isPlayableVideo
+        let dimAlpha: CGFloat = isPlayable ? 1.0 : 0.58
+        coverBox.imageView.alpha = dimAlpha
+        titleLabel.alpha = dimAlpha
+        authorLabel.alpha = dimAlpha
+        if isPlayable {
+            unavailableBadge.isHidden = true
+        } else {
+            unavailableBadge.configurePill(
+                text: String(localized: "Unavailable"),
+                backgroundColor: UIColor.systemRed.withAlphaComponent(0.84),
+                textColor: .white,
+                traitCollection: traits
+            )
+        }
+
+        var parts: [String] = []
+        if !isPlayable { parts.append(String(localized: "Unavailable")) }
+        parts.append(item.title)
+        if !upper.isEmpty { parts.append(upper) }
+        accessibilityLabel = parts.joined(separator: ", ")
     }
 
     override func prepareForReuse() {
         super.prepareForReuse()
         coverBox.resetCover()
+        coverBox.imageView.alpha = 1.0
+        titleLabel.alpha = 1.0
+        authorLabel.alpha = 1.0
+        unavailableBadge.isHidden = true
         titleLabel.text = nil
         authorLabel.text = nil
         accessibilityLabel = nil

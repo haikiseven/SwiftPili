@@ -234,7 +234,7 @@ private extension ImagePreviewViewController {
         isServerCropped: Bool = false
     ) -> (clip: CGRect, image: CGRect) {
         let bounds = view.bounds
-        let mode = ImagePreviewRasterPolicy.displayMode(url: url, aspect: aspect)
+        let mode = ImagePreviewRasterPolicy.displayMode(url: url, aspect: aspect, viewport: bounds.size)
         if mode == .reading {
             if isServerCropped, let thumbAspect {
                 let fitted = ImagePreviewMath.fittedSize(in: bounds.size, aspect: thumbAspect)
@@ -246,11 +246,17 @@ private extension ImagePreviewViewController {
                 )
                 return (clip, CGRect(origin: .zero, size: clip.size))
             }
-            let fullHeight = bounds.width / aspect
-            let clip = CGRect(x: 0, y: 0, width: bounds.width, height: min(bounds.height, fullHeight))
-            return (clip, CGRect(x: 0, y: 0, width: bounds.width, height: fullHeight))
+            let baseSize = ImagePreviewMath.baseSize(in: bounds.size, aspect: aspect, mode: .reading)
+            let originY = baseSize.height > bounds.height ? 0 : (bounds.height - baseSize.height) / 2
+            let clip = CGRect(
+                x: (bounds.width - baseSize.width) / 2,
+                y: originY,
+                width: baseSize.width,
+                height: min(bounds.height, baseSize.height)
+            )
+            return (clip, CGRect(x: 0, y: 0, width: baseSize.width, height: baseSize.height))
         }
-        let fitted = ImagePreviewMath.fittedSize(in: bounds.size, aspect: aspect)
+        let fitted = ImagePreviewMath.baseSize(in: bounds.size, aspect: aspect, mode: .fitted)
         let clip = CGRect(
             x: (bounds.width - fitted.width) / 2,
             y: (bounds.height - fitted.height) / 2,

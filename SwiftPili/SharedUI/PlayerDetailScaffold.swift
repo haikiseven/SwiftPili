@@ -151,9 +151,9 @@ struct PlayerDetailInlineNavigationOverlay: View {
 
     var body: some View {
         if !player.isFullscreenPresentationActive, isActiveRoute {
-            let showsNavigation = !hasInlineExitChrome() || player.showControls
+            let showsNavigation = !hasInlineExitChrome() || player.showControls || player.playbackEnded
             ZStack(alignment: .topLeading) {
-                if showsNavigation && !player.showControls {
+                if showsNavigation && !player.showControls && !player.playbackEnded {
                     PlayerControlsScrim()
                         .frame(width: scrimWidth, height: scrimHeight)
                         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))

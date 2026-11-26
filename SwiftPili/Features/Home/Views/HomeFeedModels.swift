@@ -29,6 +29,49 @@ struct HomeFeedItemData: Identifiable, Equatable, Sendable {
     let viewCount: Int
     var rank: Int?
     let routeTarget: VideoRouteTarget?
+    var ownerMid: Int?
+    var ownerFace: String?
+
+    init(
+        id: HomeFeedItemIdentifier,
+        title: String,
+        sources: VideoCoverSources,
+        duration: Int,
+        ownerName: String,
+        viewCount: Int,
+        rank: Int? = nil,
+        routeTarget: VideoRouteTarget?,
+        ownerMid: Int? = nil,
+        ownerFace: String? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.sources = sources
+        self.duration = duration
+        self.ownerName = ownerName
+        self.viewCount = viewCount
+        self.rank = rank
+        self.routeTarget = routeTarget
+        self.ownerMid = ownerMid
+        self.ownerFace = ownerFace
+    }
+
+    var resolvedAID: Int? {
+        if case .aid(let aid) = routeTarget?.videoID, aid > 0 {
+            return aid
+        }
+        if case .int(let aid) = id, aid > 0 {
+            return aid
+        }
+        return nil
+    }
+
+    var resolvedBVID: String? {
+        if case .bvid(let bvid) = routeTarget?.videoID, !bvid.isEmpty {
+            return bvid
+        }
+        return nil
+    }
 }
 
 typealias HomeFeedSectionData = VideoFeedSection<HomeFeedItemData>

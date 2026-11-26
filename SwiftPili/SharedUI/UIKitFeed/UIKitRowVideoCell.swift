@@ -1,9 +1,16 @@
+import SwiftUI
 import UIKit
 
 @MainActor
-final class UIKitRowVideoCell: UICollectionViewCell {
+final class UIKitRowVideoCell: UICollectionViewListCell {
+    private enum LayoutMode: Equatable {
+        case horizontal
+        case libraryVertical
+    }
+
     private let coverBox = UIKitCoverBoxView()
     private let rankBadge = UIKitRankBadgeView()
+    private let statusBadgeView = UIKitMediaBadgeView(horizontalPadding: 6, verticalPadding: 2)
     private let progressBar = UIKitWatchProgressBar()
     private let durationBadge = UIKitDurationBadge(
         isCapsule: false,
@@ -21,8 +28,13 @@ final class UIKitRowVideoCell: UICollectionViewCell {
     private var coverWidthConstraint: NSLayoutConstraint?
     private var coverHeightConstraint: NSLayoutConstraint?
     private var rowMinHeightConstraint: NSLayoutConstraint?
-    private var titleTrailingConstraint: NSLayoutConstraint?
+    private var horizontalTitleTrailingConstraint: NSLayoutConstraint?
+
+    private var horizontalConstraints: [NSLayoutConstraint] = []
+    private var libraryVerticalConstraints: [NSLayoutConstraint] = []
+
     private var activeStyle: RowStyle?
+    private var activeLayoutMode: LayoutMode?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -34,8 +46,14 @@ final class UIKitRowVideoCell: UICollectionViewCell {
     }
 
     private func setup() {
+        automaticallyUpdatesBackgroundConfiguration = false
+        automaticallyUpdatesContentConfiguration = false
+        backgroundConfiguration = .clear()
         backgroundColor = .clear
         contentView.backgroundColor = .clear
+        contentView.layer.cornerRadius = 0
+        contentView.layer.borderWidth = 0
+        contentView.layer.borderColor = nil
         isAccessibilityElement = true
         accessibilityTraits = .button
 
@@ -56,6 +74,10 @@ final class UIKitRowVideoCell: UICollectionViewCell {
         rankBadge.translatesAutoresizingMaskIntoConstraints = false
         rankBadge.isHidden = true
         coverBox.addSubview(rankBadge)
+
+        statusBadgeView.translatesAutoresizingMaskIntoConstraints = false
+        statusBadgeView.isHidden = true
+        coverBox.addSubview(statusBadgeView)
 
         progressBar.translatesAutoresizingMaskIntoConstraints = false
         progressBar.isHidden = true
@@ -118,49 +140,74 @@ final class UIKitRowVideoCell: UICollectionViewCell {
         let coverWidth = coverBox.widthAnchor.constraint(equalToConstant: RowCardMetrics.compactCoverWidth)
         let coverHeight = coverBox.heightAnchor.constraint(equalToConstant: 90)
         let rowMinHeight = contentView.heightAnchor.constraint(greaterThanOrEqualToConstant: 90)
-        let titleTrailing = titleLabel.trailingAnchor.constraint(
-            equalTo: contentView.trailingAnchor,
-            constant: -8
-        )
         coverWidthConstraint = coverWidth
         coverHeightConstraint = coverHeight
         rowMinHeightConstraint = rowMinHeight
-        titleTrailingConstraint = titleTrailing
 
         NSLayoutConstraint.activate([
             rowMinHeight,
-            coverBox.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-            coverBox.topAnchor.constraint(equalTo: contentView.topAnchor),
             coverWidth,
             coverHeight,
             rankBadge.topAnchor.constraint(equalTo: coverBox.topAnchor, constant: 6),
             rankBadge.leadingAnchor.constraint(equalTo: coverBox.leadingAnchor, constant: 6),
+            statusBadgeView.topAnchor.constraint(equalTo: coverBox.topAnchor, constant: 6),
+            statusBadgeView.leadingAnchor.constraint(equalTo: coverBox.leadingAnchor, constant: 6),
+            statusBadgeView.trailingAnchor.constraint(lessThanOrEqualTo: coverBox.trailingAnchor, constant: -6),
             progressBar.leadingAnchor.constraint(equalTo: coverBox.leadingAnchor),
             progressBar.trailingAnchor.constraint(equalTo: coverBox.trailingAnchor),
             progressBar.bottomAnchor.constraint(equalTo: coverBox.bottomAnchor),
             progressBar.heightAnchor.constraint(equalToConstant: 3),
             durationBadge.trailingAnchor.constraint(equalTo: coverBox.trailingAnchor, constant: -6),
             durationBadge.bottomAnchor.constraint(equalTo: coverBox.bottomAnchor, constant: -6),
+            menuButton.topAnchor.constraint(equalTo: contentView.topAnchor),
+            menuButton.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            menuButton.widthAnchor.constraint(equalToConstant: 44),
+            menuButton.heightAnchor.constraint(equalToConstant: 44),
+        ])
+
+        let horizontalTrailing = titleLabel.trailingAnchor.constraint(
+            equalTo: contentView.trailingAnchor,
+            constant: -8
+        )
+        horizontalTitleTrailingConstraint = horizontalTrailing
+        horizontalConstraints = [
+            coverBox.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            coverBox.topAnchor.constraint(equalTo: contentView.topAnchor),
             titleLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 6),
             titleLabel.leadingAnchor.constraint(
                 equalTo: coverBox.trailingAnchor,
                 constant: RowGeometry.coverToTextSpacing
             ),
-            titleTrailing,
-            menuButton.topAnchor.constraint(equalTo: contentView.topAnchor),
-            menuButton.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            menuButton.widthAnchor.constraint(equalToConstant: 44),
-            menuButton.heightAnchor.constraint(equalToConstant: 44),
+            horizontalTrailing,
             textStack.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             textStack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -8),
             textStack.topAnchor.constraint(greaterThanOrEqualTo: titleLabel.bottomAnchor, constant: 4),
             textStack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -6),
-        ])
+        ]
+
+        libraryVerticalConstraints = [
+            coverBox.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            coverBox.topAnchor.constraint(equalTo: contentView.topAnchor),
+            titleLabel.topAnchor.constraint(equalTo: coverBox.bottomAnchor, constant: 10),
+            titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            titleLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            textStack.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            textStack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            textStack.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 6),
+            textStack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+        ]
+
+        applyLayoutMode(.horizontal)
     }
 
     func configure(_ model: Model) {
-        applyStyleIfNeeded(model.style)
         let traits = traitCollection
+        applyStyleIfNeeded(model.style)
+        let usesVertical = model.style == .library
+            && traits.preferredContentSizeCategory.isAccessibilityCategory
+        let desiredMode: LayoutMode = usesVertical ? .libraryVertical : .horizontal
+        applyLayoutMode(desiredMode)
+
         let isRegular = traits.horizontalSizeClass == .regular
         let coverWidth = model.style == .feed
             ? RowCardMetrics.coverWidth(columnWidth: model.columnWidth, isRegularWidth: isRegular)
@@ -179,6 +226,7 @@ final class UIKitRowVideoCell: UICollectionViewCell {
         coverBox.setCover(request: request)
 
         configureOverlays(model, traits: traits)
+        titleLabel.numberOfLines = usesVertical ? 3 : 2
         titleLabel.text = model.title
         titleLabel.font = UIKitFeedFont.font(
             for: model.style == .feed ? .rowTitle : .libraryRowTitle,
@@ -186,7 +234,8 @@ final class UIKitRowVideoCell: UICollectionViewCell {
             traitCollection: traits
         )
         configureSubtitleAndFooter(model, traits: traits)
-        configureTrailingMenu(model)
+        configureTrailingMenu(model, mode: desiredMode)
+        applyAvailabilityPresentation(isUnavailable: model.isUnavailable)
         updateAccessibility(model)
     }
 
@@ -195,14 +244,56 @@ final class UIKitRowVideoCell: UICollectionViewCell {
         activeStyle = style
         let radius = style == .feed ? VideoCardMetrics.cornerRadius : AppRadius.thumbnail
         coverBox.configureStyle(cornerRadius: radius, scrim: .cardBottom, showsBorder: true)
+        contentView.backgroundColor = .clear
+        contentView.layer.cornerRadius = 0
+        contentView.layer.borderWidth = 0
+        contentView.layer.borderColor = nil
+    }
+
+    private func applyLayoutMode(_ mode: LayoutMode) {
+        guard activeLayoutMode != mode else { return }
+        switch activeLayoutMode {
+        case .horizontal: NSLayoutConstraint.deactivate(horizontalConstraints)
+        case .libraryVertical: NSLayoutConstraint.deactivate(libraryVerticalConstraints)
+        case nil: break
+        }
+        activeLayoutMode = mode
+        switch mode {
+        case .horizontal: NSLayoutConstraint.activate(horizontalConstraints)
+        case .libraryVertical: NSLayoutConstraint.activate(libraryVerticalConstraints)
+        }
+    }
+
+    private func applyAvailabilityPresentation(isUnavailable: Bool) {
+        let alpha: CGFloat = isUnavailable ? 0.58 : 1.0
+        coverBox.imageView.alpha = alpha
+        titleLabel.alpha = alpha
+        textStack.alpha = alpha
+        menuButton.alpha = 1.0
     }
 
     private func configureOverlays(_ model: Model, traits: UITraitCollection) {
         if let rank = model.rank {
             rankBadge.isHidden = false
             rankBadge.configure(rank: rank, traitCollection: traits)
+            statusBadgeView.isHidden = true
         } else {
             rankBadge.isHidden = true
+            if let badge = model.statusBadge, !badge.isEmpty {
+                let bgColor: UIColor = switch model.statusBadgeStyle {
+                case .neutral: UIColor.black.withAlphaComponent(0.72)
+                case .warning: UIColor.systemRed.withAlphaComponent(0.84)
+                case .accent: UIColor(AccentStore.shared.semanticAccent)
+                }
+                statusBadgeView.configurePill(
+                    text: badge,
+                    backgroundColor: bgColor,
+                    textColor: .white,
+                    traitCollection: traits
+                )
+            } else {
+                statusBadgeView.isHidden = true
+            }
         }
         progressBar.configure(progress: model.watchProgress)
 
@@ -259,18 +350,22 @@ final class UIKitRowVideoCell: UICollectionViewCell {
         }
     }
 
-    private func configureTrailingMenu(_ model: Model) {
+    private func configureTrailingMenu(_ model: Model, mode: LayoutMode) {
         if let menu = model.trailingMenu {
             menuButton.isHidden = false
             menuButton.menu = menu
             menuButton.isEnabled = model.isTrailingMenuEnabled
             menuButton.accessibilityLabel = model.trailingMenuAccessibilityLabel ?? String(localized: "More")
-            titleTrailingConstraint?.constant = -44
+            if mode == .horizontal {
+                horizontalTitleTrailingConstraint?.constant = -44
+            }
             isAccessibilityElement = false
         } else {
             menuButton.isHidden = true
             menuButton.menu = nil
-            titleTrailingConstraint?.constant = -8
+            if mode == .horizontal {
+                horizontalTitleTrailingConstraint?.constant = -8
+            }
             isAccessibilityElement = true
         }
     }
@@ -282,6 +377,7 @@ final class UIKitRowVideoCell: UICollectionViewCell {
         }
         var parts: [String] = []
         if let rank = model.rank { parts.append("#\(rank)") }
+        if let statusBadge = model.statusBadge, !statusBadge.isEmpty { parts.append(statusBadge) }
         parts.append(model.title)
         switch model.subtitle {
         case .metaLine(let ownerName, let viewCount, _):
@@ -301,7 +397,12 @@ final class UIKitRowVideoCell: UICollectionViewCell {
     override func prepareForReuse() {
         super.prepareForReuse()
         coverBox.resetCover()
+        coverBox.imageView.alpha = 1.0
+        titleLabel.alpha = 1.0
+        textStack.alpha = 1.0
+        titleLabel.numberOfLines = 2
         rankBadge.isHidden = true
+        statusBadgeView.isHidden = true
         progressBar.configure(progress: nil)
         menuButton.menu = nil
         menuButton.isHidden = true
@@ -317,6 +418,12 @@ extension UIKitRowVideoCell {
     enum RowStyle: Equatable, Sendable {
         case feed
         case library
+    }
+
+    enum StatusBadgeStyle: Equatable, Sendable {
+        case neutral
+        case warning
+        case accent
     }
 
     enum SubtitleMode: Equatable, Sendable {
@@ -340,6 +447,9 @@ extension UIKitRowVideoCell {
         var footer: FooterMode = .none
         var rank: Int?
         var watchProgress: Double?
+        var isUnavailable: Bool = false
+        var statusBadge: String?
+        var statusBadgeStyle: StatusBadgeStyle = .neutral
         var trailingMenu: UIMenu?
         var trailingMenuAccessibilityLabel: String?
         var isTrailingMenuEnabled: Bool = true

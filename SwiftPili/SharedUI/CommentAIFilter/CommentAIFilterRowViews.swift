@@ -65,7 +65,7 @@ struct CommentAIFilterRowContainer<Content: View>: View {
                 Image(systemName: "sparkles")
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.secondary)
-                Text("Collapsed suspected AI comment · \(assessment.score)%")
+                Text("Collapsed suspected AI comment (\(assessment.score)%)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
@@ -191,8 +191,6 @@ private struct CommentAIFilterDetailSheet: View {
                             Label("Collapse Comment Again", systemImage: "rectangle.compress.vertical")
                         }
                     }
-                } footer: {
-                    Text("Whitelisted authors are stored locally and never filtered on this device.")
                 }
 
                 if let access = ExperimentalSettingsStore.shared.captureAccess(.aiCommentFilter) {
@@ -205,7 +203,6 @@ private struct CommentAIFilterDetailSheet: View {
                     }
                 }
             }
-            .listRowBackground(AppFill.card)
             .navigationTitle("AI Comment Filter")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -241,7 +238,7 @@ private struct CommentAIFilterSheetPresentation: ViewModifier {
             }
         } else {
             content
-                .presentationDetents([.medium, .large])
+                .presentationDetents([.medium])
                 .presentationDragIndicator(.visible)
         }
     }

@@ -28,6 +28,8 @@ struct BangumiDetailView: View {
     @State private var compactComposerPresentation = CommentComposerPresentation()
     @State private var commentFocus = CommentComposerFocus()
     @State private var commentLinkLifetime = ContentLinkLifetime()
+    @State private var batchDownloadPresentation: BatchDownloadPresentation?
+    @State private var downloadRequestSerial: UInt64 = 0
     @Environment(AppCoordinator.self) private var coordinator
     @Environment(\.horizontalSizeClass) private var sizeClass
     @Environment(\.scenePhase) private var scenePhase
@@ -96,6 +98,21 @@ struct BangumiDetailView: View {
         )
     }
 
+    private var effectiveInlineAspectRatio: CGFloat? {
+        playerShapeIsCurrent ? DetailPlayerGeometry.normalizedAspect(player.videoAspectRatio) : nil
+    }
+
+    private var effectiveInlineAspectRatioKey: Int? {
+        effectiveInlineAspectRatio.map { Int(($0 * 100).rounded()) }
+    }
+
+    private var inlineAspectAnimation: Animation? {
+        guard !isWideLayout,
+              !player.isFullscreenPresentationActive,
+              !player.isFullscreen else { return nil }
+        return motion.animation(normal: .snappy(duration: 0.22))
+    }
+
     private var playerVideoHeight: CGFloat {
         if isWideLayout { return wideVideoSize.height }
         let fallbackBounds = WindowMetricsFallback.currentBounds
@@ -103,12 +120,27 @@ struct BangumiDetailView: View {
             ? containerWidth
             : min(fallbackBounds.width, fallbackBounds.height)
         let shapeIsCurrent = playerShapeIsCurrent
-        return DetailPlayerGeometry.videoHeight(
+        let isPortraitFallback = DeviceCapability.usesCompactPortraitVideoFraming
+            && shapeIsCurrent && player.isPortraitContent
+        if shapeIsCurrent && player.inlineCondensed {
+            return DetailPlayerGeometry.dynamicInlineVideoHeight(
+                containerWidth: base,
+                primaryColumnWidth: nil,
+                containerHeight: containerMetrics.restingHeight,
+                topSafeArea: AppWindowMetrics.safeAreaInsets.top,
+                videoAspectRatio: effectiveInlineAspectRatio,
+                isPortraitFallback: isPortraitFallback,
+                isManuallyCondensed: true,
+                isManualLockActive: true
+            )
+        }
+        return DetailPlayerGeometry.expandedVideoHeight(
             containerWidth: base,
             primaryColumnWidth: nil,
-            isPortraitContent: DeviceCapability.usesCompactPortraitVideoFraming
-                && shapeIsCurrent && player.isPortraitContent,
-            isCondensed: shapeIsCurrent && player.inlineCondensed
+            containerHeight: containerMetrics.restingHeight,
+            topSafeArea: AppWindowMetrics.safeAreaInsets.top,
+            videoAspectRatio: effectiveInlineAspectRatio,
+            isPortraitFallback: isPortraitFallback
         )
     }
 
@@ -124,14 +156,57 @@ struct BangumiDetailView: View {
         await viewModel.load(seasonId: seasonId)
     }
 
+    private var playableDownloadItems: [BatchDownloadEpisodeItem] {
+        viewModel.season.map(BatchDownloadSelectionState.items(from:)) ?? []
+    }
+
     private var playerPageNavigation: PlayerPageNavigationActions {
         PlayerPageNavigationActions(
             onBack: { coordinator.goBack() },
             onHome: { coordinator.goHome() },
-            onDownload: nil,
+            onDownload: playableDownloadItems.isEmpty ? nil : { offerBatchDownload() },
             onReport: nil,
             pageOwnsInlineNavigation: true
         )
+    }
+
+    private func offerBatchDownload() {
+        guard let season = viewModel.season else { return }
+        let items = BatchDownloadSelectionState.items(from: season)
+        guard !items.isEmpty else { return }
+        let probeItem = items.first(where: { $0.epId == viewModel.selectedEpisodeId }) ?? items[0]
+        let isImmediate = DownloadManager.shared.hasImmediateQualityList(
+            aid: probeItem.aid, cid: probeItem.cid
+        )
+        if !isImmediate {
+            viewModel.showToast(String(localized: "Preparing…"), style: .progress)
+        }
+        downloadRequestSerial &+= 1
+        let serial = downloadRequestSerial
+        let seasonTitle = (season.title?.isEmpty == false ? season.title : nil)
+            ?? String(localized: "Anime")
+        Task {
+            do {
+                let qualities = try await DownloadManager.shared.availableQualities(
+                    aid: probeItem.aid,
+                    cid: probeItem.cid,
+                    epId: probeItem.epId
+                )
+                guard !Task.isCancelled,
+                      downloadRequestSerial == serial,
+                      isActiveBangumiRoute,
+                      viewModel.season?.seasonId == season.seasonId else { return }
+                batchDownloadPresentation = BatchDownloadPresentation(
+                    title: seasonTitle,
+                    items: items,
+                    qualities: qualities,
+                    initialSelectedID: probeItem.id
+                )
+            } catch {
+                guard !Task.isCancelled, downloadRequestSerial == serial else { return }
+                viewModel.showToast(error.localizedDescription, style: .error)
+            }
+        }
     }
 
     private var pageWidth: CGFloat {
@@ -229,6 +304,7 @@ struct BangumiDetailView: View {
                 .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
                 .padding(.bottom, DetailPlayerGeometry.headerBottomInset(isFullscreen: false))
             }
+            .animation(inlineAspectAnimation, value: effectiveInlineAspectRatioKey)
             .ignoresSafeArea(.keyboard, edges: .bottom)
 
             Group {
@@ -246,6 +322,7 @@ struct BangumiDetailView: View {
 
             if !isWideLayout {
                 compactCommentsOverlay
+                    .animation(inlineAspectAnimation, value: effectiveInlineAspectRatioKey)
             }
 
             if showsWideChrome, wideComposerExpanded, stagePresentation == .stage, showThread == nil {
@@ -287,12 +364,15 @@ struct BangumiDetailView: View {
         }
         .onChange(of: isActiveBangumiRoute, initial: true) { oldActive, active in
             if !active, oldActive {
+                downloadRequestSerial &+= 1
                 viewModel.revokeLoadForRouteDeparture()
                 player.pauseForRouteDeparture(lease: viewModel.playerLease)
             }
         }
         .task(id: isActiveBangumiRoute) { await activateIfNeeded() }
         .onDisappear {
+            downloadRequestSerial &+= 1
+            batchDownloadPresentation = nil
             guard scenePhase == .active else {
                 PlayerLog.log("[BangumiDetail] playback release deferred scenePhase=\(scenePhase)")
                 return
@@ -342,6 +422,19 @@ struct BangumiDetailView: View {
             }
         }
         .imagePreview(item: $previewImages)
+        .sheet(item: $batchDownloadPresentation) { presentation in
+            BatchEpisodeDownloadSheet(
+                title: presentation.title,
+                items: presentation.items,
+                qualities: presentation.qualities,
+                initialSelectedID: presentation.initialSelectedID
+            ) { count in
+                viewModel.showToast(
+                    String(format: String(localized: "Added %lld downloads"), count),
+                    style: .progress
+                )
+            }
+        }
     }
 
     private func continueBanner(_ episode: PGCSeasonInfo.Episode) -> some View {
@@ -477,7 +570,7 @@ struct BangumiDetailView: View {
     private var compactCommentsOverlay: some View {
         CommentZoomContainer(
             presentation: commentPresentation,
-            destination: commentsSurface,
+            destination: { commentsSurface },
             onPresentationChanged: { isPresented in
                 if !isPresented {
                     commentFocus.dismiss()
@@ -1174,9 +1267,23 @@ struct BangumiDetailView: View {
     private func episodePanel(
         _ episodes: [PGCSeasonInfo.Episode], horizontalInset: CGFloat
     ) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            DetailSectionHeader("Episodes", count: episodes.count)
-                .padding(.horizontal, horizontalInset)
+        let canDownload = !playableDownloadItems.isEmpty
+        return VStack(alignment: .leading, spacing: 8) {
+            DetailSectionHeader(title: "Episodes", count: episodes.count) {
+                if canDownload {
+                    Button {
+                        offerBatchDownload()
+                    } label: {
+                        Label("Download", systemImage: "arrow.down.circle")
+                            .appFont(.controlLabel)
+                            .fontWeight(.medium)
+                            .foregroundStyle(.biliAccent)
+                    }
+                    .buttonStyle(.appControl)
+                    .accessibilityIdentifier("bangumi.batchDownload")
+                }
+            }
+            .padding(.horizontal, horizontalInset)
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
