@@ -147,7 +147,8 @@ struct PlayerTopControlBar: View {
                 } label: {
                     DanmakuSymbolIcon(
                         isOn: danmakuEnabled,
-                        fontSize: 16,
+                        fontSize: 13.0,
+                        matchesSubheadlineCapsuleMetrics: true,
                         activeColor: Color.biliAccent,
                         inactiveColor: .white.opacity(0.92)
                     )

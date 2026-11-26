@@ -1079,7 +1079,7 @@ struct PlayerPortraitFullscreenChrome: View {
                     } label: {
                         DanmakuSymbolIcon(
                             isOn: danmakuEnabled,
-                            fontSize: 15.5,
+                            fontSize: 13.5,
                             activeColor: Color.biliAccent,
                             inactiveColor: .white.opacity(0.88)
                         )
@@ -1108,7 +1108,7 @@ struct PlayerPortraitFullscreenChrome: View {
     private func danmakuDockCapsuleLabel(text: LocalizedStringKey) -> some View {
         HStack(spacing: 8) {
             Image(systemName: DanmakuSymbolIcon.inactiveSymbolName)
-                .font(.system(size: 13.5, weight: .medium))
+                .font(.system(size: 12.5, weight: .medium))
                 .foregroundStyle(.white.opacity(0.72))
             Text(text)
                 .font(.subheadline)

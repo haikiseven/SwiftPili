@@ -248,29 +248,44 @@ struct DanmakuSymbolIcon: View {
     static let inactiveSymbolName = "bubble.left.and.text.bubble.right"
 
     let isOn: Bool
-    var fontSize: CGFloat = 17
+    var fontSize: CGFloat = 13.2
+    var matchesSubheadlineCapsuleMetrics = false
     var activeColor: Color = .biliAccent
     var inactiveColor: Color = .white.opacity(0.90)
 
     var body: some View {
-        let box = fontSize * 1.42
+        if matchesSubheadlineCapsuleMetrics {
+            Image(systemName: "captions.bubble")
+                .font(.subheadline.weight(.semibold))
+                .hidden()
+                .overlay {
+                    renderedGlyph
+                }
+        } else {
+            renderedGlyph
+        }
+    }
+
+    @ViewBuilder
+    private var renderedGlyph: some View {
         if isOn {
             Image(systemName: Self.activeSymbolName)
                 .font(.system(size: fontSize, weight: .semibold))
                 .foregroundStyle(activeColor)
-                .frame(width: box, height: box)
         } else {
+            let slashSpan = fontSize * 1.34
             Image(systemName: Self.inactiveSymbolName)
                 .font(.system(size: fontSize, weight: .medium))
                 .foregroundStyle(inactiveColor)
-                .frame(width: box, height: box)
                 .compositingGroup()
                 .mask {
                     ZStack {
-                        Rectangle().fill(.white)
+                        Rectangle()
+                            .fill(.white)
+                            .padding(-4)
                         Capsule()
                             .fill(.black)
-                            .frame(width: box * 1.04, height: max(3.2, fontSize * 0.22))
+                            .frame(width: slashSpan * 1.06, height: max(2.8, fontSize * 0.21))
                             .rotationEffect(.degrees(-42))
                     }
                     .compositingGroup()
@@ -279,7 +294,7 @@ struct DanmakuSymbolIcon: View {
                 .overlay {
                     Capsule()
                         .fill(inactiveColor)
-                        .frame(width: box * 0.96, height: max(1.5, fontSize * 0.10))
+                        .frame(width: slashSpan, height: max(1.35, fontSize * 0.105))
                         .rotationEffect(.degrees(-42))
                 }
         }
