@@ -110,6 +110,28 @@ struct AdvancedSettingsView: View {
             )) {
                 settingsLabel("Prewarm Decoder", symbol: "bolt.badge.clock")
             }
+
+            #if DEBUG
+            Picker(selection: Binding(
+                get: { experiments.snapshot.diagnosticOverrides.vodEngine },
+                set: { value in updateEngineOverrides { $0.vodEngine = value } }
+            )) {
+                ForEach(PlayerEngineKind.userSelectableCases, id: \.rawValue) { kind in
+                    Text(kind.displayName).tag(kind)
+                }
+            } label: {
+                settingsLabel("VOD Engine", symbol: "gearshape.2")
+            }
+            .disabled(!canEditEngineOverrides)
+
+            Toggle(isOn: Binding(
+                get: { experiments.snapshot.diagnosticOverrides.livePin },
+                set: { value in updateEngineOverrides { $0.livePin = value } }
+            )) {
+                settingsLabel("Pin Live Engine", symbol: "pin")
+            }
+            .disabled(!canEditEngineOverrides)
+            #endif
         }
     }
 
@@ -175,16 +197,21 @@ struct AdvancedSettingsView: View {
             )) {
                 settingsLabel("Debug Logging", symbol: "waveform.path.ecg")
             }
-
-            #if DEBUG
-            NavigationLink {
-                DiagnosticsSettingsView()
-            } label: {
-                settingsLabel("Diagnostic Tools", symbol: "stethoscope")
-            }
-            #endif
         }
     }
+
+    #if DEBUG
+    private var canEditEngineOverrides: Bool {
+        experiments.storageError == nil && experiments.isAllowed(.diagnostics)
+    }
+
+    private func updateEngineOverrides(_ edit: (inout ExperimentalDiagnosticOverrides) -> Void) {
+        guard canEditEngineOverrides else { return }
+        var overrides = experiments.snapshot.diagnosticOverrides
+        edit(&overrides)
+        _ = experiments.updateDiagnosticOverrides(overrides)
+    }
+    #endif
 
     private var videoEnhancementSummary: String {
         let srMode = experiments.videoEnhancementDefaultSRMode

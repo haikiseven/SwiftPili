@@ -40,13 +40,12 @@ enum ExperimentalFeature: String, Codable, CaseIterable, Sendable {
 struct ExperimentalDiagnosticOverrides: Codable, Equatable, Sendable {
     var vodEngine: PlayerEngineKind = .demandPaced
     var livePin = false
-    var setTimeSeek = true
-    var prefetchFilter = true
-    var audioOutputSpeed = true
-    var demandPitch = true
 
     static let stock = Self()
     static let fieldNames: Set<String> = [
+        "vodEngine", "livePin"
+    ]
+    static let acceptedSerializedFieldNames: Set<String> = [
         "vodEngine", "livePin", "setTimeSeek", "prefetchFilter", "audioOutputSpeed", "demandPitch"
     ]
 }

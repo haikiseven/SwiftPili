@@ -459,17 +459,7 @@
 "Scale Probe on Cellular" = "Scale Probe on Cellular";
 "HTTP/2 Probe" = "HTTP/2 Probe";
 
-"Tencent OSS" = "Tencent OSS";
-"Tencent COS" = "Tencent COS";
-"Huawei ESTG" = "Huawei ESTG";
 "Baidu Cloud" = "Baidu Cloud";
-"UPOS Mirror BD" = "UPOS Mirror BD";
-"UPOS Mirror BDB" = "UPOS Mirror BDB";
-"UPOS Mirror 14B" = "UPOS Mirror 14B";
-"UPOS Mirror ZOS" = "UPOS Mirror ZOS";
-"UPOS Mirror BOS" = "UPOS Mirror BOS";
-"CN-TJ-CU Node 01-02" = "CN-TJ-CU Node 01-02";
-"CN-TJ-CU Node 01-03" = "CN-TJ-CU Node 01-03";
 "CDN Nodes" = "CDN Nodes";
 "Pinned" = "Pinned";
 "Playing %@…" = "Playing %@…";
@@ -485,8 +475,6 @@
 "Operation Failed" = "Operation Failed";
 "Operation failed: %@" = "Operation failed: %@";
 "Debug Logging" = "Debug Logging";
-"set_time Seek" = "set_time Seek";
-"Prefetch Filter" = "Prefetch Filter";
 "Pin Live Engine" = "Pin Live Engine";
 "Playback Report" = "Playback Report";
 "View Playback Report" = "View Playback Report";
@@ -503,8 +491,6 @@
 "%lld events (%lld dropped)" = "%lld events (%lld dropped)";
 "Capture started %@" = "Capture started %@";
 "Preload Video Decoder" = "Preload Video Decoder";
-"Audio-Output Speed Engine" = "Audio-Output Speed Engine";
-"Demand Pitch Correction" = "Demand Pitch Correction";
 "Preload" = "Preload";
 "Minimal (15s)" = "Minimal (15s)";
 "Standard (30s)" = "Standard (30s)";

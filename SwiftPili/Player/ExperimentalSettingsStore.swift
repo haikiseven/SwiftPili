@@ -112,6 +112,21 @@ final class ExperimentalSettingsStore {
         return true
     }
 
+    var http2ProbeEnabled: Bool { isAllowed(.http2Probe) }
+
+    @discardableResult
+    func setHTTP2ProbeEnabled(_ enabled: Bool) -> Bool {
+        guard storageError == nil else { return false }
+        var next = snapshot
+        next.masterEnabled = enabled
+        next.grants[.http2Probe] = enabled
+        if bootstrapped {
+            return commit(next)
+        }
+        publish(next)
+        return true
+    }
+
     @discardableResult
     func setDebugLoggingEnabled(_ enabled: Bool) -> Bool {
         guard isAllowed(.diagnostics) else { return false }

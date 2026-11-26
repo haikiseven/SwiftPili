@@ -2,6 +2,7 @@ import SwiftUI
 
 struct CDNSettingsView: View {
     @AppMotion private var motion
+    private let experiments = ExperimentalSettingsStore.shared
     @State private var selected = CDNService.current
     @State private var results: [CDNService: CDNTestResult] = [:]
     @State private var isTesting = false
@@ -16,8 +17,6 @@ struct CDNSettingsView: View {
     private var smart: SmartCDNSelector { SmartCDNSelector.shared }
 
     private let defaultCDNs: [CDNService] = [.baseUrl, .backupUrl]
-
-    @State private var expandedProviders: Set<CDNProvider> = []
 
     private var accent: Color { .biliAccent }
 
@@ -44,9 +43,6 @@ struct CDNSettingsView: View {
         .animation(motion.animation(normal: .default), value: selected)
         .animation(motion.animation(normal: .default), value: smartEnabled)
         .onAppear {
-            if let current = selected.provider {
-                expandedProviders.insert(current)
-            }
             Task { await smart.refreshClientNetwork(trigger: "settings opened") }
         }
     }
@@ -85,10 +81,10 @@ struct CDNSettingsView: View {
                     .foregroundStyle(.red)
             }
 
-            ForEach(defaultCDNs) { cdn in cdnRow(cdn) }
+            ForEach(defaultCDNs) { cdn in defaultCDNRow(cdn) }
 
             ForEach(CDNProvider.allCases) { provider in
-                categoryGroup(provider)
+                providerRow(provider)
             }
         } header: {
             if smartEnabled {
@@ -100,55 +96,34 @@ struct CDNSettingsView: View {
     }
 
     @ViewBuilder
-    private func categoryGroup(_ provider: CDNProvider) -> some View {
-        let expanded = expandedProviders.contains(provider)
+    private func providerRow(_ provider: CDNProvider) -> some View {
+        let isSelected = selected.provider == provider
         Button {
-            withAnimation(motion.animation(normal: .snappy(duration: 0.28))) {
-                if expanded {
-                    expandedProviders.remove(provider)
-                } else {
-                    expandedProviders.insert(provider)
-                }
-            }
+            let target = provider.primaryService
+            selected = target
+            CDNService.current = target
         } label: {
             HStack(spacing: 12) {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .foregroundStyle(isSelected ? accent : Color(.tertiaryLabel))
+
                 CDNProviderMark(provider: provider)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(provider.title)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.primary)
-                    Text("\(provider.services.count) nodes")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
+
+                Text(provider.title)
+                    .font(.subheadline)
+                    .foregroundStyle(.primary)
+
                 Spacer()
-                if !expanded, selected.provider == provider {
-                    HStack(spacing: 3) {
-                        Image(systemName: "checkmark")
-                            .font(.caption2.weight(.bold))
-                        Text(selected.label)
-                            .font(.caption2.weight(.medium))
-                            .lineLimit(1)
-                    }
-                    .foregroundStyle(accent)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(accent.opacity(0.12))
-                    .clipShape(Capsule())
+
+                if let result = results[provider.primaryService] {
+                    speedBadge(result)
                 }
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.tertiary)
-                    .rotationEffect(.degrees(expanded ? 90 : 0))
             }
             .contentShape(Rectangle())
             .padding(.vertical, 2)
         }
         .buttonStyle(.plain)
-
-        if expanded {
-            ForEach(provider.services) { cdn in cdnRow(cdn) }
-        }
     }
 
     // MARK: - Smart CDN Selection (智能CDN选择)
@@ -347,6 +322,18 @@ struct CDNSettingsView: View {
                     SettingsIcon(symbol: "antenna.radiowaves.left.and.right")
                 }
             }
+
+            Toggle(isOn: Binding(
+                get: { experiments.http2ProbeEnabled },
+                set: { _ = experiments.setHTTP2ProbeEnabled($0) }
+            )) {
+                Label {
+                    Text("HTTP/2 Probe")
+                } icon: {
+                    SettingsIcon(symbol: "bolt.horizontal")
+                }
+            }
+            .disabled(experiments.storageError != nil)
         }
     }
 
@@ -374,7 +361,7 @@ struct CDNSettingsView: View {
     }
 
     @ViewBuilder
-    private func cdnRow(_ cdn: CDNService) -> some View {
+    private func defaultCDNRow(_ cdn: CDNService) -> some View {
         Button {
             selected = cdn
             CDNService.current = cdn
@@ -384,18 +371,9 @@ struct CDNSettingsView: View {
                     .font(.title3)
                     .foregroundStyle(selected == cdn ? accent : Color(.tertiaryLabel))
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(cdn.label)
-                        .font(.subheadline)
-                        .foregroundStyle(.primary)
-                    if let host = cdn.host {
-                        Text(verbatim: host)
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.7)
-                    }
-                }
+                Text(cdn.label)
+                    .font(.subheadline)
+                    .foregroundStyle(.primary)
 
                 Spacer()
 
@@ -444,7 +422,7 @@ struct CDNSettingsView: View {
             return
         }
 
-        let cdns = CDNService.publishableServices
+        let cdns = defaultCDNs + CDNProvider.allCases.map(\.primaryService)
         testTotal = cdns.count
 
         for cdn in cdns {
@@ -465,6 +443,7 @@ extension CDNProvider {
         case .alibaba: .orange
         case .tencent: .blue
         case .huawei: .red
+        case .baidu: .cyan
         case .other: .gray
         case .overseas: .indigo
         }
@@ -475,7 +454,8 @@ extension CDNProvider {
         case .alibaba: "square.stack.3d.up.fill"
         case .tencent: "server.rack"
         case .huawei: "antenna.radiowaves.left.and.right"
-        case .other: "questionmark.folder.fill"
+        case .baidu: "cloud.fill"
+        case .other: "square.grid.2x2.fill"
         case .overseas: "globe.americas.fill"
         }
     }

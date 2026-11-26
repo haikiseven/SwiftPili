@@ -184,13 +184,15 @@ enum PlayerPlaybackPreferences {
     }
 
     static func clearDebugOnlyPlaybackExperiments() {
-        #if !DEBUG
-        guard UserDefaults.standard.object(forKey: "pitch_corrected_rate") != nil else { return }
-        UserDefaults.standard.removeObject(forKey: "pitch_corrected_rate")
-        PlayerLog.log(
-            "[Player] legacy pitch_corrected_rate override cleared to product default"
-        )
-        #endif
+        let retiredKeys = [
+            "settime_seek_experiment",
+            "prefetch_filter_experiment",
+            "pitch_corrected_rate",
+            "patha_pitch_enabled_v2"
+        ]
+        for key in retiredKeys where UserDefaults.standard.object(forKey: key) != nil {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
     }
 }
 

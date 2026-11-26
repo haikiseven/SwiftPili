@@ -2880,6 +2880,64 @@ struct PlayerArchitectureTests {
         #expect(disabledMaster.isAllowed(.http2Probe))
     }
 
+    @Test("CDN categories use high-level directions without internal UPOS mirror labels and legacy experimental overrides decode cleanly")
+    func cdnHighLevelDirectionsAndLegacyExperimentalOverridesMigration() throws {
+        #expect(CDNProvider.defaultPriority == [.alibaba, .tencent, .huawei, .baidu, .other, .overseas])
+        #expect(CDNService.upcdnbda2.provider == .baidu)
+        #expect(CDNService.mirrorbd.provider == .baidu)
+        #expect(CDNService.mirrorbdb.provider == .baidu)
+        #expect(CDNService.mirrorbos.provider == .baidu)
+
+        for provider in CDNProvider.allCases {
+            #expect(provider.primaryService.provider == provider)
+            #expect(provider.services.allSatisfy { $0.label == provider.title })
+        }
+
+        for service in CDNService.allCases {
+            let label = service.label
+            #expect(!label.localizedCaseInsensitiveContains("upos"))
+            #expect(!label.localizedCaseInsensitiveContains("cn-tj"))
+            #expect(!label.localizedCaseInsensitiveContains("estg"))
+        }
+
+        let suiteName = "SwiftPiliTests.LegacyExperimentalOverrides.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let legacyJSON = """
+        {
+          "schemaVersion": 1,
+          "masterEnabled": false,
+          "grants": {
+            "ambient": true,
+            "decoderPrewarm": true,
+            "equalizer": true,
+            "multiConnection": true,
+            "commentTools": true,
+            "diagnostics": true,
+            "videoEnhancement": true,
+            "aiCommentFilter": false,
+            "http2Probe": false
+          },
+          "diagnosticOverrides": {
+            "vodEngine": "vlc",
+            "livePin": true,
+            "setTimeSeek": false,
+            "prefetchFilter": false,
+            "audioOutputSpeed": false,
+            "demandPitch": false
+          }
+        }
+        """
+        defaults.set(Data(legacyJSON.utf8), forKey: ExperimentalSettingsPreferences.storageKey)
+        defaults.set(true, forKey: ExperimentalSettingsPreferences.graduationMarkerKey)
+
+        let record = ExperimentalSettingsPreferences.bootstrap(defaults: defaults, bundleID: suiteName)
+        #expect(record.storageError == nil)
+        #expect(record.snapshot.diagnosticOverrides.vodEngine == .vlc)
+        #expect(record.snapshot.diagnosticOverrides.livePin == true)
+    }
+
     @Test("Playback ended auto-advance state and library row metrics stay bounded")
     func playbackEndedAutoAdvanceAndLibraryMetrics() {
         let state = PlayerEndedAutoAdvanceState(

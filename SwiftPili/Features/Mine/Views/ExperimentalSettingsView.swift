@@ -54,12 +54,6 @@ struct ExperimentalSettingsView: View {
                 settingsLabel("VOD Engine", symbol: "gearshape.2")
             }
             overrideToggle("Pin Live Engine", symbol: "pin", keyPath: \.livePin)
-            overrideToggle("set_time Seek", symbol: "flask", keyPath: \.setTimeSeek)
-            overrideToggle("Prefetch Filter", symbol: "memorychip", keyPath: \.prefetchFilter)
-            overrideToggle("Audio-Output Speed Engine", symbol: "gauge.with.needle", keyPath: \.audioOutputSpeed)
-            overrideToggle(
-                "Demand Pitch Correction", symbol: "waveform.badge.magnifyingglass", keyPath: \.demandPitch
-            )
         }
         .disabled(!canEdit)
     }

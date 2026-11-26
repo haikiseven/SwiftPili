@@ -473,16 +473,6 @@ private extension SettingsView {
                 }
             }
 
-            NavigationLink {
-                ExperimentalSettingsView()
-            } label: {
-                LabeledContent {
-                    Text(experiments.snapshot.masterEnabled ? "On" : "Off")
-                } label: {
-                    settingsLabel("Experimental Features", symbol: "flask")
-                }
-            }
-
             Button {
                 showSetupWizard = true
             } label: {

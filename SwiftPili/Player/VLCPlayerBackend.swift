@@ -247,15 +247,8 @@ final class VLCPlayerBackend: PlayerBackend {
     }
 
     private func logPitchConfiguration() {
-        let pitchWanted = ExperimentalSettingsPolicy.diagnosticBool(
-            key: "pitch_corrected_rate",
-            saved: ExperimentalSettingsPolicy.diagnosticOverrides.audioOutputSpeed
-        )
         let instancePitch = instancePitchEngine.map { $0 ? "1" : "0" } ?? "unknown"
-        PlayerLog.log(
-            "[VLC] load aout=avsamplebuffer instance_pitch=\(instancePitch) "
-            + "desired_next_launch=\(pitchWanted ? 1 : 0) (instance arg; toggle needs app relaunch)"
-        )
+        PlayerLog.log("[VLC] load aout=avsamplebuffer instance_pitch=\(instancePitch)")
     }
 
     private func applyDiagnosticLogPolicy() {
@@ -294,20 +287,6 @@ final class VLCPlayerBackend: PlayerBackend {
                 runSuppressed = 0
                 PlayerLog.log("[VLC:\(entry.module ?? "core")] \(entry.level): \(message)")
             }
-        }
-    }
-
-    static var prefetchFilterExperimentEnabled: Bool {
-        get {
-            ExperimentalSettingsPolicy.diagnosticBool(
-                key: "prefetch_filter_experiment",
-                saved: ExperimentalSettingsPolicy.diagnosticOverrides.prefetchFilter
-            )
-        }
-        set {
-            var overrides = ExperimentalSettingsStore.shared.snapshot.diagnosticOverrides
-            overrides.prefetchFilter = newValue
-            ExperimentalSettingsStore.shared.updateDiagnosticOverrides(overrides)
         }
     }
 
@@ -376,17 +355,8 @@ final class VLCPlayerBackend: PlayerBackend {
             media.addOption(":file-caching=\(maxBufferMs)")
         }
 
-        if Self.prefetchFilterExperimentEnabled, !url.isFileURL {
+        if !url.isFileURL {
             media.addOption(":stream-filter=prefetch")
-            PlayerLog.log(
-                "[VLC] 🧪 prefetch stream filter armed (default 16 MiB ring; experiment; " +
-                """
-                setTimeSeek=\(ExperimentalSettingsPolicy.diagnosticBool(
-                    key: "settime_seek_experiment",
-                    saved: ExperimentalSettingsPolicy.diagnosticOverrides.setTimeSeek
-                ) ? "on" : "OFF — reopen seeks discard the ring"))
-                """
-            )
         }
 
         media.addOption(hardwareDecode ? ":avcodec-hw=any" : ":avcodec-hw=none")
@@ -1178,23 +1148,14 @@ private enum VLCEngineHost {
         args.append("--aout=avsamplebuffer")
         args.append("--no-equalizer-vlcfreqs")
         args.append("--no-equalizer-2pass")
-        let pitchEngine = ExperimentalSettingsPolicy.diagnosticBool(
-            key: "pitch_corrected_rate",
-            saved: ExperimentalSettingsPolicy.diagnosticOverrides.audioOutputSpeed
-        )
-        args.append(pitchEngine ? "--avsb-pitch-engine" : "--no-avsb-pitch-engine")
-        if pitchEngine {
-            args.append("--slave-audio-lead-ms=6000")
-        }
-        PlayerLog.log(
-            "[VLC] instance aout=avsamplebuffer pitch_engine=\(pitchEngine ? "on" : "off")"
-            + (pitchEngine ? " slave-audio-lead-ms=6000 0015" : "")
-        )
+        args.append("--avsb-pitch-engine")
+        args.append("--slave-audio-lead-ms=6000")
+        PlayerLog.log("[VLC] instance aout=avsamplebuffer pitch_engine=on slave-audio-lead-ms=6000")
         if let instance = try? VLCInstance(arguments: args) {
             return Selection(
                 instance: instance,
                 supportsEqualizer: PlayerEqualizerArtifact.isLinkedSliceSupported,
-                pitchEngine: pitchEngine
+                pitchEngine: true
             )
         }
         PlayerLog.diagnostic(

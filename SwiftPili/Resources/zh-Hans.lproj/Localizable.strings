@@ -459,17 +459,7 @@
 "Scale Probe on Cellular" = "蜂窝网络下加大探测";
 "HTTP/2 Probe" = "HTTP/2 探测";
 
-"Tencent OSS" = "腾讯云 OSS";
-"Tencent COS" = "腾讯云 COS";
-"Huawei ESTG" = "华为云 ESTG";
 "Baidu Cloud" = "百度云";
-"UPOS Mirror BD" = "UPOS 镜像 BD";
-"UPOS Mirror BDB" = "UPOS 镜像 BDB";
-"UPOS Mirror 14B" = "UPOS 镜像 14B";
-"UPOS Mirror ZOS" = "UPOS 镜像 ZOS";
-"UPOS Mirror BOS" = "UPOS 镜像 BOS";
-"CN-TJ-CU Node 01-02" = "CN-TJ-CU 节点 01-02";
-"CN-TJ-CU Node 01-03" = "CN-TJ-CU 节点 01-03";
 "CDN Nodes" = "CDN 节点";
 "Pinned" = "置顶";
 "Playing %@…" = "正在播放 %@…";
@@ -485,8 +475,6 @@
 "Operation Failed" = "操作失败";
 "Operation failed: %@" = "操作失败：%@";
 "Debug Logging" = "调试日志";
-"set_time Seek" = "set_time 跳转";
-"Prefetch Filter" = "预取过滤器";
 "Pin Live Engine" = "锁定直播引擎";
 "Playback Report" = "播放报告";
 "View Playback Report" = "查看播放报告";
@@ -503,8 +491,6 @@
 "%lld events (%lld dropped)" = "%lld 条事件（丢弃 %lld 条）";
 "Capture started %@" = "捕获开始于 %@";
 "Preload Video Decoder" = "预加载视频解码器";
-"Audio-Output Speed Engine" = "音频输出变速引擎";
-"Demand Pitch Correction" = "自研引擎变速不变调";
 "Preload" = "预加载";
 "Minimal (15s)" = "最小（15秒）";
 "Standard (30s)" = "标准（30秒）";

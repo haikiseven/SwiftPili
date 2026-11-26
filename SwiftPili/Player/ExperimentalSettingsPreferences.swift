@@ -56,7 +56,7 @@ enum ExperimentalSettingsPreferences {
               let grants = root["grants"] as? [String: Any],
               Set(grants.keys).isSubset(of: Set(ExperimentalFeature.allCases.map(\.rawValue))),
               let overrides = root["diagnosticOverrides"] as? [String: Any],
-              Set(overrides.keys).isSubset(of: ExperimentalDiagnosticOverrides.fieldNames),
+              Set(overrides.keys).isSubset(of: ExperimentalDiagnosticOverrides.acceptedSerializedFieldNames),
               let snapshot = try? JSONDecoder().decode(ExperimentalSettingsSnapshot.self, from: data)
         else { return nil }
         return snapshot
@@ -181,11 +181,7 @@ enum ExperimentalSettingsPreferences {
         snapshot.diagnosticOverrides = ExperimentalDiagnosticOverrides(
             vodEngine: (domain[PlayerEngineKind.storageKey] as? String)
                 .flatMap(PlayerEngineKind.init(rawValue:)) ?? .defaultKind,
-            livePin: bool(domain[PlayerEngineKind.livePinStorageKey], defaultValue: false),
-            setTimeSeek: bool(domain["settime_seek_experiment"], defaultValue: true),
-            prefetchFilter: bool(domain["prefetch_filter_experiment"], defaultValue: true),
-            audioOutputSpeed: bool(domain["pitch_corrected_rate"], defaultValue: true),
-            demandPitch: bool(domain["patha_pitch_enabled_v2"], defaultValue: true)
+            livePin: bool(domain[PlayerEngineKind.livePinStorageKey], defaultValue: false)
         )
         return snapshot
     }
@@ -199,8 +195,7 @@ enum ExperimentalSettingsPreferences {
             "image_perf_diagnostics_enabled", "image_perf_diagnostics_overlay", "image_loading_indicator_static",
             "image_ab_suppress_diagnostics", "image_ab_stable_geometry", "image_ab_async_decode",
             "image_ab_instant_transition", "image_ab_split_layout_probes", PlayerEngineKind.storageKey,
-            PlayerEngineKind.livePinStorageKey, "settime_seek_experiment", "prefetch_filter_experiment",
-            "pitch_corrected_rate", "patha_pitch_enabled_v2", "wifi_quality", "cellular_quality",
+            PlayerEngineKind.livePinStorageKey, "wifi_quality", "cellular_quality",
             "preload_strategy", "background_audio_enabled", "picture_in_picture_enabled", "cdn_service",
             "smart_cdn_enabled", "cdn_fallback_enabled", "block_pcdn", "preferred_codec", "hardware_decode"
         ]

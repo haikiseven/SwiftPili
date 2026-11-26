@@ -4,6 +4,7 @@ enum CDNProvider: String, CaseIterable, Sendable, Identifiable {
     case alibaba
     case tencent
     case huawei
+    case baidu
     case other
     case overseas
 
@@ -14,8 +15,20 @@ enum CDNProvider: String, CaseIterable, Sendable, Identifiable {
         case .alibaba: String(localized: "Alibaba Cloud")
         case .tencent: String(localized: "Tencent Cloud")
         case .huawei: String(localized: "Huawei Cloud")
+        case .baidu: String(localized: "Baidu Cloud")
         case .other: String(localized: "Other")
         case .overseas: String(localized: "Overseas")
+        }
+    }
+
+    var primaryService: CDNService {
+        switch self {
+        case .alibaba: .ali
+        case .tencent: .cos
+        case .huawei: .hw
+        case .baidu: .upcdnbda2
+        case .other: .mirrorzos
+        case .overseas: .aliov
         }
     }
 
@@ -25,7 +38,7 @@ enum CDNProvider: String, CaseIterable, Sendable, Identifiable {
 
     // MARK: - User-configured ranking
 
-    static let defaultPriority: [CDNProvider] = [.alibaba, .tencent, .huawei, .other, .overseas]
+    static let defaultPriority: [CDNProvider] = [.alibaba, .tencent, .huawei, .baidu, .other, .overseas]
 
     static var priority: [CDNProvider] {
         get {

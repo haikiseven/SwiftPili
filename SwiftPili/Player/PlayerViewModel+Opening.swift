@@ -85,10 +85,7 @@ extension PlayerViewModel {
         }
         let openAt = PlayerBackendLoadConfiguration.openPosition(
             startAt,
-            useAbsoluteVLCSeek: ExperimentalSettingsPolicy.diagnosticBool(
-                key: "settime_seek_experiment", saved: ExperimentalSettingsPolicy.diagnosticOverrides.setTimeSeek
-            )
-                && mode == .vod && backendKind == .vlc
+            useAbsoluteVLCSeek: mode == .vod && backendKind == .vlc
         )
         if openAt != startAt, startAt > 2 || (streamRetryID != nil && startAt > 0) {
             resumeAtTime = startAt

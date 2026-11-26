@@ -155,9 +155,7 @@ extension PlayerViewModel {
             return
         }
 
-        if mode.isSeekable, backendKind == .vlc, (mode == .offline || !ExperimentalSettingsPolicy.diagnosticBool(
-            key: "settime_seek_experiment", saved: ExperimentalSettingsPolicy.diagnosticOverrides.setTimeSeek
-        )) {
+        if mode.isSeekable, backendKind == .vlc, mode == .offline {
             activeSeekToken?.settle(.handedOff)
             activeSeekToken = nil
             reopenForSeek(to: time, isRestore: isRestore, settlement: settlement)
@@ -166,7 +164,7 @@ extension PlayerViewModel {
         if mode == .vod {
             PlayerLog.log(
                 backendKind == .vlc
-                    ? "[Player] ⚡︎ seek → set_time \(String(format: "%.1f", time))s (experiment; no reopen)"
+                    ? "[Player] ⚡︎ seek → set_time \(String(format: "%.1f", time))s (no reopen)"
                     : "[Player] ⚡︎ seek → \(backendKind.shortLabel) native \(String(format: "%.1f", time))s (no reopen)"
             )
             if !isRestore {

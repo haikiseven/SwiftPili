@@ -34,16 +34,8 @@ enum PathAPitchFlag {
                 return resolved
             }
         }
-        #if DEBUG
-        _ = userDefaults
-        return ExperimentalSettingsPolicy.diagnosticBool(
-            key: defaultsKey,
-            saved: ExperimentalSettingsPolicy.diagnosticOverrides.demandPitch
-        )
-        #else
         _ = userDefaults
         return true
-        #endif
     }
 
     private static func parseOverride(_ raw: String) -> Bool? {
