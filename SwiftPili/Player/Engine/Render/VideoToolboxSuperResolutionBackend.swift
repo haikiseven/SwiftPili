@@ -7,8 +7,10 @@ import VideoToolbox
 enum VTSRNegotiation {
     static let preferredFallbackFormats: [OSType] = [
         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
         kCVPixelFormatType_32BGRA,
         kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
     ]
 
     /// Extracts pixel formats listed under `kCVPixelBufferPixelFormatTypeKey` (single value or array).

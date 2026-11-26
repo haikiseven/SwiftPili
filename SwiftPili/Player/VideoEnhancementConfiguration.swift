@@ -56,7 +56,96 @@ enum VideoSuperResolutionMode: String, Codable, CaseIterable, Identifiable, Send
     }
 }
 
-enum VideoInterpolationRate: Int, CaseIterable, Identifiable, Sendable {
+enum VideoFrameInterpolationBackend: String, Codable, CaseIterable, Identifiable, Sendable {
+    case auto = "auto"
+    case videoToolbox = "videotoolbox"
+    case visionOpticalFlow = "vision_optical_flow"
+
+    var id: Self { self }
+
+    var label: String {
+        switch self {
+        case .auto:
+            String(localized: "Auto")
+        case .videoToolbox:
+            String(localized: "iOS 26 System", defaultValue: "iOS 26 System")
+        case .visionOpticalFlow:
+            String(localized: "Optical Flow (iOS 18+)", defaultValue: "Optical Flow (iOS 18+)")
+        }
+    }
+
+    var telemetryLabel: String {
+        switch self {
+        case .auto:
+            resolved().telemetryLabel
+        case .videoToolbox:
+            "VT System"
+        case .visionOpticalFlow:
+            "Vision Flow"
+        }
+    }
+
+    var persistenceValue: String { rawValue }
+
+    init?(persistedValue: String) {
+        switch persistedValue {
+        case "auto":
+            self = .auto
+        case "videotoolbox", "videoToolbox":
+            self = .videoToolbox
+        case "vision_optical_flow", "visionOpticalFlow", "vision":
+            self = .visionOpticalFlow
+        default:
+            return nil
+        }
+    }
+
+    /// Resolves user preference to a concrete runtime backend (`.videoToolbox` or `.visionOpticalFlow`).
+    /// - `.auto` resolves to `.videoToolbox` when iOS 26+ `VTFrameProcessor` FRC is supported,
+    ///   otherwise `.visionOpticalFlow`.
+    /// - `.videoToolbox` gracefully falls back to `.visionOpticalFlow` when hardware/OS lacks support.
+    /// - `.visionOpticalFlow` always runs Vision optical flow (including on iOS 26+ devices).
+    func resolved(
+        vtSupported: Bool = VideoEnhancementCapabilities.supportsVideoToolboxFrameInterpolation
+    ) -> Self {
+        switch self {
+        case .auto, .videoToolbox:
+            vtSupported ? .videoToolbox : .visionOpticalFlow
+        case .visionOpticalFlow:
+            .visionOpticalFlow
+        }
+    }
+
+    func supportsArbitraryPhases(
+        vtSupported: Bool = VideoEnhancementCapabilities.supportsVideoToolboxFrameInterpolation
+    ) -> Bool {
+        switch resolved(vtSupported: vtSupported) {
+        case .videoToolbox, .auto:
+            false
+        case .visionOpticalFlow:
+            true
+        }
+    }
+
+    func isSelectable(
+        vtSupported: Bool = VideoEnhancementCapabilities.supportsVideoToolboxFrameInterpolation
+    ) -> Bool {
+        switch self {
+        case .auto, .visionOpticalFlow:
+            true
+        case .videoToolbox:
+            vtSupported
+        }
+    }
+
+    static func selectableBackends(
+        vtSupported: Bool = VideoEnhancementCapabilities.supportsVideoToolboxFrameInterpolation
+    ) -> [Self] {
+        allCases.filter { $0.isSelectable(vtSupported: vtSupported) }
+    }
+}
+
+enum VideoInterpolationRate: Int, Codable, CaseIterable, Identifiable, Sendable {
     case doubleRate = 0
     case fps60 = 60
     case fps120 = 120
@@ -93,9 +182,17 @@ enum VideoInterpolationRate: Int, CaseIterable, Identifiable, Sendable {
         case .fps120: String(localized: "Up to 120 fps")
         }
     }
+
+    var shortStatsLabel: String {
+        switch self {
+        case .doubleRate: "2×"
+        case .fps60: "60 fps"
+        case .fps120: "120 fps"
+        }
+    }
 }
 
-enum VideoSuperResolutionScale: Int, CaseIterable, Identifiable, Sendable {
+enum VideoSuperResolutionScale: Int, Codable, CaseIterable, Identifiable, Sendable {
     case two = 2
     case three = 3
     case four = 4
@@ -112,7 +209,7 @@ enum VideoSuperResolutionScale: Int, CaseIterable, Identifiable, Sendable {
     }
 }
 
-enum VideoSuperResolutionSharpness: String, CaseIterable, Identifiable, Sendable {
+enum VideoSuperResolutionSharpness: String, Codable, CaseIterable, Identifiable, Sendable {
     case off
     case light
     case standard
@@ -150,12 +247,23 @@ enum VideoSuperResolutionTargetOutcome: Equatable, Sendable {
     case exceedsRasterBudget
 }
 
-enum VideoSuperResolutionTargetResolution: Equatable, Hashable, Sendable {
+enum VideoSuperResolutionTargetResolution: Equatable, Hashable, Codable, Sendable {
     case auto
     case p1080
     case p1440
     case p2160
     case custom(Int)
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = try container.decode(Int.self)
+        self.init(persistedValue: raw)
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(persistedValue)
+    }
 
     static let minimumCustomShortEdge = 720
     static let maximumCustomShortEdge = 2160
@@ -289,7 +397,7 @@ enum VideoSuperResolutionTargetResolution: Equatable, Hashable, Sendable {
     }
 }
 
-enum VideoEnhancementMaxInputResolution: String, CaseIterable, Identifiable, Sendable {
+enum VideoEnhancementMaxInputResolution: String, Codable, CaseIterable, Identifiable, Sendable {
     case p1080 = "1080p"
     case p1440 = "1440p"
     case unlimited = "unlimited"
@@ -318,19 +426,35 @@ enum VideoEnhancementMaxInputResolution: String, CaseIterable, Identifiable, Sen
         let shortEdge = min(width, height)
         switch self {
         case .p1080:
-            return longEdge <= 1920 && shortEdge <= 1080
+            // Include standard 1920x1080, 16-aligned 1920x1088, DCI 2048x1080, and 21:9 cinema 1080p (up to 2560x1080).
+            return shortEdge <= 1088 && longEdge <= 2560 && (width * height) <= (2560 * 1088)
         case .p1440:
-            return longEdge <= 2560 && shortEdge <= 1440
+            return shortEdge <= 1448 && longEdge <= 3440 && (width * height) <= (3440 * 1448)
         case .unlimited:
             return VideoSuperResolutionRasterBudget.contains(width: width, height: height)
         }
     }
 }
 
-struct VideoEnhancementConfiguration: Equatable, Sendable {
+enum VideoEnhancementConfigurationChange: Equatable, Sendable {
+    case unchanged
+    case shaderUniformOnly
+    case interpolationBackendAliasOnly
+    case interpolationBackendHotSwap(
+        outgoing: VideoFrameInterpolationBackend,
+        incoming: VideoFrameInterpolationBackend
+    )
+    case fullPipelineReset
+}
+
+struct VideoEnhancementConfiguration: Equatable, Codable, Sendable {
     var superResolutionMode: VideoSuperResolutionMode = .off
     var frameInterpolationEnabled: Bool = false
+    var frameInterpolationBackend: VideoFrameInterpolationBackend = .auto
     var interpolationRate: VideoInterpolationRate = .doubleRate
+    /// Locks optical flow to its highest quality profile (`540p .medium`), expands lookahead runway
+    /// (`0.45s`), and ignores `.fair`/`.serious` thermal & worker-busy step-downs (retaining only `.critical` OS safety).
+    var forceFrameInterpolation: Bool = false
     var superResolutionScale: VideoSuperResolutionScale = .two
     var superResolutionTargetResolution: VideoSuperResolutionTargetResolution = .auto
     var superResolutionSharpness: VideoSuperResolutionSharpness = .standard
@@ -344,21 +468,167 @@ struct VideoEnhancementConfiguration: Equatable, Sendable {
 
     static let disabled = Self()
 
+    init(
+        superResolutionMode: VideoSuperResolutionMode = .off,
+        frameInterpolationEnabled: Bool = false,
+        frameInterpolationBackend: VideoFrameInterpolationBackend = .auto,
+        interpolationRate: VideoInterpolationRate = .doubleRate,
+        forceFrameInterpolation: Bool = false,
+        superResolutionScale: VideoSuperResolutionScale = .two,
+        superResolutionTargetResolution: VideoSuperResolutionTargetResolution = .auto,
+        superResolutionSharpness: VideoSuperResolutionSharpness = .standard,
+        superResolutionSplitCompare: Bool = false,
+        maxInputResolution: VideoEnhancementMaxInputResolution = .p1080,
+        isLiveStream: Bool = false,
+        limitToScreenResolution: Bool = true
+    ) {
+        self.superResolutionMode = superResolutionMode
+        self.frameInterpolationEnabled = frameInterpolationEnabled
+        self.frameInterpolationBackend = frameInterpolationBackend
+        self.interpolationRate = interpolationRate
+        self.forceFrameInterpolation = forceFrameInterpolation
+        self.superResolutionScale = superResolutionScale
+        self.superResolutionTargetResolution = superResolutionTargetResolution
+        self.superResolutionSharpness = superResolutionSharpness
+        self.superResolutionSplitCompare = superResolutionSplitCompare
+        self.maxInputResolution = maxInputResolution
+        self.isLiveStream = isLiveStream
+        self.limitToScreenResolution = limitToScreenResolution
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case superResolutionMode
+        case frameInterpolationEnabled
+        case frameInterpolationBackend
+        case interpolationRate
+        case forceFrameInterpolation
+        case superResolutionScale
+        case superResolutionTargetResolution
+        case superResolutionSharpness
+        case superResolutionSplitCompare
+        case maxInputResolution
+        case isLiveStream
+        case limitToScreenResolution
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        superResolutionMode = try container.decodeIfPresent(
+            VideoSuperResolutionMode.self, forKey: .superResolutionMode
+        ) ?? .off
+        frameInterpolationEnabled = try container.decodeIfPresent(
+            Bool.self, forKey: .frameInterpolationEnabled
+        ) ?? false
+        if let rawBackend = try container.decodeIfPresent(String.self, forKey: .frameInterpolationBackend) {
+            frameInterpolationBackend = VideoFrameInterpolationBackend(persistedValue: rawBackend) ?? .auto
+        } else {
+            frameInterpolationBackend = .auto
+        }
+        interpolationRate = try container.decodeIfPresent(
+            VideoInterpolationRate.self, forKey: .interpolationRate
+        ) ?? .doubleRate
+        forceFrameInterpolation = try container.decodeIfPresent(
+            Bool.self, forKey: .forceFrameInterpolation
+        ) ?? false
+        superResolutionScale = try container.decodeIfPresent(
+            VideoSuperResolutionScale.self, forKey: .superResolutionScale
+        ) ?? .two
+        superResolutionTargetResolution = try container.decodeIfPresent(
+            VideoSuperResolutionTargetResolution.self, forKey: .superResolutionTargetResolution
+        ) ?? .auto
+        superResolutionSharpness = try container.decodeIfPresent(
+            VideoSuperResolutionSharpness.self, forKey: .superResolutionSharpness
+        ) ?? .standard
+        superResolutionSplitCompare = try container.decodeIfPresent(
+            Bool.self, forKey: .superResolutionSplitCompare
+        ) ?? false
+        maxInputResolution = try container.decodeIfPresent(
+            VideoEnhancementMaxInputResolution.self, forKey: .maxInputResolution
+        ) ?? .p1080
+        isLiveStream = try container.decodeIfPresent(Bool.self, forKey: .isLiveStream) ?? false
+        limitToScreenResolution = try container.decodeIfPresent(
+            Bool.self, forKey: .limitToScreenResolution
+        ) ?? true
+    }
+
     var isRequested: Bool {
         superResolutionMode != .off || frameInterpolationEnabled
     }
 
-    /// Returns `true` when changing from `other` only alters per-frame MetalFX shader uniforms
-    /// (`superResolutionSharpness` or `superResolutionSplitCompare`) and requires zero pipeline flush.
+    var isForceInterpolationActive: Bool {
+        frameInterpolationEnabled && forceFrameInterpolation
+    }
+
+    var resolvedFrameInterpolationBackend: VideoFrameInterpolationBackend {
+        resolvedFrameInterpolationBackend()
+    }
+
+    func resolvedFrameInterpolationBackend(
+        vtSupported: Bool = VideoEnhancementCapabilities.supportsVideoToolboxFrameInterpolation
+    ) -> VideoFrameInterpolationBackend {
+        frameInterpolationBackend.resolved(vtSupported: vtSupported)
+    }
+
+    static var selectableFrameInterpolationBackends: [VideoFrameInterpolationBackend] {
+        VideoFrameInterpolationBackend.selectableBackends()
+    }
+
+    static func selectableFrameInterpolationBackends(
+        vtSupported: Bool
+    ) -> [VideoFrameInterpolationBackend] {
+        VideoFrameInterpolationBackend.selectableBackends(vtSupported: vtSupported)
+    }
+
+    /// Returns `true` when changing from `other` only alters live per-frame uniforms or force-interpolation
+    /// policy (`superResolutionSharpness`, `superResolutionSplitCompare`, or `forceFrameInterpolation`)
+    /// and requires zero pipeline flush.
     func isShaderUniformOnlyChange(from other: Self) -> Bool {
         superResolutionMode == other.superResolutionMode
             && frameInterpolationEnabled == other.frameInterpolationEnabled
+            && frameInterpolationBackend == other.frameInterpolationBackend
             && interpolationRate == other.interpolationRate
             && superResolutionScale == other.superResolutionScale
             && superResolutionTargetResolution == other.superResolutionTargetResolution
             && maxInputResolution == other.maxInputResolution
             && isLiveStream == other.isLiveStream
             && limitToScreenResolution == other.limitToScreenResolution
+    }
+
+    /// Returns `true` when changing from `other` only alters `frameInterpolationBackend`
+    /// while every other enhancement setting stays identical.
+    func isFrameInterpolationBackendOnlyChange(from other: Self) -> Bool {
+        frameInterpolationBackend != other.frameInterpolationBackend
+            && superResolutionMode == other.superResolutionMode
+            && frameInterpolationEnabled == other.frameInterpolationEnabled
+            && interpolationRate == other.interpolationRate
+            && forceFrameInterpolation == other.forceFrameInterpolation
+            && superResolutionScale == other.superResolutionScale
+            && superResolutionTargetResolution == other.superResolutionTargetResolution
+            && superResolutionSharpness == other.superResolutionSharpness
+            && superResolutionSplitCompare == other.superResolutionSplitCompare
+            && maxInputResolution == other.maxInputResolution
+            && isLiveStream == other.isLiveStream
+            && limitToScreenResolution == other.limitToScreenResolution
+    }
+
+    func changeKind(
+        from other: Self,
+        vtSupported: Bool = VideoEnhancementCapabilities.supportsVideoToolboxFrameInterpolation
+    ) -> VideoEnhancementConfigurationChange {
+        guard self != other else { return .unchanged }
+        if isShaderUniformOnlyChange(from: other) {
+            return .shaderUniformOnly
+        }
+        if isFrameInterpolationBackendOnlyChange(from: other) {
+            guard frameInterpolationEnabled else { return .interpolationBackendAliasOnly }
+            let outgoing = other.resolvedFrameInterpolationBackend(vtSupported: vtSupported)
+            let incoming = resolvedFrameInterpolationBackend(vtSupported: vtSupported)
+            if outgoing == incoming {
+                return .interpolationBackendAliasOnly
+            }
+            return .interpolationBackendHotSwap(outgoing: outgoing, incoming: incoming)
+        }
+        return .fullPipelineReset
     }
 }
 
@@ -402,6 +672,28 @@ struct VideoEnhancementCapabilities: Equatable, Sendable {
         )
     }
 
+    var supportsVideoToolboxFrameInterpolation: Bool {
+        frameInterpolation == .supported
+    }
+
+    var selectableFrameInterpolationBackends: [VideoFrameInterpolationBackend] {
+        VideoFrameInterpolationBackend.selectableBackends(
+            vtSupported: supportsVideoToolboxFrameInterpolation
+        )
+    }
+
+    static var supportsVideoToolboxFrameInterpolation: Bool {
+        #if targetEnvironment(simulator)
+        return false
+        #else
+        if #available(iOS 26.0, *) {
+            return VTLowLatencyFrameInterpolationConfiguration.isSupported
+        } else {
+            return false
+        }
+        #endif
+    }
+
     private static func currentMetalFXSpatialSupport() -> VideoEnhancementCapabilityStatus {
         #if canImport(MetalFX)
         let supported = MTLCreateSystemDefaultDevice().map {
@@ -418,7 +710,10 @@ struct VideoEnhancementCapabilities: Equatable, Sendable {
         return .simulatorUnsupported
         #else
         if #available(iOS 26.0, *) {
-            return VTLowLatencyFrameInterpolationConfiguration.isSupported ? .supported : .unsupported
+            if VTLowLatencyFrameInterpolationConfiguration.isSupported {
+                return .supported
+            }
+            return MTLCreateSystemDefaultDevice() != nil ? .supportedVisionFallback : .unsupported
         } else {
             return MTLCreateSystemDefaultDevice() != nil ? .supportedVisionFallback : .unsupported
         }
@@ -468,7 +763,7 @@ enum VideoEnhancementBypassDisplay {
     }
 
     static func pausedMenuLabel(for rawReason: String) -> String {
-        String(format: String(localized: "Paused · %@"), shortLabel(for: rawReason))
+        String(format: String(localized: "Paused (%@)"), shortLabel(for: rawReason))
     }
 
     static func pausedStatsLabel(for rawReason: String) -> String {
@@ -495,6 +790,27 @@ struct VideoEnhancementTelemetry: Equatable, Sendable {
     var interpolationShare: Double?
     /// Dominant reason some recent frames were not fully enhanced while enhancement is active.
     var partialReason: String?
+    /// Active/resolved frame interpolation backend label (`"VT System"` vs `"Vision Flow"`),
+    /// or `nil` when frame interpolation is off.
+    var activeFrameInterpolationBackendLabel: String?
+
+    /// Resolves the interpolation engine label (`"VT System"` vs `"Vision Flow"`), preferring
+    /// explicit `activeFrameInterpolationBackendLabel` and falling back to tokens in `activeModeLabel`.
+    var resolvedFrameInterpolationBackendLabel: String? {
+        if let explicit = activeFrameInterpolationBackendLabel, !explicit.isEmpty {
+            return explicit
+        }
+        let tokens = activeModeLabel
+            .split(separator: "+")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        if tokens.contains("VT System") || tokens.contains("VT FI") {
+            return VideoFrameInterpolationBackend.videoToolbox.telemetryLabel
+        }
+        if tokens.contains("Vision Flow") || tokens.contains("Vision FI") {
+            return VideoFrameInterpolationBackend.visionOpticalFlow.telemetryLabel
+        }
+        return nil
+    }
 
     static func bypassed(reason: String) -> Self {
         Self(
@@ -520,7 +836,7 @@ struct VideoEnhancementTelemetry: Equatable, Sendable {
             parts.append(String(format: "%.1fms", smoothedProcessingMs))
         }
         if let degradationNote {
-            parts.append(String(format: String(localized: "(Reduced · %@)"),
+            parts.append(String(format: String(localized: "(Reduced: %@)"),
                                 VideoEnhancementBypassDisplay.shortLabel(for: degradationNote)))
         }
         return parts.joined(separator: " ")
@@ -542,7 +858,7 @@ struct VideoEnhancementTelemetry: Equatable, Sendable {
             parts.append(String(format: "%.1fms", smoothedProcessingMs))
         }
         if let degradationNote {
-            parts.append(String(format: String(localized: "(Reduced · %@)"),
+            parts.append(String(format: String(localized: "(Reduced: %@)"),
                                 VideoEnhancementBypassDisplay.shortLabel(for: degradationNote)))
         }
         return parts.joined(separator: " ")
@@ -552,6 +868,8 @@ struct VideoEnhancementTelemetry: Equatable, Sendable {
 enum VideoEnhancementPreferences {
     static let defaultSRBackendKey = "experimental_video_enhancement_default_sr_backend"
     static let defaultFrameInterpolationKey = "experimental_video_enhancement_default_frame_interpolation"
+    static let frameInterpolationBackendKey = "experimental_video_enhancement_frame_interpolation_backend"
+    static let forceFrameInterpolationKey = "experimental_video_enhancement_force_frame_interpolation"
 
     static var defaultSRMode: VideoSuperResolutionMode {
         get {
@@ -630,5 +948,40 @@ enum VideoEnhancementPreferences {
         set {
             UserDefaults.standard.set(newValue, forKey: defaultFrameInterpolationKey)
         }
+    }
+
+    static var frameInterpolationBackend: VideoFrameInterpolationBackend {
+        get { loadFrameInterpolationBackend() }
+        set { saveFrameInterpolationBackend(newValue) }
+    }
+
+    static func loadFrameInterpolationBackend(
+        from defaults: UserDefaults = .standard
+    ) -> VideoFrameInterpolationBackend {
+        guard let raw = defaults.string(forKey: frameInterpolationBackendKey),
+              let backend = VideoFrameInterpolationBackend(persistedValue: raw) else {
+            return .auto
+        }
+        return backend
+    }
+
+    static func saveFrameInterpolationBackend(
+        _ backend: VideoFrameInterpolationBackend,
+        to defaults: UserDefaults = .standard
+    ) {
+        defaults.set(backend.persistenceValue, forKey: frameInterpolationBackendKey)
+    }
+
+    static var forceFrameInterpolation: Bool {
+        get { loadForceFrameInterpolation() }
+        set { saveForceFrameInterpolation(newValue) }
+    }
+
+    static func loadForceFrameInterpolation(from defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: forceFrameInterpolationKey)
+    }
+
+    static func saveForceFrameInterpolation(_ enabled: Bool, to defaults: UserDefaults = .standard) {
+        defaults.set(enabled, forKey: forceFrameInterpolationKey)
     }
 }

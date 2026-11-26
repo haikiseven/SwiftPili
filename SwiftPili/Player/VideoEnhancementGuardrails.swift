@@ -42,13 +42,25 @@ enum VideoEnhancementGuardrails {
         state == .serious || state == .critical
     }
 
-    static func isSDR8Bit(_ pixelBuffer: CVPixelBuffer) -> Bool {
-        let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
-        let is8BitFormat = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-            || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            || format == kCVPixelFormatType_32BGRA
-        guard is8BitFormat else { return false }
+    /// When `forceFrameInterpolation` is active, ignores `.serious` thermal throttling and retains
+    /// only `.critical` OS emergency shutdown protection.
+    static func isThermalBlocked(
+        _ state: ProcessInfo.ThermalState = ProcessInfo.processInfo.thermalState,
+        forceFrameInterpolation: Bool = false
+    ) -> Bool {
+        forceFrameInterpolation ? (state == .critical) : isThermalThrottled(state)
+    }
 
+    static func is10BitBiPlanar(_ pixelBuffer: CVPixelBuffer) -> Bool {
+        let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        return format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+    }
+
+    static func isHDRTransfer(_ pixelBuffer: CVPixelBuffer) -> Bool {
+        if CVBufferCopyAttachment(pixelBuffer, kCVImageBufferLogTransferFunctionKey, nil) != nil {
+            return true
+        }
         if let transfer = CVBufferCopyAttachment(
             pixelBuffer,
             kCVImageBufferTransferFunctionKey,
@@ -57,10 +69,36 @@ enum VideoEnhancementGuardrails {
             if CFEqual(transfer, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ)
                 || CFEqual(transfer, kCVImageBufferTransferFunction_ITU_R_2100_HLG)
                 || CFEqual(transfer, kCVImageBufferTransferFunction_Linear) {
-                return false
+                return true
             }
         }
-        return true
+        return false
+    }
+
+    static func isSDR8Bit(_ pixelBuffer: CVPixelBuffer) -> Bool {
+        let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        let is8BitFormat = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            || format == kCVPixelFormatType_32BGRA
+        guard is8BitFormat else { return false }
+        return !isHDRTransfer(pixelBuffer)
+    }
+
+    /// True for both 8-bit SDR (`420v`, `420f`, `BGRA`) and 10-bit SDR (`x420`, `xf20`, e.g. Bilibili HEVC Main10 / AV1).
+    static func isSDR(_ pixelBuffer: CVPixelBuffer) -> Bool {
+        guard isSupportedInterpolationBuffer(pixelBuffer) else { return false }
+        return !isHDRTransfer(pixelBuffer)
+    }
+
+    /// True for all progressive 8-bit and 10-bit pixel formats supported by native YCbCr/BGRA frame interpolation
+    /// (including 10-bit SDR and PQ/HLG HDR10 / Dolby Vision).
+    static func isSupportedInterpolationBuffer(_ pixelBuffer: CVPixelBuffer) -> Bool {
+        let format = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        return format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            || format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+            || format == kCVPixelFormatType_32BGRA
     }
 
     static func commonBypassReason(
@@ -72,13 +110,23 @@ enum VideoEnhancementGuardrails {
         if configuration.isLiveStream {
             return "VOD only"
         }
-        if isThermalThrottled(thermalState) {
+        let forceFI = configuration.isForceInterpolationActive
+        if isThermalBlocked(thermalState, forceFrameInterpolation: forceFI) {
             return "Thermal throttling"
         }
-        if memoryPressure {
+        if memoryPressure, !forceFI {
             return "Memory pressure"
         }
-        if !isSDR8Bit(pixelBuffer) {
+        if configuration.frameInterpolationEnabled {
+            if !isSupportedInterpolationBuffer(pixelBuffer) {
+                return "Unsupported pixel format"
+            }
+            if CVBufferCopyAttachment(pixelBuffer, kCVImageBufferLogTransferFunctionKey, nil) != nil {
+                return "HDR / log transfer"
+            }
+            return nil
+        }
+        if !isSDR(pixelBuffer) {
             return "HDR / 10-bit"
         }
         return nil
@@ -88,7 +136,10 @@ enum VideoEnhancementGuardrails {
         _ pixelBuffer: CVPixelBuffer,
         maxInputResolution: VideoEnhancementMaxInputResolution = .p1080
     ) -> String? {
-        isWithin(
+        if !isSDR(pixelBuffer) {
+            return "HDR / 10-bit"
+        }
+        return isWithin(
             width: CVPixelBufferGetWidth(pixelBuffer),
             height: CVPixelBufferGetHeight(pixelBuffer),
             limit: maxInputResolution
@@ -101,6 +152,22 @@ enum VideoFramePairFormat {
         kCVImageBufferFieldCountKey,
         kCVImageBufferFieldDetailKey,
         kCVImageBufferChromaLocationBottomFieldKey,
+    ]
+
+    /// Core static color/geometry attachments that must stay consistent across an interpolated pair.
+    /// Per-frame SEI metadata (`ContentLightLevelInfo`, `MasteringDisplayColorVolume`, `AmbientViewingEnvironment`)
+    /// is still propagated onto synthesized frames via `copyInterpretation` without falsely rejecting pairs.
+    private nonisolated(unsafe) static let pairMatchKeys: [CFString] = [
+        kCVImageBufferColorPrimariesKey,
+        kCVImageBufferTransferFunctionKey,
+        kCVImageBufferYCbCrMatrixKey,
+        kCVImageBufferGammaLevelKey,
+        kCVImageBufferCleanApertureKey,
+        kCVImageBufferPreferredCleanApertureKey,
+        kCVImageBufferPixelAspectRatioKey,
+        kCVImageBufferDisplayDimensionsKey,
+        kCVImageBufferChromaLocationTopFieldKey,
+        kCVImageBufferLogTransferFunctionKey,
     ]
 
     private nonisolated(unsafe) static let interpretationKeys: [CFString] = [
@@ -135,7 +202,7 @@ enum VideoFramePairFormat {
         guard hasSameStorageFormat(previous, current) else { return false }
         let previousIsInterlaced = isInterlaced(previous)
         guard previousIsInterlaced == isInterlaced(current) else { return false }
-        let keys = previousIsInterlaced ? allKeys : interpretationKeys
+        let keys = previousIsInterlaced ? (pairMatchKeys + fieldKeys) : pairMatchKeys
         for key in keys {
             switch (CVBufferCopyAttachment(previous, key, nil), CVBufferCopyAttachment(current, key, nil)) {
             case (nil, nil):
@@ -150,9 +217,10 @@ enum VideoFramePairFormat {
     }
 
     static func interpolationBypassReason(_ buffer: CVPixelBuffer) -> String? {
-        if CVBufferCopyAttachment(buffer, kCVImageBufferLogTransferFunctionKey, nil) != nil
-            || CVBufferCopyAttachment(buffer, kCVImageBufferMasteringDisplayColorVolumeKey, nil) != nil
-            || CVBufferCopyAttachment(buffer, kCVImageBufferContentLightLevelInfoKey, nil) != nil {
+        if !VideoEnhancementGuardrails.isSupportedInterpolationBuffer(buffer) {
+            return "Unsupported pixel format"
+        }
+        if CVBufferCopyAttachment(buffer, kCVImageBufferLogTransferFunctionKey, nil) != nil {
             return "HDR / log transfer"
         }
         return isInterlaced(buffer) ? "Interlaced input" : nil
@@ -174,6 +242,7 @@ enum VideoFramePairFormat {
 
     static func copyInterpretation(from source: CVPixelBuffer, to destination: CVPixelBuffer) {
         precondition(hasSameStorageFormat(source, destination))
+        CVBufferPropagateAttachments(source, destination)
         for key in allKeys {
             var mode = CVAttachmentMode.shouldPropagate
             if let value = CVBufferCopyAttachment(source, key, &mode) {

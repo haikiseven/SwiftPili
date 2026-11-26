@@ -1,3 +1,4 @@
+import CoreImage
 import CoreVideo
 import Foundation
 import IOSurface
@@ -48,6 +49,7 @@ final class VideoEnhancementMetalContext: @unchecked Sendable {
         let commandQueue: any MTLCommandQueue
         let library: any MTLLibrary
         let textureCache: CVMetalTextureCache
+        let visionCIContext: CIContext
     }
 
     struct MappedTexture {
@@ -65,10 +67,16 @@ final class VideoEnhancementMetalContext: @unchecked Sendable {
         case rcasSharpen
         case rcasToNV12
 
-        // VisionFrameInterpolation.metal
+        // VisionFrameInterpolation.metal (Vision optical flow validation, forward splat & full-res synthesis)
         case visionInterpolationPrepare
+        case visionInterpolationCoarseFlow
         case visionInterpolationValidate
+        case visionInterpolationRegularizeFlow
+        case visionInterpolationClearSplat
+        case visionInterpolationSplatPhase
+        case visionInterpolationResolvePhase
         case visionInterpolationSynthesize
+        case visionInterpolationSynthesizeNV12
     }
 
     struct SetupFailure: Error, Sendable {
@@ -281,7 +289,20 @@ final class VideoEnhancementMetalContext: @unchecked Sendable {
         guard let cache = cacheOut else {
             throw SetupFailure(stage: "texture cache missing result", status: Int(cacheStatus))
         }
-        let created = Resources(device: device, commandQueue: queue, library: library, textureCache: cache)
+        let ciContext = CIContext(
+            mtlDevice: device,
+            options: [
+                .cacheIntermediates: false,
+                .allowLowPower: false,
+            ]
+        )
+        let created = Resources(
+            device: device,
+            commandQueue: queue,
+            library: library,
+            textureCache: cache,
+            visionCIContext: ciContext
+        )
         cachedResources = created
         return created
     }

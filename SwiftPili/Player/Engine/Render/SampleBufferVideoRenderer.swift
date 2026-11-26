@@ -49,8 +49,22 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
     private let displayView: SampleBufferDisplayView
     private let presentationHoldView: PresentationImageHoldView
     private let synchronizer = AVSampleBufferRenderSynchronizer()
-    private static let maxPendingEnhancedFrames = 8
-    private static let maxPendingEnhancedStartFrames = 4
+    private static let maxPendingEnhancedFrames = 12
+    private static let maxPendingEnhancedStartFrames = 8
+    private static let forceMaxPendingEnhancedFrames = 18
+    private static let forceMaxPendingEnhancedStartFrames = 12
+
+    private var effectiveMaxPendingEnhancedFrames: Int {
+        postProcessor.configuration.isForceInterpolationActive
+            ? Self.forceMaxPendingEnhancedFrames
+            : Self.maxPendingEnhancedFrames
+    }
+
+    private var effectiveMaxPendingEnhancedStartFrames: Int {
+        postProcessor.configuration.isForceInterpolationActive
+            ? Self.forceMaxPendingEnhancedStartFrames
+            : Self.maxPendingEnhancedStartFrames
+    }
 
     private struct PendingEnhancedFrame {
         var frame: MediaVideoFrame
@@ -398,7 +412,17 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
             duration: duration,
             isPlaying: isPlaying
         )
+        if #available(iOS 15.0, *) {
+            pipController?.canStartPictureInPictureAutomaticallyFromInline = isPlaying
+        }
         pipController?.invalidatePlaybackState()
+    }
+
+    var allowsAutomaticPiPFromInline: Bool {
+        if #available(iOS 15.0, *), let pipController {
+            return pipController.canStartPictureInPictureAutomaticallyFromInline
+        }
+        return pipPlaybackDelegate.isPlaying
     }
 
     private func preparePiPControllerIfPossible() {
@@ -414,7 +438,7 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
                 playbackDelegate: pipPlaybackDelegate
             )
             let controller = AVPictureInPictureController(contentSource: contentSource)
-            controller.canStartPictureInPictureAutomaticallyFromInline = true
+            controller.canStartPictureInPictureAutomaticallyFromInline = pipPlaybackDelegate.isPlaying
             controller.delegate = self
             pipController = controller
             pipPlaybackDelegate.bind(to: controller)
@@ -589,10 +613,11 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
     var videoEnhancementConfiguration: VideoEnhancementConfiguration {
         get { postProcessor.configuration }
         set {
-            let oldValue = postProcessor.configuration
-            guard oldValue != newValue else { return }
-            postProcessor.configuration = newValue
-            if !newValue.isShaderUniformOnlyChange(from: oldValue) {
+            let change = postProcessor.updateConfiguration(newValue)
+            switch change {
+            case .unchanged, .shaderUniformOnly, .interpolationBackendAliasOnly, .interpolationBackendHotSwap:
+                break
+            case .fullPipelineReset:
                 retireEnhancement(wakeWaitingDrain: true)
             }
         }
@@ -802,12 +827,30 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         return ready ? .attachedButUnproven : .missingSurface
     }
 
-    func currentDisplayedImage() -> UIImage? {
+    func currentDisplayedFrameCaptureSource() -> DisplayedFrameCaptureSource? {
         let renderer = displayView.sampleBufferLayer.sampleBufferRenderer
         let pixelBuffer = frontmostNonWarmPresentationPixelBuffer()
             ?? renderer.displayedPixelBuffer()
         guard let pixelBuffer else { return nil }
-        let image = CIImage(cvPixelBuffer: pixelBuffer)
+        return DisplayedFrameCaptureSource(
+            pixelBuffer: pixelBuffer,
+            displayScale: max(resolvedDisplayScale(), 1)
+        )
+    }
+
+    private func resolvedDisplayScale() -> CGFloat {
+        if let windowScale = displayView.window?.windowScene?.screen.scale, windowScale > 0 {
+            return windowScale
+        }
+        if displayView.traitCollection.displayScale > 0 {
+            return displayView.traitCollection.displayScale
+        }
+        return AppWindowMetrics.current?.windowScene?.screen.scale ?? 2
+    }
+
+    func currentDisplayedImage() -> UIImage? {
+        guard let source = currentDisplayedFrameCaptureSource() else { return nil }
+        let image = CIImage(cvPixelBuffer: source.pixelBuffer)
         let extent = image.extent.integral
         guard extent.width > 0, extent.height > 0 else { return nil }
         let maxDimension: CGFloat = 640
@@ -819,18 +862,9 @@ final class SampleBufferVideoRenderer: NSObject, MediaVideoPresentation, MediaPi
         guard let cgImage else {
             return nil
         }
-        let displayScale: CGFloat = {
-            if let windowScale = displayView.window?.windowScene?.screen.scale, windowScale > 0 {
-                return windowScale
-            }
-            if displayView.traitCollection.displayScale > 0 {
-                return displayView.traitCollection.displayScale
-            }
-            return AppWindowMetrics.current?.windowScene?.screen.scale ?? 2
-        }()
         return UIImage(
             cgImage: cgImage,
-            scale: max(displayScale, 1),
+            scale: source.displayScale,
             orientation: .up
         )
     }
@@ -1917,9 +1951,9 @@ extension SampleBufferVideoRenderer {
             let canPipelineEnhancement: Bool
             if tracksEnhancementAdmissions {
                 if enhancementAttempt != nil {
-                    canPipelineEnhancement = pendingEnhancedOutput.count < Self.maxPendingEnhancedFrames
+                    canPipelineEnhancement = pendingEnhancedOutput.count < effectiveMaxPendingEnhancedFrames
                 } else {
-                    canPipelineEnhancement = pendingEnhancedOutput.count <= Self.maxPendingEnhancedStartFrames
+                    canPipelineEnhancement = pendingEnhancedOutput.count <= effectiveMaxPendingEnhancedStartFrames
                 }
             } else {
                 canPipelineEnhancement = false
@@ -1993,11 +2027,14 @@ extension SampleBufferVideoRenderer {
         }
         let hasEligibleWork = request.canUpscale || request.midpointDelay != nil
         if postProcessor.isBusy, hasEligibleWork {
+            let forceFI = postProcessor.configuration.isForceInterpolationActive
+            let minRunway: TimeInterval = forceFI ? 0.002 : 0.015
             let waitRunway = request.canUpscale ? request.originalDelay : (request.midpointDelay ?? request.originalDelay)
-            if let waitRunway, waitRunway > 0.015 {
+            if let waitRunway, waitRunway > minRunway {
                 parkForBusyWorker(
                     frame: frame,
                     originalDelay: waitRunway,
+                    forceInterpolation: forceFI,
                     wake: onEnhancementWake
                 )
                 return .waitingOnEnhancement
@@ -2038,11 +2075,14 @@ extension SampleBufferVideoRenderer {
     private func parkForBusyWorker(
         frame: MediaVideoFrame,
         originalDelay: TimeInterval,
+        forceInterpolation: Bool = false,
         wake: @escaping @MainActor () -> Void
     ) {
         let boundary = enhancementBoundary
         let identity = EnhancementFrameIdentity(frame)
-        let waitSeconds = max(0.005, originalDelay - 0.010)
+        let reserve: TimeInterval = forceInterpolation ? 0.002 : 0.010
+        let floorWait: TimeInterval = forceInterpolation ? 0.002 : 0.005
+        let waitSeconds = max(floorWait, originalDelay - reserve)
         let deadline = ContinuousClock.now.advanced(by: .seconds(waitSeconds))
         busyWaitState = BusyWaitState(
             frame: identity,
@@ -2167,7 +2207,8 @@ extension SampleBufferVideoRenderer {
 
     private func enhancementDelay(pts: TimeInterval, clock: TimeInterval, rate: Double) -> TimeInterval? {
         guard clock.isFinite, rate.isFinite, rate > 0, displayRate > 0 else { return nil }
-        let delay = (pts - clock) / rate - 0.008
+        let safetyMargin: TimeInterval = postProcessor.configuration.isForceInterpolationActive ? 0.002 : 0.008
+        let delay = (pts - clock) / rate - safetyMargin
         return delay.isFinite && delay > 0 ? min(delay, preferredPresentLeadSeconds) : nil
     }
 
@@ -2196,6 +2237,7 @@ extension SampleBufferVideoRenderer {
             request.original,
             previous: request.reference,
             admission: request.admission,
+            playbackRate: request.playbackRate,
             deadlines: deadlines
         ) { [weak self] update in
             guard let self, self.enhancementBoundary == boundary else { return }
@@ -2381,8 +2423,11 @@ extension SampleBufferVideoRenderer {
         playbackRate: Double,
         renderer: AVSampleBufferVideoRenderer
     ) throws -> DemandFramePresentationResult {
-        if VideoEnhancementGuardrails.isThermalThrottled() || VideoEnhancementGuardrails.isUnderMemoryPressure {
-            let reason = VideoEnhancementGuardrails.isThermalThrottled() ? "Thermal throttling" : "Memory pressure"
+        let forceFI = postProcessor.configuration.isForceInterpolationActive
+        let thermalBlocked = VideoEnhancementGuardrails.isThermalBlocked(forceFrameInterpolation: forceFI)
+        let memoryBlocked = VideoEnhancementGuardrails.isUnderMemoryPressure && !forceFI
+        if thermalBlocked || memoryBlocked {
+            let reason = thermalBlocked ? "Thermal throttling" : "Memory pressure"
             postProcessor.noteBypass(reason)
             if tracksSuperResolutionAdmissions {
                 enhancementDiagnostics.superResolution.noteBypass(reason)
@@ -3162,6 +3207,7 @@ final class EnginePiPPlaybackDelegate: NSObject, @preconcurrency AVPictureInPict
     private(set) var currentTime: TimeInterval = 0
     private(set) var duration: TimeInterval = 0
     private(set) var isPaused = true
+    var isPlaying: Bool { !isPaused }
     weak var transportDelegate: (any EnginePiPTransportDelegate)?
     private weak var currentController: AVPictureInPictureController?
 

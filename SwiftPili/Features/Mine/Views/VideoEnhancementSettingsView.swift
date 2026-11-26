@@ -2,42 +2,39 @@ import SwiftUI
 
 struct VideoEnhancementSettingsView: View {
     private let experiments = ExperimentalSettingsStore.shared
-    let access: ExperimentalAccessReceipt
+    private let interpolationBackendStore = InterpolationBackendPreferencesStore.shared
+    var access: ExperimentalAccessReceipt?
 
     private var canMutate: Bool {
-        experiments.storageError == nil && experiments.isCurrentAccess(access)
+        experiments.storageError == nil
+            && (access.map { experiments.isCurrentAccess($0) } ?? experiments.isAllowed(.videoEnhancement))
     }
 
     var body: some View {
         let capabilities = VideoEnhancementCapabilities.current
 
         List {
-            if let storageError = experiments.storageError {
-                Section {
-                    Text(verbatim: storageError)
-                        .foregroundStyle(.red)
+            Group {
+                if let storageError = experiments.storageError {
+                    Section {
+                        Text(verbatim: storageError)
+                            .foregroundStyle(.red)
+                    }
                 }
-            } else if !experiments.isCurrentAccess(access) {
-                Section {
-                    Text("Video enhancement is disabled in Experimental Features.")
-                        .foregroundStyle(.secondary)
+
+                superResolutionSection
+                interpolationSection
+
+                Section("Device Support") {
+                    capabilityRow("MetalFX Spatial", status: capabilities.metalFXSpatial)
+                    capabilityRow("Frame Interpolation", status: capabilities.frameInterpolation)
                 }
             }
-
-            superResolutionSection
-            interpolationSection
-
-            Section {
-                capabilityRow("MetalFX Spatial", status: capabilities.metalFXSpatial)
-                capabilityRow("Frame Interpolation", status: capabilities.frameInterpolation)
-            } header: {
-                Text("Device Support")
-            }
+            .listRowBackground(AppFill.card)
         }
-        .listRowBackground(AppFill.card)
         .readableFormWidth()
         .accentContentBoundary()
-        .navigationTitle("Video Enhancement Settings")
+        .navigationTitle("Video Enhancement")
         .navigationBarTitleDisplayMode(.inline)
     }
 
@@ -107,14 +104,6 @@ struct VideoEnhancementSettingsView: View {
             }
         } header: {
             Text("Super Resolution")
-        } footer: {
-            Text(
-                """
-                Applies to SDR Demand VOD streams within the max input resolution. \
-                MetalFX Spatial supports manual target resolution, which overrides Limit to Screen Resolution. \
-                High temperatures pause enhancement.
-                """
-            )
         }
         .disabled(!canMutate)
     }
@@ -122,7 +111,9 @@ struct VideoEnhancementSettingsView: View {
     // MARK: Frame interpolation
 
     private var interpolationSection: some View {
-        Section {
+        let vtSupported = VideoEnhancementCapabilities.current.supportsVideoToolboxFrameInterpolation
+
+        return Section {
             Toggle(isOn: binding(
                 \.videoEnhancementDefaultFrameInterpolation, experiments.setVideoEnhancementDefaultFrameInterpolation
             )) {
@@ -143,10 +134,50 @@ struct VideoEnhancementSettingsView: View {
             }
             .pickerStyle(.menu)
             .menuOrder(.fixed)
+
+            Picker(
+                "Interpolation Engine",
+                selection: Binding(
+                    get: {
+                        let stored = interpolationBackendStore.defaultBackend
+                        return stored.isSelectable(vtSupported: vtSupported)
+                            ? stored
+                            : stored.resolved(vtSupported: vtSupported)
+                    },
+                    set: { backend in
+                        guard canMutate, backend.isSelectable(vtSupported: vtSupported) else { return }
+                        _ = interpolationBackendStore.setDefaultBackend(backend)
+                    }
+                )
+            ) {
+                ForEach(VideoFrameInterpolationBackend.allCases) { backend in
+                    let selectable = backend.isSelectable(vtSupported: vtSupported)
+                    Text(backend.label)
+                        .selectionDisabled(!selectable)
+                        .disabled(!selectable)
+                        .tag(backend)
+                }
+            }
+            .pickerStyle(.menu)
+            .menuOrder(.fixed)
+
+            Toggle(isOn: Binding(
+                get: { interpolationBackendStore.defaultForceFrameInterpolation },
+                set: { enabled in
+                    guard canMutate else { return }
+                    _ = interpolationBackendStore.setDefaultForceFrameInterpolation(enabled)
+                }
+            )) {
+                Label {
+                    Text("Force Frame Interpolation")
+                } icon: {
+                    SettingsIcon(symbol: "bolt.fill")
+                }
+            }
         } header: {
             Text("Frame Interpolation")
         } footer: {
-            Text("Applies to supported progressive SDR Demand VOD streams. High temperatures pause enhancement.")
+            Text("VideoEnhancementForceFIFooter")
         }
         .disabled(!canMutate)
     }

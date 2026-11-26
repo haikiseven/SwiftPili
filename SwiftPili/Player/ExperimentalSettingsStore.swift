@@ -67,10 +67,57 @@ final class ExperimentalSettingsStore {
 
     @discardableResult
     func setGranted(_ granted: Bool, for feature: ExperimentalFeature) -> Bool {
-        guard snapshot.masterEnabled else { return false }
+        if feature.isAlwaysAvailableGraduated {
+            return true
+        }
+        guard feature.isGraduated || snapshot.masterEnabled else { return false }
         var next = snapshot
         next.grants[feature] = granted
-        return commit(next)
+        let committed = commit(next)
+        if committed {
+            if feature == .ambient {
+                PlayerPlaybackPreferences.ambientModeEnabled = granted
+            } else if feature == .decoderPrewarm {
+                UserDefaults.standard.set(granted, forKey: ExperimentalSettingsPreferences.decoderPrewarmDefaultsKey)
+            }
+        }
+        return committed
+    }
+
+    var ambientModeEnabled: Bool { isAllowed(.ambient) }
+
+    @discardableResult
+    func setAmbientModeEnabled(_ enabled: Bool) -> Bool {
+        PlayerPlaybackPreferences.ambientModeEnabled = enabled
+        var next = snapshot
+        next.grants[.ambient] = enabled
+        if bootstrapped, storageError == nil {
+            return commit(next)
+        }
+        publish(next)
+        return true
+    }
+
+    var decoderPrewarmEnabled: Bool { isAllowed(.decoderPrewarm) }
+
+    @discardableResult
+    func setDecoderPrewarmEnabled(_ enabled: Bool) -> Bool {
+        UserDefaults.standard.set(enabled, forKey: ExperimentalSettingsPreferences.decoderPrewarmDefaultsKey)
+        var next = snapshot
+        next.grants[.decoderPrewarm] = enabled
+        if bootstrapped, storageError == nil {
+            return commit(next)
+        }
+        publish(next)
+        return true
+    }
+
+    @discardableResult
+    func setDebugLoggingEnabled(_ enabled: Bool) -> Bool {
+        guard isAllowed(.diagnostics) else { return false }
+        PlayerLog.setEnabled(enabled)
+        notifyObservers([.diagnostics])
+        return true
     }
 
     @discardableResult
@@ -253,10 +300,18 @@ final class ExperimentalSettingsStore {
 
     private func publish(_ next: ExperimentalSettingsSnapshot) {
         let changed = Set(ExperimentalFeature.allCases.filter { snapshot.isAllowed($0) != next.isAllowed($0) })
-        for feature in changed {
-            access[feature]?.permit.revoke()
-            access[feature] = next.isAllowed(feature)
-                ? ExperimentalAccessReceipt(feature: feature, id: UUID(), permit: ExperimentalAccessPermit()) : nil
+        for feature in ExperimentalFeature.allCases {
+            if next.isAllowed(feature) {
+                if access[feature] == nil || changed.contains(feature) {
+                    access[feature]?.permit.revoke()
+                    access[feature] = ExperimentalAccessReceipt(
+                        feature: feature, id: UUID(), permit: ExperimentalAccessPermit()
+                    )
+                }
+            } else if access[feature] != nil {
+                access[feature]?.permit.revoke()
+                access[feature] = nil
+            }
         }
         if changed.contains(.commentTools) { retireAutoVerification() }
         let overridesChanged = snapshot.diagnosticOverrides != next.diagnosticOverrides

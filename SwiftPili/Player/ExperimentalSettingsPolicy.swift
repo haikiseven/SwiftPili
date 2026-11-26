@@ -3,7 +3,7 @@ import os
 import Synchronization
 
 enum ExperimentalSettingsPolicy {
-    private static let effectiveBits = Atomic<UInt32>(0)
+    private static let effectiveBits = Atomic<UInt32>(ExperimentalSettingsSnapshot().effectiveMask)
     private struct State {
         var overrides = ExperimentalDiagnosticOverrides.stock
         var access: [ExperimentalFeature: ExperimentalAccessReceipt] = [:]

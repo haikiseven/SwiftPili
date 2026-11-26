@@ -246,16 +246,17 @@ enum VTNV12StagingCopy {
         let lumaHeight: Int
         let chromaWidth: Int
         let chromaHeight: Int
+        let lumaFormat: MTLPixelFormat
+        let chromaFormat: MTLPixelFormat
+        let bytesPerComponent: Int
     }
 
     private static func validateNV12Layout(
         from source: CVPixelBuffer, to destination: CVPixelBuffer
     ) throws -> NV12Layout {
         let pixelFormat = CVPixelBufferGetPixelFormatType(source)
-        let isNV12 = pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-            || pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-        guard VideoFramePairFormat.hasSameStorageFormat(source, destination),
-              isNV12,
+        guard let planes = MetalNV12PixelConverter.biPlanarFormats(for: pixelFormat),
+              VideoFramePairFormat.hasSameStorageFormat(source, destination),
               CVPixelBufferGetPlaneCount(source) == 2, CVPixelBufferGetPlaneCount(destination) == 2 else {
             throw VTInterpolationFailure(reason: "VT FI staging layout incompatible")
         }
@@ -270,7 +271,13 @@ enum VTNV12StagingCopy {
               chromaH == CVPixelBufferGetHeightOfPlane(destination, 1) else {
             throw VTInterpolationFailure(reason: "VT FI staging layout incompatible")
         }
-        return NV12Layout(lumaWidth: lumaW, lumaHeight: lumaH, chromaWidth: chromaW, chromaHeight: chromaH)
+        let bpc = MetalNV12PixelConverter.is10BitBiPlanarYUV(pixelFormat) ? 2 : 1
+        return NV12Layout(
+            lumaWidth: lumaW, lumaHeight: lumaH,
+            chromaWidth: chromaW, chromaHeight: chromaH,
+            lumaFormat: planes.luma, chromaFormat: planes.chroma,
+            bytesPerComponent: bpc
+        )
     }
 
     private static func copyPlanesGPU(
@@ -283,10 +290,10 @@ enum VTNV12StagingCopy {
         guard let resources = try? metal.resources(),
               let commandBuffer = resources.commandQueue.makeCommandBuffer(),
               let srcY = metal.makeTexture(
-                buffer: source, format: .r8Unorm, width: layout.lumaWidth, height: layout.lumaHeight, plane: 0
+                buffer: source, format: layout.lumaFormat, width: layout.lumaWidth, height: layout.lumaHeight, plane: 0
               ),
               let srcCbCr = metal.makeTexture(
-                buffer: source, format: .rg8Unorm, width: layout.chromaWidth, height: layout.chromaHeight, plane: 1
+                buffer: source, format: layout.chromaFormat, width: layout.chromaWidth, height: layout.chromaHeight, plane: 1
               ) else {
             return (false, false)
         }
@@ -294,10 +301,10 @@ enum VTNV12StagingCopy {
         // Fast DMA blit when destination has no extended pixels.
         if dstPadding.isEmpty,
            let dstY = metal.makeTexture(
-            buffer: destination, format: .r8Unorm, width: layout.lumaWidth, height: layout.lumaHeight, plane: 0
+            buffer: destination, format: layout.lumaFormat, width: layout.lumaWidth, height: layout.lumaHeight, plane: 0
            ),
            let dstCbCr = metal.makeTexture(
-            buffer: destination, format: .rg8Unorm, width: layout.chromaWidth, height: layout.chromaHeight, plane: 1
+            buffer: destination, format: layout.chromaFormat, width: layout.chromaWidth, height: layout.chromaHeight, plane: 1
            ),
            let blit = commandBuffer.makeBlitCommandEncoder() {
             blit.copy(
@@ -346,11 +353,11 @@ enum VTNV12StagingCopy {
 
         if lumaTarget.coversAllPadding, chromaTarget.coversAllPadding,
            let paddedY = metal.makeTexture(
-            buffer: destination, format: .r8Unorm,
+            buffer: destination, format: layout.lumaFormat,
             width: lumaTarget.width, height: lumaTarget.height, plane: 0, usage: .shaderWrite
            ),
            let paddedCbCr = metal.makeTexture(
-            buffer: destination, format: .rg8Unorm,
+            buffer: destination, format: layout.chromaFormat,
             width: chromaTarget.width, height: chromaTarget.height, plane: 1, usage: .shaderWrite
            ),
            paddedY.texture.width == lumaTarget.width, paddedY.texture.height == lumaTarget.height,
@@ -362,11 +369,11 @@ enum VTNV12StagingCopy {
 
         if dstY == nil || dstCbCr == nil {
             dstY = metal.makeTexture(
-                buffer: destination, format: .r8Unorm,
+                buffer: destination, format: layout.lumaFormat,
                 width: layout.lumaWidth, height: layout.lumaHeight, plane: 0, usage: .shaderWrite
             )
             dstCbCr = metal.makeTexture(
-                buffer: destination, format: .rg8Unorm,
+                buffer: destination, format: layout.chromaFormat,
                 width: layout.chromaWidth, height: layout.chromaHeight, plane: 1, usage: .shaderWrite
             )
             paddingCovered = dstPadding.isEmpty
@@ -412,6 +419,7 @@ enum VTNV12StagingCopy {
     }
 
     private static func copyPlanes(from source: CVPixelBuffer, to destination: CVPixelBuffer) throws {
+        let bpc = MetalNV12PixelConverter.is10BitBiPlanarYUV(CVPixelBufferGetPixelFormatType(source)) ? 2 : 1
         let read = CVPixelBufferLockBaseAddress(source, .readOnly)
         guard read == kCVReturnSuccess else {
             throw VTInterpolationFailure(reason: "VT FI staging read failed", detail: "lock=\(read)")
@@ -422,8 +430,8 @@ enum VTNV12StagingCopy {
             throw VTInterpolationFailure(reason: "VT FI staging write failed", detail: "lock=\(write)")
         }
         defer { CVPixelBufferUnlockBaseAddress(destination, []) }
-        try copyPlane(0, bytesPerSample: 1, from: source, to: destination)
-        try copyPlane(1, bytesPerSample: 2, from: source, to: destination)
+        try copyPlane(0, bytesPerSample: bpc, from: source, to: destination)
+        try copyPlane(1, bytesPerSample: bpc * 2, from: source, to: destination)
     }
 
     private static func copyPlane(

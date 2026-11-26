@@ -14,10 +14,14 @@ enum VTInterpolationFormatNegotiation {
 
     static func canStage(inputFormat: OSType, targetFormat: OSType) -> Bool {
         if inputFormat == targetFormat {
-            return MetalNV12PixelConverter.isNV12(inputFormat)
+            return MetalNV12PixelConverter.isBiPlanarYUV(inputFormat)
                 || inputFormat == kCVPixelFormatType_32BGRA
         }
         if MetalNV12PixelConverter.isNV12(inputFormat) {
+            return MetalNV12PixelConverter.isNV12(targetFormat)
+                || targetFormat == kCVPixelFormatType_32BGRA
+        }
+        if MetalNV12PixelConverter.is10BitBiPlanarYUV(inputFormat) {
             return MetalNV12PixelConverter.isNV12(targetFormat)
                 || targetFormat == kCVPixelFormatType_32BGRA
         }
@@ -162,7 +166,9 @@ private extension VideoToolboxFrameInterpolationBackend {
         plan: VideoFrameInterpolationPlan?,
         hasTimeRemaining: @Sendable () -> Bool
     ) async -> VideoInterpolationBackendOutcome {
-        guard VideoFrameInterpolationTiming.sourceFPS(frame) != nil else {
+        let hasValidTiming = VideoFrameInterpolationTiming.sourceFPS(frame) != nil
+            || (frame.pts.isFinite && (plan?.sourceInterval ?? 0) > 0)
+        guard hasValidTiming else {
             return bypass("VT FI invalid source timing")
         }
         if let reason = VideoFramePairFormat.interpolationBypassReason(frame.pixelBuffer) {

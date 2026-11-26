@@ -10,8 +10,11 @@ struct PlayerVideoEnhancementSheet: View {
             Form {
                 if let reason = player.videoEnhancementControlStatus.bypassReason {
                     Section {
-                        Label(VideoEnhancementBypassDisplay.pausedMenuLabel(for: reason), systemImage: "pause.circle")
-                            .foregroundStyle(.secondary)
+                        Label(
+                            VideoEnhancementBypassDisplay.pausedMenuLabel(for: reason),
+                            systemImage: "pause.circle"
+                        )
+                        .foregroundStyle(.secondary)
                     }
                 }
 
@@ -64,20 +67,13 @@ struct PlayerVideoEnhancementSheet: View {
                 .pickerStyle(.menu)
                 .menuOrder(.fixed)
 
-                Toggle(isOn: Binding(
+                Toggle("Split-Screen Compare", isOn: Binding(
                     get: { player.videoSuperResolutionSplitCompare },
                     set: { enabled in
                         guard canEdit() else { return }
                         player.setVideoSuperResolutionSplitCompare(enabled)
                     }
-                )) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Split-Screen Compare")
-                        Text("Left: Original · Right: Super Resolution")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
+                ))
             }
 
             Picker("Max Input Resolution", selection: Binding(
@@ -95,21 +91,12 @@ struct PlayerVideoEnhancementSheet: View {
             .menuOrder(.fixed)
         } header: {
             Text("Super Resolution")
-        } footer: {
-            if player.videoSuperResolutionMode == .metalFXSpatial,
-               player.videoSuperResolutionTargetResolution.isManual {
-                Text(
-                    """
-                    Manual target resolution overrides Limit to Screen Resolution. \
-                    Inputs already at or above the target skip upscaling.
-                    """
-                )
-            }
         }
     }
 
     private var interpolationSection: some View {
-        Section("Frame Interpolation") {
+        let vtSupported = VideoEnhancementCapabilities.current.supportsVideoToolboxFrameInterpolation
+        return Section("Frame Interpolation") {
             Toggle("Frame Interpolation", isOn: Binding(
                 get: { player.videoFrameInterpolationEnabled },
                 set: { enabled in
@@ -131,6 +118,39 @@ struct PlayerVideoEnhancementSheet: View {
             }
             .pickerStyle(.menu)
             .menuOrder(.fixed)
+            .disabled(!player.videoFrameInterpolationEnabled)
+
+            Picker("Interpolation Engine", selection: Binding(
+                get: {
+                    let current = player.videoFrameInterpolationBackend
+                    return current.isSelectable(vtSupported: vtSupported)
+                        ? current
+                        : current.resolved(vtSupported: vtSupported)
+                },
+                set: { backend in
+                    guard canEdit(), backend.isSelectable(vtSupported: vtSupported) else { return }
+                    player.setVideoFrameInterpolationBackend(backend)
+                }
+            )) {
+                ForEach(VideoFrameInterpolationBackend.allCases) { backend in
+                    let selectable = backend.isSelectable(vtSupported: vtSupported)
+                    Text(backend.label)
+                        .selectionDisabled(!selectable)
+                        .disabled(!selectable)
+                        .tag(backend)
+                }
+            }
+            .pickerStyle(.menu)
+            .menuOrder(.fixed)
+            .disabled(!player.videoFrameInterpolationEnabled)
+
+            Toggle("Force Frame Interpolation", isOn: Binding(
+                get: { player.videoForceFrameInterpolation },
+                set: { enabled in
+                    guard canEdit() else { return }
+                    player.setVideoForceFrameInterpolation(enabled)
+                }
+            ))
             .disabled(!player.videoFrameInterpolationEnabled)
         }
     }

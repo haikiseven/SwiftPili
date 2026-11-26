@@ -1,4 +1,121 @@
 import Foundation
+import Observation
+
+/// Observable preference store for global default frame interpolation backend & force-interpolation mode.
+/// Keeps `VideoEnhancementSettingsView` and active `PlayerViewModel` instances synchronized
+/// without modifying `ExperimentalSettingsStore.swift`.
+@MainActor
+@Observable
+final class InterpolationBackendPreferencesStore {
+    static let shared = InterpolationBackendPreferencesStore()
+
+    private(set) var defaultBackend: VideoFrameInterpolationBackend =
+        VideoEnhancementPreferences.frameInterpolationBackend
+    private(set) var defaultForceFrameInterpolation: Bool =
+        VideoEnhancementPreferences.forceFrameInterpolation
+
+    @ObservationIgnored
+    private var observers: [Observer] = []
+
+    private struct Observer {
+        weak var owner: AnyObject?
+        let handler: @MainActor (AnyObject, VideoFrameInterpolationBackend) -> Void
+    }
+
+    private init() {}
+
+    func reloadFromDefaults() {
+        defaultBackend = VideoEnhancementPreferences.frameInterpolationBackend
+        defaultForceFrameInterpolation = VideoEnhancementPreferences.forceFrameInterpolation
+    }
+
+    @discardableResult
+    func setDefaultBackend(_ backend: VideoFrameInterpolationBackend) -> Bool {
+        let experiments = ExperimentalSettingsStore.shared
+        guard experiments.isAllowed(.videoEnhancement), experiments.storageError == nil else {
+            return false
+        }
+        guard defaultBackend != backend else { return true }
+        VideoEnhancementPreferences.frameInterpolationBackend = backend
+        defaultBackend = backend
+        notifyObservers(backend)
+        return true
+    }
+
+    @discardableResult
+    func setDefaultForceFrameInterpolation(_ enabled: Bool) -> Bool {
+        let experiments = ExperimentalSettingsStore.shared
+        guard experiments.isAllowed(.videoEnhancement), experiments.storageError == nil else {
+            return false
+        }
+        guard defaultForceFrameInterpolation != enabled else { return true }
+        VideoEnhancementPreferences.forceFrameInterpolation = enabled
+        defaultForceFrameInterpolation = enabled
+        notifyObservers(defaultBackend)
+        return true
+    }
+
+    func addObserver<Owner: AnyObject>(
+        owner: Owner,
+        handler: @escaping @MainActor (Owner, VideoFrameInterpolationBackend) -> Void
+    ) {
+        observers.removeAll { $0.owner == nil || $0.owner === owner }
+        observers.append(Observer(owner: owner, handler: { object, backend in
+            guard let typed = object as? Owner else { return }
+            handler(typed, backend)
+        }))
+    }
+
+    private func notifyObservers(_ backend: VideoFrameInterpolationBackend) {
+        observers.removeAll { $0.owner == nil }
+        for observer in observers {
+            if let owner = observer.owner {
+                observer.handler(owner, backend)
+            }
+        }
+    }
+}
+
+@MainActor
+@Observable
+private final class PlayerInterpolationBackendState {
+    var backend: VideoFrameInterpolationBackend
+    var forceFrameInterpolation: Bool
+
+    init(backend: VideoFrameInterpolationBackend, forceFrameInterpolation: Bool) {
+        self.backend = backend
+        self.forceFrameInterpolation = forceFrameInterpolation
+    }
+}
+
+@MainActor
+private final class PlayerInterpolationBackendRegistry {
+    private struct Entry {
+        weak var owner: PlayerViewModel?
+        let state: PlayerInterpolationBackendState
+    }
+
+    static let shared = PlayerInterpolationBackendRegistry()
+    private var entries: [ObjectIdentifier: Entry] = [:]
+
+    func state(for player: PlayerViewModel) -> PlayerInterpolationBackendState {
+        let key = ObjectIdentifier(player)
+        if let existing = entries[key], existing.owner === player {
+            return existing.state
+        }
+        entries = entries.filter { $0.value.owner != nil }
+        let store = InterpolationBackendPreferencesStore.shared
+        let state = PlayerInterpolationBackendState(
+            backend: store.defaultBackend,
+            forceFrameInterpolation: store.defaultForceFrameInterpolation
+        )
+        entries[key] = Entry(owner: player, state: state)
+        store.addObserver(owner: player) { owner, _ in
+            owner.handleVideoEnhancementPolicyChange()
+        }
+        return state
+    }
+}
 
 /// The settings that seed per-player enhancement choices. Changes to global display limits
 /// are synced without touching what the user picked in the player.
@@ -6,7 +123,9 @@ struct VideoEnhancementDefaultsSnapshot: Equatable {
     let allowed: Bool
     let superResolutionMode: VideoSuperResolutionMode
     let frameInterpolation: Bool
+    let frameInterpolationBackend: VideoFrameInterpolationBackend
     let interpolationRate: VideoInterpolationRate
+    let forceFrameInterpolation: Bool
     let superResolutionScale: VideoSuperResolutionScale
     let superResolutionTargetResolution: VideoSuperResolutionTargetResolution
     let superResolutionSharpness: VideoSuperResolutionSharpness
@@ -14,11 +133,14 @@ struct VideoEnhancementDefaultsSnapshot: Equatable {
 
     @MainActor static var current: Self {
         let store = ExperimentalSettingsStore.shared
+        let fiStore = InterpolationBackendPreferencesStore.shared
         return Self(
             allowed: store.isAllowed(.videoEnhancement),
             superResolutionMode: store.videoEnhancementDefaultSRMode,
             frameInterpolation: store.videoEnhancementDefaultFrameInterpolation,
+            frameInterpolationBackend: fiStore.defaultBackend,
             interpolationRate: store.videoEnhancementDefaultRate,
+            forceFrameInterpolation: fiStore.defaultForceFrameInterpolation,
             superResolutionScale: store.videoEnhancementDefaultScale,
             superResolutionTargetResolution: store.videoEnhancementDefaultTargetResolution,
             superResolutionSharpness: store.videoEnhancementDefaultSharpness,
@@ -38,6 +160,16 @@ struct VideoEnhancementControlStatus: Equatable {
 }
 
 extension PlayerViewModel {
+    var videoFrameInterpolationBackend: VideoFrameInterpolationBackend {
+        get { PlayerInterpolationBackendRegistry.shared.state(for: self).backend }
+        set { PlayerInterpolationBackendRegistry.shared.state(for: self).backend = newValue }
+    }
+
+    var videoForceFrameInterpolation: Bool {
+        get { PlayerInterpolationBackendRegistry.shared.state(for: self).forceFrameInterpolation }
+        set { PlayerInterpolationBackendRegistry.shared.state(for: self).forceFrameInterpolation = newValue }
+    }
+
     var videoSuperResolutionTargetResolution: VideoSuperResolutionTargetResolution {
         get { session.videoSuperResolutionTargetResolution }
         set { session.videoSuperResolutionTargetResolution = newValue }
@@ -73,11 +205,14 @@ extension PlayerViewModel {
         return VideoEnhancementConfiguration(
             superResolutionMode: videoSuperResolutionMode,
             frameInterpolationEnabled: videoFrameInterpolationEnabled,
+            frameInterpolationBackend: videoFrameInterpolationBackend,
             interpolationRate: videoInterpolationRate,
+            forceFrameInterpolation: videoForceFrameInterpolation,
             superResolutionScale: videoSuperResolutionScale,
             superResolutionTargetResolution: videoSuperResolutionTargetResolution,
             superResolutionSharpness: videoSuperResolutionSharpness,
-            superResolutionSplitCompare: videoSuperResolutionMode == .metalFXSpatial && videoSuperResolutionSplitCompare,
+            superResolutionSplitCompare: videoSuperResolutionMode == .metalFXSpatial
+                && videoSuperResolutionSplitCompare,
             maxInputResolution: videoEnhancementMaxInputResolution,
             isLiveStream: mode == .live,
             limitToScreenResolution: ExperimentalSettingsStore.shared.videoEnhancementLimitToScreen
@@ -106,6 +241,23 @@ extension PlayerViewModel {
               isVideoEnhancementEligibleForStream, videoFrameInterpolationEnabled,
               videoInterpolationRate != rate else { return }
         videoInterpolationRate = rate
+        syncVideoEnhancementToBackend()
+    }
+
+    func setVideoFrameInterpolationBackend(_ backend: VideoFrameInterpolationBackend) {
+        guard ExperimentalSettingsStore.shared.isAllowed(.videoEnhancement),
+              isVideoEnhancementEligibleForStream, videoFrameInterpolationEnabled,
+              backend.isSelectable(),
+              videoFrameInterpolationBackend != backend else { return }
+        videoFrameInterpolationBackend = backend
+        syncVideoEnhancementToBackend()
+    }
+
+    func setVideoForceFrameInterpolation(_ enabled: Bool) {
+        guard ExperimentalSettingsStore.shared.isAllowed(.videoEnhancement),
+              isVideoEnhancementEligibleForStream, videoFrameInterpolationEnabled,
+              videoForceFrameInterpolation != enabled else { return }
+        videoForceFrameInterpolation = enabled
         syncVideoEnhancementToBackend()
     }
 
@@ -188,36 +340,55 @@ extension PlayerViewModel {
             videoSuperResolutionSplitCompare = false
             videoFrameInterpolationEnabled = false
         } else if !previous.allowed {
-            videoSuperResolutionMode = defaults.superResolutionMode
-            videoFrameInterpolationEnabled = defaults.frameInterpolation
-            videoInterpolationRate = defaults.interpolationRate
-            videoSuperResolutionScale = defaults.superResolutionScale
-            videoSuperResolutionTargetResolution = defaults.superResolutionTargetResolution
-            videoSuperResolutionSharpness = defaults.superResolutionSharpness
-            videoEnhancementMaxInputResolution = defaults.maxInputResolution
+            applyAllVideoEnhancementDefaults(defaults)
         } else {
-            if defaults.superResolutionMode != previous.superResolutionMode {
-                videoSuperResolutionMode = defaults.superResolutionMode
-            }
-            if defaults.frameInterpolation != previous.frameInterpolation {
-                videoFrameInterpolationEnabled = defaults.frameInterpolation
-            }
-            if defaults.interpolationRate != previous.interpolationRate {
-                videoInterpolationRate = defaults.interpolationRate
-            }
-            if defaults.superResolutionScale != previous.superResolutionScale {
-                videoSuperResolutionScale = defaults.superResolutionScale
-            }
-            if defaults.superResolutionTargetResolution != previous.superResolutionTargetResolution {
-                videoSuperResolutionTargetResolution = defaults.superResolutionTargetResolution
-            }
-            if defaults.superResolutionSharpness != previous.superResolutionSharpness {
-                videoSuperResolutionSharpness = defaults.superResolutionSharpness
-            }
-            if defaults.maxInputResolution != previous.maxInputResolution {
-                videoEnhancementMaxInputResolution = defaults.maxInputResolution
-            }
+            applyChangedVideoEnhancementDefaults(from: previous, to: defaults)
         }
         syncVideoEnhancementToBackend()
+    }
+
+    private func applyAllVideoEnhancementDefaults(_ defaults: VideoEnhancementDefaultsSnapshot) {
+        videoSuperResolutionMode = defaults.superResolutionMode
+        videoFrameInterpolationEnabled = defaults.frameInterpolation
+        videoFrameInterpolationBackend = defaults.frameInterpolationBackend
+        videoInterpolationRate = defaults.interpolationRate
+        videoForceFrameInterpolation = defaults.forceFrameInterpolation
+        videoSuperResolutionScale = defaults.superResolutionScale
+        videoSuperResolutionTargetResolution = defaults.superResolutionTargetResolution
+        videoSuperResolutionSharpness = defaults.superResolutionSharpness
+        videoEnhancementMaxInputResolution = defaults.maxInputResolution
+    }
+
+    private func applyChangedVideoEnhancementDefaults(
+        from previous: VideoEnhancementDefaultsSnapshot,
+        to defaults: VideoEnhancementDefaultsSnapshot
+    ) {
+        if defaults.superResolutionMode != previous.superResolutionMode {
+            videoSuperResolutionMode = defaults.superResolutionMode
+        }
+        if defaults.frameInterpolation != previous.frameInterpolation {
+            videoFrameInterpolationEnabled = defaults.frameInterpolation
+        }
+        if defaults.frameInterpolationBackend != previous.frameInterpolationBackend {
+            videoFrameInterpolationBackend = defaults.frameInterpolationBackend
+        }
+        if defaults.interpolationRate != previous.interpolationRate {
+            videoInterpolationRate = defaults.interpolationRate
+        }
+        if defaults.forceFrameInterpolation != previous.forceFrameInterpolation {
+            videoForceFrameInterpolation = defaults.forceFrameInterpolation
+        }
+        if defaults.superResolutionScale != previous.superResolutionScale {
+            videoSuperResolutionScale = defaults.superResolutionScale
+        }
+        if defaults.superResolutionTargetResolution != previous.superResolutionTargetResolution {
+            videoSuperResolutionTargetResolution = defaults.superResolutionTargetResolution
+        }
+        if defaults.superResolutionSharpness != previous.superResolutionSharpness {
+            videoSuperResolutionSharpness = defaults.superResolutionSharpness
+        }
+        if defaults.maxInputResolution != previous.maxInputResolution {
+            videoEnhancementMaxInputResolution = defaults.maxInputResolution
+        }
     }
 }

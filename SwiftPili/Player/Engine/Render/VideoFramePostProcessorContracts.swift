@@ -15,18 +15,21 @@ enum VideoEnhancementPoolLimits {
         }
     }
 
-    static let defaultLead: TimeInterval = 0.24
+    static let defaultLead: TimeInterval = 0.30
+    static let forceLead: TimeInterval = 0.45
 
     private struct State: Equatable, Sendable {
         var roundedSourceFPS: Int = 30
         var roundedOutputFPS: Int = 60
         var maxPhasesPerPair: Int = 1
         var underMemoryPressure: Bool = false
+        var forceFrameInterpolation: Bool = false
         var sizing: Sizing = VideoEnhancementPoolLimits.computeSizing(
             sourceFPS: 30,
             outputFPS: 60,
             maxPhasesPerPair: 1,
-            underMemoryPressure: false
+            underMemoryPressure: false,
+            forceFrameInterpolation: false
         )
     }
 
@@ -36,7 +39,8 @@ enum VideoEnhancementPoolLimits {
         sourceFPS: Double,
         outputFPS: Double,
         maxPhasesPerPair: Int,
-        underMemoryPressure: Bool
+        underMemoryPressure: Bool,
+        forceFrameInterpolation: Bool = false
     ) -> Sizing {
         let safeSourceFPS = (sourceFPS.isFinite && sourceFPS > 0) ? min(max(sourceFPS, 1), 240) : 30
         let safeOutputFPS = (outputFPS.isFinite && outputFPS > 0)
@@ -44,20 +48,26 @@ enum VideoEnhancementPoolLimits {
             : safeSourceFPS
         let safePhases = max(0, min(maxPhasesPerPair, VideoFrameInterpolationPlan.maximumPhasesPerPair))
 
+        let effectivePressure = underMemoryPressure && !forceFrameInterpolation
         let lead: TimeInterval
-        if underMemoryPressure {
-            lead = 0.14
+        if effectivePressure {
+            lead = 0.16
+        } else if forceFrameInterpolation {
+            lead = Self.forceLead
         } else if safeOutputFPS > 70 {
-            lead = 0.20
+            lead = 0.26
         } else {
-            lead = 0.24
+            lead = 0.30
         }
 
         let srFrames: Int
         let interpPairs: Int
-        if underMemoryPressure {
+        if effectivePressure {
             srFrames = min(26, max(8, Int(ceil((lead + 0.08) * safeOutputFPS)) + 2 * safePhases + 3))
             interpPairs = min(12, max(5, Int(ceil((lead + 0.08) * safeSourceFPS)) + 4))
+        } else if forceFrameInterpolation {
+            srFrames = min(76, max(16, Int(ceil((lead + 0.12) * safeOutputFPS)) + 2 * safePhases + 6))
+            interpPairs = min(28, max(12, Int(ceil((lead + 0.12) * safeSourceFPS)) + 7))
         } else {
             srFrames = min(56, max(12, Int(ceil((lead + 0.10) * safeOutputFPS)) + 2 * safePhases + 4))
             interpPairs = min(20, max(8, Int(ceil((lead + 0.10) * safeSourceFPS)) + 5))
@@ -74,7 +84,8 @@ enum VideoEnhancementPoolLimits {
         sourceFPS: Double,
         outputFPS: Double,
         maxPhasesPerPair: Int,
-        underMemoryPressure: Bool = VideoEnhancementGuardrails.isUnderMemoryPressure
+        underMemoryPressure: Bool = VideoEnhancementGuardrails.isUnderMemoryPressure,
+        forceFrameInterpolation: Bool = false
     ) {
         let safeSourceFPS = (sourceFPS.isFinite && sourceFPS > 0) ? min(max(sourceFPS, 1), 240) : 30
         let safeOutputFPS = (outputFPS.isFinite && outputFPS > 0)
@@ -88,18 +99,21 @@ enum VideoEnhancementPoolLimits {
             guard current.roundedSourceFPS != roundedSource
                 || current.roundedOutputFPS != roundedOutput
                 || current.maxPhasesPerPair != safePhases
-                || current.underMemoryPressure != underMemoryPressure else {
+                || current.underMemoryPressure != underMemoryPressure
+                || current.forceFrameInterpolation != forceFrameInterpolation else {
                 return
             }
             current.roundedSourceFPS = roundedSource
             current.roundedOutputFPS = roundedOutput
             current.maxPhasesPerPair = safePhases
             current.underMemoryPressure = underMemoryPressure
+            current.forceFrameInterpolation = forceFrameInterpolation
             current.sizing = computeSizing(
                 sourceFPS: Double(roundedSource),
                 outputFPS: Double(roundedOutput),
                 maxPhasesPerPair: safePhases,
-                underMemoryPressure: underMemoryPressure
+                underMemoryPressure: underMemoryPressure,
+                forceFrameInterpolation: forceFrameInterpolation
             )
         }
     }
@@ -111,12 +125,13 @@ enum VideoEnhancementPoolLimits {
     private static func currentSizing() -> Sizing {
         let livePressure = VideoEnhancementGuardrails.isUnderMemoryPressure
         return state.withLock { current in
-            if livePressure, !current.underMemoryPressure {
+            if livePressure, !current.underMemoryPressure, !current.forceFrameInterpolation {
                 return computeSizing(
                     sourceFPS: Double(current.roundedSourceFPS),
                     outputFPS: Double(current.roundedOutputFPS),
                     maxPhasesPerPair: current.maxPhasesPerPair,
-                    underMemoryPressure: true
+                    underMemoryPressure: true,
+                    forceFrameInterpolation: false
                 )
             }
             return current.sizing
@@ -192,6 +207,7 @@ struct VideoFrameEnhancementResult: Sendable {
     let interpolationBypassReason: String?
     let originalSuperResolutionBypassReason: String?
     let midpointsUpscaled: Bool
+    let resolvedInterpolationBackend: VideoFrameInterpolationBackend?
 
     init(
         midpoints: [PostProcessFrameBox],
@@ -199,7 +215,8 @@ struct VideoFrameEnhancementResult: Sendable {
         telemetry: VideoEnhancementTelemetry,
         interpolationBypassReason: String?,
         originalSuperResolutionBypassReason: String?,
-        midpointsUpscaled: Bool = false
+        midpointsUpscaled: Bool = false,
+        resolvedInterpolationBackend: VideoFrameInterpolationBackend? = nil
     ) {
         self.midpoints = midpoints
         self.enhancedOriginal = enhancedOriginal
@@ -207,6 +224,7 @@ struct VideoFrameEnhancementResult: Sendable {
         self.interpolationBypassReason = interpolationBypassReason
         self.originalSuperResolutionBypassReason = originalSuperResolutionBypassReason
         self.midpointsUpscaled = midpointsUpscaled
+        self.resolvedInterpolationBackend = resolvedInterpolationBackend
     }
 }
 
@@ -336,13 +354,19 @@ struct VideoFrameInterpolationTiming {
         current: MediaVideoFrame,
         expectedInterval: TimeInterval? = nil
     ) {
-        guard Self.sourceFPS(current) != nil, previousPTS.isFinite,
-              previousDuration.isFinite, previousDuration > 0 else { return nil }
+        guard current.pts.isFinite, previousPTS.isFinite else { return nil }
+        let validPrevDuration = (previousDuration.isFinite && previousDuration > 0) ? previousDuration : nil
+        let validCurrentDuration = (current.duration.isFinite && current.duration > 0) ? current.duration : nil
+        let validExpected = expectedInterval.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        guard let referenceInterval = [validPrevDuration, validExpected, validCurrentDuration]
+            .compactMap({ $0 })
+            .max() else {
+            return nil
+        }
         let delta = current.pts - previousPTS
         let midpointPTS = previousPTS + delta * 0.5
-        let referenceInterval = max(previousDuration, expectedInterval ?? previousDuration)
         // Permit normal VFR swings and misdeclared container durations (e.g. 30 fps frames inside
-        // a 60 fps timebase) while still rejecting genuine multi-frame gaps / discontinuities.
+        // a 60 fps timebase or 0-duration packets) while still rejecting genuine multi-frame gaps.
         let allowedDelta = min(Self.maximumDelta, max(referenceInterval * 1.75, 0.055))
         guard delta.isFinite, delta > 0, delta <= allowedDelta + Self.tolerance,
               midpointPTS > previousPTS, midpointPTS < current.pts else { return nil }
@@ -396,8 +420,8 @@ struct VideoFrameInterpolationPlan: Sendable {
     let targetOutputFPS: Double
 
     /// Whether the active interpolation backend supports arbitrary phases in `(0, 1)`.
-    /// On iOS 26+, interpolation is strictly locked to hardware-fast dyadic Apple LLFI (2× / 4×);
-    /// legacy iOS 18–25 Vision optical flow still accepts arbitrary phases when invoked explicitly.
+    /// On iOS 26+, the default Auto/LLFI path uses hardware-fast dyadic Apple LLFI (2× / 4×);
+    /// Vision optical flow accepts arbitrary phases on both iOS 18–25 and iOS 26+ when selected.
     static var supportsArbitraryPhases: Bool {
         #if targetEnvironment(simulator)
         return false
@@ -407,6 +431,16 @@ struct VideoFrameInterpolationPlan: Sendable {
         }
         return true
         #endif
+    }
+
+    /// Backend-aware arbitrary-phase capability: `.videoToolbox` is strictly dyadic LLFI (2× / 4×),
+    /// whereas `.visionOpticalFlow` supports arbitrary phases (2×–5× and CFR resampling) on iOS 18+
+    /// including iOS 26+.
+    static func supportsArbitraryPhases(
+        for backend: VideoFrameInterpolationBackend,
+        vtSupported: Bool = VideoEnhancementCapabilities.supportsVideoToolboxFrameInterpolation
+    ) -> Bool {
+        backend.supportsArbitraryPhases(vtSupported: vtSupported)
     }
 
     static var defaultMultipliers: [Int] {

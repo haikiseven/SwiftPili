@@ -17,6 +17,24 @@ enum ExperimentalFeature: String, Codable, CaseIterable, Sendable {
         case .videoEnhancement: 1 << 8
         }
     }
+
+    /// Mature features graduated to regular Settings / Advanced Settings and no longer gated
+    /// by `ExperimentalSettingsSnapshot.masterEnabled`.
+    var isGraduated: Bool {
+        self != .http2Probe
+    }
+
+    /// Graduated features whose capability gate is always available because they expose
+    /// direct feature-specific controls (SR/FI, EQ enabled, Parallel Connections, Auto-Verify,
+    /// Debug Logging) or standalone tools (Comment Check, App Reports).
+    var isAlwaysAvailableGraduated: Bool {
+        switch self {
+        case .equalizer, .multiConnection, .commentTools, .diagnostics, .videoEnhancement:
+            true
+        case .ambient, .decoderPrewarm, .aiCommentFilter, .http2Probe:
+            false
+        }
+    }
 }
 
 struct ExperimentalDiagnosticOverrides: Codable, Equatable, Sendable {
@@ -35,13 +53,37 @@ struct ExperimentalDiagnosticOverrides: Codable, Equatable, Sendable {
 
 struct ExperimentalSettingsSnapshot: Codable, Equatable, Sendable {
     static let currentSchema = 1
+    static let defaultGrants: [ExperimentalFeature: Bool] = [
+        .ambient: true,
+        .decoderPrewarm: true,
+        .equalizer: true,
+        .multiConnection: true,
+        .commentTools: true,
+        .diagnostics: true,
+        .videoEnhancement: true,
+        .aiCommentFilter: false,
+        .http2Probe: false
+    ]
+
     var schemaVersion = currentSchema
     // swiftlint:disable:next inclusive_language
-    var masterEnabled = true
-    var grants: [ExperimentalFeature: Bool] = [.ambient: true]
+    var masterEnabled = false
+    var grants: [ExperimentalFeature: Bool] = defaultGrants
     var diagnosticOverrides = ExperimentalDiagnosticOverrides.stock
 
     func isAllowed(_ feature: ExperimentalFeature) -> Bool {
+        if feature.isAlwaysAvailableGraduated {
+            return true
+        }
+        if feature.isGraduated {
+            return grants[feature] == true
+        }
+        return masterEnabled && grants[feature] == true
+    }
+
+    /// Evaluates whether `feature` was effectively enabled under pre-graduation rules
+    /// (where every feature required both `masterEnabled` and an explicit grant).
+    func wasLegacyAllowed(_ feature: ExperimentalFeature) -> Bool {
         masterEnabled && grants[feature] == true
     }
 

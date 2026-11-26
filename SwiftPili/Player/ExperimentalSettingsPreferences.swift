@@ -3,6 +3,8 @@ import CoreFoundation
 
 enum ExperimentalSettingsPreferences {
     static let storageKey = "experimental_settings_v1"
+    static let graduationMarkerKey = "experimental_features_graduated_v1"
+    static let decoderPrewarmDefaultsKey = "decoder_prewarm"
 
     struct Record {
         let snapshot: ExperimentalSettingsSnapshot
@@ -15,11 +17,19 @@ enum ExperimentalSettingsPreferences {
         guard let bundleID, !bundleID.isEmpty else { return unavailableRecord }
         let domain = defaults.persistentDomain(forName: bundleID) ?? [:]
         if let stored = domain[storageKey] {
-            guard let data = stored as? Data, let snapshot = decode(data) else { return unavailableRecord }
-            return Record(snapshot: snapshot, storageError: nil)
+            guard let data = stored as? Data, let decoded = decode(data) else { return unavailableRecord }
+            if bool(domain[graduationMarkerKey], defaultValue: false) {
+                let normalized = normalizeGraduatedSnapshot(decoded, domain: domain)
+                return Record(snapshot: normalized, storageError: nil)
+            }
+            let migrated = graduateLegacySnapshot(decoded, domain: domain, defaults: defaults)
+            guard persist(migrated, defaults: defaults) else { return unavailableRecord }
+            defaults.set(true, forKey: graduationMarkerKey)
+            return Record(snapshot: migrated, storageError: nil)
         }
         let snapshot = migratedSnapshot(domain: domain)
         guard persist(snapshot, defaults: defaults) else { return unavailableRecord }
+        defaults.set(true, forKey: graduationMarkerKey)
         return Record(snapshot: snapshot, storageError: nil)
     }
 
@@ -52,18 +62,121 @@ enum ExperimentalSettingsPreferences {
         return snapshot
     }
 
+    private static func normalizeGraduatedSnapshot(
+        _ decoded: ExperimentalSettingsSnapshot,
+        domain: [String: Any]
+    ) -> ExperimentalSettingsSnapshot {
+        var snapshot = decoded
+        for feature in ExperimentalFeature.allCases where feature.isAlwaysAvailableGraduated {
+            snapshot.grants[feature] = true
+        }
+        if let rawAmbient = domain[PlayerPlaybackPreferences.ambientModeDefaultsKey] {
+            snapshot.grants[.ambient] = bool(rawAmbient, defaultValue: snapshot.grants[.ambient] ?? true)
+        } else if snapshot.grants[.ambient] == nil {
+            snapshot.grants[.ambient] = true
+        }
+        if let rawPrewarm = domain[decoderPrewarmDefaultsKey] {
+            snapshot.grants[.decoderPrewarm] = bool(
+                rawPrewarm,
+                defaultValue: snapshot.grants[.decoderPrewarm] ?? true
+            )
+        } else if snapshot.grants[.decoderPrewarm] == nil {
+            snapshot.grants[.decoderPrewarm] = true
+        }
+        return snapshot
+    }
+
+    private static func graduateLegacySnapshot(
+        _ legacy: ExperimentalSettingsSnapshot,
+        domain: [String: Any],
+        defaults: UserDefaults
+    ) -> ExperimentalSettingsSnapshot {
+        let ambientOn = legacy.wasLegacyAllowed(.ambient)
+        defaults.set(ambientOn, forKey: PlayerPlaybackPreferences.ambientModeDefaultsKey)
+
+        let decoderPrewarmOn: Bool
+        if let explicit = legacy.grants[.decoderPrewarm] {
+            decoderPrewarmOn = legacy.masterEnabled && explicit
+        } else {
+            decoderPrewarmOn = true
+        }
+        defaults.set(decoderPrewarmOn, forKey: decoderPrewarmDefaultsKey)
+
+        if !legacy.wasLegacyAllowed(.equalizer),
+           let data = domain[PlayerEqualizerPreferences.defaultsKey] as? Data,
+           var eq = try? JSONDecoder().decode(PlayerEqualizerConfiguration.self, from: data),
+           eq.schemaVersion == PlayerEqualizerConfiguration.currentSchemaVersion,
+           eq.normalized.enabled {
+            eq = eq.normalized
+            eq.enabled = false
+            if let encoded = try? JSONEncoder().encode(eq) {
+                defaults.set(encoded, forKey: PlayerEqualizerPreferences.defaultsKey)
+            }
+        }
+
+        if !legacy.wasLegacyAllowed(.videoEnhancement) {
+            if domain[VideoEnhancementPreferences.defaultSRBackendKey] != nil {
+                defaults.set(
+                    VideoSuperResolutionMode.off.persistenceValue,
+                    forKey: VideoEnhancementPreferences.defaultSRBackendKey
+                )
+            }
+            if bool(domain[VideoEnhancementPreferences.defaultFrameInterpolationKey], defaultValue: false) {
+                defaults.set(false, forKey: VideoEnhancementPreferences.defaultFrameInterpolationKey)
+            }
+        }
+
+        if !legacy.wasLegacyAllowed(.multiConnection),
+           bool(domain[MultiConnectionFeatureGate.defaultsKey], defaultValue: false) {
+            defaults.set(false, forKey: MultiConnectionFeatureGate.defaultsKey)
+        }
+
+        if !legacy.wasLegacyAllowed(.commentTools),
+           bool(domain["comment_check_after_post"], defaultValue: false) {
+            defaults.set(false, forKey: "comment_check_after_post")
+        }
+
+        let diagnosticsWasAllowed = legacy.wasLegacyAllowed(.diagnostics)
+        if !diagnosticsWasAllowed,
+           bool(domain["debug_logging_enabled"], defaultValue: false) {
+            defaults.set(false, forKey: "debug_logging_enabled")
+        }
+
+        let aiCommentFilterOn = legacy.wasLegacyAllowed(.aiCommentFilter)
+        let http2ProbeOn = legacy.wasLegacyAllowed(.http2Probe)
+
+        var migrated = ExperimentalSettingsSnapshot()
+        migrated.masterEnabled = http2ProbeOn
+        migrated.grants = [
+            .ambient: ambientOn,
+            .decoderPrewarm: decoderPrewarmOn,
+            .equalizer: true,
+            .multiConnection: true,
+            .commentTools: true,
+            .diagnostics: true,
+            .videoEnhancement: true,
+            .aiCommentFilter: aiCommentFilterOn,
+            .http2Probe: http2ProbeOn
+        ]
+        migrated.diagnosticOverrides = diagnosticsWasAllowed ? legacy.diagnosticOverrides : .stock
+        return migrated
+    }
+
     private static func migratedSnapshot(domain: [String: Any]) -> ExperimentalSettingsSnapshot {
         var snapshot = ExperimentalSettingsSnapshot()
         guard isUpgrade(domain) else { return snapshot }
-        snapshot.masterEnabled = true
+        let http2ProbeOn = bool(domain["smart_cdn_experimental_http2"], defaultValue: false)
+        snapshot.masterEnabled = http2ProbeOn
         snapshot.grants = [
-            .ambient: domain["player_ambient_mode_enabled"] as? Bool ?? true,
-            .decoderPrewarm: domain["decoder_prewarm"] as? Bool ?? true,
-            .equalizer: legacyEqualizerEnabled(domain),
-            .multiConnection: bool(domain["multi_connection_enabled"], defaultValue: false),
-            .http2Probe: bool(domain["smart_cdn_experimental_http2"], defaultValue: false),
+            .ambient: bool(domain[PlayerPlaybackPreferences.ambientModeDefaultsKey], defaultValue: true),
+            .decoderPrewarm: bool(domain[decoderPrewarmDefaultsKey], defaultValue: true),
+            .equalizer: true,
+            .multiConnection: true,
+            .http2Probe: http2ProbeOn,
             .commentTools: true,
-            .diagnostics: true
+            .diagnostics: true,
+            .videoEnhancement: true,
+            .aiCommentFilter: false
         ]
         snapshot.diagnosticOverrides = ExperimentalDiagnosticOverrides(
             vodEngine: (domain[PlayerEngineKind.storageKey] as? String)
@@ -75,13 +188,6 @@ enum ExperimentalSettingsPreferences {
             demandPitch: bool(domain["patha_pitch_enabled_v2"], defaultValue: true)
         )
         return snapshot
-    }
-
-    private static func legacyEqualizerEnabled(_ domain: [String: Any]) -> Bool {
-        guard let data = domain[PlayerEqualizerPreferences.defaultsKey] as? Data,
-              let value = try? JSONDecoder().decode(PlayerEqualizerConfiguration.self, from: data),
-              value.schemaVersion == PlayerEqualizerConfiguration.currentSchemaVersion else { return false }
-        return value.normalized.enabled
     }
 
     private static func isUpgrade(_ domain: [String: Any]) -> Bool {

@@ -7,8 +7,10 @@ private struct VideoFrameEnhancementJob: Sendable {
     let current: PostProcessFrameBox
     let previous: PostProcessFrameBox
     let configuration: VideoEnhancementConfiguration
+    let resolvedInterpolationBackend: VideoFrameInterpolationBackend
     let interpolationLabel: String
     let interpolationPlan: VideoFrameInterpolationPlan?
+    let playbackRate: Double
     let deadlines: VideoEnhancementDeadlines
     let upscalingBypassReason: String?
     let superResolutionCap: Float
@@ -20,6 +22,7 @@ private struct VideoFrameEnhancementJob: Sendable {
 private struct VideoFrameWarmJob: Sendable {
     let frame: PostProcessFrameBox
     let configuration: VideoEnhancementConfiguration
+    let resolvedInterpolationBackend: VideoFrameInterpolationBackend
     let superResolutionCap: Float
     let superResolutionTargetDimensions: VideoSuperResolutionDimensions?
     let interpolationPreviousPTS: TimeInterval?
@@ -44,6 +47,7 @@ private enum WorkerCommand: Sendable {
         publishMidpoints: @Sendable ([PostProcessFrameBox]) async -> Void,
         complete: @Sendable (VideoFrameEnhancementResult) async -> Void
     )
+    case retireInterpolationBackend(VideoFrameInterpolationBackend)
     case flush
     case tearDown
 }
@@ -79,6 +83,8 @@ private actor VideoFramePostProcessorActor {
                     publishMidpoints: publishMidpoints
                 )
                 await complete(result)
+            case let .retireInterpolationBackend(backend):
+                pipeline.retireInterpolationBackend(backend)
             case .flush:
                 pipeline.flush()
             case .tearDown:
@@ -97,6 +103,7 @@ final class VideoFramePostProcessor {
         let superResolutionTargetResolution: VideoSuperResolutionTargetResolution
         let limitToScreenResolution: Bool
         let frameInterpolationEnabled: Bool
+        let resolvedFrameInterpolationBackend: VideoFrameInterpolationBackend
         let interpolationRate: VideoInterpolationRate
         let maxInputResolution: VideoEnhancementMaxInputResolution
         let width: Int
@@ -113,13 +120,63 @@ final class VideoFramePostProcessor {
     private var idleCallback: (@MainActor () -> Void)?
     private var cadenceEstimator = VideoFrameCadenceEstimator()
     private var interpolationGridNextPTS: TimeInterval?
+    /// Stream-scoped runtime fallback to `.visionOpticalFlow` when `.auto` picks `.videoToolbox`
+    /// on iOS 26+ and `VTFrameProcessor` rejects the current stream's format/resolution/ratio.
+    private var autoRuntimeFallbackBackend: VideoFrameInterpolationBackend?
+    private var suppressConfigurationDidSet = false
 
     var configuration = VideoEnhancementConfiguration.disabled {
         didSet {
-            guard configuration != oldValue else { return }
-            if configuration.isShaderUniformOnlyChange(from: oldValue) {
-                return
+            guard !suppressConfigurationDidSet else { return }
+            let change = configuration.changeKind(from: oldValue)
+            guard change != .unchanged else { return }
+            applyConfigurationChange(change)
+        }
+    }
+
+    @discardableResult
+    func updateConfiguration(
+        _ newConfiguration: VideoEnhancementConfiguration
+    ) -> VideoEnhancementConfigurationChange {
+        let oldValue = configuration
+        let change = newConfiguration.changeKind(from: oldValue)
+        guard change != .unchanged else { return .unchanged }
+        suppressConfigurationDidSet = true
+        configuration = newConfiguration
+        suppressConfigurationDidSet = false
+        if newConfiguration.isForceInterpolationActive != oldValue.isForceInterpolationActive {
+            warmedKey = nil
+            telemetryWindow.reset()
+            if newConfiguration.isForceInterpolationActive, frameTelemetry.bypassReason != nil {
+                frameTelemetry.bypassReason = nil
             }
+        }
+        applyConfigurationChange(change)
+        return change
+    }
+
+    private func applyConfigurationChange(_ change: VideoEnhancementConfigurationChange) {
+        switch change {
+        case .unchanged, .shaderUniformOnly, .interpolationBackendAliasOnly:
+            return
+        case let .interpolationBackendHotSwap(outgoing, _):
+            // Live hot-swap: keep cadence history, MetalFX SR state, and active playback intact;
+            // reset only the interpolation grid/warm/window state and retire the outgoing backend.
+            autoRuntimeFallbackBackend = nil
+            warmedKey = nil
+            interpolationGridNextPTS = nil
+            telemetryWindow.reset()
+            if !frameTelemetry.isActive {
+                frameTelemetry = VideoEnhancementTelemetry(
+                    activeFrameInterpolationBackendLabel: activeFrameInterpolationBackendLabel
+                )
+            } else {
+                frameTelemetry.activeFrameInterpolationBackendLabel = activeFrameInterpolationBackendLabel
+            }
+            let continuation = workerChannel.withLock { $0.continuation }
+            continuation?.yield(.retireInterpolationBackend(outgoing))
+        case .fullPipelineReset:
+            autoRuntimeFallbackBackend = nil
             warmedKey = nil
             if !configuration.isRequested || configuration.isLiveStream {
                 VideoEnhancementPoolLimits.reset()
@@ -128,8 +185,12 @@ final class VideoFramePostProcessor {
             telemetryWindow.reset()
             cadenceEstimator.reset()
             interpolationGridNextPTS = nil
-            frameTelemetry = configuration.isRequested && configuration.isLiveStream
+            var resetTelemetry: VideoEnhancementTelemetry = configuration.isRequested && configuration.isLiveStream
                 ? .bypassed(reason: "VOD only") : VideoEnhancementTelemetry()
+            resetTelemetry.activeFrameInterpolationBackendLabel = configuration.frameInterpolationEnabled
+                ? activeFrameInterpolationBackendLabel
+                : nil
+            frameTelemetry = resetTelemetry
         }
     }
 
@@ -155,6 +216,9 @@ final class VideoFramePostProcessor {
         ) ?? frameTelemetry
         if value.smoothedProcessingMs <= 0.01 { value.smoothedProcessingMs = lastProcessingMs }
         value.degradationNote = nil
+        value.activeFrameInterpolationBackendLabel = configuration.frameInterpolationEnabled
+            ? activeFrameInterpolationBackendLabel
+            : nil
         return value
     }
 
@@ -166,9 +230,23 @@ final class VideoFramePostProcessor {
     /// Steady presentation lookahead requested when video enhancement is active.
     var preferredPresentLeadSeconds: TimeInterval { VideoEnhancementPoolLimits.currentLead }
 
+    /// Concrete runtime interpolation backend resolved for the current configuration and device
+    /// (honoring stream-scoped `.auto` fallback from `VT System` to `Vision Flow` when VT rejects a stream).
+    var resolvedFrameInterpolationBackend: VideoFrameInterpolationBackend {
+        if configuration.frameInterpolationBackend == .auto,
+           let autoRuntimeFallbackBackend {
+            return autoRuntimeFallbackBackend
+        }
+        return configuration.resolvedFrameInterpolationBackend
+    }
+
+    /// Runtime display label for the active/resolved interpolation backend (`"VT System"` vs `"Vision Flow"`).
+    var activeFrameInterpolationBackendLabel: String {
+        resolvedFrameInterpolationBackend.telemetryLabel
+    }
+
     var interpolationLabel: String {
-        if #available(iOS 26.0, *) { return "VT FI" }
-        return "Vision FI"
+        activeFrameInterpolationBackendLabel
     }
 
     // MARK: - Single-Pass Admission Snapshot
@@ -259,20 +337,50 @@ final class VideoFramePostProcessor {
         var fiStreamBypass: String?
         var activeOriginalDuration: TimeInterval?
 
+        var resolvedBackend = resolvedFrameInterpolationBackend
+        var supportsArbitraryPhases = VideoFrameInterpolationPlan.supportsArbitraryPhases(for: resolvedBackend)
         if configuration.frameInterpolationEnabled {
-            if let reason = interpolationInputBypassReason(frame) {
+            if let reason = interpolationInputBypassReason(frame, backend: resolvedBackend) {
                 fiStreamBypass = reason
             } else if let estimatedInterval = cadenceEstimator.estimatedInterval(fallbackDuration: frame.duration) {
                 if let reason = VideoFrameInterpolationPlan.streamEligibilityBypassReason(
                     sourceInterval: estimatedInterval,
                     rate: configuration.interpolationRate,
-                    playbackRate: playbackRate
+                    playbackRate: playbackRate,
+                    supportsArbitraryPhases: supportsArbitraryPhases
                 ) {
-                    fiStreamBypass = reason
+                    // Under `.auto` on iOS 26+, if dyadic VT LLFI rejects a non-dyadic cadence ratio
+                    // (e.g. 50fps -> 60fps), fall back automatically to arbitrary-phase Vision Flow.
+                    if configuration.frameInterpolationBackend == .auto,
+                       resolvedBackend == .videoToolbox,
+                       reason == "Interpolation ratio unsupported",
+                       interpolationInputBypassReason(frame, backend: .visionOpticalFlow) == nil,
+                       VideoFrameInterpolationPlan.streamEligibilityBypassReason(
+                           sourceInterval: estimatedInterval,
+                           rate: configuration.interpolationRate,
+                           playbackRate: playbackRate,
+                           supportsArbitraryPhases: true
+                       ) == nil {
+                        autoRuntimeFallbackBackend = .visionOpticalFlow
+                        resolvedBackend = .visionOpticalFlow
+                        supportsArbitraryPhases = true
+                        fiStreamEligible = true
+                        activeOriginalDuration = computeActiveOutputFrameDuration(
+                            for: frame,
+                            estimatedInterval: estimatedInterval,
+                            playbackRate: playbackRate,
+                            supportsArbitraryPhases: true
+                        )
+                    } else {
+                        fiStreamBypass = reason
+                    }
                 } else {
                     fiStreamEligible = true
                     activeOriginalDuration = computeActiveOutputFrameDuration(
-                        for: frame, estimatedInterval: estimatedInterval, playbackRate: playbackRate
+                        for: frame,
+                        estimatedInterval: estimatedInterval,
+                        playbackRate: playbackRate,
+                        supportsArbitraryPhases: supportsArbitraryPhases
                     )
                 }
             } else {
@@ -341,10 +449,11 @@ final class VideoFramePostProcessor {
         current: MediaVideoFrame,
         playbackRate: Double
     ) -> VideoInterpolationPlanOutcome {
-        if !VideoEnhancementGuardrails.isSDR8Bit(previous.pixelBuffer) {
-            return .bypass("HDR / 10-bit")
+        let resolvedBackend = resolvedFrameInterpolationBackend
+        if let reason = VideoFramePairFormat.interpolationBypassReason(previous.pixelBuffer) {
+            return .bypass(reason)
         }
-        if let reason = interpolationInputBypassReason(previous) {
+        if let reason = interpolationInputBypassReason(previous, backend: resolvedBackend) {
             return .bypass(reason)
         }
         let cadence = cadenceEstimator.medianInterval
@@ -359,8 +468,9 @@ final class VideoFramePostProcessor {
         guard VideoFramePairFormat.matches(previous.pixelBuffer, current.pixelBuffer) else {
             return .bypass("Frame format changed")
         }
-        if #unavailable(iOS 26.0), !VisionFrameInterpolationBackend.acceptsPairDelta(timing.delta) {
-            return .bypass("Vision FI > 30fps pair")
+        if resolvedBackend == .visionOpticalFlow,
+           !VisionFrameInterpolationBackend.acceptsPairDelta(timing.delta) {
+            return .bypass("Vision FI > 60fps pair")
         }
         return VideoFrameInterpolationPlan.plan(
             previousPTS: previous.pts,
@@ -370,23 +480,30 @@ final class VideoFramePostProcessor {
             isCadenceStable: cadenceEstimator.isConstantRate,
             gridNextPTS: interpolationGridNextPTS,
             rate: configuration.interpolationRate,
-            playbackRate: playbackRate
+            playbackRate: playbackRate,
+            supportsArbitraryPhases: VideoFrameInterpolationPlan.supportsArbitraryPhases(for: resolvedBackend)
         )
     }
 
     private func computeActiveOutputFrameDuration(
         for frame: MediaVideoFrame,
         estimatedInterval: TimeInterval,
-        playbackRate: Double
+        playbackRate: Double,
+        supportsArbitraryPhases: Bool
     ) -> TimeInterval? {
-        guard frame.duration.isFinite, frame.duration > 0 else { return nil }
+        let referenceDuration = (frame.duration.isFinite && frame.duration > 0)
+            ? frame.duration
+            : estimatedInterval
+        guard referenceDuration.isFinite, referenceDuration > 0 else { return nil }
         let speed = VideoFrameInterpolationPlan.normalizedPlaybackRate(playbackRate)
         let outputDuration: TimeInterval
         if let targetFPS = configuration.interpolationRate.targetFPS {
             let cap = Double(targetFPS)
             let targetPeriod = 1.0 / cap
             let wallCadence = estimatedInterval / speed
-            let allowedMultipliers = VideoFrameInterpolationPlan.defaultMultipliers
+            let allowedMultipliers = supportsArbitraryPhases
+                ? VideoFrameInterpolationPlan.fullMultipliers
+                : VideoFrameInterpolationPlan.dyadicMultipliers
             let ratio = cap * wallCadence
             if interpolationGridNextPTS == nil, cadenceEstimator.isConstantRate,
                let exactMultiplier = allowedMultipliers.first(where: { multiplier in
@@ -394,7 +511,7 @@ final class VideoFramePostProcessor {
                    return abs(ratio - target) / target <= VideoFrameInterpolationPlan.exactIntegerTolerance
                }) {
                 outputDuration = estimatedInterval / Double(exactMultiplier)
-            } else if VideoFrameInterpolationPlan.supportsArbitraryPhases {
+            } else if supportsArbitraryPhases {
                 outputDuration = targetPeriod * speed
             } else if let multiplier = VideoFrameInterpolationPlan.bestMultiplier(
                 forInterval: wallCadence,
@@ -408,30 +525,42 @@ final class VideoFramePostProcessor {
         } else {
             outputDuration = estimatedInterval * 0.5
         }
-        guard outputDuration.isFinite, outputDuration > 0, outputDuration < frame.duration else {
+        guard outputDuration.isFinite, outputDuration > 0, outputDuration < referenceDuration else {
             return nil
         }
         return outputDuration
     }
 
-    private func interpolationInputBypassReason(_ frame: MediaVideoFrame) -> String? {
+    private func interpolationInputBypassReason(
+        _ frame: MediaVideoFrame,
+        backend: VideoFrameInterpolationBackend
+    ) -> String? {
         if let reason = VideoFramePairFormat.interpolationBypassReason(frame.pixelBuffer) { return reason }
-        if #available(iOS 26.0, *) { return nil }
-        return VisionFrameInterpolationBackend.inputBypassReason(
-            frame,
-            maxInputResolution: configuration.maxInputResolution,
-            cadenceInterval: cadenceEstimator.medianInterval
-        )
+        switch backend.resolved() {
+        case .videoToolbox:
+            return nil
+        case .visionOpticalFlow, .auto:
+            return VisionFrameInterpolationBackend.inputBypassReason(
+                frame,
+                maxInputResolution: configuration.maxInputResolution,
+                cadenceInterval: cadenceEstimator.medianInterval
+            )
+        }
     }
 
     // MARK: - Telemetry & Continuity
 
     func noteBypass(_ reason: String) {
-        frameTelemetry = .bypassed(reason: reason)
+        var telemetry = VideoEnhancementTelemetry.bypassed(reason: reason)
+        telemetry.activeFrameInterpolationBackendLabel = configuration.frameInterpolationEnabled
+            ? activeFrameInterpolationBackendLabel
+            : nil
+        frameTelemetry = telemetry
     }
 
     /// Seek / stream switch / renderer reset.
     func noteDiscontinuity() {
+        autoRuntimeFallbackBackend = nil
         pendingExpectation = nil
         telemetryWindow.reset()
         cadenceEstimator.reset()
@@ -454,7 +583,12 @@ final class VideoFramePostProcessor {
             inputHeight: CVPixelBufferGetHeight(original.pixelBuffer),
             outputWidth: CVPixelBufferGetWidth(midpoint.pixelBuffer),
             outputHeight: CVPixelBufferGetHeight(midpoint.pixelBuffer),
-            inputFPS: sourceFPS, outputFPS: outputFPS, isActive: true
+            inputFPS: sourceFPS,
+            outputFPS: outputFPS,
+            isActive: true,
+            activeFrameInterpolationBackendLabel: configuration.frameInterpolationEnabled
+                ? activeFrameInterpolationBackendLabel
+                : nil
         )
     }
 
@@ -472,14 +606,16 @@ final class VideoFramePostProcessor {
         } else {
             displayed.outputFPS = displayed.inputFPS * Double(midpointCount + (emittedOriginal ? 1 : 0))
         }
+        let jobInterpolationLabel = result.resolvedInterpolationBackend?.telemetryLabel ?? interpolationLabel
         let hasMidpoints = midpointCount > 0
         switch (srActive, hasMidpoints) {
         case (true, true):
-            displayed.activeModeLabel = "\(configuration.superResolutionMode.telemetryLabel) + \(interpolationLabel)"
+            displayed.activeModeLabel =
+                "\(configuration.superResolutionMode.telemetryLabel) + \(jobInterpolationLabel)"
         case (true, false):
             displayed.activeModeLabel = configuration.superResolutionMode.telemetryLabel
         case (false, true):
-            displayed.activeModeLabel = interpolationLabel
+            displayed.activeModeLabel = jobInterpolationLabel
         case (false, false):
             displayed.activeModeLabel = "Bypass"
         }
@@ -496,6 +632,9 @@ final class VideoFramePostProcessor {
         displayed.bypassReason = displayed.isActive ? nil : (
             displayed.bypassReason ?? result.interpolationBypassReason ?? "Enhancement not admitted"
         )
+        displayed.activeFrameInterpolationBackendLabel = configuration.frameInterpolationEnabled
+            ? activeFrameInterpolationBackendLabel
+            : nil
         frameTelemetry = displayed
     }
 
@@ -568,6 +707,24 @@ final class VideoFramePostProcessor {
         } else if !stepUpscaled, midpointCount == 0, !validZeroMidpointCFRStep {
             missReason = frameTelemetry.bypassReason
         }
+        // Adopt runtime `.auto` VT -> Vision fallback before checking transition-framebackend mismatch.
+        if let result,
+           configuration.frameInterpolationEnabled,
+           configuration.frameInterpolationBackend == .auto,
+           result.resolvedInterpolationBackend == .visionOpticalFlow,
+           autoRuntimeFallbackBackend != .visionOpticalFlow {
+            autoRuntimeFallbackBackend = .visionOpticalFlow
+            warmedKey = nil
+            frameTelemetry.activeFrameInterpolationBackendLabel = activeFrameInterpolationBackendLabel
+        }
+        // Skip recording a single in-flight transition frame from an outgoing backend after a live
+        // backend hot-swap so the rolling telemetry window reflects only the incoming backend.
+        if let result,
+           configuration.frameInterpolationEnabled,
+           let jobBackend = result.resolvedInterpolationBackend,
+           jobBackend != resolvedFrameInterpolationBackend {
+            return
+        }
         let input = original.pixelBuffer
         let output = upscaled?.pixelBuffer
             ?? (midpointsWereUpscaled ? result?.midpoints.first?.frame.pixelBuffer : nil)
@@ -629,7 +786,8 @@ final class VideoFramePostProcessor {
             sourceFPS: sourceFPS,
             outputFPS: outputFPS,
             maxPhasesPerPair: maxPhasesPerPair,
-            underMemoryPressure: VideoEnhancementGuardrails.isUnderMemoryPressure
+            underMemoryPressure: VideoEnhancementGuardrails.isUnderMemoryPressure,
+            forceFrameInterpolation: configuration.isForceInterpolationActive
         )
     }
 
@@ -696,12 +854,14 @@ final class VideoFramePostProcessor {
         let height = CVPixelBufferGetHeight(frame.pixelBuffer)
         let pixelFormat = CVPixelBufferGetPixelFormatType(frame.pixelBuffer)
         let speed = VideoFrameInterpolationPlan.normalizedPlaybackRate(playbackRate)
+        let resolvedBackend = resolvedFrameInterpolationBackend
         let key = WarmKey(
             superResolutionMode: configuration.superResolutionMode,
             superResolutionScale: configuration.superResolutionScale,
             superResolutionTargetResolution: configuration.superResolutionTargetResolution,
             limitToScreenResolution: configuration.limitToScreenResolution,
             frameInterpolationEnabled: configuration.frameInterpolationEnabled,
+            resolvedFrameInterpolationBackend: resolvedBackend,
             interpolationRate: configuration.interpolationRate,
             maxInputResolution: configuration.maxInputResolution,
             width: width,
@@ -714,12 +874,14 @@ final class VideoFramePostProcessor {
         let srPlan = resolveSuperResolutionPlan(for: frame).resolved
         let estimatedCadence = cadenceEstimator.estimatedInterval(fallbackDuration: frame.duration)
         let fiWarmPlan: (previousPTS: TimeInterval, currentPTS: TimeInterval, plan: VideoFrameInterpolationPlan)?
-        if configuration.frameInterpolationEnabled, interpolationInputBypassReason(frame) == nil {
+        if configuration.frameInterpolationEnabled,
+           interpolationInputBypassReason(frame, backend: resolvedBackend) == nil {
             fiWarmPlan = VideoFrameInterpolationPlan.prewarmPlan(
                 for: frame,
                 cadenceInterval: estimatedCadence,
                 rate: configuration.interpolationRate,
-                playbackRate: speed
+                playbackRate: speed,
+                supportsArbitraryPhases: VideoFrameInterpolationPlan.supportsArbitraryPhases(for: resolvedBackend)
             )
         } else {
             fiWarmPlan = nil
@@ -742,6 +904,7 @@ final class VideoFramePostProcessor {
         let warmJob = VideoFrameWarmJob(
             frame: PostProcessFrameBox(frame: frame),
             configuration: configuration,
+            resolvedInterpolationBackend: resolvedBackend,
             superResolutionCap: srPlan?.scaleCap ?? 0,
             superResolutionTargetDimensions: srPlan?.targetDimensions,
             interpolationPreviousPTS: fiWarmPlan?.previousPTS,
@@ -764,6 +927,7 @@ final class VideoFramePostProcessor {
         _ frame: MediaVideoFrame,
         previous: MediaVideoFrame,
         admission: VideoEnhancementAdmission,
+        playbackRate: Double = 1.0,
         deadlines: VideoEnhancementDeadlines,
         onUpdate: @escaping @MainActor (VideoFrameEnhancementUpdate) -> Void
     ) {
@@ -776,12 +940,20 @@ final class VideoFramePostProcessor {
             admission.interpolationPlan
         }.flatMap { $0.phases.isEmpty ? nil : $0 }
 
+        let resolvedBackend: VideoFrameInterpolationBackend = if admission.configuration.frameInterpolationBackend == .auto,
+                                                                 let autoRuntimeFallbackBackend {
+            autoRuntimeFallbackBackend
+        } else {
+            admission.configuration.resolvedFrameInterpolationBackend
+        }
         let job = VideoFrameEnhancementJob(
             current: PostProcessFrameBox(frame: frame),
             previous: PostProcessFrameBox(frame: previous),
             configuration: admission.configuration,
-            interpolationLabel: interpolationLabel,
+            resolvedInterpolationBackend: resolvedBackend,
+            interpolationLabel: resolvedBackend.telemetryLabel,
             interpolationPlan: resolvedPlan,
+            playbackRate: playbackRate,
             deadlines: deadlines,
             upscalingBypassReason: admission.superResolutionBypassReason,
             superResolutionCap: admission.superResolution?.scaleCap ?? 0,
@@ -827,6 +999,7 @@ final class VideoFramePostProcessor {
         inFlightJobID = nil
         isWarming = false
         warmedKey = nil
+        autoRuntimeFallbackBackend = nil
         pendingExpectation = nil
         telemetryWindow.reset()
         cadenceEstimator.reset()
@@ -901,6 +1074,7 @@ private final class VideoFramePostProcessorPipeline {
     private var smoothedMs: Double = 0
     private var lastSuperResolutionMode = VideoSuperResolutionMode.off
     private var lastInterpolationEnabled = false
+    private var lastResolvedInterpolationBackend: VideoFrameInterpolationBackend?
 
     private struct InterpolationStage {
         var midpoints: [MediaVideoFrame] = []
@@ -908,9 +1082,13 @@ private final class VideoFramePostProcessorPipeline {
         var bypassReason: String?
         var srBypassReason: String?
         var midpointsUpscaled = false
+        var actualBackend: VideoFrameInterpolationBackend?
     }
 
-    private func releaseIdleBackends(for configuration: VideoEnhancementConfiguration) {
+    private func releaseIdleBackends(
+        for configuration: VideoEnhancementConfiguration,
+        resolvedInterpolationBackend: VideoFrameInterpolationBackend
+    ) {
         let mode = configuration.superResolutionMode
         if mode != lastSuperResolutionMode {
             if lastSuperResolutionMode == .metalFXSpatial {
@@ -918,12 +1096,34 @@ private final class VideoFramePostProcessorPipeline {
             }
             lastSuperResolutionMode = mode
         }
-        if lastInterpolationEnabled, !configuration.frameInterpolationEnabled {
-            vtFrameInterp.tearDown()
-            visionFrameInterp.tearDown()
-            interpolationReference = nil
+        if !configuration.frameInterpolationEnabled {
+            if lastInterpolationEnabled {
+                vtFrameInterp.tearDown()
+                visionFrameInterp.tearDown()
+                interpolationReference = nil
+            }
+            lastResolvedInterpolationBackend = nil
+        } else if let previousBackend = lastResolvedInterpolationBackend,
+                  previousBackend != resolvedInterpolationBackend {
+            retireInterpolationBackend(previousBackend)
+            lastResolvedInterpolationBackend = resolvedInterpolationBackend
+        } else {
+            lastResolvedInterpolationBackend = resolvedInterpolationBackend
         }
         lastInterpolationEnabled = configuration.frameInterpolationEnabled
+    }
+
+    func retireInterpolationBackend(_ backend: VideoFrameInterpolationBackend) {
+        switch backend.resolved() {
+        case .videoToolbox:
+            vtFrameInterp.tearDown()
+        case .visionOpticalFlow, .auto:
+            visionFrameInterp.tearDown()
+        }
+        if lastResolvedInterpolationBackend == backend.resolved() {
+            lastResolvedInterpolationBackend = nil
+        }
+        interpolationReference = nil
     }
 
     func flush() {
@@ -940,6 +1140,7 @@ private final class VideoFramePostProcessorPipeline {
         smoothedMs = 0
         lastSuperResolutionMode = .off
         lastInterpolationEnabled = false
+        lastResolvedInterpolationBackend = nil
     }
 
     func prewarm(
@@ -947,7 +1148,10 @@ private final class VideoFramePostProcessorPipeline {
         isAlive: @escaping @Sendable () -> Bool
     ) async -> Bool {
         guard isAlive() else { return false }
-        releaseIdleBackends(for: job.configuration)
+        releaseIdleBackends(
+            for: job.configuration,
+            resolvedInterpolationBackend: job.resolvedInterpolationBackend
+        )
         let frame = job.frame.frame
 
         if job.isUpscaling {
@@ -968,32 +1172,53 @@ private final class VideoFramePostProcessorPipeline {
         if let plan = job.interpolationPlan,
            let prevPTS = job.interpolationPreviousPTS,
            let currPTS = job.interpolationCurrentPTS {
-            resetInterpolation()
-            let warmPrev = MediaVideoFrame(
-                pts: prevPTS,
-                duration: plan.sourceInterval,
-                pixelBuffer: frame.pixelBuffer
-            )
-            let warmCurr = MediaVideoFrame(
-                pts: currPTS,
-                duration: plan.sourceInterval,
-                pixelBuffer: frame.pixelBuffer
-            )
-            _ = await interpolate(
-                warmPrev,
-                plan: nil,
-                maxInputResolution: job.configuration.maxInputResolution,
-                hasTimeRemaining: isAlive
-            )
-            if isAlive() {
-                _ = await interpolate(
-                    warmCurr,
-                    plan: plan,
+            if job.resolvedInterpolationBackend == .visionOpticalFlow {
+                // Lightweight <1 ms GPU analysis buffer prewarm that seeds Frame 0 directly as reference
+                // without locking the worker on a throwaway Vision request.
+                if await visionFrameInterp.prewarm(
+                    frame,
                     maxInputResolution: job.configuration.maxInputResolution,
+                    superResolutionActive: job.isUpscaling,
+                    forceInterpolation: job.configuration.isForceInterpolationActive
+                ) {
+                    interpolationReference = EnhancementFrameIdentity(frame)
+                }
+            } else {
+                resetInterpolation(for: job.resolvedInterpolationBackend)
+                let warmPrev = MediaVideoFrame(
+                    pts: prevPTS,
+                    duration: plan.sourceInterval,
+                    pixelBuffer: frame.pixelBuffer
+                )
+                let warmCurr = MediaVideoFrame(
+                    pts: currPTS,
+                    duration: plan.sourceInterval,
+                    pixelBuffer: frame.pixelBuffer
+                )
+                _ = await interpolate(
+                    warmPrev,
+                    plan: nil,
+                    backend: job.resolvedInterpolationBackend,
+                    maxInputResolution: job.configuration.maxInputResolution,
+                    superResolutionActive: job.isUpscaling,
+                    forceInterpolation: job.configuration.isForceInterpolationActive,
+                    playbackRate: 1.0,
                     hasTimeRemaining: isAlive
                 )
+                if isAlive() {
+                    _ = await interpolate(
+                        warmCurr,
+                        plan: plan,
+                        backend: job.resolvedInterpolationBackend,
+                        maxInputResolution: job.configuration.maxInputResolution,
+                        superResolutionActive: job.isUpscaling,
+                        forceInterpolation: job.configuration.isForceInterpolationActive,
+                        playbackRate: 1.0,
+                        hasTimeRemaining: isAlive
+                    )
+                }
+                resetInterpolation(for: job.resolvedInterpolationBackend)
             }
-            resetInterpolation()
         }
 
         return isAlive()
@@ -1006,7 +1231,10 @@ private final class VideoFramePostProcessorPipeline {
     ) async -> VideoFrameEnhancementResult {
         _ = publishMidpoints
         let start = ContinuousClock.now
-        releaseIdleBackends(for: job.configuration)
+        releaseIdleBackends(
+            for: job.configuration,
+            resolvedInterpolationBackend: job.resolvedInterpolationBackend
+        )
         let frame = job.current.frame
         let previous = job.previous.frame
         let nominalFPS = VideoFrameInterpolationTiming.sourceFPS(frame) ?? 0
@@ -1018,7 +1246,7 @@ private final class VideoFramePostProcessorPipeline {
         let previousIdentity = EnhancementFrameIdentity(previous)
         let formatMatches = VideoFramePairFormat.matches(previous.pixelBuffer, frame.pixelBuffer)
         if !formatMatches, interpolationReference != nil {
-            resetInterpolation()
+            resetInterpolation(for: job.resolvedInterpolationBackend)
         }
 
         // Stage 1: Frame interpolation (raw synthesized midpoints in strictly ascending PTS order).
@@ -1056,27 +1284,65 @@ private final class VideoFramePostProcessorPipeline {
         isAlive: @escaping @Sendable () -> Bool
     ) async -> InterpolationStage {
         let frame = job.current.frame
-        let nominalFPS = VideoFrameInterpolationTiming.sourceFPS(frame) ?? 0
-        var stage = InterpolationStage(inputFPS: nominalFPS)
+        let nominalFPS = VideoFrameInterpolationTiming.sourceFPS(frame) ?? (job.interpolationPlan?.sourceFPS ?? 0)
+        var stage = InterpolationStage(inputFPS: nominalFPS, actualBackend: job.resolvedInterpolationBackend)
         guard let deadline = job.deadlines.midpoint, let plan = job.interpolationPlan else {
-            if interpolationReference != nil { resetInterpolation() }
+            if interpolationReference != nil {
+                resetInterpolation(for: job.resolvedInterpolationBackend)
+            }
             return stage
         }
         let hasTimeRemaining: @Sendable () -> Bool = { isAlive() && .now < deadline }
+        var activeBackend = job.resolvedInterpolationBackend
+        let canAutoFallbackToVision = job.configuration.frameInterpolationBackend == .auto
+            && activeBackend == .videoToolbox
+        let forceFI = job.configuration.isForceInterpolationActive
+
         if interpolationReference != previousIdentity, hasTimeRemaining() {
-            resetInterpolation()
+            resetInterpolation(for: activeBackend)
             switch await interpolate(
                 job.previous.frame,
                 plan: nil,
+                backend: activeBackend,
                 maxInputResolution: job.configuration.maxInputResolution,
+                superResolutionActive: job.isUpscaling,
+                forceInterpolation: forceFI,
+                playbackRate: job.playbackRate,
                 hasTimeRemaining: hasTimeRemaining
             ) {
             case .passthrough, .interpolated:
                 interpolationReference = previousIdentity
             case let .bypassed(reason):
-                stage.bypassReason = reason
-                resetInterpolation()
-                return stage
+                if canAutoFallbackToVision,
+                   !Self.preservesInterpolationReference(forBypassReason: reason),
+                   hasTimeRemaining() {
+                    vtFrameInterp.tearDown()
+                    activeBackend = .visionOpticalFlow
+                    stage.actualBackend = .visionOpticalFlow
+                    lastResolvedInterpolationBackend = .visionOpticalFlow
+                    resetInterpolation(for: .visionOpticalFlow)
+                    switch await interpolate(
+                        job.previous.frame,
+                        plan: nil,
+                        backend: .visionOpticalFlow,
+                        maxInputResolution: job.configuration.maxInputResolution,
+                        superResolutionActive: job.isUpscaling,
+                        forceInterpolation: forceFI,
+                        playbackRate: job.playbackRate,
+                        hasTimeRemaining: hasTimeRemaining
+                    ) {
+                    case .passthrough, .interpolated:
+                        interpolationReference = previousIdentity
+                    case let .bypassed(visionReason):
+                        stage.bypassReason = visionReason
+                        resetInterpolation(for: .visionOpticalFlow)
+                        return stage
+                    }
+                } else {
+                    stage.bypassReason = reason
+                    resetInterpolation(for: activeBackend)
+                    return stage
+                }
             }
         }
         guard hasTimeRemaining() else {
@@ -1086,21 +1352,64 @@ private final class VideoFramePostProcessorPipeline {
         switch await interpolate(
             frame,
             plan: plan,
+            backend: activeBackend,
             maxInputResolution: job.configuration.maxInputResolution,
+            superResolutionActive: job.isUpscaling,
+            forceInterpolation: forceFI,
+            playbackRate: job.playbackRate,
             hasTimeRemaining: hasTimeRemaining
         ) {
         case let .interpolated(frames):
             stage.inputFPS = plan.sourceFPS
             stage.midpoints = frames
+            stage.actualBackend = activeBackend
             interpolationReference = EnhancementFrameIdentity(frame)
         case .passthrough:
+            stage.actualBackend = activeBackend
             interpolationReference = EnhancementFrameIdentity(frame)
         case let .bypassed(reason):
+            if canAutoFallbackToVision,
+               activeBackend == .videoToolbox,
+               !Self.preservesInterpolationReference(forBypassReason: reason),
+               hasTimeRemaining() {
+                vtFrameInterp.tearDown()
+                activeBackend = .visionOpticalFlow
+                stage.actualBackend = .visionOpticalFlow
+                lastResolvedInterpolationBackend = .visionOpticalFlow
+                resetInterpolation(for: .visionOpticalFlow)
+                _ = await interpolate(
+                    job.previous.frame,
+                    plan: nil,
+                    backend: .visionOpticalFlow,
+                    maxInputResolution: job.configuration.maxInputResolution,
+                    superResolutionActive: job.isUpscaling,
+                    forceInterpolation: forceFI,
+                    playbackRate: job.playbackRate,
+                    hasTimeRemaining: hasTimeRemaining
+                )
+                if hasTimeRemaining(),
+                   case let .interpolated(visionFrames) = await interpolate(
+                       frame,
+                       plan: plan,
+                       backend: .visionOpticalFlow,
+                       maxInputResolution: job.configuration.maxInputResolution,
+                       superResolutionActive: job.isUpscaling,
+                       forceInterpolation: forceFI,
+                       playbackRate: job.playbackRate,
+                       hasTimeRemaining: hasTimeRemaining
+                   ) {
+                    stage.inputFPS = plan.sourceFPS
+                    stage.midpoints = visionFrames
+                    stage.bypassReason = nil
+                    interpolationReference = EnhancementFrameIdentity(frame)
+                    return stage
+                }
+            }
             stage.bypassReason = reason
             if Self.preservesInterpolationReference(forBypassReason: reason) {
                 interpolationReference = EnhancementFrameIdentity(frame)
             } else {
-                resetInterpolation()
+                resetInterpolation(for: activeBackend)
             }
         }
         return stage
@@ -1224,17 +1533,19 @@ private final class VideoFramePostProcessorPipeline {
             srBypass = interpolation.srBypassReason
         }
 
+        let effectiveBackend = interpolation.actualBackend ?? job.resolvedInterpolationBackend
+        let effectiveInterpolationLabel = effectiveBackend.telemetryLabel
         let srActive = enhancedOriginal != nil || interpolation.midpointsUpscaled
         let hasMidpoints = !interpolation.midpoints.isEmpty
         let isActive = srActive || hasMidpoints
         let activeModeLabel: String
         switch (srActive, hasMidpoints) {
         case (true, true):
-            activeModeLabel = "\(job.configuration.superResolutionMode.telemetryLabel) + \(job.interpolationLabel)"
+            activeModeLabel = "\(job.configuration.superResolutionMode.telemetryLabel) + \(effectiveInterpolationLabel)"
         case (true, false):
             activeModeLabel = job.configuration.superResolutionMode.telemetryLabel
         case (false, true):
-            activeModeLabel = job.interpolationLabel
+            activeModeLabel = effectiveInterpolationLabel
         case (false, false):
             activeModeLabel = "Bypass"
         }
@@ -1253,7 +1564,10 @@ private final class VideoFramePostProcessorPipeline {
             outputFPS: outputFPS,
             smoothedProcessingMs: smoothedMs,
             bypassReason: isActive ? nil : (srBypass ?? interpolation.bypassReason),
-            isActive: isActive
+            isActive: isActive,
+            activeFrameInterpolationBackendLabel: job.configuration.frameInterpolationEnabled
+                ? effectiveInterpolationLabel
+                : nil
         )
         return VideoFrameEnhancementResult(
             midpoints: interpolation.midpoints.map(PostProcessFrameBox.init),
@@ -1261,7 +1575,10 @@ private final class VideoFramePostProcessorPipeline {
             telemetry: telemetry,
             interpolationBypassReason: interpolation.bypassReason,
             originalSuperResolutionBypassReason: srBypass,
-            midpointsUpscaled: interpolation.midpointsUpscaled
+            midpointsUpscaled: interpolation.midpointsUpscaled,
+            resolvedInterpolationBackend: job.configuration.frameInterpolationEnabled
+                ? effectiveBackend
+                : nil
         )
     }
 
@@ -1271,17 +1588,50 @@ private final class VideoFramePostProcessorPipeline {
         interpolationReference = nil
     }
 
+    private func resetInterpolation(for backend: VideoFrameInterpolationBackend) {
+        switch backend.resolved() {
+        case .videoToolbox:
+            vtFrameInterp.flush()
+        case .visionOpticalFlow, .auto:
+            visionFrameInterp.flush()
+        }
+        interpolationReference = nil
+    }
+
     private func interpolate(
         _ frame: MediaVideoFrame,
         plan: VideoFrameInterpolationPlan?,
+        backend: VideoFrameInterpolationBackend,
         maxInputResolution: VideoEnhancementMaxInputResolution,
+        superResolutionActive: Bool,
+        forceInterpolation: Bool,
+        playbackRate: Double,
         hasTimeRemaining: @Sendable () -> Bool
     ) async -> VideoInterpolationBackendOutcome {
-        if #available(iOS 26.0, *) {
-            return await vtFrameInterp.process(frame, plan: plan, hasTimeRemaining: hasTimeRemaining)
+        switch backend.resolved() {
+        case .videoToolbox:
+            if #available(iOS 26.0, *) {
+                return await vtFrameInterp.process(frame, plan: plan, hasTimeRemaining: hasTimeRemaining)
+            }
+            return await visionFrameInterp.process(
+                frame,
+                plan: plan,
+                maxInputResolution: maxInputResolution,
+                superResolutionActive: superResolutionActive,
+                forceInterpolation: forceInterpolation,
+                playbackRate: playbackRate,
+                hasTimeRemaining: hasTimeRemaining
+            )
+        case .visionOpticalFlow, .auto:
+            return await visionFrameInterp.process(
+                frame,
+                plan: plan,
+                maxInputResolution: maxInputResolution,
+                superResolutionActive: superResolutionActive,
+                forceInterpolation: forceInterpolation,
+                playbackRate: playbackRate,
+                hasTimeRemaining: hasTimeRemaining
+            )
         }
-        return await visionFrameInterp.process(
-            frame, plan: plan, maxInputResolution: maxInputResolution, hasTimeRemaining: hasTimeRemaining
-        )
     }
 }

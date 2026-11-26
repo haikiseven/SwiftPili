@@ -47,7 +47,7 @@ final class MetalNV12PixelConverter {
         let retained: [CVMetalTexture]
         let paddingCoveredByGPU: Bool
 
-        if Self.isNV12(srcFormat), dstFormat == kCVPixelFormatType_32BGRA {
+        if Self.isBiPlanarYUV(srcFormat), dstFormat == kCVPixelFormatType_32BGRA {
             guard let encoded = encodeNV12ToBGRA(
                 commandBuffer: commandBuffer, metal: metal,
                 source: source, destination: destination, size: size,
@@ -55,11 +55,14 @@ final class MetalNV12PixelConverter {
             ) else { return false }
             retained = encoded.retained
             paddingCoveredByGPU = encoded.paddingCovered
-        } else if Self.isNV12(srcFormat), Self.isNV12(dstFormat), srcFormat != dstFormat {
+        } else if Self.isBiPlanarYUV(srcFormat), Self.isNV12(dstFormat), srcFormat != dstFormat {
             guard let encoded = encodeNV12RangeConvert(
                 commandBuffer: commandBuffer, metal: metal,
                 source: source, destination: destination, size: size,
-                fullToVideo: srcFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                fullToVideo: Self.isFullRangeBiPlanarYUV(srcFormat)
+                    && dstFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                sameRangeCopy: Self.isFullRangeBiPlanarYUV(srcFormat)
+                    == (dstFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
                 padding: (padLeft, padRight, padTop, padBottom)
             ) else { return false }
             retained = encoded.retained
@@ -104,12 +107,14 @@ final class MetalNV12PixelConverter {
         size: (Int, Int),
         padding: (left: Int, right: Int, top: Int, bottom: Int)
     ) -> (retained: [CVMetalTexture], paddingCovered: Bool)? {
-        guard let nv12ToBGRAPipeline = try? metal.pipeline(for: .nv12ToBGRA) else { return nil }
+        let srcFormat = CVPixelBufferGetPixelFormatType(source)
+        guard let planes = Self.biPlanarFormats(for: srcFormat),
+              let nv12ToBGRAPipeline = try? metal.pipeline(for: .nv12ToBGRA) else { return nil }
         let chromaSize = (max(1, size.0 / 2), max(1, size.1 / 2))
         guard let yMapped = metal.makeTexture(
-            buffer: source, format: .r8Unorm, width: size.0, height: size.1, plane: 0
+            buffer: source, format: planes.luma, width: size.0, height: size.1, plane: 0
         ), let cbcrMapped = metal.makeTexture(
-            buffer: source, format: .rg8Unorm, width: chromaSize.0, height: chromaSize.1, plane: 1
+            buffer: source, format: planes.chroma, width: chromaSize.0, height: chromaSize.1, plane: 1
         ) else { return nil }
 
         let target = VideoEnhancementMetalContext.gpuPaddedPlaneSize(
@@ -140,8 +145,7 @@ final class MetalNV12PixelConverter {
 
         let chromaOffset = Self.chromaOffset(for: source)
         var params = VideoEnhancementNV12ConvertParams(
-            fullRange: CVPixelBufferGetPixelFormatType(source) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-                ? 1 : 0,
+            fullRange: planes.fullRange ? 1 : 0,
             colorMatrix: Self.colorMatrixIndex(for: source, width: size.0, height: size.1),
             chromaOffsetX: chromaOffset.0,
             chromaOffsetY: chromaOffset.1
@@ -166,17 +170,22 @@ final class MetalNV12PixelConverter {
         destination: CVPixelBuffer,
         size: (Int, Int),
         fullToVideo: Bool,
+        sameRangeCopy: Bool = false,
         padding: (left: Int, right: Int, top: Int, bottom: Int)
     ) -> (retained: [CVMetalTexture], paddingCovered: Bool)? {
-        guard let rangeYPipeline = try? metal.pipeline(for: .nv12RangeConvertY),
-              let rangeCbCrPipeline = try? metal.pipeline(for: .nv12RangeConvertCbCr) else {
+        let srcFormat = CVPixelBufferGetPixelFormatType(source)
+        guard let srcPlanes = Self.biPlanarFormats(for: srcFormat) else { return nil }
+        let yKernel: VideoEnhancementMetalContext.Kernel = sameRangeCopy ? .nv12StageCopyY : .nv12RangeConvertY
+        let cbcrKernel: VideoEnhancementMetalContext.Kernel = sameRangeCopy ? .nv12StageCopyCbCr : .nv12RangeConvertCbCr
+        guard let yPipeline = try? metal.pipeline(for: yKernel),
+              let cbcrPipeline = try? metal.pipeline(for: cbcrKernel) else {
             return nil
         }
         let chromaSize = (max(1, size.0 / 2), max(1, size.1 / 2))
         guard let srcYMapped = metal.makeTexture(
-            buffer: source, format: .r8Unorm, width: size.0, height: size.1, plane: 0
+            buffer: source, format: srcPlanes.luma, width: size.0, height: size.1, plane: 0
         ), let srcCbCrMapped = metal.makeTexture(
-            buffer: source, format: .rg8Unorm, width: chromaSize.0, height: chromaSize.1, plane: 1
+            buffer: source, format: srcPlanes.chroma, width: chromaSize.0, height: chromaSize.1, plane: 1
         ) else { return nil }
 
         let lumaTarget = VideoEnhancementMetalContext.gpuPaddedPlaneSize(
@@ -224,24 +233,50 @@ final class MetalNV12PixelConverter {
             return nil
         }
 
-        var params = VideoEnhancementNV12RangeConvertParams(fullToVideo: fullToVideo ? 1 : 0)
-        compute.setComputePipelineState(rangeYPipeline)
-        compute.setTexture(srcYMapped.texture, index: 0)
-        compute.setTexture(dstYMapped.texture, index: 1)
-        compute.setBytes(&params, length: MemoryLayout<VideoEnhancementNV12RangeConvertParams>.size, index: 0)
-        VideoEnhancementMetalContext.dispatchThreads(
-            encoder: compute, pipeline: rangeYPipeline,
-            width: dstYMapped.texture.width, height: dstYMapped.texture.height
-        )
+        if sameRangeCopy {
+            var yCopy = VideoEnhancementNV12StageCopyParams(
+                activeWidth: UInt32(size.0), activeHeight: UInt32(size.1), padLeft: 0, padTop: 0
+            )
+            compute.setComputePipelineState(yPipeline)
+            compute.setTexture(srcYMapped.texture, index: 0)
+            compute.setTexture(dstYMapped.texture, index: 1)
+            compute.setBytes(&yCopy, length: MemoryLayout<VideoEnhancementNV12StageCopyParams>.size, index: 0)
+            VideoEnhancementMetalContext.dispatchThreads(
+                encoder: compute, pipeline: yPipeline,
+                width: dstYMapped.texture.width, height: dstYMapped.texture.height
+            )
 
-        compute.setComputePipelineState(rangeCbCrPipeline)
-        compute.setTexture(srcCbCrMapped.texture, index: 0)
-        compute.setTexture(dstCbCrMapped.texture, index: 1)
-        compute.setBytes(&params, length: MemoryLayout<VideoEnhancementNV12RangeConvertParams>.size, index: 0)
-        VideoEnhancementMetalContext.dispatchThreads(
-            encoder: compute, pipeline: rangeCbCrPipeline,
-            width: dstCbCrMapped.texture.width, height: dstCbCrMapped.texture.height
-        )
+            var cbcrCopy = VideoEnhancementNV12StageCopyParams(
+                activeWidth: UInt32(chromaSize.0), activeHeight: UInt32(chromaSize.1), padLeft: 0, padTop: 0
+            )
+            compute.setComputePipelineState(cbcrPipeline)
+            compute.setTexture(srcCbCrMapped.texture, index: 0)
+            compute.setTexture(dstCbCrMapped.texture, index: 1)
+            compute.setBytes(&cbcrCopy, length: MemoryLayout<VideoEnhancementNV12StageCopyParams>.size, index: 0)
+            VideoEnhancementMetalContext.dispatchThreads(
+                encoder: compute, pipeline: cbcrPipeline,
+                width: dstCbCrMapped.texture.width, height: dstCbCrMapped.texture.height
+            )
+        } else {
+            var params = VideoEnhancementNV12RangeConvertParams(fullToVideo: fullToVideo ? 1 : 0)
+            compute.setComputePipelineState(yPipeline)
+            compute.setTexture(srcYMapped.texture, index: 0)
+            compute.setTexture(dstYMapped.texture, index: 1)
+            compute.setBytes(&params, length: MemoryLayout<VideoEnhancementNV12RangeConvertParams>.size, index: 0)
+            VideoEnhancementMetalContext.dispatchThreads(
+                encoder: compute, pipeline: yPipeline,
+                width: dstYMapped.texture.width, height: dstYMapped.texture.height
+            )
+
+            compute.setComputePipelineState(cbcrPipeline)
+            compute.setTexture(srcCbCrMapped.texture, index: 0)
+            compute.setTexture(dstCbCrMapped.texture, index: 1)
+            compute.setBytes(&params, length: MemoryLayout<VideoEnhancementNV12RangeConvertParams>.size, index: 0)
+            VideoEnhancementMetalContext.dispatchThreads(
+                encoder: compute, pipeline: cbcrPipeline,
+                width: dstCbCrMapped.texture.width, height: dstCbCrMapped.texture.height
+            )
+        }
         compute.endEncoding()
         return ([srcYMapped.bridge, srcCbCrMapped.bridge, dstYMapped.bridge, dstCbCrMapped.bridge], paddingCovered)
     }
@@ -249,6 +284,37 @@ final class MetalNV12PixelConverter {
     static func isNV12(_ format: OSType) -> Bool {
         format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
             || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+    }
+
+    static func is10BitBiPlanarYUV(_ format: OSType) -> Bool {
+        format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+    }
+
+    static func isBiPlanarYUV(_ format: OSType) -> Bool {
+        isNV12(format) || is10BitBiPlanarYUV(format)
+    }
+
+    static func isFullRangeBiPlanarYUV(_ format: OSType) -> Bool {
+        format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+    }
+
+    static func biPlanarFormats(
+        for format: OSType
+    ) -> (luma: MTLPixelFormat, chroma: MTLPixelFormat, fullRange: Bool)? {
+        switch format {
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+            (.r8Unorm, .rg8Unorm, false)
+        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+            (.r8Unorm, .rg8Unorm, true)
+        case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
+            (.r16Unorm, .rg16Unorm, false)
+        case kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+            (.r16Unorm, .rg16Unorm, true)
+        default:
+            nil
+        }
     }
 
     static func colorMatrixIndex(for pixelBuffer: CVPixelBuffer, width: Int, height: Int) -> UInt32 {
@@ -828,16 +894,17 @@ final class MetalFXSuperResolutionBackend {
             return [bgraMapped.bridge]
         }
 
+        guard let planes = MetalNV12PixelConverter.biPlanarFormats(for: pixelFormat) else { return nil }
         let chromaSize = (max(1, size.0 / 2), max(1, size.1 / 2))
         guard let yMapped = metal.makeTexture(
-            buffer: pixelBuffer, format: .r8Unorm, width: size.0, height: size.1, plane: 0
+            buffer: pixelBuffer, format: planes.luma, width: size.0, height: size.1, plane: 0
         ), let cbcrMapped = metal.makeTexture(
-            buffer: pixelBuffer, format: .rg8Unorm, width: chromaSize.0, height: chromaSize.1, plane: 1
+            buffer: pixelBuffer, format: planes.chroma, width: chromaSize.0, height: chromaSize.1, plane: 1
         ), let compute = commandBuffer.makeComputeCommandEncoder() else { return nil }
 
         let chromaOffset = MetalNV12PixelConverter.chromaOffset(for: pixelBuffer)
         var params = VideoEnhancementNV12ConvertParams(
-            fullRange: pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ? 1 : 0,
+            fullRange: planes.fullRange ? 1 : 0,
             colorMatrix: MetalNV12PixelConverter.colorMatrixIndex(
                 for: pixelBuffer, width: size.0, height: size.1
             ),
