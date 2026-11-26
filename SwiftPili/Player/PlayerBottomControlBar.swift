@@ -10,11 +10,18 @@ struct PlayerBottomControlBar: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            PlayerTransportTimeRow(player: player, owner: owner, gestureDisplay: gestureDisplay)
+            PlayerTransportTimeRow(
+                player: player,
+                owner: owner,
+                gestureDisplay: gestureDisplay
+            )
 
             HStack(spacing: 4) {
                 if let previousEpisode = player.onPreviousEpisode {
-                    Button(action: previousEpisode) {
+                    Button {
+                        player.cancelEndedAutoAdvance()
+                        previousEpisode()
+                    } label: {
                         Image(systemName: "backward.end.fill")
                             .font(.body)
                             .foregroundStyle(.white)
@@ -25,7 +32,11 @@ struct PlayerBottomControlBar: View {
                 }
 
                 Button { player.togglePlayPause() } label: {
-                    Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
+                    Image(
+                        systemName: player.playbackEnded
+                            ? "arrow.counterclockwise"
+                            : (player.isPlaying ? "pause.fill" : "play.fill")
+                    )
                         .font(.title3)
                         .foregroundStyle(.white)
                         .contentTransition(.symbolEffect(.replace))
@@ -34,10 +45,17 @@ struct PlayerBottomControlBar: View {
                         .accessibilityHidden(true)
                 }
                 .accessibilityIdentifier("player.playPause")
-                .accessibilityLabel(player.isPlaying ? Text("Pause") : Text("Play"))
+                .accessibilityLabel(
+                    player.playbackEnded
+                        ? Text("Replay")
+                        : (player.isPlaying ? Text("Pause") : Text("Play"))
+                )
 
                 if let nextEpisode = player.onNextEpisode {
-                    Button(action: nextEpisode) {
+                    Button {
+                        player.cancelEndedAutoAdvance()
+                        nextEpisode()
+                    } label: {
                         Image(systemName: "forward.end.fill")
                             .font(.body)
                             .foregroundStyle(.white)
@@ -61,11 +79,12 @@ struct PlayerBottomControlBar: View {
                     Button { player.seek(to: min(player.duration, player.displayTime + 10)) } label: {
                         Image(systemName: "goforward.10")
                             .font(.title3)
-                            .foregroundStyle(.white)
+                            .foregroundStyle(.white.opacity(player.playbackEnded ? 0.35 : 1))
                             .frame(width: 44, height: 44)
                             .contentShape(Rectangle())
                             .accessibilityHidden(true)
                     }
+                    .disabled(player.playbackEnded)
                     .accessibilityLabel(Text("Forward 10 seconds"))
                 }
 
@@ -99,22 +118,6 @@ struct PlayerBottomControlBar: View {
                 }
 
                 Spacer()
-
-                if player.isPortraitContent, !player.isFullscreen, player.mode.isSeekable {
-                    Button {
-                        player.togglePortraitExpand()
-                    } label: {
-                        Image(systemName: "arrow.up.arrow.down")
-                            .font(.title3)
-                            .foregroundStyle(.white)
-                            .frame(width: 44, height: 44)
-                            .contentShape(Rectangle())
-                            .accessibilityHidden(true)
-                    }
-                    .accessibilityIdentifier("player.portraitWindow")
-                    .accessibilityLabel(Text("Player Window"))
-                    .accessibilityValue(Text(verbatim: player.inlineCondensed ? "condensed" : "expanded"))
-                }
 
                 Button {
                     player.requestFullscreenTransition(target: !player.isFullscreen, source: .button)

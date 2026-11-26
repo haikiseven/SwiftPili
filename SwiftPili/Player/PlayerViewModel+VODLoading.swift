@@ -4,6 +4,55 @@ import UIKit
 
 extension PlayerViewModel {
 
+    func loadVOD(
+        aid: Int,
+        cid: Int,
+        bvid: String? = nil,
+        quality: Int? = nil,
+        source: StreamSource = .ugc,
+        resumeAt: TimeInterval? = nil,
+        resumedPartNumber: Int?,
+        portraitHint: Bool? = nil,
+        aspectRatioHint: CGFloat? = nil,
+        preservePlayState: Bool = false,
+        owner: String? = nil,
+        ownerLease: PlayerOwnerLease? = nil,
+        startupTraceToken: StartupTrace.Token? = nil,
+        requestAdmission: (@MainActor @Sendable () -> Bool)? = nil,
+        mediaResetID: UUID? = nil,
+        recoveryCoverIdentity: UInt64? = nil,
+        cdnSwitchID: UUID? = nil,
+        streamRetryID: UUID? = nil
+    ) async {
+        let loadTask = Task {
+            await performLoadVOD(
+                aid: aid,
+                cid: cid,
+                bvid: bvid,
+                quality: quality,
+                source: source,
+                resumeAt: resumeAt,
+                resumedPartNumber: resumedPartNumber,
+                portraitHint: portraitHint,
+                aspectRatioHint: aspectRatioHint,
+                preservePlayState: preservePlayState,
+                owner: owner,
+                ownerLease: ownerLease,
+                startupTraceToken: startupTraceToken,
+                requestAdmission: requestAdmission,
+                mediaResetID: mediaResetID,
+                recoveryCoverIdentity: recoveryCoverIdentity,
+                cdnSwitchID: cdnSwitchID,
+                streamRetryID: streamRetryID
+            )
+        }
+        await withTaskCancellationHandler {
+            await loadTask.value
+        } onCancel: {
+            loadTask.cancel()
+        }
+    }
+
     func performLoadVOD(
         aid: Int,
         cid: Int,
@@ -11,7 +60,9 @@ extension PlayerViewModel {
         quality: Int?,
         source: StreamSource,
         resumeAt: TimeInterval?,
+        resumedPartNumber: Int? = nil,
         portraitHint: Bool?,
+        aspectRatioHint: CGFloat? = nil,
         preservePlayState: Bool,
         owner: String?,
         ownerLease: PlayerOwnerLease?,
@@ -81,6 +132,10 @@ extension PlayerViewModel {
         let failedResumeHost = activeCDNSwitch.flatMap { transaction in
             cdnSwitchID == transaction.id ? CDNHostPolicy.canonicalHost(transaction.authority.videoURL?.host()) : nil
         }
+        let failedFallbackHost = failedResumeHost
+            ?? (sameContent && cdnFallbackActive
+                ? CDNHostPolicy.canonicalHost(currentURL?.host() ?? stats.videoHost)
+                : nil)
         let preloadedPlayerInfo = takePlayerInfoHandoff(
             aid: aid,
             cid: cid,
@@ -94,6 +149,8 @@ extension PlayerViewModel {
             newOwner: presentationResetPendingForOwnerChange
         )
         let retainedPortraitHint = sameContent ? portraitPropagation.apiHint : nil
+        let initialAspectHint = DetailPlayerGeometry.normalizedAspect(aspectRatioHint)
+        let retainedAspectRatio = sameContent ? videoAspectRatio : nil
         playbackTerminalState = .active
 
         if !sameContent {
@@ -108,9 +165,17 @@ extension PlayerViewModel {
             pgcSeasonContext = nil
             inlineCondensed = false
             portraitCondenseLocked = false
+            portraitPureViewEnabled = false
+            if portraitFullscreenContext?.ownerLease != ownerLease {
+                portraitFullscreenContext = nil
+            }
             sponsorSkippedUUIDs = []
             autoSkippedSegmentKeys = []
             pendingSponsorManualSegment = nil
+        }
+        let fallbackContentKey = Self.vodDecodeFallbackContentKey(aid: aid, cid: cid, source: source)
+        if !sameContent || session.decodeFallback.contentKey != fallbackContentKey {
+            session.decodeFallback = PlayerDecodeFallbackState(contentKey: fallbackContentKey)
         }
         stop(reason: teardownReason, preservingParkedBackend: backend.hasParkedSession,
              mediaResetID: mediaResetID, recoveryCoverIdentity: recoveryCoverIdentity,
@@ -148,7 +213,10 @@ extension PlayerViewModel {
             )
         }
         reconcileAmbientStoryboard()
-        let effectivePortraitHint = portraitHint ?? retainedPortraitHint
+        let effectivePortraitHint = portraitHint
+            ?? initialAspectHint.map { DetailPlayerGeometry.isPortraitAspect($0) }
+            ?? retainedPortraitHint
+        videoAspectRatio = sameContent ? (retainedAspectRatio ?? initialAspectHint) : initialAspectHint
         if !sameContent {
             isPortraitContent = DeviceCapability.usesCompactPortraitVideoFraming
                 && (effectivePortraitHint ?? false)
@@ -164,7 +232,8 @@ extension PlayerViewModel {
         if !preservePlayState {
             playbackIntent = .playing
         }
-        pendingRestartNotice = false
+        pendingHistoryResumeNotice = nil
+        pendingPartLocationNotice = nil
         let effectiveResumeIntent = resumeAt ?? resumeAtTime
         PlayerLog.log(
             "[Player] reopen-reason=\(String(describing: teardownReason)) " +
@@ -182,7 +251,7 @@ extension PlayerViewModel {
             mediaTime = resumeAt
             PlayerLog.log("[Player] loadVOD: will resume at \(String(format: "%.0f", resumeAt))s once ready")
         } else if let resumeAt, resumeAt < 0 {
-            pendingRestartNotice = true
+            PlayerLog.log("[Player] loadVOD: saved history marked watched to end — starting from 0")
         } else if let resumeAt {
             PlayerLog.log("[Player] loadVOD: resume point \(String(format: "%.1f", resumeAt))s too early — starting from 0")
         }
@@ -258,16 +327,52 @@ extension PlayerViewModel {
                 PlayerLog.log("[Player] saved position \(String(format: "%.1f", t))s is at the end of \(String(format: "%.1f", dur))s — playing from beginning")
                 resumeAtTime = nil
                 resumeIsFromHistory = false
-                pendingRestartNotice = true
                 armDurableResumeTarget(nil, source: "restart")
                 mediaTime = 0
             }
             let startAt = resumeAtTime ?? 0
+            if !preservePlayState, mediaResetID == nil, cdnSwitchID == nil, streamRetryID == nil {
+                if resumeIsFromHistory, let resumedSeconds = resumeAtTime, resumedSeconds > 2 {
+                    pendingHistoryResumeNotice = PendingHistoryResumeNotice(
+                        resumedSeconds: resumedSeconds,
+                        partNumber: resumedPartNumber
+                    )
+                    pendingPartLocationNotice = nil
+                } else if let resumedPartNumber, startAt <= 2 {
+                    pendingHistoryResumeNotice = nil
+                    pendingPartLocationNotice = resumedPartNumber
+                }
+            }
+
+            var resolvedVideoStream: PlayURLResult.DashInfo.DashStream?
+            if let dash = dashResult.dash {
+                resolvedVideoStream = selectVideoStream(
+                    from: dash.video,
+                    quality: effectiveQ,
+                    hardwareCapabilities: hardwareCapabilities,
+                    requiresHardwareSupport: activeBackendKind == .demandPaced,
+                    rejectedCodecKeys: session.decodeFallback.rejectedCodecKeys
+                )
+                if resolvedVideoStream == nil,
+                   !dash.video.isEmpty,
+                   activeBackendKind == .demandPaced,
+                   handOffBackend(to: .vlc, reason: "vod dash stream requires software decode")
+                       || activeBackendKind == .vlc {
+                    session.decodeFallback.engineOverride = .vlc
+                    session.decodeFallback.rejectedCodecKeys.removeAll()
+                    queueDecodeFallbackNoticeIfNeeded(switchedEngine: true)
+                    resolvedVideoStream = selectVideoStream(
+                        from: dash.video,
+                        quality: effectiveQ,
+                        hardwareCapabilities: hardwareCapabilities,
+                        requiresHardwareSupport: false,
+                        rejectedCodecKeys: []
+                    )
+                }
+            }
 
             if let dash = dashResult.dash,
-               let videoStream = selectVideoStream(
-                from: dash.video, quality: effectiveQ, hardwareCapabilities: hardwareCapabilities
-               ) {
+               let videoStream = resolvedVideoStream {
                 PlayerLog.log("[Player] preferring DASH split over durl")
                 availableCodecs = codecsOffered(in: dash.video, quality: videoStream.id)
                 stats.codec = videoStream.codecs
@@ -310,8 +415,9 @@ extension PlayerViewModel {
                 async let probedVideo = selectReachableURL(
                     videoStream.allURLs,
                     resume: runningEngine == .demandPaced ? .init(
-                        startAt: startAt, track: .video, failedHost: failedResumeHost
+                        startAt: startAt, track: .video, failedHost: failedFallbackHost
                     ) : nil,
+                    failedHost: failedFallbackHost,
                     requestAdmission: probeAdmission
                 )
                 async let probedAudio: StreamURLSelection? = { () async -> StreamURLSelection? in
@@ -319,15 +425,18 @@ extension PlayerViewModel {
                     return await self.selectReachableURL(
                         bestAudio.allURLs,
                         resume: runningEngine == .demandPaced ? .init(
-                            startAt: startAt, track: .audio, failedHost: failedResumeHost
+                            startAt: startAt, track: .audio, failedHost: failedFallbackHost
                         ) : nil,
+                        failedHost: failedFallbackHost,
                         requestAdmission: probeAdmission
                     )
                 }()
                 let videoSelection = await probedVideo
                 let audioSelection = await probedAudio
                 let videoURL = videoSelection.url
-                let audioURL = audioSelection?.url
+                var selectedAudio = bestAudio
+                var audioURL = audioSelection?.url
+                var audioFallbackEvidence: StreamProbeEvidence?
                 guard mediaResetRecovery.allowsLoadCompletion(
                           loadCompletion, currentGeneration: loadGeneration, currentOwner: currentOwnerLease
                       ),
@@ -358,6 +467,61 @@ extension PlayerViewModel {
                     return
                 }
 
+                if let primaryAudio = selectedAudio, audioURL == nil {
+                    let fallbackEvidence = StreamProbeEvidence()
+                    audioFallbackEvidence = fallbackEvidence
+                    if let recovered = await recoverOfferedAudioURL(
+                        primary: primaryAudio,
+                        dash: dash,
+                        preference: audioPreference,
+                        videoURL: videoURL,
+                        runningEngine: runningEngine,
+                        startAt: startAt,
+                        failedHost: failedFallbackHost,
+                        evidence: fallbackEvidence,
+                        requestAdmission: probeAdmission
+                    ) {
+                        selectedAudio = recovered.stream
+                        audioURL = recovered.url
+                        playingAudioTier = AudioQualityTier(rawValue: recovered.stream.id)
+                        stats.audioCodec = recovered.stream.codecs
+                        stats.audioBitrate = recovered.stream.bandwidth
+                        stats.audioTier = playingAudioTier
+                    }
+                    guard mediaResetRecovery.allowsLoadCompletion(
+                              loadCompletion, currentGeneration: loadGeneration, currentOwner: currentOwnerLease
+                          ),
+                          ownerLease.map({ self.isCurrentOwner($0) }) ?? true,
+                          admitsLoadRequest(
+                            requestAdmission?() ?? true,
+                            after: "audio-fallback-probe",
+                            token: startupTraceToken ?? self.startupTraceToken
+                          ) else { return }
+                    try Self.checkLoadCancellation()
+                }
+
+                if selectedAudio != nil, audioURL == nil, runningEngine == .demandPaced {
+                    let combinedOutcomes = (audioSelection?.outcomes ?? [])
+                        + (audioFallbackEvidence?.outcomes ?? [])
+                    let combinedSelection = StreamURLSelection(
+                        url: nil,
+                        outcomes: combinedOutcomes,
+                        cancelled: Task.isCancelled || !probeAdmission()
+                    )
+                    PlayerLog.log(
+                        "[StreamRetry] offered-audio unreachable after fallback — aborting video-only demand open " +
+                            "reasons=\(combinedOutcomes.map(\.diagnostic))"
+                    )
+                    if let failure = combinedSelection.eligibleFailure,
+                       handleStreamTransportFailure(failure, quality: q, loadGeneration: generation) { return }
+                    guard settleResetPreOpenFailure(
+                        loadCompletion, retryable: PlaybackUnavailability.streamUnreachable.isRetryable
+                    ) else { return }
+                    retireStreamRecovery(reason: "permanent-audio-probe")
+                    markTransientStreamUnreachable()
+                    return
+                }
+
                 stats.decoderType = decoderLabel(
                     codecs: videoStream.codecs,
                     hardwareSupported: hardwareCapabilities.supports(codecs: videoStream.codecs)
@@ -368,15 +532,15 @@ extension PlayerViewModel {
                 currentQuality = videoStream.id
                 isDASHMode = true
                 currentVideoIsAV1 = VideoCodecPreference.av1.matches(videoStream.codecs)
-                streamNominalBitrate = videoStream.bandwidth + (bestAudio?.bandwidth ?? 0)
+                streamNominalBitrate = videoStream.bandwidth + (selectedAudio?.bandwidth ?? 0)
                 PlayerLog.log("[Player] DASH: \(videoStream.codecs) qn=\(videoStream.id) audio=\(audioURL != nil)")
 
                 multiConnectionVideoURLs = videoStream.allURLs
-                multiConnectionAudioURLs = bestAudio?.allURLs ?? []
+                multiConnectionAudioURLs = selectedAudio?.allURLs ?? []
                 let videoBootstrapIdentity = Self.selectedDASHBootstrapIdentity(
                     aid: aid, cid: cid, source: source, track: .video, stream: videoStream
                 )
-                let audioBootstrapIdentity = audioURL == nil ? nil : bestAudio.map {
+                let audioBootstrapIdentity = audioURL == nil ? nil : selectedAudio.map {
                     Self.selectedDASHBootstrapIdentity(
                         aid: aid, cid: cid, source: source, track: .audio, stream: $0
                     )
@@ -401,7 +565,10 @@ extension PlayerViewModel {
                     after: "durl-playurl",
                     token: startupTraceToken ?? self.startupTraceToken
                   ) else { return }
-            let durlSelection = await selectReachableURL(durlResult.durl?.first.map { [$0.url] } ?? [])
+            let durlSelection = await selectReachableURL(
+                durlResult.durl?.first.map { [$0.url] } ?? [],
+                failedHost: failedFallbackHost
+            )
             let fallback = durlResult
             if let durlURL = durlSelection.url {
                 guard mediaResetRecovery.allowsLoadCompletion(
@@ -506,5 +673,64 @@ extension PlayerViewModel {
                 logMessage: "[Player] loadVOD failed: \(error)"
             ))
         }
+    }
+
+    private func recoverOfferedAudioURL(
+        primary: PlayURLResult.DashInfo.DashStream,
+        dash: PlayURLResult.DashInfo,
+        preference: AudioQualityTier,
+        videoURL: URL,
+        runningEngine: PlayerEngineKind,
+        startAt: TimeInterval,
+        failedHost: String?,
+        evidence: StreamProbeEvidence,
+        requestAdmission: @escaping @MainActor @Sendable () -> Bool
+    ) async -> (stream: PlayURLResult.DashInfo.DashStream, url: URL)? {
+        guard !Task.isCancelled, requestAdmission() else { return nil }
+        if let sameHost = AudioStreamSelection.rewriteStreamURL(primary.allURLs, toHostOf: videoURL),
+           await probeURL(sameHost, evidence: evidence),
+           !Task.isCancelled, requestAdmission() {
+            PlayerLog.log(
+                "[CDN] recovered offered audio id=\(primary.id) on proven video host=" +
+                    "\(CDNHostPolicy.diagnosticHost(sameHost.host()))"
+            )
+            return (primary, sameHost)
+        }
+        let alternates = AudioStreamSelection.fallbackCandidates(
+            in: dash,
+            preference: preference,
+            excludingID: primary.id,
+            decodable: { runningEngine.decodesAudio($0) }
+        )
+        for alternate in alternates {
+            guard !Task.isCancelled, requestAdmission() else { return nil }
+            if let sameHost = AudioStreamSelection.rewriteStreamURL(alternate.allURLs, toHostOf: videoURL),
+               await probeURL(sameHost, evidence: evidence),
+               !Task.isCancelled, requestAdmission() {
+                PlayerLog.log(
+                    "[CDN] recovered audio via alternate tier id=\(alternate.id) on proven video host=" +
+                        "\(CDNHostPolicy.diagnosticHost(sameHost.host()))"
+                )
+                return (alternate, sameHost)
+            }
+            guard !Task.isCancelled, requestAdmission() else { return nil }
+            let selection = await selectReachableURL(
+                alternate.allURLs,
+                resume: runningEngine == .demandPaced ? .init(
+                    startAt: startAt, track: .audio, failedHost: failedHost
+                ) : nil,
+                failedHost: failedHost,
+                requestAdmission: requestAdmission
+            )
+            evidence.outcomes.append(contentsOf: selection.outcomes)
+            if let recovered = selection.url, !Task.isCancelled, requestAdmission() {
+                PlayerLog.log(
+                    "[CDN] recovered audio via alternate tier id=\(alternate.id) host=" +
+                        "\(CDNHostPolicy.diagnosticHost(recovered.host()))"
+                )
+                return (alternate, recovered)
+            }
+        }
+        return nil
     }
 }

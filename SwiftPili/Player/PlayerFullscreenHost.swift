@@ -98,6 +98,22 @@ final class PlayerFullscreenLiveControls {
 // MARK: - The presented host
 
 @MainActor
+private final class PlayerFullscreenContentHostingController: UIHostingController<PlayerFullscreenHostContent> {
+    var resolvedSheetInterfaceStyle: (@MainActor () -> UIUserInterfaceStyle)?
+
+    override func present(
+        _ viewControllerToPresent: UIViewController,
+        animated flag: Bool,
+        completion: (() -> Void)? = nil
+    ) {
+        if let style = resolvedSheetInterfaceStyle?() {
+            viewControllerToPresent.overrideUserInterfaceStyle = style
+        }
+        super.present(viewControllerToPresent, animated: flag, completion: completion)
+    }
+}
+
+@MainActor
 final class PlayerFullscreenHostController: UIViewController, PlayerPresentationHost {
     enum RotationTransitionKind: Equatable, Sendable {
         case entering
@@ -128,7 +144,7 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
     private weak var lastPresentingController: UIViewController?
     let receipt: PlayerPresentationReceipt
     let identity: UUID
-    private let content: UIHostingController<PlayerFullscreenHostContent>
+    private let content: PlayerFullscreenContentHostingController
     private let geometry: PlayerFullscreenHostGeometry
     private let initialInlineSnapshot: PlayerFullscreenStageGeometry.InlineSnapshot?
     private var initialTransitionCover: PlayerFullscreenTransitionCover?
@@ -168,7 +184,7 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
         self.initialTransitionCover = initialTransitionCover
         let geometry = PlayerFullscreenHostGeometry()
         self.geometry = geometry
-        content = UIHostingController(
+        content = PlayerFullscreenContentHostingController(
             rootView: PlayerFullscreenHostContent(
                 receipt: receipt,
                 hostIdentity: identity,
@@ -213,25 +229,35 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
     }
 
     override var prefersStatusBarHidden: Bool { true }
+    override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
     override var prefersHomeIndicatorAutoHidden: Bool { true }
     override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge { .all }
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        overrideUserInterfaceStyle = .dark
-        content.overrideUserInterfaceStyle = .dark
+        syncAppearanceStyle()
+        content.overrideUserInterfaceStyle = .unspecified
+        content.resolvedSheetInterfaceStyle = { [weak self] in
+            self?.resolvedPresentedSheetInterfaceStyle() ?? Self.resolvedAppearanceInterfaceStyle()
+        }
         view.backgroundColor = .clear
 
         backdropView.backgroundColor = .black
+        backdropView.overrideUserInterfaceStyle = .dark
         backdropView.alpha = 0
         backdropView.frame = view.bounds
         backdropView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         view.addSubview(backdropView)
 
         stageContainerView.backgroundColor = .black
+        stageContainerView.overrideUserInterfaceStyle = .dark
         stageContainerView.clipsToBounds = true
         stageContainerView.layer.cornerCurve = .continuous
         view.addSubview(stageContainerView)
+
+        registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (self: Self, _) in
+            self.syncPresentedSheetAppearanceIfNeeded()
+        }
 
         applyInitialStageGeometry()
 
@@ -553,9 +579,19 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
+        syncAppearanceStyle()
         if let presentingViewController {
             lastPresentingController = presentingViewController
         }
+    }
+
+    override func present(
+        _ viewControllerToPresent: UIViewController,
+        animated flag: Bool,
+        completion: (() -> Void)? = nil
+    ) {
+        viewControllerToPresent.overrideUserInterfaceStyle = resolvedPresentedSheetInterfaceStyle()
+        super.present(viewControllerToPresent, animated: flag, completion: completion)
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -575,6 +611,46 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
         restorePresentingAppearanceAndSafeArea()
         lastPresentingController = nil
         presenter?.hostDidDisappear(self)
+    }
+
+    private static func resolvedAppearanceInterfaceStyle() -> UIUserInterfaceStyle {
+        let raw = UserDefaults.standard.string(forKey: AppearanceMode.storageKey)
+            ?? AppearanceMode.system.rawValue
+        return switch AppearanceMode(rawValue: raw) ?? .system {
+        case .system: .unspecified
+        case .light: .light
+        case .dark: .dark
+        }
+    }
+
+    private func resolvedPresentedSheetInterfaceStyle() -> UIUserInterfaceStyle {
+        let explicit = Self.resolvedAppearanceInterfaceStyle()
+        if explicit != .unspecified {
+            return explicit
+        }
+        if traitCollection.userInterfaceStyle != .unspecified {
+            return traitCollection.userInterfaceStyle
+        }
+        return view.window?.traitCollection.userInterfaceStyle ?? .unspecified
+    }
+
+    private func syncAppearanceStyle() {
+        let style = Self.resolvedAppearanceInterfaceStyle()
+        if overrideUserInterfaceStyle != style {
+            overrideUserInterfaceStyle = style
+        }
+        syncPresentedSheetAppearanceIfNeeded()
+    }
+
+    private func syncPresentedSheetAppearanceIfNeeded() {
+        let style = resolvedPresentedSheetInterfaceStyle()
+        if let presented = presentedViewController, presented.overrideUserInterfaceStyle != style {
+            presented.overrideUserInterfaceStyle = style
+        }
+        if let contentPresented = content.presentedViewController,
+           contentPresented.overrideUserInterfaceStyle != style {
+            contentPresented.overrideUserInterfaceStyle = style
+        }
     }
 
     private func restorePresentingAppearanceAndSafeArea() {

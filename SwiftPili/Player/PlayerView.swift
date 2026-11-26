@@ -13,6 +13,7 @@ private final class PlayerSurfaceDragStore {
 
 final class PlayerVerticalPagingCoordinator {
     struct Handlers {
+        var canPagePrevious: @MainActor () -> Bool = { false }
         let begin: @MainActor () -> Bool
         let change: @MainActor (CGFloat) -> Void
         let end: @MainActor (CGFloat, CGFloat) -> Void
@@ -26,6 +27,8 @@ final class PlayerVerticalPagingCoordinator {
         self.handlers = handlers
     }
 
+    @MainActor
+    func canPagePrevious() -> Bool { handlers?.canPagePrevious() ?? false }
     @MainActor
     func begin() -> Bool { handlers?.begin() ?? false }
     @MainActor
@@ -45,6 +48,8 @@ struct PlayerPageNavigationActions {
     let onDownload: (() -> Void)?
     let onReport: (() -> Void)?
     var pageOwnsInlineNavigation = false
+    var onHideVideo: (() -> Void)?
+    var onBlockOwner: (() -> Void)?
 }
 
 struct PlayerView: View {
@@ -58,12 +63,15 @@ struct PlayerView: View {
     let fullscreenViewportAspect: CGFloat?
     let inlineViewportSize: CGSize?
     let inlineCornerRadius: CGFloat
+    let isInlinePortraitImmersive: Bool
     let fullscreenSafeAreaInsets: EdgeInsets?
     let screenLease: PlayerOwnerLease?
     let presentationReceipt: PlayerPresentationReceipt?
     let fullscreenHostIdentity: UUID?
     let placeholderCoverURL: String?
     let showsLoadingIndicator: Bool
+    let endedRecommendations: [PlayerEndedRecommendation]
+    let onSelectEndedRecommendation: ((PlayerEndedRecommendation) -> Void)?
 
     init(
         owner: String,
@@ -76,13 +84,16 @@ struct PlayerView: View {
         fullscreenViewportAspect: CGFloat? = nil,
         inlineViewportSize: CGSize? = nil,
         inlineCornerRadius: CGFloat = 0,
+        isInlinePortraitImmersive: Bool = false,
         fullscreenSafeAreaInsets: EdgeInsets? = nil,
         screenLease: PlayerOwnerLease? = nil,
         presentationReceipt: PlayerPresentationReceipt? = nil,
         fullscreenHostIdentity: UUID? = nil,
         placeholderCoverURL: String? = nil,
         showsLoadingIndicator: Bool = true,
-        gestureDisplay: PlayerGestureDisplay = PlayerGestureDisplay()
+        gestureDisplay: PlayerGestureDisplay = PlayerGestureDisplay(),
+        endedRecommendations: [PlayerEndedRecommendation] = [],
+        onSelectEndedRecommendation: ((PlayerEndedRecommendation) -> Void)? = nil
     ) {
         self.owner = owner
         self.surfaceRole = surfaceRole
@@ -94,6 +105,7 @@ struct PlayerView: View {
         self.fullscreenViewportAspect = fullscreenViewportAspect
         self.inlineViewportSize = inlineViewportSize
         self.inlineCornerRadius = inlineCornerRadius
+        self.isInlinePortraitImmersive = isInlinePortraitImmersive
         self.fullscreenSafeAreaInsets = fullscreenSafeAreaInsets
         self.screenLease = screenLease
         self.presentationReceipt = presentationReceipt
@@ -101,6 +113,8 @@ struct PlayerView: View {
         self.placeholderCoverURL = placeholderCoverURL
         self.showsLoadingIndicator = showsLoadingIndicator
         _gestureDisplay = State(initialValue: gestureDisplay)
+        self.endedRecommendations = endedRecommendations
+        self.onSelectEndedRecommendation = onSelectEndedRecommendation
     }
 
     private var vm: PlayerViewModel { PlayerViewModel.shared }
@@ -109,8 +123,12 @@ struct PlayerView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @AppMotion private var motion
+    @AppStorage(AppearanceMode.storageKey) private var appearanceRaw = AppearanceMode.system.rawValue
     @AppStorage(DanmakuFeatureGate.defaultsKey) private var danmakuEnabled = false
     @State private var danmakuPanelPresented = false
+    @State private var landscapeDanmakuDragOffset: CGSize = .zero
+    @State private var subtitlePanelPresented = false
+    @State private var landscapeSubtitleDragOffset: CGSize = .zero
     @State private var gestureDisplay: PlayerGestureDisplay
     private var isSeeking: Bool {
         get { gestureDisplay.isSeeking }
@@ -123,12 +141,22 @@ struct PlayerView: View {
     @State private var verticalPagingActive = false
     @State private var verticalAdjustIsVolume = false
     @State private var verticalAdjustBase: Double = 0
+    @State private var portraitDismissDragActive = false
+    @State private var portraitVerticalDragOffset: CGFloat = 0
+    @State private var isDraggingHairlineBar = false
+    @State private var doubleTapLikePulse: PortraitDoubleTapPulse?
+    @State private var doubleTapPulseClearTask: Task<Void, Never>?
+    @State private var pinchTransitionLatched = false
     @State private var surfaceSize: CGSize = .zero
     @GestureState private var isSurfacePressing = false
     @State private var surfaceTouchInFlight = false
     @State private var surfaceHoldEngaged = false
     private var surfaceOwnsTouch: Bool {
-        surfaceHoldEngaged || swipeSeekActive || verticalAdjustActive || verticalPagingActive
+        surfaceHoldEngaged
+            || swipeSeekActive
+            || verticalAdjustActive
+            || verticalPagingActive
+            || portraitDismissDragActive
     }
     @State private var surfaceHoldTask: Task<Void, Never>?
     @State private var pendingTapTask: Task<Void, Never>?
@@ -152,12 +180,89 @@ struct PlayerView: View {
         surfaceRole == .fullscreen || vm.isFullscreen
     }
 
+    private var isImmersiveStagePresentation: Bool {
+        isFullscreenPresentation || isInlinePortraitImmersive
+    }
+
+    private var isPortraitImmersiveFullscreen: Bool {
+        (isInlinePortraitImmersive || (isFullscreenPresentation && vm.isPortraitContent))
+            && vm.mode != .live
+    }
+
+    private var usesLandscapeDanmakuDrawer: Bool {
+        surfaceRole == .fullscreen && vm.isFullscreen && !isPortraitImmersiveFullscreen
+    }
+
+    private var danmakuSheetBinding: Binding<Bool> {
+        Binding(
+            get: { !usesLandscapeDanmakuDrawer && danmakuPanelPresented && danmakuEnabled },
+            set: { presented in
+                danmakuPanelPresented = presented
+                if !presented, isOwner {
+                    vm.setDanmakuSettingsHold(subtitlePanelPresented)
+                }
+            }
+        )
+    }
+
+    private var subtitleSheetBinding: Binding<Bool> {
+        Binding(
+            get: { !usesLandscapeDanmakuDrawer && subtitlePanelPresented },
+            set: { presented in
+                subtitlePanelPresented = presented
+                if !presented, isOwner {
+                    vm.setDanmakuSettingsHold(danmakuPanelPresented && danmakuEnabled)
+                }
+            }
+        )
+    }
+
+    private func dismissDanmakuPanel() {
+        danmakuPanelPresented = false
+        landscapeDanmakuDragOffset = .zero
+        if isOwner {
+            vm.setDanmakuSettingsHold(subtitlePanelPresented)
+        }
+    }
+
+    private func dismissSubtitlePanel() {
+        subtitlePanelPresented = false
+        landscapeSubtitleDragOffset = .zero
+        if isOwner {
+            vm.setDanmakuSettingsHold(danmakuPanelPresented && danmakuEnabled)
+        }
+    }
+
+    private var activePortraitFullscreenContext: PlayerPortraitFullscreenContext? {
+        guard let screenLease,
+              vm.portraitFullscreenContext?.ownerLease == screenLease else {
+            return nil
+        }
+        return vm.portraitFullscreenContext
+    }
+
+    private var portraitStageOffsetY: CGFloat {
+        guard isPortraitImmersiveFullscreen, portraitVerticalDragOffset != 0 else { return 0 }
+        if portraitVerticalDragOffset > 0 {
+            return portraitVerticalDragOffset * 0.56
+        }
+        return portraitVerticalDragOffset * 0.18
+    }
+
+    private var portraitStageScale: CGFloat {
+        guard isPortraitImmersiveFullscreen, portraitVerticalDragOffset > 0 else { return 1.0 }
+        return max(0.88, 1.0 - portraitVerticalDragOffset / 2200)
+    }
+
     private var containerAspect: CGFloat {
         if isFullscreenPresentation {
             return fullscreenViewportAspect ?? PlayerFullscreenViewportPolicy.fallbackAspect
         }
         if let size = allocatedInlineViewport, size.width > 0, size.height > 0 {
             return size.width / size.height
+        }
+        if let aspect = vm.videoAspectRatio, aspect.isFinite, aspect > 0.1 {
+            return aspect
         }
         if vm.isPortraitContent, vm.mode != .live {
             return vm.inlineCondensed ? 16.0 / 9.0 : 3.0 / 4.0
@@ -166,21 +271,30 @@ struct PlayerView: View {
     }
 
     private var chromeInsets: PlayerChromeInsets {
-        let insets = fullscreenSafeAreaInsets ?? {
+        let insets: EdgeInsets
+        if let fullscreenSafeAreaInsets {
+            insets = fullscreenSafeAreaInsets
+        } else {
             let window = AppWindowMetrics.safeAreaInsets
-            return EdgeInsets(top: window.top, leading: window.left, bottom: window.bottom, trailing: window.right)
-        }()
+            insets = EdgeInsets(
+                top: window.top,
+                leading: window.left,
+                bottom: window.bottom,
+                trailing: window.right
+            )
+        }
         return PlayerChromeInsets.resolve(
             presentation: resolvedPresentation,
             windowTop: insets.top,
             windowBottom: insets.bottom,
             windowLeft: insets.leading,
-            windowRight: insets.trailing
+            windowRight: insets.trailing,
+            isPortraitViewport: isPortraitImmersiveFullscreen || containerAspect <= 1.0
         )
     }
 
     private var resolvedPresentation: PlayerContainerPresentation {
-        isFullscreenPresentation ? .fullscreen : container
+        (isFullscreenPresentation || isInlinePortraitImmersive) ? .fullscreen : container
     }
 
     private var transportPlacement: PlayerTransportPlacement {
@@ -231,6 +345,58 @@ struct PlayerView: View {
         ownerPlaybackError != nil
     }
 
+    private var isPlaybackEnded: Bool {
+        isOwner && vm.playbackEnded && !isPlaybackUnavailable
+    }
+
+    private var resolvedEndedRecommendations: [PlayerEndedRecommendation] {
+        if !endedRecommendations.isEmpty {
+            return endedRecommendations
+        }
+        guard isOwner,
+              let screenLease,
+              vm.session.endedRecommendationsOwnerLease == screenLease else {
+            return []
+        }
+        return vm.endedRecommendations
+    }
+
+    private var resolvedOnSelectEndedRecommendation: ((PlayerEndedRecommendation) -> Void)? {
+        if let onSelectEndedRecommendation {
+            return { recommendation in
+                vm.cancelEndedAutoAdvance()
+                onSelectEndedRecommendation(recommendation)
+            }
+        }
+        guard isOwner,
+              let screenLease,
+              vm.session.endedRecommendationsOwnerLease == screenLease,
+              let handler = vm.onSelectEndedRecommendation else {
+            return nil
+        }
+        return { recommendation in
+            vm.cancelEndedAutoAdvance()
+            if isFullscreenPresentation, vm.isFullscreen {
+                vm.requestFullscreenTransition(target: false, source: .button)
+            }
+            handler(recommendation)
+        }
+    }
+
+    private func syncInlineEndedRecommendationsIfNeeded() {
+        guard surfaceRole == .inline,
+              isOwner,
+              let screenLease,
+              !endedRecommendations.isEmpty || onSelectEndedRecommendation != nil else {
+            return
+        }
+        vm.syncEndedRecommendations(
+            endedRecommendations,
+            ownerLease: screenLease,
+            onSelect: onSelectEndedRecommendation
+        )
+    }
+
     private var hasRenderedFirstFrameForOwner: Bool {
         isOwner && vm.hasRenderedFirstFrame && vm.currentURL != nil
     }
@@ -253,7 +419,7 @@ struct PlayerView: View {
     }
 
     private var showsUnifiedInlineAmbient: Bool {
-        guard surfaceRole == .inline, !isFullscreenPresentation,
+        guard surfaceRole == .inline, !isImmersiveStagePresentation,
               isOwner, let screenLease,
               !reduceTransparency,
               vm.ambientModeEnabled,
@@ -267,14 +433,16 @@ struct PlayerView: View {
     var body: some View {
         let isFullscreenTransitioning = surfaceRole == .fullscreen
             && PlayerFullscreenTransitionState.shared.isGeometryTransitioning
-        let effectiveCornerRadius = isFullscreenPresentation
-            ? 0
-            : max(
+        let effectiveCornerRadius: CGFloat = if isImmersiveStagePresentation {
+            0
+        } else {
+            max(
                 inlineCornerRadius,
                 PlayerPresentationCornerPolicy.cornerRadius(
                     isPiPRestoringInline: vm.isPiPRestoringInline
                 )
             )
+        }
         let outgoingStill = !isOwner ? vm.outgoingRouteStill(for: owner) : nil
         let activeFreezeFrame = isOwner ? vm.freezeFrame.flatMap { $0.size.width > 0 ? $0 : nil } : nil
         let showsFirstFrameCover = !hasRenderedFirstFrameForOwner
@@ -283,7 +451,7 @@ struct PlayerView: View {
             && !isPlaybackUnavailable
         let showsCoverProgress = showsLoadingIndicator && (!isOwner || vm.playbackIntent != .pausedByUser)
         ZStack {
-            if isFullscreenPresentation {
+            if isImmersiveStagePresentation {
                 Color.black
             } else if surfaceRole == .inline {
                 Color.black
@@ -296,7 +464,7 @@ struct PlayerView: View {
                 Color.clear
             }
 
-            if isOwner, isFullscreenPresentation {
+            if isOwner, isImmersiveStagePresentation {
                 PlayerFullscreenAmbientBackdrop(player: vm)
             }
 
@@ -314,9 +482,13 @@ struct PlayerView: View {
                 source: vm.currentURL,
                 isOwner: isOwner,
                 hasSurfaceLease: surfaceLease != nil,
-                enabled: danmakuEnabled
+                enabled: danmakuEnabled,
+                hasOfflineDanmaku: vm.hasRegisteredOfflineDanmaku
             ) {
-                PlayerDanmakuOverlay(player: vm)
+                PlayerDanmakuOverlay(
+                    player: vm,
+                    topSafeInset: isPortraitImmersiveFullscreen ? chromeInsets.top : 0
+                )
             }
 
             if let still = outgoingStill {
@@ -344,20 +516,20 @@ struct PlayerView: View {
                 }
             }
             .animation(
-                reduceMotion ? nil : .easeOut(duration: 0.2),
+                (reduceMotion || showsFirstFrameCover) ? nil : .easeOut(duration: 0.18),
                 value: showsFirstFrameCover
             )
             .allowsHitTesting(false)
             .accessibilityHidden(true)
 
-            if isOwner, vm.isBuffering, !showsFirstFrameCover, !isPlaybackUnavailable {
+            if isOwner, vm.isBuffering, !showsFirstFrameCover, !isPlaybackUnavailable, !isPlaybackEnded {
                 ProgressView()
                     .controlSize(.large)
                     .tint(.white)
             }
 
             HStack(spacing: 0) {
-                if !isFullscreenPresentation {
+                if !isFullscreenPresentation || isPortraitImmersiveFullscreen {
                     Color.clear
                         .frame(width: Self.systemBackEdgeReserve)
                         .allowsHitTesting(false)
@@ -365,88 +537,201 @@ struct PlayerView: View {
                 Color.clear
                     .contentShape(Rectangle())
                     .simultaneousGesture(surfaceGesture)
+                    .simultaneousGesture(pinchGesture)
                     .interactiveDismissDisabled(surfaceOwnsTouch)
                     .background(PresentationDismissGestureGate(isHeld: surfaceOwnsTouch))
             }
+            .allowsHitTesting(!isPlaybackUnavailable && !isPlaybackEnded)
             .zIndex(0)
 
-            let showsControlsOverlay = vm.showControls
-                && !isFullscreenTransitioning
-                && (surfaceRole == .inline || vm.isFullscreen)
-            if surfaceRole == .inline || vm.isFullscreen {
-                PlayerControlsOverlay(
-                    player: vm, owner: owner, screenLease: screenLease,
-                    presentationReceipt: presentationReceipt, fullscreenHostIdentity: fullscreenHostIdentity,
-                    gestureDisplay: gestureDisplay, liveQualityControl: liveQualityControl,
-                    pageNavigationActions: pageNavigationActions,
-                    showsAnimeOptions: showsAnimeOptions,
-                    chromeInsets: chromeInsets, transportPlacement: transportPlacement,
-                    suppressTransportRow: isPlaybackUnavailable,
-                    danmakuPanelPresented: $danmakuPanelPresented, showSponsorBlock: $showSponsorBlock
+            if let error = ownerPlaybackError {
+                PlayerPlaybackErrorOverlay(
+                    message: error,
+                    unavailability: vm.unavailability,
+                    isFullscreen: isImmersiveStagePresentation,
+                    chromeInsets: chromeInsets,
+                    onRetry: { vm.retryPlayback() }
                 )
-                    .opacity(showsControlsOverlay ? 1 : 0)
-                    .allowsHitTesting(showsControlsOverlay)
-                    .animation(controlAnimation, value: isFullscreenTransitioning)
-                    .animation(controlAnimation, value: vm.showControls)
-                    .zIndex(1)
+                .zIndex(1)
             }
 
-            if surfaceRole == .fullscreen, vm.isFullscreen, danmakuPanelPresented, danmakuEnabled {
-                ZStack {
-                    Color.clear
+            ZStack {
+                if isPlaybackEnded {
+                    PlayerPlaybackEndedOverlay(
+                        isFullscreen: isImmersiveStagePresentation,
+                        isPortraitFullscreen: isPortraitImmersiveFullscreen,
+                        chromeInsets: chromeInsets,
+                        transportPlacement: transportPlacement,
+                        autoAdvance: vm.endedAutoAdvance,
+                        recommendations: resolvedEndedRecommendations,
+                        onReplay: { vm.play() },
+                        onNextEpisode: vm.endedNextEpisodeAction,
+                        onPlayAutoAdvanceNow: { vm.playEndedAutoAdvanceNow() },
+                        onCancelAutoAdvance: { vm.cancelEndedAutoAdvance() },
+                        onSelectRecommendation: resolvedOnSelectEndedRecommendation
+                    )
+                    .transition(.opacity)
+                }
+            }
+            .animation(controlAnimation, value: isPlaybackEnded)
+            .allowsHitTesting(isPlaybackEnded)
+            .zIndex(1)
+
+            ZStack {
+                if isPortraitImmersiveFullscreen {
+                    let showsPortraitChrome = !isFullscreenTransitioning
+                        && (isInlinePortraitImmersive || vm.isFullscreen)
+                    if isInlinePortraitImmersive || surfaceRole == .inline || vm.isFullscreen {
+                        PlayerPortraitFullscreenChrome(
+                            player: vm,
+                            owner: owner,
+                            isCurrentOwner: isOwner,
+                            screenLease: screenLease,
+                            presentationReceipt: presentationReceipt,
+                            fullscreenHostIdentity: fullscreenHostIdentity,
+                            gestureDisplay: gestureDisplay,
+                            chromeInsets: chromeInsets,
+                            isScrubbingOrFastForwarding: swipeSeekActive
+                                || isSeeking
+                                || surfaceHoldEngaged
+                                || isDraggingHairlineBar,
+                            isPlaybackUnavailable: isPlaybackUnavailable,
+                            isPlaybackEnded: isPlaybackEnded,
+                            doubleTapLikePulse: doubleTapLikePulse,
+                            danmakuPanelPresented: $danmakuPanelPresented,
+                            subtitlePanelPresented: $subtitlePanelPresented,
+                            showSponsorBlock: $showSponsorBlock,
+                            isDraggingHairlineBar: $isDraggingHairlineBar
+                        )
+                        .opacity(showsPortraitChrome ? 1 : 0)
+                        .allowsHitTesting(showsPortraitChrome)
+                        .animation(controlAnimation, value: isFullscreenTransitioning)
+                        .transition(.opacity)
+                    }
+                } else {
+                    let showsControlsOverlay = (vm.showControls || isPlaybackUnavailable || isPlaybackEnded)
+                        && !isFullscreenTransitioning
+                        && (surfaceRole == .inline || vm.isFullscreen)
+                    if surfaceRole == .inline || vm.isFullscreen {
+                        PlayerControlsOverlay(
+                            player: vm, owner: owner, screenLease: screenLease,
+                            presentationReceipt: presentationReceipt, fullscreenHostIdentity: fullscreenHostIdentity,
+                            gestureDisplay: gestureDisplay, liveQualityControl: liveQualityControl,
+                            pageNavigationActions: pageNavigationActions,
+                            showsAnimeOptions: showsAnimeOptions,
+                            chromeInsets: chromeInsets, transportPlacement: transportPlacement,
+                            suppressTransportRow: isPlaybackUnavailable,
+                            danmakuPanelPresented: $danmakuPanelPresented,
+                            subtitlePanelPresented: $subtitlePanelPresented,
+                            showSponsorBlock: $showSponsorBlock
+                        )
+                        .opacity(showsControlsOverlay ? 1 : 0)
+                        .allowsHitTesting(showsControlsOverlay)
+                        .animation(controlAnimation, value: isFullscreenTransitioning)
+                        .animation(controlAnimation, value: showsControlsOverlay)
+                        .transition(.opacity)
+                    }
+                }
+            }
+            .animation(controlAnimation, value: isPortraitImmersiveFullscreen)
+            .zIndex(2)
+
+            if usesLandscapeDanmakuDrawer, subtitlePanelPresented {
+                ZStack(alignment: .trailing) {
+                    Color.black.opacity(0.001)
                         .contentShape(Rectangle())
                         .onTapGesture {
-                            danmakuPanelPresented = false
-                            vm.setDanmakuSettingsHold(false)
+                            withAnimation(controlAnimation) {
+                                dismissSubtitlePanel()
+                            }
                         }
-                    ScrollView {
-                        DanmakuPlayerSettingsPanel(presentation: .fullscreen) {
-                            danmakuPanelPresented = false
-                            vm.setDanmakuSettingsHold(false)
+
+                    SubtitlePlayerSettingsPanel(player: vm, surface: .overlay) {
+                        withAnimation(controlAnimation) {
+                            dismissSubtitlePanel()
                         }
                     }
-                    .frame(width: 280)
-                    .padding(.top, 8 + chromeInsets.top + 44)
+                    .offset(
+                        x: max(0, landscapeSubtitleDragOffset.width),
+                        y: max(0, landscapeSubtitleDragOffset.height)
+                    )
+                    .gesture(
+                        DragGesture(minimumDistance: 16)
+                            .onChanged { value in
+                                landscapeSubtitleDragOffset = value.translation
+                            }
+                            .onEnded { value in
+                                let dx = value.translation.width
+                                let dy = value.translation.height
+                                let predictedDx = value.predictedEndTranslation.width
+                                let predictedDy = value.predictedEndTranslation.height
+                                if dy > 44 || dx > 44 || predictedDy > 110 || predictedDx > 110 {
+                                    withAnimation(controlAnimation) {
+                                        dismissSubtitlePanel()
+                                    }
+                                } else {
+                                    withAnimation(reduceMotion ? nil : .spring(duration: 0.24)) {
+                                        landscapeSubtitleDragOffset = .zero
+                                    }
+                                }
+                            }
+                    )
+                    .padding(.top, max(10, chromeInsets.top + 8))
                     .padding(.trailing, 12 + chromeInsets.horizontal)
-                    .padding(.bottom, 20 + chromeInsets.bottom + 52)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                    .padding(.bottom, max(10, chromeInsets.bottom + 10))
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
-                .zIndex(2)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .zIndex(3)
             }
 
-            if let error = ownerPlaybackError {
-                let title: LocalizedStringKey = vm.unavailability == nil
-                    ? "Playback Failed"
-                    : "Playback Unavailable"
-                ContentUnavailableView {
-                    Label {
-                        Text(title)
-                            .font(.headline)
-                            .foregroundStyle(.white)
-                    } icon: {
-                        Image(systemName: vm.unavailability?.symbolName
-                            ?? "exclamationmark.triangle.fill")
-                            .font(.title2)
-                            .foregroundStyle(vm.unavailability == nil ? .yellow : .white.opacity(0.8))
-                    }
-                } description: {
-                    Text(error)
-                        .font(.footnote)
-                        .foregroundStyle(.white.opacity(0.82))
-                        .multilineTextAlignment(.center)
-                        .lineLimit(3)
-                } actions: {
-                    if vm.unavailability?.isRetryable ?? true {
-                        Button("Retry") {
-                            vm.retryPlayback()
+            if usesLandscapeDanmakuDrawer,
+               danmakuPanelPresented, danmakuEnabled {
+                ZStack(alignment: .trailing) {
+                    Color.black.opacity(0.001)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            withAnimation(controlAnimation) {
+                                dismissDanmakuPanel()
+                            }
                         }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
+
+                    DanmakuPlayerSettingsPanel(presentation: .fullscreen, surface: .overlay) {
+                        withAnimation(controlAnimation) {
+                            dismissDanmakuPanel()
+                        }
                     }
+                    .offset(
+                        x: max(0, landscapeDanmakuDragOffset.width),
+                        y: max(0, landscapeDanmakuDragOffset.height)
+                    )
+                    .gesture(
+                        DragGesture(minimumDistance: 16)
+                            .onChanged { value in
+                                landscapeDanmakuDragOffset = value.translation
+                            }
+                            .onEnded { value in
+                                let dx = value.translation.width
+                                let dy = value.translation.height
+                                let predictedDx = value.predictedEndTranslation.width
+                                let predictedDy = value.predictedEndTranslation.height
+                                if dy > 44 || dx > 44 || predictedDy > 110 || predictedDx > 110 {
+                                    withAnimation(controlAnimation) {
+                                        dismissDanmakuPanel()
+                                    }
+                                } else {
+                                    withAnimation(reduceMotion ? nil : .spring(duration: 0.24)) {
+                                        landscapeDanmakuDragOffset = .zero
+                                    }
+                                }
+                            }
+                    )
+                    .padding(.top, max(10, chromeInsets.top + 8))
+                    .padding(.trailing, 12 + chromeInsets.horizontal)
+                    .padding(.bottom, max(10, chromeInsets.bottom + 10))
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
-                .environment(\.colorScheme, .dark)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, 16)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .zIndex(3)
             }
 
@@ -462,6 +747,7 @@ struct PlayerView: View {
                     }
                     .clipped()
                     .allowsHitTesting(false)
+                    .zIndex(4)
             }
         }
         .ignoresSafeArea(.keyboard, edges: .all)
@@ -472,24 +758,39 @@ struct PlayerView: View {
             )
         )
         .overlay(alignment: .bottom) {
-            PlayerSubtitleOverlay(player: vm)
-                .ignoresSafeArea(.keyboard, edges: .all)
+            PlayerSubtitleOverlay(
+                player: vm,
+                isFullscreenSurface: surfaceRole == .fullscreen || isInlinePortraitImmersive,
+                portraitChromeBottomInset: isPortraitImmersiveFullscreen ? chromeInsets.bottom : 0
+            )
+            .ignoresSafeArea(.keyboard, edges: .all)
         }
         .overlay(alignment: .bottom) {
             if !isPlaybackUnavailable,
+               !isPortraitImmersiveFullscreen,
                surfaceRole == .inline || (vm.isFullscreen && !isFullscreenTransitioning) {
                 PlayerSeekStrip(
                     player: vm, owner: owner, isCurrentOwner: isOwner, gestureDisplay: gestureDisplay,
                     chromeInsets: chromeInsets,
                     inlineCornerRadius: isFullscreenPresentation ? 0 : inlineCornerRadius,
+                    suppressScrubPreview: swipeSeekActive,
                     controlAnimation: controlAnimation
                 )
                 .ignoresSafeArea(.keyboard, edges: .all)
             }
         }
-        .overlay(alignment: .bottomTrailing) {
-            ZStack(alignment: .bottomTrailing) {
+        .overlay(
+            alignment: (isPortraitImmersiveFullscreen && !vm.portraitPureViewEnabled)
+                ? .topTrailing
+                : .bottomTrailing
+        ) {
+            ZStack(
+                alignment: (isPortraitImmersiveFullscreen && !vm.portraitPureViewEnabled)
+                    ? .topTrailing
+                    : .bottomTrailing
+            ) {
                 if vm.mode.usesOnlineVODServices, let seg = vm.pendingSponsorManualSegment {
+                    let placesAtPortraitTop = isPortraitImmersiveFullscreen && !vm.portraitPureViewEnabled
                     Button {
                         vm.skipSponsorSegment(seg)
                     } label: {
@@ -502,38 +803,109 @@ struct PlayerView: View {
                         }
                         .playerChromeCapsule(horizontal: 14, vertical: 9)
                     }
-                    .padding(.trailing, (isFullscreenPresentation ? 4 : 12) + chromeInsets.horizontal)
-                    .padding(.bottom, (isFullscreenPresentation ? 32 : 20) + chromeInsets.bottom)
+                    .padding(
+                        .top,
+                        placesAtPortraitTop ? (chromeInsets.top + 54) : 0
+                    )
+                    .padding(
+                        .trailing,
+                        placesAtPortraitTop
+                            ? 16
+                            : (isPortraitImmersiveFullscreen
+                                ? 20
+                                : ((isFullscreenPresentation ? 4 : 12) + chromeInsets.horizontal))
+                    )
+                    .padding(
+                        .bottom,
+                        placesAtPortraitTop
+                            ? 0
+                            : ((isPortraitImmersiveFullscreen ? 24 : (isFullscreenPresentation ? 32 : 20))
+                                + chromeInsets.bottom)
+                    )
                     .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
             .animation(microControlAnimation, value: vm.pendingSponsorManualSegment?.uuid)
             .ignoresSafeArea(.keyboard, edges: .all)
         }
+        .scaleEffect(portraitStageScale)
+        .offset(y: portraitStageOffsetY)
         .ignoresSafeArea(.keyboard, edges: .all)
         .sheet(isPresented: $showSponsorBlock) {
             SponsorBlockPanel(vm: vm)
+                .preferredColorScheme((AppearanceMode(rawValue: appearanceRaw) ?? .system).colorScheme)
+        }
+        .background {
+            Color.clear
+                .sheet(isPresented: danmakuSheetBinding) {
+                    PlayerDanmakuSettingsSheet(
+                        presentation: isImmersiveStagePresentation ? .fullscreen : .inline,
+                        onClose: { dismissDanmakuPanel() }
+                    )
+                    .preferredColorScheme((AppearanceMode(rawValue: appearanceRaw) ?? .system).colorScheme)
+                }
+        }
+        .background {
+            Color.clear
+                .sheet(isPresented: subtitleSheetBinding) {
+                    PlayerSubtitleSettingsSheet(
+                        player: vm,
+                        onClose: { dismissSubtitlePanel() }
+                    )
+                    .preferredColorScheme((AppearanceMode(rawValue: appearanceRaw) ?? .system).colorScheme)
+                }
+        }
+        .onChange(of: danmakuPanelPresented) { _, presented in
+            if presented {
+                subtitlePanelPresented = false
+                landscapeSubtitleDragOffset = .zero
+            } else {
+                landscapeDanmakuDragOffset = .zero
+            }
+            if isOwner {
+                vm.setDanmakuSettingsHold((presented && danmakuEnabled) || subtitlePanelPresented)
+            }
+        }
+        .onChange(of: subtitlePanelPresented) { _, presented in
+            if presented {
+                danmakuPanelPresented = false
+                landscapeDanmakuDragOffset = .zero
+            } else {
+                landscapeSubtitleDragOffset = .zero
+            }
+            if isOwner {
+                vm.setDanmakuSettingsHold(presented || (danmakuPanelPresented && danmakuEnabled))
+            }
         }
         .modifier(
             PlayerViewportFrameModifier(
                 surfaceRole: surfaceRole,
                 containerAspect: containerAspect,
                 allocatedInlineViewport: allocatedInlineViewport,
-                isFullscreenPresentation: isFullscreenPresentation
+                fillsAllocatedViewport: isImmersiveStagePresentation
             )
         )
-        .background { if isFullscreenPresentation { Color.black } }
+        .coordinateSpace(name: Self.surfaceCoordinateSpace)
+        .background { if isImmersiveStagePresentation { Color.black } }
         .ignoresSafeArea(.keyboard, edges: .all)
-        .ignoresSafeArea(.all, edges: isFullscreenPresentation ? .all : [])
+        .ignoresSafeArea(.all, edges: isImmersiveStagePresentation ? .all : [])
         .onGeometryChange(for: CGSize.self) { $0.size } action: { newValue in
             publishSurfaceSizeIfAllowed(newValue)
         }
         .overlay(alignment: .top) {
+            let noticeTopPadding: CGFloat = if isPortraitImmersiveFullscreen {
+                chromeInsets.top + 56
+            } else if vm.activeNoticeBanner?.isInteractive == true, vm.showControls {
+                chromeInsets.top + (isFullscreenPresentation ? 56 : 50)
+            } else {
+                chromeInsets.top + 12
+            }
             VStack(spacing: 6) {
-                if swipeSeekActive {
+                if swipeSeekActive, (!isPortraitImmersiveFullscreen || vm.portraitPureViewEnabled) {
                     PlayerSwipeSeekHUD(
                         player: vm, gestureDisplay: gestureDisplay, swipeSeekBase: swipeSeekBase
                     )
+                    .allowsHitTesting(false)
                 }
                 if vm.isHoldFastForwarding {
                     HStack(spacing: 5) {
@@ -541,23 +913,21 @@ struct PlayerView: View {
                         Text("2x")
                     }
                     .playerChromeCapsule()
+                    .allowsHitTesting(false)
                     .transition(.opacity)
                 }
-                if let notice = vm.skipNotice {
-                    Text(notice)
-                        .font(.footnote)
-                        .fontWeight(.medium)
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .environment(\.colorScheme, .dark)
-                        .transition(.opacity)
+                if isOwner, let banner = vm.activeNoticeBanner {
+                    PlayerNoticeBannerView(banner: banner) {
+                        vm.triggerNoticeBannerAction()
+                    }
+                    .allowsHitTesting(banner.isInteractive)
+                    .transition(.opacity)
                 }
             }
-            .padding(.top, 12)
+            .padding(.top, noticeTopPadding)
             .animation(microControlAnimation, value: vm.isHoldFastForwarding)
-            .animation(microControlAnimation, value: vm.skipNotice)
+            .animation(microControlAnimation, value: vm.activeNoticeBanner)
+            .animation(microControlAnimation, value: vm.showControls)
             .animation(microControlAnimation, value: swipeSeekActive)
             .ignoresSafeArea(.keyboard, edges: .all)
         }
@@ -577,6 +947,7 @@ struct PlayerView: View {
         .allowsHitTesting(isOwner && surfaceLease != nil)
         .onAppear {
             claimScreenSurfaceIfCurrent()
+            syncInlineEndedRecommendationsIfNeeded()
             scheduleHideControls()
         }
         .onDisappear {
@@ -584,13 +955,20 @@ struct PlayerView: View {
             claimedSurfaceLease = nil
             resetSurfaceTouch(reason: "view disappeared")
             danmakuPanelPresented = false
+            portraitVerticalDragOffset = 0
+            pinchTransitionLatched = false
+            isDraggingHairlineBar = false
             if vm.ownerKey == owner {
                 vm.setDanmakuSettingsHold(false)
+                PlayerStoryboardPreviewLoader.shared.clearActivePreview()
             }
             surfaceHoldTask?.cancel()
             surfaceHoldTask = nil
             pendingTapTask?.cancel()
             pendingTapTask = nil
+            doubleTapPulseClearTask?.cancel()
+            doubleTapPulseClearTask = nil
+            doubleTapLikePulse = nil
         }
         .onChange(of: isSurfacePressing) { _, pressing in
             if !pressing, surfaceTouchInFlight {
@@ -600,20 +978,72 @@ struct PlayerView: View {
         .onChange(of: gestureDisplay.isSeeking) { _, seeking in
             guard isOwner else { return }
             if seeking {
+                vm.dismissNoticeBanner(onlyIfResume: true)
+                vm.cancelEndedAutoAdvance()
+                vm.hideControlsTask?.cancel()
+                vm.hideControlsTask = nil
+                PlayerStoryboardPreviewLoader.shared.updatePreview(
+                    aid: vm.currentAid,
+                    cid: vm.currentCid,
+                    time: gestureDisplay.seekValue,
+                    isSeekableOnlineVOD: vm.mode.usesOnlineVODServices && vm.currentURL != nil
+                )
+            } else {
+                PlayerStoryboardPreviewLoader.shared.clearActivePreview()
+                scheduleHideControls()
+            }
+        }
+        .onChange(of: gestureDisplay.seekValue) { _, targetTime in
+            guard isOwner, gestureDisplay.isSeeking else { return }
+            PlayerStoryboardPreviewLoader.shared.updatePreview(
+                aid: vm.currentAid,
+                cid: vm.currentCid,
+                time: targetTime,
+                isSeekableOnlineVOD: vm.mode.usesOnlineVODServices && vm.currentURL != nil
+            )
+        }
+        .onChange(of: vm.playbackEnded) { _, ended in
+            guard isOwner else { return }
+            if ended {
                 vm.hideControlsTask?.cancel()
                 vm.hideControlsTask = nil
             } else {
-                vm.scheduleHideControls()
+                scheduleHideControls()
             }
+        }
+        .onChange(of: isPortraitImmersiveFullscreen, initial: true) { _, immersive in
+            if immersive {
+                if isOwner {
+                    vm.hideControlsTask?.cancel()
+                    vm.hideControlsTask = nil
+                    if !vm.showControls { vm.showControls = true }
+                }
+            } else {
+                portraitVerticalDragOffset = 0
+                portraitDismissDragActive = false
+                isDraggingHairlineBar = false
+            }
+        }
+        .onChange(of: vm.showControls) { _, shown in
+            guard isOwner, isPortraitImmersiveFullscreen, !shown else { return }
+            vm.hideControlsTask?.cancel()
+            vm.hideControlsTask = nil
+            vm.showControls = true
         }
         .onChange(of: vm.ownerKey) { _, _ in
             claimScreenSurfaceIfCurrent()
+            syncInlineEndedRecommendationsIfNeeded()
         }
         .onChange(of: vm.activeSurfaceLease) { _, _ in
             claimScreenSurfaceIfCurrent()
+            syncInlineEndedRecommendationsIfNeeded()
         }
         .onChange(of: screenLease) { _, _ in
             claimScreenSurfaceIfCurrent()
+            syncInlineEndedRecommendationsIfNeeded()
+        }
+        .onChange(of: endedRecommendations) { _, _ in
+            syncInlineEndedRecommendationsIfNeeded()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
             guard isOwner, DeviceCapability.supportsOrientationLock else { return }
@@ -644,6 +1074,19 @@ struct PlayerView: View {
         }
         .onChange(of: vm.isFullscreen) { _, _ in
             resetSurfaceTouch(reason: "fullscreen changed")
+            dismissDanmakuPanel()
+            portraitVerticalDragOffset = 0
+            portraitDismissDragActive = false
+            pinchTransitionLatched = false
+            isDraggingHairlineBar = false
+            gestureDisplay.cancelSeek()
+        }
+        .onChange(of: isInlinePortraitImmersive) { _, _ in
+            resetSurfaceTouch(reason: "inline portrait immersive changed")
+            dismissDanmakuPanel()
+            portraitVerticalDragOffset = 0
+            portraitDismissDragActive = false
+            isDraggingHairlineBar = false
             gestureDisplay.cancelSeek()
         }
         .opacity(isInlineViewportCollapsed ? 0 : 1)
@@ -653,17 +1096,20 @@ struct PlayerView: View {
 
     // MARK: - Unified Surface Gesture (tap / hold-2x / swipe-seek)
 
+    private static let surfaceCoordinateSpace = "playerSurface"
     private static let swipeEngageDistance: CGFloat = 24
     private static let scrollRejectDistance: CGFloat = 36
+    private static let portraitDismissEngageDistance: CGFloat = 28
     private static let holdMaxDrift: CGFloat = 30
     private static let tapMaxDistance: CGFloat = 24
     private static let surfaceHoldDelay: Duration = .milliseconds(200)
-    private static let systemBackEdgeReserve: CGFloat = 20
+    private static let systemBackEdgeReserve: CGFloat = 24
+    private static let portraitBackEdgeRejectLimit: CGFloat = 28
     private static let verticalAdjustHardwareStep: Double = 1.0 / 256
 
     private func resetSurfaceTouch(reason: String) {
         guard surfaceTouchInFlight || surfaceHoldEngaged || swipeSeekActive || swipeSeekRejected
-                || verticalAdjustActive || verticalPagingActive else { return }
+                || verticalAdjustActive || verticalPagingActive || portraitDismissDragActive else { return }
         PlayerLog.log("[PlayerGesture] reset (\(reason))")
         surfaceHoldTask?.cancel()
         surfaceHoldTask = nil
@@ -681,19 +1127,76 @@ struct PlayerView: View {
             verticalPagingActive = false
             verticalPagingGestureSink?.cancel()
         }
+        if portraitDismissDragActive {
+            portraitDismissDragActive = false
+            if portraitVerticalDragOffset != 0 {
+                withAnimation(reduceMotion ? nil : .spring(duration: 0.25)) {
+                    portraitVerticalDragOffset = 0
+                }
+            }
+        }
         verticalAdjustActive = false
         swipeSeekRejected = false
         surfaceTouchInFlight = false
         surfaceDrag.reset()
     }
 
+    private var pinchGesture: some Gesture {
+        MagnifyGesture()
+            .onChanged { value in
+                guard isOwner, surfaceLease != nil, vm.mode != .live,
+                      (isPortraitImmersiveFullscreen || vm.isPortraitContent) else { return }
+                let scale = value.magnification
+                if abs(scale - 1.0) > 0.04 {
+                    surfaceHoldTask?.cancel()
+                    swipeSeekRejected = true
+                }
+                guard !pinchTransitionLatched else { return }
+                if !isPortraitImmersiveFullscreen {
+                    if scale > 1.18 {
+                        pinchTransitionLatched = true
+                        resetSurfaceTouch(reason: "pinch-out to immersive")
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        PlayerLog.log("[PlayerGesture] portrait pinch-out → immersive")
+                        vm.requestFullscreenTransition(target: true, source: .button)
+                    }
+                } else if scale > 1.18 {
+                    if !vm.portraitPureViewEnabled {
+                        pinchTransitionLatched = true
+                        resetSurfaceTouch(reason: "pinch-out to pure view")
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        PlayerLog.log("[PlayerGesture] portrait pinch-out → pure view")
+                        vm.portraitPureViewEnabled = true
+                    }
+                } else if scale < 0.84 {
+                    pinchTransitionLatched = true
+                    resetSurfaceTouch(reason: "pinch-in from immersive")
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    if vm.portraitPureViewEnabled {
+                        PlayerLog.log("[PlayerGesture] portrait pinch-in → exit pure view")
+                        vm.portraitPureViewEnabled = false
+                    } else {
+                        PlayerLog.log("[PlayerGesture] portrait pinch-in → collapse to detail")
+                        if let collapse = activePortraitFullscreenContext?.onCollapseToDetail {
+                            collapse()
+                        } else {
+                            vm.requestFullscreenTransition(target: false, source: .button)
+                        }
+                    }
+                }
+            }
+            .onEnded { _ in
+                pinchTransitionLatched = false
+            }
+    }
+
     private var surfaceGesture: some Gesture {
-        DragGesture(minimumDistance: 0)
+        DragGesture(minimumDistance: 0, coordinateSpace: .named(Self.surfaceCoordinateSpace))
             .updating($isSurfacePressing) { _, pressing, _ in
                 pressing = true
             }
             .onChanged { gesture in
-                guard isOwner, surfaceLease != nil else { return }
+                guard isOwner, surfaceLease != nil, !pinchTransitionLatched else { return }
                 if surfaceTouchInFlight, gesture.startLocation != surfaceStartLocation {
                     resetSurfaceTouch(reason: "stale touch — previous one was system-cancelled")
                 }
@@ -711,7 +1214,8 @@ struct PlayerView: View {
                     surfaceHoldTask = Task { @MainActor in
                         try? await Task.sleep(for: Self.surfaceHoldDelay)
                         guard !Task.isCancelled, isOwner, surfaceLease != nil, surfaceTouchInFlight,
-                              !swipeSeekActive, !swipeSeekRejected, !verticalAdjustActive, !verticalPagingActive,
+                              !swipeSeekActive, !swipeSeekRejected, !verticalAdjustActive,
+                              !verticalPagingActive, !portraitDismissDragActive, !pinchTransitionLatched,
                               hypot(surfaceDrag.translation.width, surfaceDrag.translation.height) < Self.holdMaxDrift,
                               vm.supportsHoldFastForward, vm.isPlaying else { return }
                         surfaceHoldEngaged = true
@@ -724,9 +1228,22 @@ struct PlayerView: View {
                 if surfaceHoldEngaged || swipeSeekRejected { return }
                 surfaceDrag.translation = gesture.translation
 
-                if !swipeSeekActive, !verticalAdjustActive, !verticalPagingActive {
+                if !swipeSeekActive, !verticalAdjustActive, !verticalPagingActive, !portraitDismissDragActive {
+                    if isPortraitImmersiveFullscreen,
+                       surfaceStartLocation.x <= Self.portraitBackEdgeRejectLimit,
+                       dx > 0, dx >= abs(dy) {
+                        surfaceHoldTask?.cancel()
+                        swipeSeekRejected = true
+                        return
+                    }
                     if abs(dx) > Self.swipeEngageDistance, abs(dx) > abs(dy) * 1.2 {
                         surfaceHoldTask?.cancel()
+                        if isPortraitImmersiveFullscreen,
+                           surfaceStartLocation.x <= Self.portraitBackEdgeRejectLimit,
+                           dx > 0 {
+                            swipeSeekRejected = true
+                            return
+                        }
                         guard vm.mode.isSeekable, vm.currentURL != nil, vm.duration > 0 else {
                             swipeSeekRejected = true
                             return
@@ -736,8 +1253,29 @@ struct PlayerView: View {
                         gestureDisplay.seekValue = swipeSeekBase
                         isSeeking = true
                         PlayerLog.log("[PlayerGesture] swipe-seek engaged at \(Int(swipeSeekBase))s")
-                    } else if abs(dy) > Self.scrollRejectDistance, abs(dy) >= abs(dx) {
-                        if let verticalPagingGestureSink, !vm.isFullscreen {
+                    } else if isPortraitImmersiveFullscreen,
+                              abs(dy) > Self.portraitDismissEngageDistance,
+                              abs(dy) > abs(dx) * 1.15 {
+                        surfaceHoldTask?.cancel()
+                        if let verticalPagingGestureSink,
+                           dy < 0 || verticalPagingGestureSink.canPagePrevious() {
+                            guard verticalPagingGestureSink.begin() else {
+                                swipeSeekRejected = true
+                                return
+                            }
+                            verticalPagingActive = true
+                            verticalPagingGestureSink.change(dy)
+                            PlayerLog.log("[PlayerGesture] portrait immersive vertical paging engaged")
+                            return
+                        }
+                        portraitDismissDragActive = true
+                        portraitVerticalDragOffset = dy
+                        PlayerLog.log("[PlayerGesture] portrait immersive pull-to-standard engaged")
+                        return
+                    } else if !isPortraitImmersiveFullscreen,
+                              abs(dy) > Self.scrollRejectDistance,
+                              abs(dy) >= abs(dx) {
+                        if let verticalPagingGestureSink {
                             surfaceHoldTask?.cancel()
                             guard verticalPagingGestureSink.begin() else {
                                 swipeSeekRejected = true
@@ -760,6 +1298,11 @@ struct PlayerView: View {
                     } else {
                         return
                     }
+                }
+
+                if portraitDismissDragActive {
+                    portraitVerticalDragOffset = dy
+                    return
                 }
 
                 if verticalPagingActive {
@@ -801,6 +1344,10 @@ struct PlayerView: View {
                 surfaceTouchInFlight = false
                 defer { swipeSeekRejected = false }
 
+                if pinchTransitionLatched {
+                    return
+                }
+
                 if surfaceHoldEngaged {
                     surfaceHoldEngaged = false
                     let wall = CFAbsoluteTimeGetCurrent()
@@ -813,6 +1360,29 @@ struct PlayerView: View {
                     isSeeking = false
                     PlayerLog.log("[PlayerGesture] swipe-seek commit → \(Int(gestureDisplay.seekValue))s")
                     vm.seek(to: gestureDisplay.seekValue)
+                    return
+                }
+                if portraitDismissDragActive {
+                    portraitDismissDragActive = false
+                    let dragY = gesture.translation.height
+                    let predictedY = gesture.predictedEndTranslation.height
+                    let shouldCollapseToStandard = dragY > 84 || predictedY > 175
+                    if shouldCollapseToStandard {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        withAnimation(reduceMotion ? nil : .spring(duration: 0.28, bounce: 0.03)) {
+                            portraitVerticalDragOffset = 0
+                        }
+                        PlayerLog.log("[PlayerGesture] portrait pull-down → collapse to standard view")
+                        if let collapse = activePortraitFullscreenContext?.onCollapseToDetail {
+                            collapse()
+                        } else {
+                            vm.requestFullscreenTransition(target: false, source: .button)
+                        }
+                    } else {
+                        withAnimation(reduceMotion ? nil : .spring(duration: 0.25)) {
+                            portraitVerticalDragOffset = 0
+                        }
+                    }
                     return
                 }
                 if verticalPagingActive {
@@ -832,24 +1402,59 @@ struct PlayerView: View {
                 }
                 let moved = hypot(gesture.translation.width, gesture.translation.height)
                 if !swipeSeekRejected, moved <= Self.tapMaxDistance {
-                    if pendingTapTask != nil {
-                        pendingTapTask?.cancel()
-                        pendingTapTask = nil
-                        PlayerLog.log("[PlayerGesture] double-tap → \(vm.isPlaying ? "pause" : "play")")
-                        vm.togglePlayPause()
-                    } else {
-                        pendingTapTask = Task { @MainActor in
-                            try? await Task.sleep(for: .milliseconds(280))
-                            guard !Task.isCancelled, isOwner, surfaceLease != nil else { return }
+                    if isPortraitImmersiveFullscreen {
+                        if pendingTapTask != nil {
+                            pendingTapTask?.cancel()
                             pendingTapTask = nil
-                            withAnimation(.easeInOut(duration: 0.2)) {
-                                vm.showControls.toggle()
+                            if let onDoubleTapLike = activePortraitFullscreenContext?.onDoubleTapLike {
+                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                triggerDoubleTapLikePulse(at: gesture.location)
+                                PlayerLog.log("[PlayerGesture] portrait double-tap → like")
+                                Task { await onDoubleTapLike() }
+                            } else {
+                                PlayerLog.log("[PlayerGesture] portrait double-tap → fallback togglePlayPause")
+                                vm.togglePlayPause()
                             }
-                            scheduleHideControls()
+                        } else {
+                            pendingTapTask = Task { @MainActor in
+                                try? await Task.sleep(for: .milliseconds(220))
+                                guard !Task.isCancelled, isOwner, surfaceLease != nil else { return }
+                                pendingTapTask = nil
+                                PlayerLog.log("[PlayerGesture] portrait single-tap → \(vm.isPlaying ? "pause" : "play")")
+                                vm.togglePlayPause()
+                            }
+                        }
+                    } else {
+                        if pendingTapTask != nil {
+                            pendingTapTask?.cancel()
+                            pendingTapTask = nil
+                            PlayerLog.log("[PlayerGesture] double-tap → \(vm.isPlaying ? "pause" : "play")")
+                            vm.togglePlayPause()
+                        } else {
+                            pendingTapTask = Task { @MainActor in
+                                try? await Task.sleep(for: .milliseconds(280))
+                                guard !Task.isCancelled, isOwner, surfaceLease != nil else { return }
+                                pendingTapTask = nil
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    vm.showControls.toggle()
+                                }
+                                scheduleHideControls()
+                            }
                         }
                     }
                 }
             }
+    }
+
+    private func triggerDoubleTapLikePulse(at location: CGPoint) {
+        let pulse = PortraitDoubleTapPulse(location: location)
+        doubleTapLikePulse = pulse
+        doubleTapPulseClearTask?.cancel()
+        doubleTapPulseClearTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(650))
+            guard !Task.isCancelled, doubleTapLikePulse?.id == pulse.id else { return }
+            doubleTapLikePulse = nil
+        }
     }
 
     // MARK: - Helpers
@@ -892,7 +1497,14 @@ struct PlayerView: View {
     }
 
     private func scheduleHideControls() {
-        if isOwner { vm.scheduleHideControls(isSeeking: gestureDisplay.isSeeking) }
+        guard isOwner else { return }
+        if isPortraitImmersiveFullscreen {
+            vm.hideControlsTask?.cancel()
+            vm.hideControlsTask = nil
+            if !vm.showControls { vm.showControls = true }
+            return
+        }
+        vm.scheduleHideControls(isSeeking: gestureDisplay.isSeeking)
     }
 }
 
@@ -930,18 +1542,782 @@ private struct PlayerViewportFrameModifier: ViewModifier {
     let surfaceRole: PlayerSurfaceRole
     let containerAspect: CGFloat
     let allocatedInlineViewport: CGSize?
-    let isFullscreenPresentation: Bool
+    let fillsAllocatedViewport: Bool
 
     func body(content: Content) -> some View {
         if surfaceRole == .fullscreen {
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if fillsAllocatedViewport {
+            content
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(width: allocatedInlineViewport?.width, height: allocatedInlineViewport?.height)
         } else {
             content
                 .frame(maxWidth: .infinity)
                 .aspectRatio(containerAspect, contentMode: .fit)
                 .frame(width: allocatedInlineViewport?.width, height: allocatedInlineViewport?.height)
-                .frame(maxHeight: isFullscreenPresentation ? .infinity : nil)
         }
+    }
+}
+
+private struct PlayerPlaybackErrorOverlay: View {
+    let message: String
+    let unavailability: PlaybackUnavailability?
+    let isFullscreen: Bool
+    let chromeInsets: PlayerChromeInsets
+    let onRetry: () -> Void
+
+    private var title: LocalizedStringKey {
+        unavailability == nil ? "Playback Failed" : "Playback Unavailable"
+    }
+
+    private var symbolName: String {
+        unavailability?.symbolName ?? "exclamationmark.triangle.fill"
+    }
+
+    private var canRetry: Bool {
+        unavailability?.isRetryable ?? true
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.82)
+
+            VStack(spacing: isFullscreen ? 10 : 6) {
+                if isFullscreen {
+                    Image(systemName: symbolName)
+                        .font(.title2)
+                        .foregroundStyle(unavailability == nil ? .yellow : .white.opacity(0.85))
+                    Text(title)
+                        .font(.headline)
+                        .foregroundStyle(.white)
+                } else {
+                    HStack(spacing: 6) {
+                        Image(systemName: symbolName)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(unavailability == nil ? .yellow : .white.opacity(0.85))
+                        Text(title)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.white)
+                    }
+                }
+
+                Text(message)
+                    .font(isFullscreen ? .footnote : .caption)
+                    .foregroundStyle(.white.opacity(0.84))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(isFullscreen ? 3 : 2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: isFullscreen ? 380 : 300)
+
+                if canRetry {
+                    Button(action: onRetry) {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .buttonBorderShape(.capsule)
+                    .controlSize(isFullscreen ? .regular : .small)
+                    .tint(Color.biliAccent)
+                    .padding(.top, 4)
+                    .accessibilityIdentifier("player.retryButton")
+                }
+            }
+            .padding(.top, isFullscreen ? (chromeInsets.top + 56) : (chromeInsets.top + 38))
+            .padding(.bottom, isFullscreen ? (chromeInsets.bottom + 16) : 12)
+            .padding(.horizontal, isFullscreen ? (chromeInsets.horizontal + 24) : 20)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .ignoresSafeArea(.keyboard, edges: .all)
+        .environment(\.colorScheme, .dark)
+    }
+}
+
+private struct PlayerPlaybackEndedOverlay: View {
+    let isFullscreen: Bool
+    var isPortraitFullscreen = false
+    let chromeInsets: PlayerChromeInsets
+    let transportPlacement: PlayerTransportPlacement
+    let autoAdvance: PlayerEndedAutoAdvanceState?
+    let recommendations: [PlayerEndedRecommendation]
+    let onReplay: () -> Void
+    let onNextEpisode: (() -> Void)?
+    let onPlayAutoAdvanceNow: () -> Void
+    let onCancelAutoAdvance: () -> Void
+    let onSelectRecommendation: ((PlayerEndedRecommendation) -> Void)?
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    private var topClearance: CGFloat {
+        isFullscreen ? (chromeInsets.top + 60) : (chromeInsets.top + 52)
+    }
+
+    private var bottomClearance: CGFloat {
+        guard transportPlacement == .playerBottomEdge else {
+            return chromeInsets.bottom + 16
+        }
+        return isFullscreen ? (chromeInsets.bottom + 92) : (chromeInsets.bottom + 78)
+    }
+
+    private var horizontalInset: CGFloat {
+        if isPortraitFullscreen {
+            return max(16, chromeInsets.horizontal)
+        }
+        return isFullscreen ? (chromeInsets.horizontal + 24) : (chromeInsets.horizontal + 14)
+    }
+
+    private var progressAnimation: Animation? {
+        reduceMotion ? nil : .easeInOut(duration: 0.25)
+    }
+
+    private var selectableRecommendations: [PlayerEndedRecommendation] {
+        guard onSelectRecommendation != nil else { return [] }
+        return Array(recommendations.prefix(3))
+    }
+
+    var body: some View {
+        ZStack {
+            endedBackdrop
+
+            GeometryReader { proxy in
+                let availableWidth = max(0, proxy.size.width - horizontalInset * 2)
+                let availableHeight = max(0, proxy.size.height - topClearance - bottomClearance)
+                if availableWidth > 1, availableHeight > 1 {
+                    Group {
+                        if availableHeight < 136 {
+                            compactContent(
+                                totalHeight: proxy.size.height,
+                                availableWidth: availableWidth,
+                                availableHeight: availableHeight
+                            )
+                        } else if availableHeight < 252 {
+                            mediumContent(
+                                availableWidth: availableWidth,
+                                availableHeight: availableHeight
+                            )
+                        } else {
+                            spaciousContent(
+                                availableWidth: availableWidth,
+                                availableHeight: availableHeight
+                            )
+                        }
+                    }
+                    .frame(width: availableWidth, height: availableHeight, alignment: .center)
+                    .padding(.top, topClearance)
+                    .padding(.bottom, bottomClearance)
+                    .padding(.horizontal, horizontalInset)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .ignoresSafeArea(.keyboard, edges: .all)
+        .environment(\.colorScheme, .dark)
+    }
+
+    private var endedBackdrop: some View {
+        ZStack {
+            if reduceTransparency {
+                Color.black.opacity(0.86)
+            } else {
+                Rectangle()
+                    .fill(.ultraThinMaterial)
+                    .opacity(0.55)
+                Color.black.opacity(0.62)
+                LinearGradient(
+                    stops: [
+                        .init(color: .black.opacity(0.32), location: 0),
+                        .init(color: .clear, location: 0.28),
+                        .init(color: .clear, location: 0.72),
+                        .init(color: .black.opacity(0.38), location: 1),
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            }
+        }
+    }
+
+    // MARK: - Adaptive Tiers
+
+    @ViewBuilder
+    private func compactContent(
+        totalHeight: CGFloat,
+        availableWidth: CGFloat,
+        availableHeight: CGFloat
+    ) -> some View {
+        if let countdown = autoAdvance {
+            compactCountdownBanner(countdown, maxWidth: min(availableWidth, 390))
+        } else {
+            let showMiniRecommendation = !selectableRecommendations.isEmpty
+                && totalHeight >= 205
+                && availableHeight >= 74
+            VStack(spacing: showMiniRecommendation ? 7 : 6) {
+                if !showMiniRecommendation, availableHeight >= 56 {
+                    Text("Playback Ended")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.white.opacity(0.84))
+                        .lineLimit(1)
+                }
+                actionButtonsRow(compact: true)
+                if showMiniRecommendation, let first = selectableRecommendations.first {
+                    compactRecommendationMiniCard(first, maxWidth: min(availableWidth, 352))
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func mediumContent(
+        availableWidth: CGFloat,
+        availableHeight: CGFloat
+    ) -> some View {
+        let recs = visibleRecommendations(for: availableWidth)
+        let showsRecommendations = !recs.isEmpty && availableHeight >= 156
+        VStack(spacing: showsRecommendations ? 12 : 14) {
+            if let countdown = autoAdvance {
+                countdownBanner(
+                    countdown,
+                    maxWidth: min(availableWidth, 560),
+                    showsReplayAction: !showsRecommendations
+                )
+            } else if showsRecommendations {
+                HStack(spacing: 12) {
+                    Text("Playback Ended")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.88))
+                        .lineLimit(1)
+                    actionButtonsRow(compact: true)
+                }
+            } else {
+                VStack(spacing: 10) {
+                    Text("Playback Ended")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.88))
+                    actionButtonsRow(compact: false)
+                }
+            }
+
+            if showsRecommendations {
+                let headerReserve: CGFloat = autoAdvance != nil ? 86 : 44
+                let cardAreaHeight = max(84, availableHeight - headerReserve)
+                recommendationCardsRow(
+                    recs,
+                    availableWidth: min(availableWidth, 660),
+                    maxCardHeight: cardAreaHeight,
+                    showsSectionLabel: false
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func spaciousContent(
+        availableWidth: CGFloat,
+        availableHeight: CGFloat
+    ) -> some View {
+        let recs = visibleRecommendations(for: availableWidth)
+        VStack(spacing: 18) {
+            if let countdown = autoAdvance {
+                VStack(spacing: 12) {
+                    countdownBanner(
+                        countdown,
+                        maxWidth: min(availableWidth, 540),
+                        showsReplayAction: false
+                    )
+                    Button(action: onReplay) {
+                        Label("Replay", systemImage: "arrow.counterclockwise")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                    }
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.capsule)
+                    .controlSize(.small)
+                    .tint(.white)
+                    .accessibilityIdentifier("player.replayButton")
+                }
+            } else {
+                VStack(spacing: 12) {
+                    Text("Playback Ended")
+                        .font(.headline.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.92))
+                    actionButtonsRow(compact: false)
+                }
+            }
+
+            if !recs.isEmpty {
+                let headerReserve: CGFloat = autoAdvance != nil ? 136 : 92
+                let cardAreaHeight = max(120, min(availableHeight - headerReserve, 220))
+                recommendationCardsRow(
+                    recs,
+                    availableWidth: min(availableWidth, 700),
+                    maxCardHeight: cardAreaHeight,
+                    showsSectionLabel: true
+                )
+            }
+        }
+    }
+
+    // MARK: - Actions & Countdown
+
+    private func actionButtonsRow(compact: Bool) -> some View {
+        HStack(spacing: compact ? 8 : 12) {
+            Button(action: onReplay) {
+                Label("Replay", systemImage: "arrow.counterclockwise")
+                    .font((compact ? Font.footnote : Font.subheadline).weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+            }
+            .buttonStyle(.borderedProminent)
+            .buttonBorderShape(.capsule)
+            .controlSize(compact ? .small : .regular)
+            .tint(Color.biliAccent)
+            .accessibilityIdentifier("player.replayButton")
+
+            if let onNextEpisode {
+                Button(action: onNextEpisode) {
+                    Label("Next Episode", systemImage: "forward.end.fill")
+                        .font((compact ? Font.footnote : Font.subheadline).weight(.semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                }
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
+                .controlSize(compact ? .small : .regular)
+                .tint(.white)
+                .accessibilityIdentifier("player.endedNextEpisodeButton")
+            }
+        }
+    }
+
+    private func compactCountdownBanner(
+        _ countdown: PlayerEndedAutoAdvanceState,
+        maxWidth: CGFloat
+    ) -> some View {
+        HStack(spacing: 10) {
+            countdownRing(countdown, size: 30, lineWidth: 2.5)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Up next in \(countdown.remainingSeconds)s")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Color.biliAccent)
+                    .monospacedDigit()
+                    .lineLimit(1)
+
+                countdownTitleText(countdown)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                countdownProgressBar(countdown, height: 2.5)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(spacing: 6) {
+                Button(action: onPlayAutoAdvanceNow) {
+                    Label("Play Now", systemImage: "play.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                }
+                .buttonStyle(.borderedProminent)
+                .buttonBorderShape(.capsule)
+                .controlSize(.mini)
+                .tint(Color.biliAccent)
+                .accessibilityIdentifier("player.endedAutoAdvancePlayNow")
+
+                Button(action: onCancelAutoAdvance) {
+                    Text("Cancel")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                }
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
+                .controlSize(.mini)
+                .tint(.white)
+                .accessibilityIdentifier("player.endedAutoAdvanceCancel")
+            }
+            .fixedSize(horizontal: true, vertical: false)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .frame(maxWidth: maxWidth)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.white.opacity(0.11))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.16), lineWidth: 0.75)
+                )
+        )
+    }
+
+    private func countdownBanner(
+        _ countdown: PlayerEndedAutoAdvanceState,
+        maxWidth: CGFloat,
+        showsReplayAction: Bool
+    ) -> some View {
+        HStack(spacing: 12) {
+            if let coverURL = countdown.coverURL, !coverURL.isEmpty {
+                ZStack {
+                    CoverImage(
+                        urlString: coverURL,
+                        displaySize: CGSize(width: 80, height: 45),
+                        contentMode: .fill,
+                        requestsServerCrop: true,
+                        groundColor: Color.white.opacity(0.08),
+                        fillsOfferedBox: true
+                    )
+                    .frame(width: 80, height: 45)
+                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+
+                    Color.black.opacity(0.32)
+                        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+
+                    countdownRing(countdown, size: 28, lineWidth: 2.5)
+                }
+                .frame(width: 80, height: 45)
+            } else {
+                countdownRing(countdown, size: 38, lineWidth: 3)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Up next in \(countdown.remainingSeconds)s")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.biliAccent)
+                    .monospacedDigit()
+                    .lineLimit(1)
+
+                countdownTitleText(countdown)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                if let author = countdown.authorName, !author.isEmpty {
+                    Text(verbatim: author)
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.68))
+                        .lineLimit(1)
+                }
+
+                countdownProgressBar(countdown, height: 3)
+                    .padding(.top, 2)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(spacing: 8) {
+                if showsReplayAction {
+                    Button(action: onReplay) {
+                        Image(systemName: "arrow.counterclockwise")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.circle)
+                    .controlSize(.small)
+                    .tint(.white)
+                    .accessibilityIdentifier("player.replayButton")
+                    .accessibilityLabel(Text("Replay"))
+                }
+
+                Button(action: onPlayAutoAdvanceNow) {
+                    Label("Play Now", systemImage: "play.fill")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                }
+                .buttonStyle(.borderedProminent)
+                .buttonBorderShape(.capsule)
+                .controlSize(.small)
+                .tint(Color.biliAccent)
+                .accessibilityIdentifier("player.endedAutoAdvancePlayNow")
+
+                Button(action: onCancelAutoAdvance) {
+                    Text("Cancel")
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                }
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
+                .controlSize(.small)
+                .tint(.white)
+                .accessibilityIdentifier("player.endedAutoAdvanceCancel")
+            }
+            .fixedSize(horizontal: true, vertical: false)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: maxWidth)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.white.opacity(0.11))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.16), lineWidth: 0.75)
+                )
+        )
+    }
+
+    private func countdownTitleText(_ countdown: PlayerEndedAutoAdvanceState) -> Text {
+        if let title = countdown.title, !title.isEmpty {
+            return Text(verbatim: title)
+        }
+        return Text("Next Episode")
+    }
+
+    private func countdownRing(
+        _ countdown: PlayerEndedAutoAdvanceState,
+        size: CGFloat,
+        lineWidth: CGFloat
+    ) -> some View {
+        ZStack {
+            Circle()
+                .stroke(Color.white.opacity(0.24), lineWidth: lineWidth)
+            Circle()
+                .trim(from: 0, to: CGFloat(max(0.08, countdown.progress)))
+                .stroke(
+                    Color.biliAccent,
+                    style: StrokeStyle(lineWidth: lineWidth, lineCap: .round)
+                )
+                .rotationEffect(.degrees(-90))
+                .animation(progressAnimation, value: countdown.remainingSeconds)
+            Text(verbatim: "\(max(0, countdown.remainingSeconds))")
+                .font(.system(size: size * 0.42, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(.white)
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+    }
+
+    private func countdownProgressBar(
+        _ countdown: PlayerEndedAutoAdvanceState,
+        height: CGFloat
+    ) -> some View {
+        GeometryReader { barProxy in
+            let filledWidth = max(0, barProxy.size.width * CGFloat(min(max(countdown.progress, 0.08), 1)))
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.white.opacity(0.2))
+                Capsule()
+                    .fill(Color.biliAccent)
+                    .frame(width: filledWidth)
+                    .animation(progressAnimation, value: countdown.remainingSeconds)
+            }
+        }
+        .frame(height: height)
+        .accessibilityHidden(true)
+    }
+
+    // MARK: - Recommendations
+
+    private func visibleRecommendations(for availableWidth: CGFloat) -> [PlayerEndedRecommendation] {
+        let maxCount: Int
+        if availableWidth >= 460 {
+            maxCount = 3
+        } else if availableWidth >= 300 {
+            maxCount = 2
+        } else {
+            maxCount = 1
+        }
+        return Array(selectableRecommendations.prefix(maxCount))
+    }
+
+    private func compactRecommendationMiniCard(
+        _ recommendation: PlayerEndedRecommendation,
+        maxWidth: CGFloat
+    ) -> some View {
+        Button {
+            onSelectRecommendation?(recommendation)
+        } label: {
+            HStack(spacing: 8) {
+                recommendationThumbnail(
+                    coverURL: recommendation.coverURL,
+                    durationSeconds: recommendation.durationSeconds,
+                    size: CGSize(width: 64, height: 36),
+                    cornerRadius: 6,
+                    compactBadge: true
+                )
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(verbatim: recommendation.title)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+
+                    if !recommendation.authorName.isEmpty {
+                        Text(verbatim: recommendation.authorName)
+                            .font(.caption2)
+                            .foregroundStyle(.white.opacity(0.7))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.55))
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .frame(maxWidth: maxWidth)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(Color.white.opacity(0.11))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.16), lineWidth: 0.75)
+                    )
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("player.endedRecommendation.\(recommendation.id)")
+    }
+
+    private func recommendationCardsRow(
+        _ items: [PlayerEndedRecommendation],
+        availableWidth: CGFloat,
+        maxCardHeight: CGFloat,
+        showsSectionLabel: Bool
+    ) -> some View {
+        let spacing: CGFloat = 12
+        let count = CGFloat(max(items.count, 1))
+        let labelReserve: CGFloat = showsSectionLabel ? 20 : 0
+        let textReserve: CGFloat = maxCardHeight >= 155 ? 52 : 42
+        let maxThumbHeight = max(56, maxCardHeight - labelReserve - textReserve)
+        let widthLimitedCard = (availableWidth - spacing * (count - 1)) / count
+        let heightLimitedCard = maxThumbHeight * 16.0 / 9.0
+        let cardWidth = max(min(availableWidth, 120), min(widthLimitedCard, heightLimitedCard, 216))
+        let thumbHeight = max(1, (cardWidth * 9.0 / 16.0).rounded())
+        let titleLines = maxCardHeight >= 155 ? 2 : 1
+        let totalRowWidth = cardWidth * count + spacing * (count - 1)
+
+        return VStack(alignment: .leading, spacing: 8) {
+            if showsSectionLabel {
+                Text("Recommended")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.72))
+            }
+
+            HStack(alignment: .top, spacing: spacing) {
+                ForEach(items) { recommendation in
+                    Button {
+                        onSelectRecommendation?(recommendation)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 6) {
+                            recommendationThumbnail(
+                                coverURL: recommendation.coverURL,
+                                durationSeconds: recommendation.durationSeconds,
+                                size: CGSize(width: cardWidth, height: thumbHeight),
+                                cornerRadius: 8,
+                                compactBadge: false
+                            )
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(verbatim: recommendation.title)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.white)
+                                    .lineLimit(titleLines)
+                                    .truncationMode(.tail)
+                                    .multilineTextAlignment(.leading)
+
+                                if !recommendation.authorName.isEmpty {
+                                    Text(verbatim: recommendation.authorName)
+                                        .font(.caption2)
+                                        .foregroundStyle(.white.opacity(0.68))
+                                        .lineLimit(1)
+                                        .truncationMode(.tail)
+                                }
+                            }
+                            .padding(.horizontal, 6)
+                            .padding(.bottom, 6)
+                        }
+                        .frame(width: cardWidth, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(Color.white.opacity(0.09))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .strokeBorder(Color.white.opacity(0.14), lineWidth: 0.75)
+                                )
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("player.endedRecommendation.\(recommendation.id)")
+                }
+            }
+        }
+        .frame(maxWidth: totalRowWidth)
+    }
+
+    private func recommendationThumbnail(
+        coverURL: String?,
+        durationSeconds: Int?,
+        size: CGSize,
+        cornerRadius: CGFloat,
+        compactBadge: Bool
+    ) -> some View {
+        ZStack(alignment: .bottomTrailing) {
+            if let coverURL, !coverURL.isEmpty {
+                CoverImage(
+                    urlString: coverURL,
+                    displaySize: size,
+                    contentMode: .fill,
+                    requestsServerCrop: true,
+                    groundColor: Color.white.opacity(0.08),
+                    fillsOfferedBox: true
+                )
+                .frame(width: size.width, height: size.height)
+                .clipped()
+            } else {
+                Rectangle()
+                    .fill(Color.white.opacity(0.08))
+                    .overlay {
+                        Image(systemName: "play.rectangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.35))
+                    }
+                    .frame(width: size.width, height: size.height)
+            }
+
+            if let durationSeconds, let formatted = Self.formattedDuration(durationSeconds) {
+                Text(verbatim: formatted)
+                    .font(.system(size: compactBadge ? 9 : 10, weight: .semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, compactBadge ? 4 : 5)
+                    .padding(.vertical, compactBadge ? 1 : 2)
+                    .background(
+                        Color.black.opacity(0.72),
+                        in: RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    )
+                    .padding(compactBadge ? 3 : 5)
+            }
+        }
+        .frame(width: size.width, height: size.height)
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+    }
+
+    private static func formattedDuration(_ totalSeconds: Int) -> String? {
+        guard totalSeconds > 0 else { return nil }
+        let hours = totalSeconds / 3600
+        let minutes = (totalSeconds % 3600) / 60
+        let seconds = totalSeconds % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "%02d:%02d", minutes, seconds)
     }
 }

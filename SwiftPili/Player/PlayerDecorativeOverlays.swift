@@ -170,11 +170,17 @@ enum PlayerDanmakuMountPolicy {
         source: URL?,
         isOwner: Bool,
         hasSurfaceLease: Bool,
-        enabled: Bool
+        enabled: Bool,
+        hasOfflineDanmaku: Bool = false
     ) -> Bool {
-        guard enabled, isOwner, hasSurfaceLease, mode.usesOnlineVODServices,
-              let source, !source.isFileURL else { return false }
-        return true
+        guard enabled, isOwner, hasSurfaceLease, let source else { return false }
+        if mode.usesOnlineVODServices {
+            return !source.isFileURL
+        }
+        if mode == .offline {
+            return hasOfflineDanmaku && source.isFileURL
+        }
+        return false
     }
 }
 
@@ -237,22 +243,81 @@ enum PlayerDanmakuPicture {
     }
 }
 
+struct DanmakuSymbolIcon: View {
+    static let activeSymbolName = "bubble.left.and.text.bubble.right.fill"
+    static let inactiveSymbolName = "bubble.left.and.text.bubble.right"
+
+    let isOn: Bool
+    var fontSize: CGFloat = 17
+    var activeColor: Color = .biliAccent
+    var inactiveColor: Color = .white.opacity(0.90)
+
+    var body: some View {
+        let box = fontSize * 1.42
+        if isOn {
+            Image(systemName: Self.activeSymbolName)
+                .font(.system(size: fontSize, weight: .semibold))
+                .foregroundStyle(activeColor)
+                .frame(width: box, height: box)
+        } else {
+            Image(systemName: Self.inactiveSymbolName)
+                .font(.system(size: fontSize, weight: .medium))
+                .foregroundStyle(inactiveColor)
+                .frame(width: box, height: box)
+                .compositingGroup()
+                .mask {
+                    ZStack {
+                        Rectangle().fill(.white)
+                        Capsule()
+                            .fill(.black)
+                            .frame(width: box * 1.04, height: max(3.2, fontSize * 0.22))
+                            .rotationEffect(.degrees(-42))
+                    }
+                    .compositingGroup()
+                    .luminanceToAlpha()
+                }
+                .overlay {
+                    Capsule()
+                        .fill(inactiveColor)
+                        .frame(width: box * 0.96, height: max(1.5, fontSize * 0.10))
+                        .rotationEffect(.degrees(-42))
+                }
+        }
+    }
+}
+
 struct PlayerDanmakuOverlay: View {
     let player: PlayerViewModel
+    var topSafeInset: CGFloat = 0
+
+    static func topInsetViewportHeight(totalHeight: CGFloat, topSafeInset: CGFloat) -> CGFloat {
+        let clampedTop = min(max(0, topSafeInset), max(0, totalHeight - 1))
+        return max(0, totalHeight - clampedTop)
+    }
 
     var body: some View {
         GeometryReader { proxy in
+            let clampedTop = min(max(0, topSafeInset), max(0, proxy.size.height - 1))
+            let safeHeight = Self.topInsetViewportHeight(
+                totalHeight: proxy.size.height,
+                topSafeInset: clampedTop
+            )
+            let fullPicture = PlayerDanmakuPicture.rect(
+                in: proxy.size,
+                scaleMode: player.scaleMode,
+                resolution: player.videoResolution,
+                isPortraitContent: player.isPortraitContent,
+                portraitHint: player.danmakuPortraitHint
+            )
+            let shiftedPicture = clampedTop > 0
+                ? fullPicture.offsetBy(dx: 0, dy: -clampedTop)
+                : fullPicture
             DanmakuOverlayView(
                 scaleMode: player.scaleMode,
-                picture: PlayerDanmakuPicture.rect(
-                    in: proxy.size,
-                    scaleMode: player.scaleMode,
-                    resolution: player.videoResolution,
-                    isPortraitContent: player.isPortraitContent,
-                    portraitHint: player.danmakuPortraitHint
-                )
+                picture: shiftedPicture
             )
-            .frame(width: proxy.size.width, height: proxy.size.height)
+            .frame(width: proxy.size.width, height: safeHeight)
+            .offset(y: clampedTop)
             .allowsHitTesting(false)
         }
         .allowsHitTesting(false)

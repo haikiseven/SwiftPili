@@ -32,6 +32,7 @@ struct PlayerControlsOverlay: View {
     let transportPlacement: PlayerTransportPlacement
     let suppressTransportRow: Bool
     @Binding var danmakuPanelPresented: Bool
+    @Binding var subtitlePanelPresented: Bool
     @Binding var showSponsorBlock: Bool
 
     var body: some View {
@@ -45,7 +46,9 @@ struct PlayerControlsOverlay: View {
                     liveQualityControl: liveQualityControl,
                     pageNavigationActions: pageNavigationActions,
                     showsAnimeOptions: showsAnimeOptions,
-                    chromeInsets: chromeInsets, danmakuPanelPresented: $danmakuPanelPresented,
+                    chromeInsets: chromeInsets,
+                    danmakuPanelPresented: $danmakuPanelPresented,
+                    subtitlePanelPresented: $subtitlePanelPresented,
                     showSponsorBlock: $showSponsorBlock
                 )
                 Spacer()

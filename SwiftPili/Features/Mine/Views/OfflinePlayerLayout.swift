@@ -12,7 +12,9 @@ struct OfflinePlayerLayout {
         isRegularWidth: Bool,
         supportsPadSplit: Bool,
         isPortraitContent: Bool,
-        isCondensed: Bool
+        isCondensed: Bool,
+        videoAspectRatio: CGFloat? = nil,
+        topSafeArea: CGFloat = 0
     ) {
         let safeWidth = containerSize.width.isFinite ? max(0, containerSize.width) : 0
         let safeHeight = containerSize.height.isFinite ? max(0, containerSize.height) : 0
@@ -39,11 +41,15 @@ struct OfflinePlayerLayout {
             )
             metadataWidth = panelWidth
         } else {
-            let height = DetailPlayerGeometry.videoHeight(
+            let height = DetailPlayerGeometry.dynamicInlineVideoHeight(
                 containerWidth: safeWidth,
                 primaryColumnWidth: nil,
-                isPortraitContent: isPortraitContent,
-                isCondensed: isCondensed
+                containerHeight: safeHeight,
+                topSafeArea: topSafeArea,
+                videoAspectRatio: videoAspectRatio,
+                isPortraitFallback: isPortraitContent,
+                isManuallyCondensed: isCondensed,
+                isManualLockActive: isCondensed
             )
             primaryColumnWidth = safeWidth
             playerSize = CGSize(width: safeWidth, height: height)

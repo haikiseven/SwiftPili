@@ -46,14 +46,23 @@ struct PlayerTopControlBar: View {
     let showsAnimeOptions: Bool
     let chromeInsets: PlayerChromeInsets
     @Binding var danmakuPanelPresented: Bool
+    @Binding var subtitlePanelPresented: Bool
     @Binding var showSponsorBlock: Bool
     @AppStorage(DanmakuFeatureGate.defaultsKey) private var danmakuEnabled = false
-    @State private var inlineDanmakuPopoverPresented = false
-    @State private var inlineDanmakuPopoverTask: Task<Void, Never>?
+    @State private var playlistSheetPresented = false
     @State private var barWidth: CGFloat = 0
 
     private var isNarrowFullscreenBar: Bool {
         player.isFullscreen && barWidth > 0 && barWidth < 540
+    }
+
+    private var activeFullscreenPlaylist: PlaybackQueueContext? {
+        player.isFullscreen ? player.activePlaylistQueue : nil
+    }
+
+    private var hasDanmakuSupport: Bool {
+        player.supportsDanmakuControls
+            || (player.mode == .offline && player.hasRegisteredOfflineDanmaku)
     }
 
     var body: some View {
@@ -121,31 +130,39 @@ struct PlayerTopControlBar: View {
 
             PlayerPlaybackOptionsMenu(
                 player: player, screenLease: screenLease,
-                presentationReceipt: presentationReceipt, fullscreenHostIdentity: fullscreenHostIdentity
+                presentationReceipt: presentationReceipt, fullscreenHostIdentity: fullscreenHostIdentity,
+                onOpenSubtitleSettings: { toggleSubtitleSettingsPanel() }
             )
 
+            if !player.mode.supportsPlaybackRate {
+                liveSleepTimerMenu
+            }
+
             if DetailDanmakuEntryPolicy.chromeShowsToggle(
-                usesOnlineVODServices: player.mode.usesOnlineVODServices
+                usesOnlineVODServices: hasDanmakuSupport,
+                hasOfflineDanmaku: player.hasRegisteredOfflineDanmaku
             ) {
                 Button {
                     danmakuEnabled.toggle()
                 } label: {
-                    Image(systemName: danmakuEnabled ? "text.bubble.fill" : "text.bubble")
-                        .playerChromeCapsule(horizontal: 10, minHeight: 44)
-                        .accessibilityHidden(true)
+                    DanmakuSymbolIcon(
+                        isOn: danmakuEnabled,
+                        fontSize: 16,
+                        activeColor: Color.biliAccent,
+                        inactiveColor: .white.opacity(0.92)
+                    )
+                    .playerChromeCapsule(horizontal: 10, minHeight: 44)
+                    .accessibilityHidden(true)
                 }
                 .danmakuToggleAccessibility(isOn: danmakuEnabled)
-                .popover(isPresented: $inlineDanmakuPopoverPresented) {
-                    inlineDanmakuSettingsPanel
-                        .presentationCompactAdaptation(.popover)
-                }
             }
 
             if isNarrowFullscreenBar {
                 narrowFullscreenToolsMenu
             } else {
                 if DetailDanmakuEntryPolicy.chromeShowsSettings(
-                    usesOnlineVODServices: player.mode.usesOnlineVODServices,
+                    usesOnlineVODServices: hasDanmakuSupport,
+                    hasOfflineDanmaku: player.hasRegisteredOfflineDanmaku,
                     danmakuEnabled: danmakuEnabled,
                     isFullscreen: player.isFullscreen
                 ) {
@@ -172,6 +189,24 @@ struct PlayerTopControlBar: View {
                 }
 
                 if player.isFullscreen {
+                    if let playlist = activeFullscreenPlaylist {
+                        Button {
+                            playlistSheetPresented = true
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: "list.bullet.rectangle")
+                                Text("\(playlist.displayIndex)/\(playlist.totalCount)")
+                                    .font(.caption.weight(.semibold))
+                                    .monospacedDigit()
+                            }
+                            .playerChromeCapsule(horizontal: 10, minHeight: 44)
+                            .accessibilityHidden(true)
+                        }
+                        .accessibilityIdentifier("player.topBarPlaylist")
+                        .accessibilityLabel(Text("Playlist"))
+                        .accessibilityValue(Text("\(playlist.displayIndex)/\(playlist.totalCount)"))
+                    }
+
                     Menu {
                         scaleModeMenuItems
                     } label: {
@@ -182,17 +217,16 @@ struct PlayerTopControlBar: View {
                     .accessibilityLabel(Text("Aspect Mode"))
                     .accessibilityValue(Text(player.scaleMode.label))
 
-                    if !player.availableSubtitles.isEmpty {
-                        Menu {
-                            subtitleMenuItems
-                        } label: {
-                            Image(systemName: player.activeSubtitleLan == nil ? "captions.bubble" : "captions.bubble.fill")
-                                .playerChromeCapsule(horizontal: 10, minHeight: 44)
-                                .accessibilityHidden(true)
-                        }
-                        .accessibilityLabel(Text("Subtitles"))
-                        .accessibilityValue(Text(activeSubtitleAccessibilityValue))
+                    Menu {
+                        subtitleMenuItems
+                    } label: {
+                        Image(systemName: player.hasAnyActiveSubtitle ? "captions.bubble.fill" : "captions.bubble")
+                            .playerChromeCapsule(horizontal: 10, minHeight: 44)
+                            .accessibilityHidden(true)
                     }
+                    .accessibilityIdentifier("player.topBarSubtitles")
+                    .accessibilityLabel(Text("Subtitles"))
+                    .accessibilityValue(Text(activeSubtitleAccessibilityValue))
 
                     Button { player.showStats.toggle() } label: {
                         Image(systemName: "info.circle")
@@ -213,9 +247,14 @@ struct PlayerTopControlBar: View {
                 showsAnimeOptions: showsAnimeOptions,
                 onDownload: pageNavigationActions?.onDownload,
                 onReport: pageNavigationActions?.onReport,
+                onHideVideo: pageNavigationActions?.onHideVideo,
+                onBlockOwner: pageNavigationActions?.onBlockOwner,
                 onDanmakuSettings: showsInlineMenuDanmakuSettings ? {
-                    presentInlineDanmakuPopoverFromMenu()
-                } : nil
+                    toggleDanmakuSettingsPanel()
+                } : nil,
+                onSubtitleSettings: {
+                    toggleSubtitleSettingsPanel()
+                }
             )
             .accessibilityIdentifier("player.more")
         }
@@ -229,33 +268,56 @@ struct PlayerTopControlBar: View {
                 barWidth = width
             }
         }
-        .onChange(of: inlineDanmakuPopoverPresented) { _, presented in
-            player.setDanmakuSettingsHold(presented || danmakuPanelPresented)
+        .onChange(of: danmakuPanelPresented) { _, _ in
+            syncControlsHold()
         }
-        .onChange(of: player.isFullscreen) { _, fullscreen in
-            if fullscreen {
-                inlineDanmakuPopoverPresented = false
-            } else {
-                danmakuPanelPresented = false
-            }
-            player.setDanmakuSettingsHold(inlineDanmakuPopoverPresented || danmakuPanelPresented)
+        .onChange(of: player.isFullscreen) { _, _ in
+            danmakuPanelPresented = false
+            subtitlePanelPresented = false
+            playlistSheetPresented = false
+            syncControlsHold()
         }
         .onChange(of: danmakuEnabled) { _, enabled in
             if !enabled {
-                inlineDanmakuPopoverPresented = false
                 danmakuPanelPresented = false
-                player.setDanmakuSettingsHold(false)
+                syncControlsHold()
+            }
+        }
+        .onChange(of: subtitlePanelPresented) { _, _ in
+            syncControlsHold()
+        }
+        .onChange(of: playlistSheetPresented) { _, _ in
+            syncControlsHold()
+        }
+        .onChange(of: player.activePlaylistQueue == nil) { _, isGone in
+            if isGone {
+                playlistSheetPresented = false
             }
         }
         .onDisappear {
-            inlineDanmakuPopoverTask?.cancel()
-            inlineDanmakuPopoverTask = nil
-            inlineDanmakuPopoverPresented = false
+            playlistSheetPresented = false
             if screenLease.map(player.isCurrentOwner) ?? false {
                 danmakuPanelPresented = false
+                subtitlePanelPresented = false
                 player.setDanmakuSettingsHold(false)
             }
         }
+        .sheet(isPresented: $playlistSheetPresented) {
+            PlayerPlaylistDrawerSheet(player: player)
+        }
+    }
+
+    private func syncControlsHold() {
+        player.setDanmakuSettingsHold(
+            danmakuPanelPresented
+                || subtitlePanelPresented
+                || playlistSheetPresented
+        )
+    }
+
+    private func toggleSubtitleSettingsPanel() {
+        subtitlePanelPresented.toggle()
+        syncControlsHold()
     }
 
     private var showsSponsorBlockControl: Bool {
@@ -263,14 +325,12 @@ struct PlayerTopControlBar: View {
     }
 
     private var activeSubtitleAccessibilityValue: String {
-        guard let active = player.activeSubtitleLan else { return String(localized: "Off") }
-        let matched = player.availableSubtitles.first { $0.lan == active }
-        return matched?.lanDoc ?? matched?.lan ?? active
+        player.activeSubtitleSummaryLabel ?? String(localized: "Off")
     }
 
     private func toggleDanmakuSettingsPanel() {
         danmakuPanelPresented.toggle()
-        player.setDanmakuSettingsHold(danmakuPanelPresented)
+        syncControlsHold()
     }
 
     @ViewBuilder
@@ -292,33 +352,177 @@ struct PlayerTopControlBar: View {
     @ViewBuilder
     private var subtitleMenuItems: some View {
         Button {
-            Task { await player.selectSubtitle(nil) }
+            player.turnOffAllSubtitles()
         } label: {
             HStack {
                 Text("Off")
-                if player.activeSubtitleLan == nil {
+                if !player.hasAnyActiveSubtitle {
                     Image(systemName: "checkmark")
                 }
             }
         }
-        ForEach(player.availableSubtitles, id: \.lan) { item in
+
+        if !player.availableSubtitles.isEmpty {
+            Section("Bilibili Cloud Subtitles") {
+                ForEach(Array(player.availableSubtitles.enumerated()), id: \.offset) { _, item in
+                    Button {
+                        Task { await player.selectSubtitle(item) }
+                    } label: {
+                        HStack {
+                            Text(item.menuDisplayTitle)
+                            if let lan = item.lan,
+                               lan == player.activeSubtitleLan || lan == player.secondarySubtitleLan {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+
+                if player.availableSubtitles.count >= 2 {
+                    Menu {
+                        Button {
+                            Task { await player.selectSecondarySubtitleTrack(id: nil) }
+                        } label: {
+                            HStack {
+                                Text("Off")
+                                if player.secondarySubtitleLan == nil {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                        ForEach(Array(player.availableSubtitles.enumerated()), id: \.offset) { _, item in
+                            if let lan = item.lan, lan != player.activeSubtitleLan {
+                                Button {
+                                    Task { await player.selectSecondarySubtitleTrack(id: lan) }
+                                } label: {
+                                    HStack {
+                                        Text(item.menuDisplayTitle)
+                                        if lan == player.secondarySubtitleLan {
+                                            Image(systemName: "checkmark")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        Label("Secondary Subtitle (Bilingual)", systemImage: "captions.bubble")
+                    }
+                }
+            }
+        }
+
+        if !player.importedSubtitleTracks.isEmpty {
+            Section("Local Subtitle File (.srt / .vtt)") {
+                ForEach(player.importedSubtitleTracks) { track in
+                    Button {
+                        Task { await player.selectPrimarySubtitleTrack(id: track.id) }
+                    } label: {
+                        HStack {
+                            Text(track.displayName)
+                            if track.id == player.activeSubtitleLan || track.id == player.secondarySubtitleLan {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if ((player.activeSubtitleLan != nil || player.isAutoTranslationEnabled) && player.supportsAutoSubtitleTranslation)
+            || player.supportsSystemSpeechSubtitles {
+            Divider()
+        }
+
+        if (player.activeSubtitleLan != nil || player.isAutoTranslationEnabled), player.supportsAutoSubtitleTranslation {
             Button {
-                Task { await player.selectSubtitle(item) }
+                player.setAutoSubtitleTranslationEnabled(!player.isAutoTranslationEnabled)
             } label: {
                 HStack {
-                    Text(item.lanDoc ?? item.lan ?? "?")
-                    if item.lan == player.activeSubtitleLan {
+                    Label {
+                        Text("Offline Translation")
+                            + Text(verbatim: " (\(player.subtitleTranslationTargetLanguage.shortLabel))")
+                    } icon: {
+                        Image(systemName: "translate")
+                    }
+                    if player.isAutoTranslationEnabled {
                         Image(systemName: "checkmark")
                     }
                 }
             }
         }
+
+        if player.supportsSystemSpeechSubtitles {
+            Button {
+                player.setSystemSpeechSubtitlesEnabled(!player.isSpeechSubtitleEnabled)
+            } label: {
+                HStack {
+                    Label("Live Speech", systemImage: "waveform")
+                    if player.isSpeechSubtitleEnabled {
+                        Image(systemName: "checkmark")
+                    }
+                }
+            }
+        }
+
+        Divider()
+        Button {
+            toggleSubtitleSettingsPanel()
+        } label: {
+            Label("Subtitle Settings & Bilingual…", systemImage: "slider.horizontal.3")
+        }
+    }
+
+    private var liveSleepTimerMenu: some View {
+        Menu {
+            ForEach(PlayerSleepTimerOption.options(allowsEndOfVideo: false)) { option in
+                Button {
+                    player.setSleepTimer(option)
+                } label: {
+                    HStack {
+                        Text(option.label)
+                        if option == player.sleepTimerOption {
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: player.sleepTimerOption == .off ? "moon.zzz" : "moon.zzz.fill")
+                if let badge = player.sleepTimerMenuBadge {
+                    Text(verbatim: badge)
+                        .font(.caption.weight(.semibold))
+                        .monospacedDigit()
+                        .lineLimit(1)
+                }
+            }
+            .playerChromeCapsule(horizontal: 10, minHeight: 44)
+            .accessibilityHidden(true)
+        }
+        .accessibilityIdentifier("player.liveSleepTimer")
+        .accessibilityLabel(Text("Sleep Timer"))
+        .accessibilityValue(Text(player.sleepTimerMenuBadge ?? String(localized: "Off")))
     }
 
     private var narrowFullscreenToolsMenu: some View {
         Menu {
+            if let playlist = activeFullscreenPlaylist {
+                Button {
+                    playlistSheetPresented = true
+                } label: {
+                    Label(
+                        String(
+                            format: String(localized: "Playlist (%lld/%lld)"),
+                            playlist.displayIndex,
+                            playlist.totalCount
+                        ),
+                        systemImage: "list.bullet.rectangle"
+                    )
+                }
+            }
             if DetailDanmakuEntryPolicy.chromeShowsSettings(
-                usesOnlineVODServices: player.mode.usesOnlineVODServices,
+                usesOnlineVODServices: hasDanmakuSupport,
+                hasOfflineDanmaku: player.hasRegisteredOfflineDanmaku,
                 danmakuEnabled: danmakuEnabled,
                 isFullscreen: player.isFullscreen
             ) {
@@ -340,15 +544,13 @@ struct PlayerTopControlBar: View {
             } label: {
                 Label("Aspect Mode", systemImage: "aspectratio")
             }
-            if !player.availableSubtitles.isEmpty {
-                Menu {
-                    subtitleMenuItems
-                } label: {
-                    Label(
-                        "Subtitles",
-                        systemImage: player.activeSubtitleLan == nil ? "captions.bubble" : "captions.bubble.fill"
-                    )
-                }
+            Menu {
+                subtitleMenuItems
+            } label: {
+                Label(
+                    "Subtitles",
+                    systemImage: player.hasAnyActiveSubtitle ? "captions.bubble.fill" : "captions.bubble"
+                )
             }
             Toggle(isOn: Binding(get: { player.showStats }, set: { player.showStats = $0 })) {
                 Label("Playback Info", systemImage: "info.circle")
@@ -362,27 +564,6 @@ struct PlayerTopControlBar: View {
     }
 
     private var showsInlineMenuDanmakuSettings: Bool {
-        !player.isFullscreen && player.mode.usesOnlineVODServices && danmakuEnabled
-    }
-
-    private func presentInlineDanmakuPopoverFromMenu() {
-        player.setDanmakuSettingsHold(true)
-        inlineDanmakuPopoverTask?.cancel()
-        inlineDanmakuPopoverTask = Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(180))
-            guard !Task.isCancelled, showsInlineMenuDanmakuSettings else {
-                if !Task.isCancelled {
-                    player.setDanmakuSettingsHold(danmakuPanelPresented)
-                }
-                return
-            }
-            inlineDanmakuPopoverPresented = true
-        }
-    }
-
-    private var inlineDanmakuSettingsPanel: some View {
-        DanmakuPlayerSettingsPanel(presentation: .inline, surface: .popover) {
-            inlineDanmakuPopoverPresented = false
-        }
+        !player.isFullscreen && hasDanmakuSupport && danmakuEnabled
     }
 }

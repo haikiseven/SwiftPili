@@ -20,9 +20,14 @@ func scheduleMainRunloopTurn(_ work: @escaping @MainActor () -> Void) {
 }
 
 struct CommentComposerMorphContainer<ExpandedComposer: View>: View {
+    static var bezelAwareHorizontalPadding: CGFloat { 20 }
+    static var bezelAwareBottomFloor: CGFloat { 14 }
+    static var bezelAwareRestingExtraSpacing: CGFloat { 6 }
+
     let isExpanded: Bool
     let hasDraft: Bool
     var sourceIdentity: AnyHashable?
+    var ignoresContainerBottomSafeArea = false
     let onExpand: () -> Void
     let expandedComposer: () -> ExpandedComposer
 
@@ -31,6 +36,7 @@ struct CommentComposerMorphContainer<ExpandedComposer: View>: View {
     @State private var latestMeasuredSize: CGSize?
     @State private var hasMeasuredComposer = false
     @State private var windowIsLandscapeIPad = false
+    @State private var trackedKeyboardFrame: CGRect?
     @Namespace private var glassNamespace
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @AppMotion private var motion
@@ -39,15 +45,50 @@ struct CommentComposerMorphContainer<ExpandedComposer: View>: View {
         isExpanded: Bool,
         hasDraft: Bool,
         sourceIdentity: AnyHashable? = nil,
+        ignoresContainerBottomSafeArea: Bool = false,
         onExpand: @escaping () -> Void,
         @ViewBuilder expandedComposer: @escaping () -> ExpandedComposer
     ) {
         self.isExpanded = isExpanded
         self.hasDraft = hasDraft
         self.sourceIdentity = sourceIdentity
+        self.ignoresContainerBottomSafeArea = ignoresContainerBottomSafeArea
         self.onExpand = onExpand
         self.expandedComposer = expandedComposer
         _presentedExpanded = State(initialValue: isExpanded)
+    }
+
+    static func resolvedBottomPadding(
+        ignoresContainerBottomSafeArea: Bool,
+        physicalBottomSafeArea: CGFloat,
+        keyboardEffectiveBottomInset: CGFloat
+    ) -> CGFloat {
+        guard ignoresContainerBottomSafeArea else {
+            return IPadKeyboardComposerLayout.keyboardBottomSpacing
+        }
+        let physical = max(0, physicalBottomSafeArea)
+        if keyboardEffectiveBottomInset > physical + 1 {
+            return IPadKeyboardComposerLayout.keyboardBottomSpacing
+        }
+        return max(physical, bezelAwareBottomFloor) + bezelAwareRestingExtraSpacing
+    }
+
+    private var effectiveHorizontalPadding: CGFloat {
+        ignoresContainerBottomSafeArea ? Self.bezelAwareHorizontalPadding : AppSpacing.l
+    }
+
+    private var effectiveBottomPadding: CGFloat {
+        let physical = max(0, AppWindowMetrics.safeAreaInsets.bottom)
+        let keyboardInset = LivePortraitKeyboardLayout.effectiveBottomInset(
+            physicalBottomInset: physical,
+            keyboardFrame: trackedKeyboardFrame,
+            containerFrame: AppWindowMetrics.frameInScreen ?? .zero
+        )
+        return Self.resolvedBottomPadding(
+            ignoresContainerBottomSafeArea: ignoresContainerBottomSafeArea,
+            physicalBottomSafeArea: physical,
+            keyboardEffectiveBottomInset: keyboardInset
+        )
     }
 
     private var expandedHeight: CGFloat {
@@ -77,6 +118,11 @@ struct CommentComposerMorphContainer<ExpandedComposer: View>: View {
                 .frame(width: 0, height: 0)
             }
             .iPadLandscapeWindowProbe($windowIsLandscapeIPad)
+            .modifier(LiveKeyboardFrameTracker(frame: $trackedKeyboardFrame))
+            .animation(
+                motion.animation(normal: .easeOut(duration: 0.2)),
+                value: effectiveBottomPadding
+            )
             .onChange(of: isExpanded) { _, expanded in
                 handleExpansionChange(expanded)
             }
@@ -110,12 +156,14 @@ struct CommentComposerMorphContainer<ExpandedComposer: View>: View {
                         )
                         .glassEffectID("composer", in: glassNamespace)
                         .glassEffectTransition(.matchedGeometry)
-                        .padding(.horizontal, AppSpacing.l)
-                        .padding(.bottom, IPadKeyboardComposerLayout.keyboardBottomSpacing)
+                        .padding(.horizontal, effectiveHorizontalPadding)
+                        .padding(.bottom, effectiveBottomPadding)
                 } else {
                     CommentComposerLauncher(
                         hasDraft: hasDraft,
                         glassNamespace: glassNamespace,
+                        horizontalPadding: effectiveHorizontalPadding,
+                        bottomPadding: effectiveBottomPadding,
                         action: onExpand
                     )
                 }
@@ -134,13 +182,15 @@ struct CommentComposerMorphContainer<ExpandedComposer: View>: View {
                         cornerRadius: AppRadius.panel,
                         reduceTransparency: reduceTransparency
                     )
-                    .padding(.horizontal, AppSpacing.l)
-                    .padding(.bottom, IPadKeyboardComposerLayout.keyboardBottomSpacing)
+                    .padding(.horizontal, effectiveHorizontalPadding)
+                    .padding(.bottom, effectiveBottomPadding)
                     .transition(.opacity)
             } else {
                 CommentComposerLauncher(
                     hasDraft: hasDraft,
                     glassNamespace: nil,
+                    horizontalPadding: effectiveHorizontalPadding,
+                    bottomPadding: effectiveBottomPadding,
                     action: onExpand
                 )
                 .transition(.opacity)
@@ -163,13 +213,15 @@ struct CommentComposerMorphContainer<ExpandedComposer: View>: View {
                     cornerRadius: platterRadius,
                     reduceTransparency: reduceTransparency
                 )
-                .padding(.horizontal, AppSpacing.l)
-                .padding(.bottom, IPadKeyboardComposerLayout.keyboardBottomSpacing)
+                .padding(.horizontal, effectiveHorizontalPadding)
+                .padding(.bottom, effectiveBottomPadding)
 
             CommentComposerLauncher(
                 hasDraft: hasDraft,
                 glassNamespace: nil,
                 showsSurface: false,
+                horizontalPadding: effectiveHorizontalPadding,
+                bottomPadding: effectiveBottomPadding,
                 action: onExpand
             )
             .animation(launcherFadeAnimation) { content in
@@ -204,8 +256,8 @@ struct CommentComposerMorphContainer<ExpandedComposer: View>: View {
             )
             .allowsHitTesting(presentedExpanded)
             .accessibilityHidden(!presentedExpanded)
-            .padding(.horizontal, AppSpacing.l)
-            .padding(.bottom, IPadKeyboardComposerLayout.keyboardBottomSpacing)
+            .padding(.horizontal, effectiveHorizontalPadding)
+            .padding(.bottom, effectiveBottomPadding)
     }
 
     private var dockedComposer: some View {
@@ -307,14 +359,16 @@ struct CommentComposerLauncher: View {
     let hasDraft: Bool
     var glassNamespace: Namespace.ID?
     var showsSurface = true
+    var horizontalPadding: CGFloat = AppSpacing.l
+    var bottomPadding: CGFloat = IPadKeyboardComposerLayout.keyboardBottomSpacing
     let action: () -> Void
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
         launcherSurface
             .accessibilityLabel(Self.accessibilityTitle(hasDraft: hasDraft))
-            .padding(.horizontal, AppSpacing.l)
-            .padding(.bottom, IPadKeyboardComposerLayout.keyboardBottomSpacing)
+            .padding(.horizontal, horizontalPadding)
+            .padding(.bottom, bottomPadding)
     }
 
     @ViewBuilder

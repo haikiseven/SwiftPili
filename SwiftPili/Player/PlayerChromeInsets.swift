@@ -20,13 +20,15 @@ struct PlayerChromeInsets: Equatable, Sendable {
     static let fullscreenBottomFloor: CGFloat = 12
     static let fullscreenHorizontalPadding: CGFloat = 4
     static let fullscreenHorizontalFloor: CGFloat = 24
+    static let fullscreenPortraitHorizontalFloor: CGFloat = 16
 
     static func resolve(
         presentation: PlayerContainerPresentation,
         windowTop: CGFloat,
         windowBottom: CGFloat,
         windowLeft: CGFloat,
-        windowRight: CGFloat
+        windowRight: CGFloat,
+        isPortraitViewport: Bool = false
     ) -> Self {
         switch presentation {
         case .inlineSafeArea:
@@ -38,12 +40,15 @@ struct PlayerChromeInsets: Equatable, Sendable {
                 horizontal: max(0, max(windowLeft, windowRight))
             )
         case .fullscreen:
+            let horizontalFloor = isPortraitViewport
+                ? fullscreenPortraitHorizontalFloor
+                : fullscreenHorizontalFloor
             return Self(
                 top: max(0, windowTop),
                 bottom: max(max(0, windowBottom), fullscreenBottomFloor),
                 horizontal: max(
                     max(0, max(windowLeft, windowRight)) + fullscreenHorizontalPadding,
-                    fullscreenHorizontalFloor
+                    horizontalFloor
                 )
             )
         }

@@ -6,6 +6,8 @@ struct VideoDetailRootToastView: View {
     let commentPresentation: CommentZoomPresentation
     let isWideLayout: Bool
     let showsWideChrome: Bool
+    var showsInRoutePortraitImmersive: Bool = false
+    var pagerBottomInset: CGFloat = 0
     let stagePresentation: DetailStagePresentation
     let stagePanelWidth: CGFloat
     let hasActiveThread: Bool
@@ -13,11 +15,18 @@ struct VideoDetailRootToastView: View {
     var body: some View {
         VideoDetailCommentPresentationReader(presentation: commentPresentation) { commentsPresented in
             let handledByWidePanel = showsWideChrome && stagePresentation == .stage && !hasActiveThread
-            let handledByCompactOverlay = !isWideLayout && commentsPresented
+            let handledByCompactOverlay = !isWideLayout && !showsInRoutePortraitImmersive && commentsPresented
             let visibleToast = (!handledByWidePanel && !handledByCompactOverlay
-                && (isWideLayout || !commentsPresented))
+                && (isWideLayout || showsInRoutePortraitImmersive || !commentsPresented))
                 ? model.toast.flatMap { $0.style == .error ? nil : $0 }
                 : nil
+            let bottomPadding: CGFloat = if showsInRoutePortraitImmersive {
+                pagerBottomInset + 132
+            } else if showsWideChrome {
+                DetailStageLayout.outerMargin
+            } else {
+                0
+            }
             Group {
                 if let toast = visibleToast {
                     ToastView(message: toast)
@@ -26,7 +35,7 @@ struct VideoDetailRootToastView: View {
             .animation(motion.feedbackAnimation(normal: .spring(duration: 0.3)), value: visibleToast)
             .frame(maxWidth: showsWideChrome ? stagePanelWidth : .infinity)
             .padding(.trailing, showsWideChrome ? DetailStageLayout.outerMargin : 0)
-            .padding(.bottom, showsWideChrome ? DetailStageLayout.outerMargin : 0)
+            .padding(.bottom, bottomPadding)
             .frame(maxWidth: .infinity, alignment: showsWideChrome ? .trailing : .center)
         }
     }
@@ -36,9 +45,9 @@ extension VideoDetailView {
     var compactCommentsOverlay: some View {
         CommentZoomContainer(
             presentation: commentPresentation,
-            destination: commentsSurface(bottomInset: pagerBottomInset),
+            destination: { commentsSurface(bottomInset: pagerBottomInset) },
             onPresentationChanged: { isPresented in
-                if isPresented { updatePlayerCondensation() }
+                updatePlayerCondensation()
                 if !isPresented {
                     composer.collapse(motion: motion)
                 }
@@ -498,6 +507,353 @@ extension VideoDetailView {
         } else if model.comments.contains(where: { $0.rpid == postedRpid }) {
             commentTargetRpid = postedRpid
         }
+    }
+
+    func makePortraitFullscreenCommentsSheet() -> PortraitFullscreenCommentsSheet {
+        let model = viewModel
+        let requestedID = videoID
+        let coordinator = coordinator
+        return PortraitFullscreenCommentsSheet(
+            model: model,
+            requestedVideoID: requestedID,
+            coordinator: coordinator,
+            isRouteActive: { isActiveVideoRoute },
+            onNavigateRoute: { route in
+                if player.isFullscreen { player.exitFullscreen() }
+                coordinator.navigate(to: route)
+            },
+            onCommentPosted: {
+                syncPortraitFullscreenContext()
+            }
+        )
+    }
+}
+
+struct PortraitFullscreenCommentsSheet: View {
+    @AppMotion private var motion
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
+    let model: VideoDetailViewModel
+    let requestedVideoID: VideoID
+    let coordinator: AppCoordinator
+    let isRouteActive: @MainActor () -> Bool
+    let onNavigateRoute: @MainActor (Route) -> Void
+    let onCommentPosted: @MainActor () -> Void
+
+    @State private var commentPresentation = CommentZoomPresentation()
+    @State private var replyPresentation = CommentZoomPresentation()
+    @State private var composer = VideoCommentComposerState()
+    @State private var showThread: CommentThreadTarget?
+    @State private var commentTargetRpid: Int?
+    @State private var highlightedCommentRpid: Int?
+    @State private var previewImages: ImagePreviewItem?
+    @State private var commentLinkLifetime = ContentLinkLifetime()
+    @State private var selectedDetent: PresentationDetent = .medium
+
+    private var isComposerEligible: Bool {
+        AuthManager.shared.isLoggedIn && !model.commentsClosed
+    }
+
+    private var usesRegularPadFormSheet: Bool {
+        guard DeviceCapability.supportsPadFormSheetPresentation else { return false }
+        let windowClass = AppWindowMetrics.current?.traitCollection.horizontalSizeClass ?? .unspecified
+        if windowClass != .unspecified {
+            return windowClass == .regular
+        }
+        return horizontalSizeClass == .regular
+    }
+
+    var body: some View {
+        adaptiveDetentPresentation(
+            NavigationStack {
+                ObservedModel(model) { observedModel in
+                    replyRegion(model: observedModel) {
+                        ZStack(alignment: .top) {
+                            commentList(model: observedModel)
+                                .allowsHitTesting(showThread == nil)
+                                .accessibilityHidden(showThread != nil)
+                            VideoDetailComposerDismissScrim(
+                                composer: composer,
+                                isActive: showThread == nil
+                            )
+                        }
+                        .overlay(alignment: .bottom) {
+                            feedbackAndComposer(model: observedModel)
+                        }
+                    }
+                }
+                .navigationTitle("Comments")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { dismiss() }
+                    }
+                }
+            }
+            .environment(coordinator)
+            .imagePreview(item: $previewImages)
+            .accentContentBoundary()
+        )
+        .onAppear {
+            commentPresentation.isPresented = true
+        }
+        .onChange(of: composer.isExpanded) { _, expanded in
+            guard expanded, !usesRegularPadFormSheet, selectedDetent != .large else { return }
+            withAnimation(motion.animation(normal: .snappy(duration: 0.25))) {
+                selectedDetent = .large
+            }
+        }
+        .onChange(of: model.currentCommentSource) { _, source in
+            composer.collapseImmediatelyIfSourceCleared(source)
+            if let showThread,
+               showThread.type != 1
+                || showThread.oid != source?.aid
+                || composer.replyCommentSource != source {
+                replyPresentation.cancelPendingAction()
+                replyPresentation.isPresented = false
+                self.showThread = nil
+                composer.replyCommentSource = nil
+                replyPresentation.anchors.sourceProvider = nil
+            }
+        }
+        .onDisappear {
+            commentPresentation.isPresented = false
+            composer.collapse(motion: motion)
+        }
+    }
+
+    @ViewBuilder
+    private func adaptiveDetentPresentation<Content: View>(_ content: Content) -> some View {
+        if usesRegularPadFormSheet {
+            content
+                .appAdaptiveSheet(padSizing: .form)
+        } else {
+            content
+                .presentationDetents([.medium, .large], selection: $selectedDetent)
+                .presentationDragIndicator(.visible)
+        }
+    }
+
+    private func replyRegion<Main: View>(
+        model: VideoDetailViewModel,
+        @ViewBuilder root: () -> Main
+    ) -> some View {
+        let target = showThread
+        return CommentReplyZoomContainer(
+            presentation: replyPresentation,
+            root: root(),
+            destination: Group {
+                if let target { commentThreadInline(target, model: model) }
+            },
+            ownsKeyboardSafeArea: true,
+            onDismissed: { finishCommentThreadDismissal(target?.id) }
+        )
+        .ignoresSafeArea(.container, edges: .bottom)
+    }
+
+    private func commentThreadInline(
+        _ target: CommentThreadTarget,
+        model: VideoDetailViewModel
+    ) -> some View {
+        VStack(spacing: 0) {
+            CommentThreadHeader(
+                isWideLayout: false,
+                anchors: replyPresentation.anchors,
+                onBack: closeCommentThread,
+                onClose: { dismiss() }
+            )
+            CommentThreadView(
+                oid: target.oid,
+                rootComment: target.root,
+                highlightRpid: target.highlightRpid,
+                type: target.type,
+                upMid: model.videoInfo?.owner.mid,
+                isStandalonePage: false,
+                onAvatarTap: { mid in
+                    navigateFromSheet(to: .userSpace(mid))
+                }
+            )
+            .id(target.id)
+            .modifier(CommentThreadLinkHandoff { url, context in
+                openCommentThreadURL(url, context: context)
+            })
+            .contentLinks(isCurrent: {
+                isRouteActive() && replyPresentation.isPresented && showThread?.id == target.id
+                    && composer.replyCommentSource == model.currentCommentSource
+            })
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    private func commentList(model: VideoDetailViewModel) -> some View {
+        let source = model.currentCommentSource
+        let eligible = AuthManager.shared.isLoggedIn && !model.commentsClosed
+        let headerView: AnyView? = model.videoInfo != nil ? AnyView(commentHeader(model: model)) : nil
+        let headerFingerprint = model.videoInfo.map { info in
+            VideoCommentHeaderFingerprint(
+                replyCount: info.stat.reply,
+                commentsClosed: model.commentsClosed,
+                commentSort: model.commentSort,
+                sourceAid: source?.aid,
+                sourceGeneration: source?.generation
+            )
+        }
+        return VideoDetailCommentList(
+            model: model,
+            requestedID: requestedVideoID,
+            highlightedRpid: highlightedCommentRpid,
+            scrollToRpid: commentTargetRpid,
+            headerView: headerView,
+            headerFingerprint: headerFingerprint,
+            showsInitialVideoSkeletons: false,
+            closedTopPadding: 40,
+            bottomClearance: eligible ? 120 : 32,
+            showsScrollIndicators: true,
+            actions: rowActions,
+            unavailableView: nil,
+            unavailableFingerprint: nil,
+            onRefresh: {
+                guard model.hasCommentSource(for: requestedVideoID),
+                      let request = model.prepareCommentRefresh(from: source) else { return false }
+                await model.performCommentRequest(request)
+                return false
+            },
+            onScrollOffsetChange: nil
+        )
+        .task(id: commentTargetRpid) {
+            guard let target = commentTargetRpid else { return }
+            highlightedCommentRpid = target
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled, highlightedCommentRpid == target else { return }
+            highlightedCommentRpid = nil
+            commentTargetRpid = nil
+        }
+    }
+
+    private func commentHeader(model: VideoDetailViewModel) -> some View {
+        let source = model.currentCommentSource
+        return HStack(spacing: 6) {
+            if let count = model.videoInfo?.stat.reply, count > 0 {
+                Text(FormatUtils.viewCount(count))
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            Spacer(minLength: 8)
+            if !model.commentsClosed {
+                CommentSortBar(selection: model.commentSort) { sort in
+                    guard model.hasCommentSource(for: requestedVideoID),
+                          model.currentCommentSource == source,
+                          let request = model.prepareCommentSort(sort, from: source) else { return }
+                    Task { await model.performCommentRequest(request) }
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func feedbackAndComposer(model: VideoDetailViewModel) -> some View {
+        let visibleToast = model.toast.flatMap { $0.style == .error ? nil : $0 }
+        let showsInput = showThread == nil && isComposerEligible
+        return VStack(spacing: 10) {
+            Group {
+                if let toast = visibleToast {
+                    ToastView(message: toast)
+                }
+            }
+            .animation(motion.feedbackAnimation(normal: .spring(duration: 0.3)), value: visibleToast)
+
+            if showsInput {
+                VideoDetailCommentComposerBar(
+                    composer: composer,
+                    model: model,
+                    commentPresentation: commentPresentation,
+                    requestedVideoID: requestedVideoID,
+                    usesFeedWidth: DeviceCapability.supportsPadDetailSplit,
+                    ignoresContainerBottomSafeArea: !usesRegularPadFormSheet,
+                    showsCommentInput: { presented in
+                        presented && showThread == nil && isComposerEligible
+                    },
+                    isModelCurrent: { model.hasCommentSource(for: requestedVideoID) },
+                    onRevealPostedComment: { postedRpid, target, postedModel, sourceIsCurrent in
+                        guard sourceIsCurrent(),
+                              let source = postedModel.currentCommentSource else { return }
+                        onCommentPosted()
+                        if let target {
+                            let root = postedModel.comments.first(where: { $0.rpid == target.rpid }) ?? target
+                            openCommentThread(CommentThreadTarget(
+                                oid: source.aid, type: 1, root: root, highlightRpid: postedRpid
+                            ))
+                        } else if postedModel.comments.contains(where: { $0.rpid == postedRpid }) {
+                            commentTargetRpid = postedRpid
+                        }
+                    }
+                )
+            }
+        }
+    }
+
+    private var rowActions: VideoDetailCommentRowActions {
+        VideoDetailCommentRowActions(
+            isRouteActive: isRouteActive,
+            currentVideoID: { requestedVideoID },
+            reply: { target in
+                composer.beginReply(
+                    to: target,
+                    aid: model.videoInfo?.aid ?? 0,
+                    motion: motion
+                )
+            },
+            openThread: { target in
+                openCommentThread(target)
+            },
+            previewImages: { item in previewImages = item }
+        )
+    }
+
+    private func openCommentThread(_ target: CommentThreadTarget) {
+        guard let source = model.currentCommentSource,
+              source.aid == target.oid, target.type == 1 else { return }
+        replyPresentation.cancelPendingAction()
+        commentLinkLifetime.invalidate()
+        coordinator.contentLinks.cancel()
+        composer.collapse(motion: motion)
+        replyPresentation.anchors.sourceProvider = { nil }
+        composer.replyCommentSource = source
+        showThread = target
+        replyPresentation.isPresented = true
+    }
+
+    private func closeCommentThread() {
+        replyPresentation.cancelPendingAction()
+        let threadID = showThread?.id
+        replyPresentation.dismissThenPerform { finishCommentThreadDismissal(threadID) }
+    }
+
+    private func finishCommentThreadDismissal(_ threadID: CommentThreadTarget.Identity?) {
+        guard !replyPresentation.isPresented, showThread?.id == threadID else { return }
+        showThread = nil
+        composer.replyCommentSource = nil
+        replyPresentation.anchors.sourceProvider = nil
+    }
+
+    private func openCommentThreadURL(
+        _ url: URL,
+        context: ContentLinkContext
+    ) -> OpenURLAction.Result {
+        guard let origin = coordinator.contentLinkOrigin(context) else { return .discarded }
+        coordinator.contentLinks.open(url, context: origin) { route in
+            origin.beforeNavigate()
+            navigateFromSheet(to: route)
+        }
+        return .handled
+    }
+
+    private func navigateFromSheet(to route: Route) {
+        composer.collapse(motion: motion)
+        dismiss()
+        onNavigateRoute(route)
     }
 }
 

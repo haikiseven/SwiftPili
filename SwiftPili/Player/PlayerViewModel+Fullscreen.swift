@@ -111,13 +111,91 @@ final class FullscreenOrientationLatch {
 
 extension PlayerViewModel {
 
-    func showNotice(_ text: String) {
-        skipNotice = text
+    func showNotice(_ text: String, duration: TimeInterval = 2.5) {
+        presentNoticeBanner(
+            PlayerNoticeBanner(
+                text: text,
+                actionTitle: nil,
+                duration: duration,
+                isResumeNotice: false,
+                onAction: nil
+            )
+        )
+    }
+
+    func showInteractiveNotice(
+        text: String,
+        actionTitle: String,
+        duration: TimeInterval = 5.0,
+        isResumeNotice: Bool = false,
+        onAction: @escaping @MainActor () -> Void
+    ) {
+        presentNoticeBanner(
+            PlayerNoticeBanner(
+                text: text,
+                actionTitle: actionTitle,
+                duration: duration,
+                isResumeNotice: isResumeNotice,
+                onAction: onAction
+            )
+        )
+    }
+
+    func triggerNoticeBannerAction() {
+        guard let banner = activeNoticeBanner else { return }
+        dismissNoticeBanner()
+        banner.onAction?()
+    }
+
+    func dismissNoticeBanner(onlyIfResume: Bool = false) {
+        if onlyIfResume, activeNoticeBanner?.isResumeNotice != true {
+            return
+        }
         skipNoticeTask?.cancel()
-        skipNoticeTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(2.5))
-            guard !Task.isCancelled else { return }
-            self?.skipNotice = nil
+        skipNoticeTask = nil
+        if activeNoticeBanner != nil {
+            activeNoticeBanner = nil
+        }
+    }
+
+    private func presentNoticeBanner(_ banner: PlayerNoticeBanner) {
+        activeNoticeBanner = banner
+        skipNoticeTask?.cancel()
+        let bannerID = banner.id
+        let duration = max(0.5, banner.duration)
+        skipNoticeTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(duration))
+            guard !Task.isCancelled, let self, self.activeNoticeBanner?.id == bannerID else { return }
+            self.activeNoticeBanner = nil
+            self.skipNoticeTask = nil
+        }
+    }
+
+    func presentPendingHistoryResumeNoticeIfNeeded() {
+        if let notice = pendingHistoryResumeNotice {
+            pendingHistoryResumeNotice = nil
+            pendingPartLocationNotice = nil
+            let expectedLoadGeneration = loadGeneration
+            showInteractiveNotice(
+                text: notice.formattedNoticeText(),
+                actionTitle: String(localized: "Start Over"),
+                duration: 5.0,
+                isResumeNotice: true
+            ) { [weak self] in
+                guard let self, self.loadGeneration == expectedLoadGeneration else { return }
+                self.seek(to: 0)
+                if !self.isPlaying {
+                    self.play()
+                }
+            }
+            return
+        }
+        if let partNumber = pendingPartLocationNotice {
+            pendingPartLocationNotice = nil
+            showNotice(
+                String(format: String(localized: "Resumed at P%lld"), Int64(partNumber)),
+                duration: 3.5
+            )
         }
     }
 
@@ -129,10 +207,12 @@ extension PlayerViewModel {
 
     func scheduleHideControls(isSeeking: Bool = false) {
         hideControlsTask?.cancel()
-        guard showControls, !danmakuSettingsHold, !isSeeking, !isSeekInFlight else { return }
+        guard showControls, !danmakuSettingsHold, !isSeeking, !isSeekInFlight,
+              !playbackEnded, error == nil else { return }
         hideControlsTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(5))
-            guard !Task.isCancelled, let self, !self.isSeekInFlight else { return }
+            guard !Task.isCancelled, let self,
+                  !self.isSeekInFlight, !self.playbackEnded, self.error == nil else { return }
             withAnimation(.easeInOut(duration: 0.2)) {
                 self.showControls = false
             }
@@ -225,6 +305,7 @@ extension PlayerViewModel {
         guard isFullscreen else { return }
         setDanmakuSettingsHold(false)
         fullscreenDanmakuComposerPresented = false
+        portraitPureViewEnabled = false
         PlayerLog.log("[Fullscreen] exit: portrait=\(isPortraitContent) condensed=\(inlineCondensed) showControls=\(showControls)")
         let hasActiveHost = fullscreenPresentation?.hasPresentedHost == true
         if !hasActiveHost, let ownerLease = currentOwnerLease {
@@ -280,6 +361,21 @@ extension PlayerViewModel {
     }
 
     func requestFullscreenTransition(target: Bool, source: FullscreenTransitionSource) {
+        if source == .button,
+           mode != .live,
+           let handler = onRequestInlinePortraitImmersive {
+            if !target, !isFullscreen, isInlinePortraitImmersiveActive, handler(false) {
+                portraitPureViewEnabled = false
+                return
+            }
+            if target, isPortraitContent, !isFullscreen, !isInlinePortraitImmersiveActive, handler(true) {
+                portraitPureViewEnabled = false
+                hideControlsTask?.cancel()
+                hideControlsTask = nil
+                if !showControls { showControls = true }
+                return
+            }
+        }
         guard fullscreenTransition.shouldStart(target: target, currentState: isFullscreen) else { return }
         if source == .button {
             FullscreenOrientationLatch.shared.recordButtonTransition(targetFullscreen: target)
@@ -289,17 +385,6 @@ extension PlayerViewModel {
         } else {
             exitFullscreen()
         }
-    }
-
-    func togglePortraitExpand() {
-        guard isPortraitContent, !isFullscreen else { return }
-        let was = inlineCondensed
-        inlineCondensed.toggle()
-        portraitCondenseLocked = true
-        PlayerLog.log(
-            "[condense] manual condensed=\(was)→\(inlineCondensed) "
-            + "locked=\(portraitCondenseLocked)"
-        )
     }
 
     @discardableResult

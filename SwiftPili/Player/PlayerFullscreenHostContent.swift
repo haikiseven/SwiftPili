@@ -83,10 +83,19 @@ struct PlayerFullscreenHostContent: View {
                 ? proxy.size
                 : geometry.containerSize
             let viewportAspect = PlayerFullscreenViewportPolicy.aspect(for: resolvedSize)
+            let isPortraitImmersive = player.isPortraitContent && player.mode != .live
+            let resolvedTopInset = isPortraitImmersive
+                ? max(geometry.safeAreaInsets.top, AppWindowMetrics.safeAreaInsets.top)
+                : max(0, geometry.safeAreaInsets.top)
+            let resolvedBottomInset = isPortraitImmersive
+                ? max(geometry.safeAreaInsets.bottom, AppWindowMetrics.safeAreaInsets.bottom)
+                : (geometry.safeAreaInsets.bottom > 0
+                    ? min(geometry.safeAreaInsets.bottom, AppWindowMetrics.safeAreaInsets.bottom)
+                    : 0)
             let playerSafeArea = EdgeInsets(
-                top: geometry.safeAreaInsets.top,
+                top: resolvedTopInset,
                 leading: geometry.safeAreaInsets.leading,
-                bottom: min(geometry.safeAreaInsets.bottom, AppWindowMetrics.safeAreaInsets.bottom),
+                bottom: resolvedBottomInset,
                 trailing: geometry.safeAreaInsets.trailing
             )
             PlayerView(
@@ -130,16 +139,11 @@ struct PlayerFullscreenHostContent: View {
             else { return }
             presentFullscreenDanmakuNotice(message)
         }
-        .onReceive(
-            NotificationCenter.default.publisher(
-                for: UIResponder.keyboardWillChangeFrameNotification
-            )
-        ) { notification in
-            fullscreenKeyboardFrame = keyboardFrame(from: notification)
-        }
+        .modifier(LiveKeyboardFrameTracker(frame: $fullscreenKeyboardFrame))
         .onChange(of: player.isFullscreen) { _, isFullscreen in
             guard isCurrentContext else { return }
             if !isFullscreen {
+                player.portraitPureViewEnabled = false
                 handOffUnsentFullscreenDanmakuDraft()
                 dismissFullscreenDanmakuComposer()
             }
@@ -275,14 +279,5 @@ struct PlayerFullscreenHostContent: View {
             fullscreenDanmakuDraft = ""
         }
         if isCurrentContext { player.fullscreenDanmakuComposerPresented = false }
-    }
-
-    private func keyboardFrame(from notification: Notification) -> CGRect? {
-        guard let value = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue else {
-            return nil
-        }
-        let frame = value.cgRectValue
-        guard frame.width > 0, frame.height > 0 else { return nil }
-        return frame
     }
 }

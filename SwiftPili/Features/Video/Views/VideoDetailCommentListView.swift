@@ -84,10 +84,24 @@ struct VideoDetailCommentList: View {
         }
         let footer = resolvedFooter(receipt: receipt)
         let currentComments = model.comments
-        let visibleComments = CommentAIFilterEngine.shared.visibleComments(
-            from: currentComments,
-            upMid: model.videoInfo?.owner.mid
+        let filterStore = LocalContentFilterStore.shared
+        let _ = (
+            filterStore.revision,
+            filterStore.collapseFilteredComments,
+            BlocklistManager.shared.isEnabled,
+            BlocklistManager.shared.blockedMids.count
         )
+        let visibleComments = CommentAIFilterEngine.shared
+            .visibleComments(
+                from: currentComments,
+                upMid: model.videoInfo?.owner.mid
+            )
+            .filter {
+                !filterStore.shouldHideCommentCompletely(
+                    mid: $0.mid,
+                    content: $0.content.displayMessage
+                )
+            }
         UIKitCommentFeedCollectionView(
             headerItems: headerItems,
             items: commentItems(visibleComments, receipt: receipt),

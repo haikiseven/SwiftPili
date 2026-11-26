@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import Observation
 
@@ -23,6 +24,7 @@ struct VideoDetailLoadAdmission: Equatable, Sendable {
 final class VideoDetailViewModel {
     var videoInfo: VideoInfo?
     var relatedVideos: [VideoCard] = []
+    @ObservationIgnored private var rawRelatedVideos: [VideoCard] = []
     var tagPublication: TagPublication?
     var tags: [VideoTag] { tagPublication?.tags ?? [] }
     @ObservationIgnored var tagRequestSerial: UInt64 = 0
@@ -49,14 +51,26 @@ final class VideoDetailViewModel {
     var isFavorited = false
     var isInWatchLater = false
     var hasShared = false
+    var tripleComboCelebrationTick: Int = 0
     var isFollowingUp: Bool?
     var defaultFolderId: Int?
     var toast: ToastMessage?
     var currentCid: Int?
     var onlineCount: String?
 
+    init() {
+        LocalContentFilterStore.shared.addObserver(self) { model in
+            model.applyRelatedVideoContentFilters()
+        }
+    }
+
     private var loadedID: VideoID?
+
+    func matchesLoadedVideo(_ id: VideoID) -> Bool {
+        loadedID == id && videoInfo != nil
+    }
     @ObservationIgnored var startupTraceToken: StartupTrace.Token?
+    @ObservationIgnored private var initialAspectRatioHint: CGFloat?
     private var loadAdmission = VideoDetailLoadAdmission()
     @ObservationIgnored private var loadAccountSession: UUID?
     @ObservationIgnored var metadataAccountSession: UUID?
@@ -146,21 +160,179 @@ final class VideoDetailViewModel {
         }
     }
 
+    struct CrossPartResumePlan: Equatable, Sendable {
+        let targetPage: VideoInfo.VideoPage
+        let resumeAt: TimeInterval?
+        let resumedPartNumber: Int
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.targetPage.cid == rhs.targetPage.cid
+                && lhs.targetPage.page == rhs.targetPage.page
+                && lhs.targetPage.part == rhs.targetPage.part
+                && lhs.targetPage.duration == rhs.targetPage.duration
+                && lhs.resumeAt == rhs.resumeAt
+                && lhs.resumedPartNumber == rhs.resumedPartNumber
+        }
+    }
+
+    static func resolveCrossPartResume(
+        info: VideoInfo,
+        initialCid: Int,
+        preferredCid: Int?,
+        hasPendingReturn: Bool,
+        lastPlayCid: Int?,
+        lastPlayTimeMs: Int?
+    ) -> CrossPartResumePlan? {
+        guard let pages = info.pages, pages.count > 1,
+              preferredCid == nil,
+              !hasPendingReturn,
+              let lastPlayCid, lastPlayCid > 0, lastPlayCid != initialCid,
+              let targetPage = pages.first(where: { $0.cid == lastPlayCid }) else {
+            return nil
+        }
+        let partLookup = ServerResumeLookup.classify(
+            lastPlayTimeMs: lastPlayTimeMs,
+            duration: TimeInterval(targetPage.duration)
+        )
+        if partLookup == .watchedToEnd, targetPage.cid == pages.last?.cid {
+            return nil
+        }
+        switch partLookup {
+        case .resume(let seconds):
+            return CrossPartResumePlan(
+                targetPage: targetPage,
+                resumeAt: seconds,
+                resumedPartNumber: targetPage.page
+            )
+        case .noHistory, .watchedToEnd, .cancelled:
+            return CrossPartResumePlan(
+                targetPage: targetPage,
+                resumeAt: nil,
+                resumedPartNumber: targetPage.page
+            )
+        }
+    }
+
+    static func resolvedInitialCid(
+        info: VideoInfo,
+        pendingReturn: PendingMiniPlayerReturnVOD?,
+        preferredCid: Int? = nil
+    ) -> Int {
+        if let pendingReturn,
+           pendingReturn.aid == info.aid,
+           pendingReturn.source == .ugc {
+            if let pages = info.pages, !pages.isEmpty {
+                return pages.contains(where: { $0.cid == pendingReturn.cid })
+                    ? pendingReturn.cid
+                    : info.cid
+            }
+            return pendingReturn.cid == info.cid ? pendingReturn.cid : info.cid
+        }
+        if let preferredCid, preferredCid > 0 {
+            if let pages = info.pages, !pages.isEmpty {
+                return pages.contains(where: { $0.cid == preferredCid })
+                    ? preferredCid
+                    : info.cid
+            }
+            return preferredCid == info.cid ? preferredCid : info.cid
+        }
+        return info.cid
+    }
+
     @discardableResult
     func load(
         id: VideoID,
+        preferredCid: Int? = nil,
         owner requestedOwner: String? = nil,
-        lease retainedLease: PlayerOwnerLease? = nil
+        lease retainedLease: PlayerOwnerLease? = nil,
+        initialAspectRatioHint: CGFloat? = nil
     ) async -> Bool {
+        if loadedID != id || initialAspectRatioHint != nil {
+            self.initialAspectRatioHint = initialAspectRatioHint
+        }
         let owner = requestedOwner ?? PlayerViewModel.vodOwner(id)
+        if let info = videoInfo,
+           loadedID == id,
+           metadataAccountSession == AuthManager.shared.sessionGeneration,
+           error == nil,
+           unavailability == nil {
+            let activeLease = retainedLease ?? playerLease
+            if let pendingReturn = PlayerViewModel.shared.pendingMiniPlayerReturnVOD(
+                forAid: info.aid,
+                ownerLease: activeLease
+            ) {
+                let targetCid = Self.resolvedInitialCid(info: info, pendingReturn: pendingReturn)
+                if targetCid != currentCid,
+                   PlayerViewModel.shared.consumeMiniPlayerReturnIfLiveVOD(
+                       aid: info.aid,
+                       cid: targetCid,
+                       bvid: info.bvid,
+                       source: .ugc,
+                       quality: nil,
+                       ownerLease: activeLease,
+                       startupTraceToken: nil,
+                       mediaResetID: nil,
+                       recoveryCoverIdentity: nil,
+                       cdnSwitchID: nil,
+                       streamRetryID: nil
+                   ) {
+                    currentCid = targetCid
+                    if let activeLease {
+                        adoptPlayerLease(activeLease)
+                    }
+                    retainedScreenData = retainedScreenData?.replacingPart(targetCid)
+                    let page = info.pages?.first(where: { $0.cid == targetCid })
+                    let artist: String = if let pages = info.pages, pages.count > 1,
+                                            let page, !page.part.isEmpty {
+                        "P\(page.page) \(page.part)"
+                    } else {
+                        info.owner.name
+                    }
+                    PlayerViewModel.shared.setNowPlaying(
+                        title: info.title,
+                        artist: artist,
+                        cover: info.pic
+                    )
+                    installNextPartHandler()
+                    Task { await SponsorBlockManager.shared.load(videoID: info.bvid, cid: targetCid) }
+                    let tagReq = prepareTags(aid: info.aid, cid: targetCid, retainsDisplay: true) { [weak self] in
+                        self?.videoInfo?.aid == info.aid && self?.currentCid == targetCid
+                    }
+                    Task { await self.loadTags(tagReq) }
+                    refreshOnlineCount()
+                    recoverCommentsAfterProvedLiveReactivation(id: id)
+                    PlayerLog.log(
+                        "[VideoDetailVM] adopted mini-player advanced part " +
+                        "aid=\(info.aid) cid=\(targetCid) owner=\(owner)"
+                    )
+                    return true
+                }
+            }
+        }
         let retainedData = retainedDataForActivation(id: id)
         let decision = VideoDetailReactivationPolicy.decision(
             alreadyLive: isLiveReactivation(id: id, owner: owner, retainedLease: retainedLease),
             dataRetained: retainedData != nil
         )
         if decision == .alreadyLive {
-            recoverCommentsAfterProvedLiveReactivation(id: id)
             let player = PlayerViewModel.shared
+            if let info = videoInfo, let cid = currentCid {
+                _ = player.consumeMiniPlayerReturnIfLiveVOD(
+                    aid: info.aid,
+                    cid: cid,
+                    bvid: info.bvid,
+                    source: .ugc,
+                    quality: nil,
+                    ownerLease: retainedLease ?? playerLease,
+                    startupTraceToken: nil,
+                    mediaResetID: nil,
+                    recoveryCoverIdentity: nil,
+                    cdnSwitchID: nil,
+                    streamRetryID: nil
+                )
+                installNextPartHandler()
+            }
+            recoverCommentsAfterProvedLiveReactivation(id: id)
             PlayerLog.log(
                 "[VideoDetailVM] re-activation is a no-op — already live " +
                 "aid=\(videoInfo?.aid ?? 0) cid=\(currentCid ?? 0) " +
@@ -223,7 +395,17 @@ final class VideoDetailViewModel {
             commentRevocationWitness = nil
             commentListReceipt = nil
             commentFeedback = CommentLoadFeedback()
-            self.currentCid = info.cid
+            let pendingReturn = PlayerViewModel.shared.pendingMiniPlayerReturnVOD(
+                forAid: info.aid,
+                ownerLease: lease
+            )
+            let initialCid = Self.resolvedInitialCid(
+                info: info,
+                pendingReturn: pendingReturn,
+                preferredCid: preferredCid
+            )
+            let initialPage = info.pages?.first(where: { $0.cid == initialCid })
+            self.currentCid = initialCid
             let initialPartBaseline = partAdmission.currentRequest
             comments = []
             commentPage = 1
@@ -232,12 +414,12 @@ final class VideoDetailViewModel {
             commentsLoadedAid = nil
             PlayerViewModel.shared.setAmbientCoverURL(info.pic, ownerLease: lease)
 
-            Task { await SponsorBlockManager.shared.load(videoID: info.bvid, cid: info.cid) }
-            let tagRequest = prepareTags(aid: info.aid, cid: info.cid) { [weak self] in
+            Task { await SponsorBlockManager.shared.load(videoID: info.bvid, cid: initialCid) }
+            let tagRequest = prepareTags(aid: info.aid, cid: initialCid) { [weak self] in
                 guard let self else { return false }
                 return self.ownsCurrentLoad(request, lease: lease)
                     && self.partAdmission.admits(initialPartBaseline)
-                    && self.currentCid == info.cid
+                    && self.currentCid == initialCid
             }
             loadInitialTags(tagRequest, cached: cachedData)
 
@@ -248,13 +430,40 @@ final class VideoDetailViewModel {
             async let firstComments: Void = loadInitialComments(
                 initialComments, request: request, lease: lease
             )
-            let partDuration = info.pages?.first(where: { $0.cid == info.cid })?.duration ?? info.duration
-            let resumeLookup = await PlayerViewModel.serverResumePoint(
+            let partDuration = initialPage?.duration ?? info.duration
+            let player = PlayerViewModel.shared
+            let isLiveMiniPlayerReturn = player.matchesLiveMiniPlayerReturnVOD(
                 aid: info.aid,
-                cid: info.cid,
-                duration: TimeInterval(partDuration),
+                cid: initialCid,
+                source: .ugc,
                 ownerLease: lease
             )
+            let isAlreadyPlayingTargetVOD = !isLiveMiniPlayerReturn
+                && player.isCurrentOwner(lease)
+                && player.mode == .vod
+                && player.currentAid == info.aid
+                && player.currentCid == initialCid
+                && player.currentSource == .ugc
+                && player.currentURL != nil
+                && !player.currentPlaybackTerminalState.isTerminal
+                && player.error == nil
+                && player.unavailability == nil
+                && !player.terminalOpenFailure
+            let resumeMetadata: ServerResumeMetadata
+            if isLiveMiniPlayerReturn || isAlreadyPlayingTargetVOD {
+                PlayerLog.log(
+                    "[VideoDetailVM] skipping serverResumePoint for live session " +
+                    "aid=\(info.aid) cid=\(initialCid)"
+                )
+                resumeMetadata = .noHistory
+            } else {
+                resumeMetadata = await PlayerViewModel.serverResumeMetadata(
+                    aid: info.aid,
+                    cid: initialCid,
+                    duration: TimeInterval(partDuration),
+                    ownerLease: lease
+                )
+            }
             guard ownsCurrentLoad(request, lease: lease) else {
                 StartupTrace.abort("stale-page-request", token: traceToken)
                 return false
@@ -262,59 +471,138 @@ final class VideoDetailViewModel {
             let initialPartStillSelected: () -> Bool = {
                 self.ownsCurrentLoad(request, lease: lease)
                     && self.partAdmission.admits(initialPartBaseline)
-                    && self.currentCid == info.cid
+                    && self.currentCid == initialCid
                     && self.partSwitchInFlight == nil
             }
+            var effectiveCid = initialCid
+            var effectivePage = initialPage
             if initialPartStillSelected() {
-                guard case .load(let resumeAt) = resumeLookup.loadDecision() else {
-                    StartupTrace.abort("resume-lookup-cancelled", token: traceToken)
+                if isAlreadyPlayingTargetVOD {
+                    let resolvedAspectRatioHint = initialPage?.dimension?.effectiveAspectRatio
+                        ?? info.dimension?.effectiveAspectRatio
+                        ?? self.initialAspectRatioHint
+                    player.applyAspectRatioHint(resolvedAspectRatioHint)
+                    StartupTrace.abort("already-playing-target-vod", token: traceToken)
                     PlayerLog.log(
-                        "[VideoDetailVM] load aborted — resume lookup cancelled aid=\(info.aid) cid=\(info.cid)"
+                        "[VideoDetailVM] adopted live playback without reload aid=\(info.aid) cid=\(initialCid)"
                     )
-                    return false
-                }
-                StartupTrace.mark("resume-point-ready", token: traceToken)
-                await PlayerViewModel.shared.loadVOD(
-                    aid: info.aid, cid: info.cid, bvid: info.bvid,
-                    resumeAt: resumeAt,
-                    portraitHint: info.dimension?.isPortrait,
-                    owner: lease.owner,
-                    ownerLease: lease,
-                    startupTraceToken: traceToken,
-                    requestAdmission: { [weak self] in
-                        guard let self else { return false }
-                        return self.ownsCurrentLoad(request, lease: lease)
-                            && self.partAdmission.admits(initialPartBaseline)
-                            && self.currentCid == info.cid
-                            && self.partSwitchInFlight == nil
+                } else {
+                    guard case .load(let rawResumeAt) = resumeMetadata.lookup.loadDecision() else {
+                        StartupTrace.abort("resume-lookup-cancelled", token: traceToken)
+                        PlayerLog.log(
+                            "[VideoDetailVM] load aborted — resume lookup cancelled aid=\(info.aid) cid=\(initialCid)"
+                        )
+                        return false
                     }
-                )
+                    let crossPart = Self.resolveCrossPartResume(
+                        info: info,
+                        initialCid: initialCid,
+                        preferredCid: preferredCid,
+                        hasPendingReturn: pendingReturn != nil,
+                        lastPlayCid: resumeMetadata.lastPlayCid,
+                        lastPlayTimeMs: resumeMetadata.lastPlayTimeMs
+                    )
+                    let effectiveResumeAt: TimeInterval?
+                    let resumedPartNumber: Int?
+                    if let crossPart {
+                        effectiveCid = crossPart.targetPage.cid
+                        effectivePage = crossPart.targetPage
+                        self.currentCid = effectiveCid
+                        PlayerViewModel.shared.clearPlayerInfoHandoff(matching: lease)
+                        let switchedCid = effectiveCid
+                        Task { await SponsorBlockManager.shared.load(videoID: info.bvid, cid: switchedCid) }
+                        let crossPartTagRequest = prepareTags(aid: info.aid, cid: switchedCid) { [weak self] in
+                            guard let self else { return false }
+                            return self.ownsCurrentLoad(request, lease: lease)
+                                && self.partAdmission.admits(initialPartBaseline)
+                                && self.currentCid == switchedCid
+                        }
+                        loadInitialTags(crossPartTagRequest, cached: nil)
+                        effectiveResumeAt = crossPart.resumeAt
+                        resumedPartNumber = crossPart.resumedPartNumber
+                        PlayerLog.log(
+                            "[VideoDetailVM] cross-part resume aid=\(info.aid) " +
+                            "cid=\(initialCid)→\(effectiveCid) (P\(crossPart.resumedPartNumber)) " +
+                            "resumeAt=\(crossPart.resumeAt.map { String(format: "%.0fs", $0) } ?? "0s")"
+                        )
+                    } else {
+                        if let lastPlayCid = resumeMetadata.lastPlayCid,
+                           lastPlayCid > 0,
+                           lastPlayCid != initialCid {
+                            effectiveResumeAt = nil
+                        } else {
+                            effectiveResumeAt = rawResumeAt
+                        }
+                        if let pages = info.pages, pages.count > 1,
+                           let page = initialPage,
+                           preferredCid != nil,
+                           page.page > 1,
+                           let effectiveResumeAt, effectiveResumeAt > 2 {
+                            resumedPartNumber = page.page
+                        } else {
+                            resumedPartNumber = nil
+                        }
+                    }
+                    let resolvedAspectRatioHint = effectivePage?.dimension?.effectiveAspectRatio
+                        ?? info.dimension?.effectiveAspectRatio
+                        ?? self.initialAspectRatioHint
+                    let targetCid = effectiveCid
+                    StartupTrace.mark("resume-point-ready", token: traceToken)
+                    await PlayerViewModel.shared.loadVOD(
+                        aid: info.aid, cid: targetCid, bvid: info.bvid,
+                        resumeAt: effectiveResumeAt,
+                        resumedPartNumber: resumedPartNumber,
+                        portraitHint: effectivePage?.dimension?.isPortrait ?? info.dimension?.isPortrait,
+                        aspectRatioHint: resolvedAspectRatioHint,
+                        owner: lease.owner,
+                        ownerLease: lease,
+                        startupTraceToken: traceToken,
+                        requestAdmission: { [weak self] in
+                            guard let self else { return false }
+                            return self.ownsCurrentLoad(request, lease: lease)
+                                && self.partAdmission.admits(initialPartBaseline)
+                                && self.currentCid == targetCid
+                                && self.partSwitchInFlight == nil
+                        }
+                    )
+                }
             } else {
                 StartupTrace.abort("superseded-by-part-switch", token: traceToken)
                 let cidDesc = self.currentCid ?? -1
                 PlayerLog.log(
-                    "[VideoDetailVM] initial P1 skipped (superseded by part switch, cid=\(cidDesc))"
+                    "[VideoDetailVM] initial part cid=\(initialCid) skipped (superseded by part switch, cid=\(cidDesc))"
                 )
             }
 
             let relatedLoaded = await related
             await firstComments
             guard ownsCurrentLoad(request, lease: lease) else { return false }
-            if initialPartStillSelected() {
+            let settledEffectiveCid = effectiveCid
+            let effectivePartStillSelected = self.ownsCurrentLoad(request, lease: lease)
+                && self.partAdmission.admits(initialPartBaseline)
+                && self.currentCid == settledEffectiveCid
+                && self.partSwitchInFlight == nil
+            if effectivePartStillSelected {
+                let artist: String = if let pages = info.pages, pages.count > 1,
+                                        let page = effectivePage, !page.part.isEmpty {
+                    "P\(page.page) \(page.part)"
+                } else {
+                    info.owner.name
+                }
                 PlayerViewModel.shared.setNowPlaying(
                     title: info.title,
-                    artist: info.owner.name,
+                    artist: artist,
                     cover: info.pic
                 )
                 installNextPartHandler()
             }
-            let settledCid = currentCid ?? info.cid
+            let settledCid = currentCid ?? settledEffectiveCid
             retainCompletedScreenData(
                 .init(id: id, aid: info.aid, cid: settledCid, dataRequest: request,
                       accountSession: accountSession, fetchedAt: fetchedAt),
                 relatedLoaded: relatedLoaded, partSwitchPending: partSwitchInFlight != nil
             )
-            if initialPartStillSelected() {
+            if effectivePartStillSelected {
                 refreshOnlineCount(request: request, lease: lease)
             }
 
@@ -356,8 +644,27 @@ final class VideoDetailViewModel {
     ) async -> Bool {
         let videos = try? await initialRelatedVideos(aid: aid, cached: cached)
         guard !Task.isCancelled, ownsCurrentLoad(request, lease: lease) else { return false }
-        relatedVideos = videos ?? []
+        setRawRelatedVideos(videos ?? [])
         return videos != nil
+    }
+
+    func setRawRelatedVideos(_ videos: [VideoCard]) {
+        rawRelatedVideos = videos
+        applyRelatedVideoContentFilters()
+    }
+
+    func applyRelatedVideoContentFilters() {
+        guard !rawRelatedVideos.isEmpty || !relatedVideos.isEmpty else { return }
+        let store = LocalContentFilterStore.shared
+        relatedVideos = rawRelatedVideos.filter { video in
+            !store.shouldHideVideo(
+                aid: video.aid,
+                bvid: video.bvid,
+                mid: video.owner.mid,
+                title: video.title,
+                includeCloudBlocklist: true
+            )
+        }
     }
 
     private func loadInitialComments(
@@ -375,18 +682,105 @@ final class VideoDetailViewModel {
     // MARK: - Multi-P parts
 
     func installNextPartHandler() {
-        guard let pages = videoInfo?.pages, pages.count > 1,
-              let cid = currentCid,
-              let index = pages.firstIndex(where: { $0.cid == cid }),
-              index + 1 < pages.count
-        else {
-            PlayerViewModel.shared.onPlaybackEnded = nil
+        let player = PlayerViewModel.shared
+        guard let info = videoInfo, let cid = currentCid else {
+            player.onPreviousEpisode = nil
+            player.onNextEpisode = nil
+            player.onPlaybackEnded = nil
             return
         }
-        PlayerViewModel.shared.onPlaybackEnded = { [weak self] in
-            Task { @MainActor [weak self] in
-                await self?.playNextPart()
+
+        if let existing = player.playbackQueue,
+           let synced = reusableExistingQueue(existing, info: info, cid: cid) {
+            player.setPlaybackQueue(
+                synced,
+                liveNavigationHandler: makeLivePartNavigationHandler(aid: info.aid)
+            )
+            return
+        }
+
+        let routeVideoID = loadedID ?? (info.bvid.isEmpty ? .aid(info.aid) : .bvid(info.bvid))
+        if let season = info.ugcSeason,
+           let seasonQueue = PlaybackQueueContext.ugcSeason(
+               season, info: info, videoID: routeVideoID, currentCid: cid
+           ) {
+            player.setPlaybackQueue(
+                seasonQueue,
+                liveNavigationHandler: makeLivePartNavigationHandler(aid: info.aid)
+            )
+            return
+        }
+
+        guard let pages = info.pages, pages.count > 1,
+              pages.contains(where: { $0.cid == cid }) else {
+            player.setPlaybackQueue(nil)
+            return
+        }
+
+        let queue = PlaybackQueueContext.videoParts(
+            info: info, videoID: routeVideoID, currentCid: cid
+        )
+        player.setPlaybackQueue(
+            queue,
+            liveNavigationHandler: makeLivePartNavigationHandler(aid: info.aid)
+        )
+    }
+
+    private func reusableExistingQueue(
+        _ existing: PlaybackQueueContext,
+        info: VideoInfo,
+        cid: Int
+    ) -> PlaybackQueueContext? {
+        switch existing.kind {
+        case .playlist:
+            guard existing.matchingItem(aid: info.aid, cid: cid, source: .ugc) != nil
+                || existing.items.contains(where: { $0.aid == info.aid && $0.source == .ugc }) else {
+                return nil
             }
+            let routeVideoID = loadedID ?? (info.bvid.isEmpty ? .aid(info.aid) : .bvid(info.bvid))
+            let expanded = existing.expandingMultiPartVideo(
+                info: info,
+                videoID: routeVideoID,
+                currentCid: cid
+            )
+            return expanded.selecting(aid: info.aid, cid: cid)
+        case .ugcSeason(let existingSeasonId):
+            guard existing.matchingItem(aid: info.aid, cid: cid, source: .ugc) != nil else {
+                return nil
+            }
+            let expectedParts = max(1, info.pages?.count ?? 1)
+            let matchingPartCount = existing.items.filter { $0.aid == info.aid }.count
+            guard existingSeasonId == info.ugcSeason?.id, matchingPartCount == expectedParts else {
+                return nil
+            }
+            return existing.selecting(aid: info.aid, cid: cid)
+        case .videoParts, .bangumiSeason:
+            return nil
+        }
+    }
+
+    private func makeLivePartNavigationHandler(aid: Int) -> (Int) -> Bool {
+        { [weak self] offset in
+            guard let self, self.videoInfo?.aid == aid else { return false }
+            if let queue = PlayerViewModel.shared.playbackQueue {
+                guard let nextItem = queue.item(atOffset: offset),
+                      nextItem.aid == aid,
+                      nextItem.cid != self.currentCid,
+                      let targetPage = self.videoInfo?.pages?.first(where: { $0.cid == nextItem.cid }) else {
+                    return false
+                }
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.showToast(String(localized: "Playing P\(targetPage.page)…"), style: .progress)
+                    await self.switchPage(targetPage)
+                }
+                return true
+            }
+            guard self.canPlayAdjacentPart(offset: offset) else { return false }
+            Task { @MainActor [weak self] in
+                await self?.playAdjacentPart(offset: offset)
+            }
+            return true
         }
     }
 
@@ -407,7 +801,7 @@ final class VideoDetailViewModel {
         Task { await self.loadTags(tagRequest) }
         let owner = lease.owner
         PlayerViewModel.shared.claim(owner: owner)
-        let resumeLookup = await PlayerViewModel.serverResumePoint(
+        let resumeMetadata = await PlayerViewModel.serverResumeMetadata(
             aid: info.aid,
             cid: page.cid,
             duration: TimeInterval(page.duration),
@@ -417,15 +811,25 @@ final class VideoDetailViewModel {
             PlayerLog.log("[VideoDetailVM] part switch to cid=\(page.cid) withdrawn before loadVOD")
             return
         }
-        guard case .load(let resumeAt) = resumeLookup.loadDecision() else {
+        guard case .load(let rawResumeAt) = resumeMetadata.lookup.loadDecision() else {
             PlayerLog.log("[VideoDetailVM] part switch aborted — resume lookup cancelled cid=\(page.cid)")
             return
+        }
+        let resumeAt: TimeInterval? = if let lastPlayCid = resumeMetadata.lastPlayCid,
+                                         lastPlayCid > 0,
+                                         lastPlayCid != page.cid {
+            nil
+        } else {
+            rawResumeAt
         }
         PlayerViewModel.shared.setAmbientCoverURL(info.pic, ownerLease: lease)
         await PlayerViewModel.shared.loadVOD(
             aid: info.aid, cid: page.cid, bvid: info.bvid,
             resumeAt: resumeAt,
             portraitHint: page.dimension?.isPortrait ?? info.dimension?.isPortrait,
+            aspectRatioHint: page.dimension?.effectiveAspectRatio
+                ?? info.dimension?.effectiveAspectRatio
+                ?? self.initialAspectRatioHint,
             owner: lease.owner,
             ownerLease: lease,
             startupTraceToken: nil,
@@ -461,6 +865,10 @@ final class VideoDetailViewModel {
             StartupTrace.abort("screen-disappear", token: token)
         }
         startupTraceToken = nil
+    }
+
+    func clearPlayerLeaseAfterLocalFilterExit() {
+        playerLease = nil
     }
 
     func revokeLoadForRouteDeparture() {
@@ -509,14 +917,29 @@ final class VideoDetailViewModel {
             && ownsCurrentLoad(request.loadRequest, lease: lease)
     }
 
-    func playNextPart() async {
+    private func canPlayAdjacentPart(offset: Int) -> Bool {
         guard let pages = videoInfo?.pages, pages.count > 1,
               let cid = currentCid,
               let index = pages.firstIndex(where: { $0.cid == cid }),
-              index + 1 < pages.count
+              pages.indices.contains(index + offset) else {
+            return false
+        }
+        return true
+    }
+
+    func playAdjacentPart(offset: Int) async {
+        guard let pages = videoInfo?.pages, pages.count > 1,
+              let cid = currentCid,
+              let index = pages.firstIndex(where: { $0.cid == cid }),
+              pages.indices.contains(index + offset)
         else { return }
-        showToast(String(localized: "Playing P\(pages[index + 1].page)…"), style: .progress)
-        await switchPage(pages[index + 1])
+        let target = pages[index + offset]
+        showToast(String(localized: "Playing P\(target.page)…"), style: .progress)
+        await switchPage(target)
+    }
+
+    func playNextPart() async {
+        await playAdjacentPart(offset: 1)
     }
 
     private func ownsCurrentLoad(_ request: UInt64, lease: PlayerOwnerLease) -> Bool {

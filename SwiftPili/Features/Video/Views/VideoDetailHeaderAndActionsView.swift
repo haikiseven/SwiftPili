@@ -2,9 +2,16 @@ import SwiftUI
 import UIKit
 
 struct VideoDetailColumnView: View {
+    private enum ContentPhase: Hashable {
+        case loading(VideoID)
+        case loaded(aid: Int, videoID: VideoID)
+    }
+
     @AppMotion private var motion
     let model: VideoDetailViewModel
+    let requestedVideoID: VideoID
     let previewTitle: String
+    let previewOwnerName: String
     let columnWidth: CGFloat
     let horizontalInset: CGFloat
     let showsHeroBar: Bool
@@ -13,6 +20,7 @@ struct VideoDetailColumnView: View {
     let isCompact: Bool
     let usesCompactPhoneActions: Bool
     let isActiveVideoRoute: Bool
+    var isTransitionSettled: Bool = true
     let favoriteRequestInFlight: Bool
     let commentPresentation: CommentZoomPresentation
     let onHeroBarHeightChange: (CGFloat) -> Void
@@ -20,101 +28,169 @@ struct VideoDetailColumnView: View {
     let onPresentFavorite: () -> Void
     let onShareCard: (VideoInfo) -> Void
     let onSelectMusic: (MusicDestination) -> Void
+    var onSelectSeasonEpisode: ((VideoInfo.UGCSeason.Episode) -> Void)? = nil
     let onRetry: () -> Void
 
     @State private var isDescExpanded = false
 
+    private var metadataRevealTransition: AnyTransition {
+        motion.transition(
+            normal: .asymmetric(
+                insertion: .modifier(
+                    active: VideoDetailMetadataRiseModifier(opacity: 0, yOffset: 6),
+                    identity: VideoDetailMetadataRiseModifier(opacity: 1, yOffset: 0)
+                ),
+                removal: .opacity
+            )
+        )
+    }
+
     var body: some View {
-        let info = model.videoInfo
+        let info: VideoInfo? = model.matchesLoadedVideo(requestedVideoID) ? model.videoInfo : nil
+        let contentPhase: ContentPhase = info.map { .loaded(aid: $0.aid, videoID: requestedVideoID) }
+            ?? .loading(requestedVideoID)
         if info != nil || model.isLoading || model.error == nil {
             VStack(alignment: .leading, spacing: 18) {
-                if showsHeroBar, let info {
-                    VideoDetailHeroBarView(
-                        info: info,
-                        model: model,
-                        previewTitle: previewTitle,
-                        columnWidth: columnWidth,
-                        horizontalInset: horizontalInset,
-                        stagePresentation: stagePresentation,
-                        favoriteRequestInFlight: favoriteRequestInFlight,
-                        isDescExpanded: $isDescExpanded,
-                        onHeroBarHeightChange: onHeroBarHeightChange,
-                        onOpenComments: onOpenComments,
-                        onPresentFavorite: onPresentFavorite,
-                        onShareCard: onShareCard
-                    )
-                    VideoDetailStatsLineView(info: info, model: model)
-                        .padding(.horizontal, horizontalInset)
-                } else {
-                    VStack(alignment: .leading, spacing: 8) {
-                        VideoDetailTitleHeaderView(
-                            info: info,
-                            model: model,
-                            previewTitle: previewTitle,
-                            horizontalInset: horizontalInset,
-                            isDescExpanded: $isDescExpanded
-                        )
-                        if let info {
+                if showsHeroBar {
+                    if let info {
+                        VStack(alignment: .leading, spacing: 18) {
+                            VideoDetailHeroBarView(
+                                info: info,
+                                model: model,
+                                previewTitle: previewTitle,
+                                columnWidth: columnWidth,
+                                horizontalInset: horizontalInset,
+                                stagePresentation: stagePresentation,
+                                favoriteRequestInFlight: favoriteRequestInFlight,
+                                isDescExpanded: $isDescExpanded,
+                                onHeroBarHeightChange: onHeroBarHeightChange,
+                                onOpenComments: onOpenComments,
+                                onPresentFavorite: onPresentFavorite,
+                                onShareCard: onShareCard
+                            )
                             VideoDetailStatsLineView(info: info, model: model)
                                 .padding(.horizontal, horizontalInset)
                         }
-                    }
-                    if let info {
-                        VideoDetailCreatorAndActionsView(
-                            info: info,
-                            model: model,
-                            columnWidth: columnWidth,
+                        .transition(.opacity)
+                    } else {
+                        VideoDetailHeroBarSkeletonView(
+                            previewTitle: previewTitle,
+                            previewOwnerName: previewOwnerName,
                             horizontalInset: horizontalInset,
-                            showsCommentsCapsule: showsCommentsCapsule,
-                            stagePresentation: stagePresentation,
-                            usesCompactPhoneActions: usesCompactPhoneActions,
-                            favoriteRequestInFlight: favoriteRequestInFlight,
-                            onOpenComments: onOpenComments,
-                            onPresentFavorite: onPresentFavorite,
-                            onShareCard: onShareCard
+                            onHeroBarHeightChange: onHeroBarHeightChange
                         )
+                        .transition(.opacity)
+                    }
+                } else {
+                    VStack(alignment: .leading, spacing: 8) {
+                        if info != nil || !previewTitle.isEmpty {
+                            VideoDetailTitleHeaderView(
+                                info: info,
+                                model: model,
+                                previewTitle: previewTitle,
+                                horizontalInset: horizontalInset,
+                                isDescExpanded: $isDescExpanded
+                            )
+                        } else {
+                            VideoDetailTitleSkeletonView(horizontalInset: horizontalInset)
+                        }
+                        if let info {
+                            VideoDetailStatsLineView(info: info, model: model)
+                                .padding(.horizontal, horizontalInset)
+                                .transition(metadataRevealTransition)
+                        } else {
+                            VideoDetailStatsLineSkeletonView(horizontalInset: horizontalInset)
+                                .transition(.opacity)
+                        }
                     }
                 }
 
                 if let info {
-                    if isDescExpanded {
-                        VideoDetailDescriptionBlockView(
-                            info: info,
+                    VStack(alignment: .leading, spacing: 18) {
+                        if !showsHeroBar {
+                            VideoDetailCreatorAndActionsView(
+                                info: info,
+                                model: model,
+                                columnWidth: columnWidth,
+                                horizontalInset: horizontalInset,
+                                showsCommentsCapsule: showsCommentsCapsule,
+                                stagePresentation: stagePresentation,
+                                usesCompactPhoneActions: usesCompactPhoneActions,
+                                favoriteRequestInFlight: favoriteRequestInFlight,
+                                onOpenComments: onOpenComments,
+                                onPresentFavorite: onPresentFavorite,
+                                onShareCard: onShareCard
+                            )
+                        }
+                        if let staff = info.staff, staff.count >= 2 {
+                            VideoDetailJointCreatorsStripView(
+                                staff: staff,
+                                horizontalInset: horizontalInset
+                            )
+                        }
+                        if isDescExpanded {
+                            VideoDetailDescriptionBlockView(
+                                info: info,
+                                model: model,
+                                horizontalInset: horizontalInset,
+                                isActiveVideoRoute: isActiveVideoRoute,
+                                isDescExpanded: $isDescExpanded,
+                                onSelectMusic: onSelectMusic
+                            )
+                            .transition(motion.transition(normal: .opacity))
+                        }
+                        if let pages = info.pages, pages.count > 1 {
+                            VideoDetailPartsSelectorView(
+                                pages: pages,
+                                model: model,
+                                horizontalInset: horizontalInset
+                            )
+                        }
+                        if let season = info.ugcSeason, !season.allEpisodes.isEmpty {
+                            VideoDetailUGCSeasonSectionView(
+                                season: season,
+                                info: info,
+                                model: model,
+                                horizontalInset: horizontalInset,
+                                onSelectSeasonEpisode: onSelectSeasonEpisode
+                            )
+                        }
+                        if isCompact {
+                            VideoDetailHotCommentsPreviewView(
+                                info: info,
+                                model: model,
+                                commentPresentation: commentPresentation,
+                                onOpenComments: onOpenComments
+                            )
+                            .padding(.horizontal, horizontalInset)
+                        }
+                        VideoDetailRelatedSectionView(
                             model: model,
+                            columnWidth: columnWidth,
                             horizontalInset: horizontalInset,
-                            isActiveVideoRoute: isActiveVideoRoute,
-                            isDescExpanded: $isDescExpanded,
-                            onSelectMusic: onSelectMusic
-                        )
-                        .transition(motion.transition(normal: .opacity))
-                    }
-                    if let pages = info.pages, pages.count > 1 {
-                        VideoDetailPartsSelectorView(
-                            pages: pages,
-                            model: model,
-                            horizontalInset: horizontalInset
+                            isCompact: isCompact,
+                            isTransitionSettled: isTransitionSettled
                         )
                     }
-                    if isCompact {
-                        VideoDetailHotCommentsPreviewView(
-                            info: info,
-                            model: model,
-                            commentPresentation: commentPresentation,
-                            onOpenComments: onOpenComments
-                        )
-                        .padding(.horizontal, horizontalInset)
-                    }
-                    VideoDetailRelatedSectionView(
-                        model: model,
+                    .transition(metadataRevealTransition)
+                } else {
+                    VideoDetailLoadingSkeletonView(
+                        previewOwnerName: previewOwnerName,
                         columnWidth: columnWidth,
                         horizontalInset: horizontalInset,
-                        isCompact: isCompact
+                        showsHeroBar: showsHeroBar,
+                        isCompact: isCompact,
+                        usesCompactPhoneActions: usesCompactPhoneActions
                     )
-                } else {
-                    ProgressView()
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 12)
+                    .transition(.opacity)
                 }
+            }
+            .animation(
+                motion.feedbackAnimation(normal: .easeOut(duration: 0.22)),
+                value: contentPhase
+            )
+            .onChange(of: requestedVideoID) { _, _ in
+                isDescExpanded = false
             }
         } else if let message = model.error {
             VideoDetailUnavailableStateView(
@@ -122,6 +198,262 @@ struct VideoDetailColumnView: View {
                 unavailability: model.unavailability,
                 onRetry: onRetry
             )
+        }
+    }
+}
+
+private struct VideoDetailMetadataRiseModifier: ViewModifier {
+    let opacity: Double
+    let yOffset: CGFloat
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(opacity)
+            .offset(y: yOffset)
+    }
+}
+
+private struct VideoDetailSkeletonPulse: ViewModifier {
+    @AppMotion private var motion
+    @State private var isDimmed = false
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(isDimmed ? 0.45 : 0.85)
+            .onAppear {
+                guard !motion.reducesGeometry else { return }
+                withAnimation(.easeInOut(duration: 0.95).repeatForever(autoreverses: true)) {
+                    isDimmed = true
+                }
+            }
+    }
+}
+
+private struct VideoDetailTitleSkeletonView: View {
+    let horizontalInset: CGFloat
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(AppFill.inset)
+                .frame(maxWidth: .infinity)
+                .frame(height: 18)
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(AppFill.inset)
+                .frame(width: 210, height: 18)
+        }
+        .padding(.horizontal, horizontalInset)
+        .modifier(VideoDetailSkeletonPulse())
+        .accessibilityHidden(true)
+    }
+}
+
+private struct VideoDetailHeroBarSkeletonView: View {
+    let previewTitle: String
+    let previewOwnerName: String
+    let horizontalInset: CGFloat
+    let onHeroBarHeightChange: (CGFloat) -> Void
+
+    var body: some View {
+        CinematicHeroBar {
+            if !previewTitle.isEmpty {
+                Text(previewTitle)
+                    .appFont(.editorialTitle)
+                    .fontWeight(.bold)
+                    .lineLimit(1)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(AppFill.inset)
+                    .frame(width: 260, height: 22)
+                    .modifier(VideoDetailSkeletonPulse())
+            }
+        } leading: {
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(AppFill.inset)
+                    .frame(width: 36, height: 36)
+                if !previewOwnerName.isEmpty {
+                    Text(previewOwnerName)
+                        .appFont(.screenOwner)
+                        .fontWeight(.medium)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else {
+                    Capsule()
+                        .fill(AppFill.inset)
+                        .frame(width: 92, height: 14)
+                }
+            }
+            .modifier(VideoDetailSkeletonPulse())
+        } trailing: {
+            HStack(spacing: 8) {
+                ForEach(0..<4, id: \.self) { _ in
+                    Capsule()
+                        .fill(AppFill.inset)
+                        .frame(width: 66, height: 34)
+                }
+            }
+            .modifier(VideoDetailSkeletonPulse())
+        }
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+            onHeroBarHeightChange(height)
+        }
+        .padding(.horizontal, horizontalInset)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(previewTitle.isEmpty ? Text("Loading…") : Text(previewTitle))
+    }
+}
+
+private struct VideoDetailStatsLineSkeletonView: View {
+    let horizontalInset: CGFloat
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Capsule()
+                .fill(AppFill.inset)
+                .frame(width: 84, height: 12)
+            Capsule()
+                .fill(AppFill.inset)
+                .frame(width: 68, height: 12)
+            Spacer()
+            Capsule()
+                .fill(AppFill.inset)
+                .frame(width: 48, height: 12)
+        }
+        .padding(.horizontal, horizontalInset)
+        .modifier(VideoDetailSkeletonPulse())
+        .accessibilityHidden(true)
+    }
+}
+
+private struct VideoDetailLoadingSkeletonView: View {
+    let previewOwnerName: String
+    let columnWidth: CGFloat
+    let horizontalInset: CGFloat
+    let showsHeroBar: Bool
+    let isCompact: Bool
+    let usesCompactPhoneActions: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            if showsHeroBar {
+                VideoDetailStatsLineSkeletonView(horizontalInset: horizontalInset)
+            } else {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 10) {
+                        Circle()
+                            .fill(AppFill.inset)
+                            .frame(width: 36, height: 36)
+                        if !previewOwnerName.isEmpty {
+                            Text(previewOwnerName)
+                                .appFont(.screenOwner)
+                                .fontWeight(.medium)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        } else {
+                            Capsule()
+                                .fill(AppFill.inset)
+                                .frame(width: 112, height: 14)
+                        }
+                        Spacer(minLength: 8)
+                        Capsule()
+                            .fill(AppFill.inset)
+                            .frame(width: 70, height: 28)
+                    }
+
+                    if usesCompactPhoneActions {
+                        HStack(spacing: 6) {
+                            ForEach(0..<5, id: \.self) { _ in
+                                Capsule()
+                                    .fill(AppFill.inset)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 34)
+                            }
+                        }
+                    } else {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(0..<5, id: \.self) { _ in
+                                    Capsule()
+                                        .fill(AppFill.inset)
+                                        .frame(width: 68, height: 34)
+                                }
+                            }
+                        }
+                        .scrollDisabled(true)
+                    }
+                }
+                .padding(.horizontal, horizontalInset)
+                .modifier(VideoDetailSkeletonPulse())
+            }
+
+            if isCompact {
+                RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
+                    .fill(AppFill.inset.opacity(0.65))
+                    .frame(height: 68)
+                    .padding(.horizontal, horizontalInset)
+                    .modifier(VideoDetailSkeletonPulse())
+            }
+
+            relatedSkeleton
+                .modifier(VideoDetailSkeletonPulse())
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text("Loading…"))
+    }
+
+    @ViewBuilder
+    private var relatedSkeleton: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Capsule()
+                .fill(AppFill.inset)
+                .frame(width: 72, height: 15)
+                .padding(.horizontal, horizontalInset)
+
+            if isCompact {
+                let columnCount = columnWidth >= VideoDetailLayoutMetrics.compactCapsuleMinimumWidth ? 3 : 2
+                LazyVGrid(
+                    columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: columnCount),
+                    spacing: 12
+                ) {
+                    ForEach(0..<(columnCount * 2), id: \.self) { _ in
+                        skeletonCard
+                    }
+                }
+                .padding(.horizontal, horizontalInset)
+            } else {
+                let cardWidth = columnWidth >= VideoDetailLayoutMetrics.compactCapsuleMinimumWidth
+                    ? VideoDetailLayoutMetrics.shelfCardWidth
+                    : VideoDetailLayoutMetrics.phoneShelfCardWidth
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 16) {
+                        ForEach(0..<4, id: \.self) { _ in
+                            skeletonCard
+                                .frame(width: cardWidth)
+                        }
+                    }
+                    .padding(.horizontal, horizontalInset)
+                }
+                .scrollDisabled(true)
+            }
+        }
+        .padding(.top, 4)
+    }
+
+    private var skeletonCard: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
+                .fill(AppFill.inset.opacity(0.65))
+                .aspectRatio(16 / 9, contentMode: .fit)
+            Capsule()
+                .fill(AppFill.inset.opacity(0.8))
+                .frame(maxWidth: .infinity)
+                .frame(height: 12)
+            Capsule()
+                .fill(AppFill.nested)
+                .frame(width: 96, height: 10)
         }
     }
 }
@@ -205,12 +537,18 @@ struct VideoDetailOwnerRowView: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            AvatarImage(urlString: info.owner.face, size: 36)
+            HStack(spacing: 10) {
+                AvatarImage(urlString: info.owner.face, size: 36)
 
-            Text(info.owner.name)
-                .appFont(.screenOwner)
-                .fontWeight(.medium)
-                .lineLimit(fillsWidth ? nil : 1)
+                Text(info.owner.name)
+                    .appFont(.screenOwner)
+                    .fontWeight(.medium)
+                    .lineLimit(fillsWidth ? nil : 1)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                coordinator.navigate(to: .userSpace(info.owner.mid))
+            }
 
             if fillsWidth { Spacer() }
 
@@ -239,10 +577,6 @@ struct VideoDetailOwnerRowView: View {
                 .buttonStyle(.appControl)
                 .disabled(followRequestInFlight)
             }
-        }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            coordinator.navigate(to: .userSpace(info.owner.mid))
         }
     }
 }
@@ -434,25 +768,33 @@ struct VideoDetailActionBarView: View {
 
     @State private var showCoinDialog = false
     @State private var coinRequestInFlight = false
+    @State private var tripleRequestInFlight = false
+    @State private var tripleHoldProgress: CGFloat = 0
 
     var body: some View {
         HStack(spacing: compact ? 6 : 8) {
-            DetailActionButton(
-                icon: model.isLiked ? "hand.thumbsup.fill" : "hand.thumbsup",
+            TripleComboLikeButton(
                 label: FormatUtils.viewCount(info.stat.like),
                 isActive: model.isLiked,
                 count: info.stat.like,
                 compact: compact,
-                accessibilityTitle: "Like"
-            ) {
-                await model.toggleLike()
-            }
+                externalActionInFlight: tripleRequestInFlight,
+                holdProgress: $tripleHoldProgress,
+                onTap: { await model.toggleLike() },
+                onTripleCombo: {
+                    guard !tripleRequestInFlight else { return }
+                    tripleRequestInFlight = true
+                    _ = await model.performTripleCombo()
+                    tripleRequestInFlight = false
+                }
+            )
+
             DetailActionButton(
                 icon: model.isCoined ? "b.circle.fill" : "b.circle",
                 label: FormatUtils.viewCount(info.stat.coin),
-                isActive: model.isCoined,
+                isActive: model.isCoined || tripleHoldProgress > 0.35,
                 count: info.stat.coin,
-                externalActionInFlight: coinRequestInFlight,
+                externalActionInFlight: coinRequestInFlight || tripleRequestInFlight,
                 compact: compact,
                 accessibilityTitle: "Coin"
             ) {
@@ -466,18 +808,20 @@ struct VideoDetailActionBarView: View {
                 Button("Give 1 Coin") { addCoinFromDialog(1) }
                 Button("Give 2 Coins") { addCoinFromDialog(2) }
             }
+
             DetailActionButton(
                 icon: model.isFavorited ? "star.fill" : "star",
                 label: FormatUtils.viewCount(info.stat.favorite),
-                isActive: model.isFavorited,
+                isActive: model.isFavorited || tripleHoldProgress > 0.65,
                 count: info.stat.favorite,
-                externalActionInFlight: favoriteRequestInFlight,
+                externalActionInFlight: favoriteRequestInFlight || tripleRequestInFlight,
                 compact: compact,
                 accessibilityTitle: "Favorite"
             ) {
                 await model.loadFavFolders()
                 onPresentFavorite()
             }
+
             DetailActionButton(
                 icon: model.isInWatchLater ? "clock.fill" : "clock",
                 label: String(localized: "Watch"),
@@ -543,6 +887,146 @@ struct VideoDetailActionBarView: View {
         }
         .accessibilityLabel(Text("Share"))
         .accessibilityValue(Text(info.stat.share, format: .number))
+    }
+}
+
+private struct TripleComboLikeButton: View {
+    let label: String
+    let isActive: Bool
+    let count: Int
+    let compact: Bool
+    let externalActionInFlight: Bool
+    @Binding var holdProgress: CGFloat
+    let onTap: () async -> Void
+    let onTripleCombo: () async -> Void
+
+    @AppMotion private var motion
+    @State private var tapInFlight = false
+    @State private var holdTask: Task<Void, Never>?
+    @State private var didFireLongPress = false
+
+    private static let holdDurationSeconds: Double = 0.85
+    private static let ringDelayMs = 150
+
+    var body: some View {
+        let isCharging = holdProgress > 0.01
+        DetailActionButtonLabel(
+            compact: compact,
+            compactIconOnly: false,
+            isActive: isActive || isCharging
+        ) {
+            ZStack {
+                if isCharging {
+                    Circle()
+                        .stroke(Color.biliAccent.opacity(0.22), lineWidth: 2)
+                        .frame(width: compact ? 22 : 24, height: compact ? 22 : 24)
+                    Circle()
+                        .trim(from: 0, to: holdProgress)
+                        .stroke(
+                            Color.biliAccent,
+                            style: StrokeStyle(lineWidth: 2, lineCap: .round)
+                        )
+                        .rotationEffect(.degrees(-90))
+                        .frame(width: compact ? 22 : 24, height: compact ? 22 : 24)
+                }
+                Image(systemName: (isActive || isCharging) ? "hand.thumbsup.fill" : "hand.thumbsup")
+                    .font(compact ? .subheadline : .body)
+                    .foregroundStyle((isActive || isCharging) ? .biliAccent : .primary)
+                    .scaleEffect(isCharging ? (1.0 + 0.08 * holdProgress) : 1.0)
+                    .appToggleFeedback(
+                        isOn: isActive,
+                        userActionInFlight: tapInFlight || externalActionInFlight
+                    )
+            }
+        } caption: {
+            Text(label)
+                .font(compact ? .footnote : .subheadline)
+                .fontWeight(.medium)
+                .appCountFeedback(value: count)
+        }
+        .onTapGesture {
+            guard !didFireLongPress, !tapInFlight, !externalActionInFlight else { return }
+            Task {
+                tapInFlight = true
+                await onTap()
+                tapInFlight = false
+            }
+        }
+        .onLongPressGesture(
+            minimumDuration: Self.holdDurationSeconds,
+            maximumDistance: 24,
+            perform: {
+                didFireLongPress = true
+                cancelHoldAnimation(resetInstantly: false)
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+                Task { await onTripleCombo() }
+            },
+            onPressingChanged: { pressing in
+                if pressing {
+                    didFireLongPress = false
+                    startHoldAnimation()
+                } else {
+                    cancelHoldAnimation(resetInstantly: false)
+                    if didFireLongPress {
+                        Task { @MainActor in
+                            try? await Task.sleep(for: .milliseconds(80))
+                            didFireLongPress = false
+                        }
+                    }
+                }
+            }
+        )
+        .onDisappear {
+            cancelHoldAnimation(resetInstantly: true)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(isActive ? [.isButton, .isSelected] : .isButton)
+        .accessibilityLabel(Text("Like"))
+        .accessibilityHint(Text("Hold for Triple Combo"))
+        .accessibilityValue(Text(count, format: .number))
+        .accessibilityAction(named: Text("Triple Combo")) {
+            Task { await onTripleCombo() }
+        }
+    }
+
+    private func startHoldAnimation() {
+        holdTask?.cancel()
+        holdTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(Self.ringDelayMs))
+            guard !Task.isCancelled else { return }
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            let remaining = max(0.2, Self.holdDurationSeconds - Double(Self.ringDelayMs) / 1000.0)
+            let step1 = remaining * 0.35
+            let step2 = remaining * 0.30
+            let step3 = remaining * 0.35
+            withAnimation(motion.animation(normal: .linear(duration: step1))) {
+                holdProgress = 0.35
+            }
+            try? await Task.sleep(for: .milliseconds(Int((step1 * 1000).rounded())))
+            guard !Task.isCancelled else { return }
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            withAnimation(motion.animation(normal: .linear(duration: step2))) {
+                holdProgress = 0.65
+            }
+            try? await Task.sleep(for: .milliseconds(Int((step2 * 1000).rounded())))
+            guard !Task.isCancelled else { return }
+            UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+            withAnimation(motion.animation(normal: .linear(duration: step3))) {
+                holdProgress = 1.0
+            }
+        }
+    }
+
+    private func cancelHoldAnimation(resetInstantly: Bool) {
+        holdTask?.cancel()
+        holdTask = nil
+        if resetInstantly {
+            holdProgress = 0
+        } else {
+            withAnimation(motion.animation(normal: .easeOut(duration: 0.16))) {
+                holdProgress = 0
+            }
+        }
     }
 }
 

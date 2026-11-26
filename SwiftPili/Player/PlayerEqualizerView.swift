@@ -80,6 +80,7 @@ struct PlayerEqualizerView: View {
             }
         }
         .accentContentBoundary()
+        .appAdaptiveSheet(compactDetents: [.medium], padSizing: .form)
     }
 
     private var isCurrentPresentation: Bool {
@@ -121,30 +122,151 @@ struct PlayerEqualizerView: View {
         LabeledContent(title) { Text(gainLabel(gain)).monospacedDigit() }
     }
 
-    private func gainLabel(_ gain: Float) -> String { String(format: "%+.1f dB", gain) }
+    private func gainLabel(_ gain: Float) -> String { PlayerEqualizerDisplay.gainLabel(gain) }
 
     private func frequencyLabel(_ frequency: Float) -> String {
+        PlayerEqualizerDisplay.frequencyLabel(frequency)
+    }
+
+    private func presetLabel(_ id: String) -> String {
+        PlayerEqualizerDisplay.presetLabel(id)
+    }
+
+    private var statusLabel: String {
+        PlayerEqualizerDisplay.statusLabel(player.equalizerStatus)
+    }
+}
+
+enum PlayerEqualizerDisplay {
+    static func gainLabel(_ gain: Float) -> String { String(format: "%+.1f dB", gain) }
+
+    static func frequencyLabel(_ frequency: Float) -> String {
         if frequency >= 1_000 { return String(format: "%.0f kHz", frequency / 1_000) }
         return String(format: "%g Hz", frequency)
     }
 
-    private func presetLabel(_ id: String) -> String {
+    static func presetLabel(_ id: String) -> String {
         switch id {
         case "bass": String(localized: "Bass")
         case "vocal": String(localized: "Vocal")
         case "treble": String(localized: "Treble")
+        case "custom": String(localized: "Custom")
         default: String(localized: "Flat")
         }
     }
 
-    private var statusLabel: String {
-        switch player.equalizerStatus {
+    static func summary(for configuration: PlayerEqualizerConfiguration) -> String {
+        guard configuration.enabled else { return String(localized: "Off") }
+        return presetLabel(configuration.presetID)
+    }
+
+    static func statusLabel(_ status: PlayerEqualizerStatus) -> String {
+        switch status {
         case .retainedNoGraph: String(localized: "Saved for Playback")
         case .pendingNativeAccess: String(localized: "Pending Audio Update")
         case .configuredCurrentGraph: String(localized: "Configured")
         case .bypassed: String(localized: "Bypassed")
         case .unsupported: String(localized: "Equalizer Unavailable")
         case .failed: String(localized: "Audio Update Failed")
+        }
+    }
+}
+
+struct SettingsEqualizerView: View {
+    private let player = PlayerViewModel.shared
+
+    var body: some View {
+        List {
+            Group {
+                Section {
+                    Toggle("Enable Equalizer", isOn: Binding(
+                        get: { player.equalizerConfiguration.enabled },
+                        set: { enabled in update { $0.enabled = enabled } }
+                    ))
+                    LabeledContent("Status", value: PlayerEqualizerDisplay.statusLabel(player.equalizerStatus))
+                }
+
+                Section("Preset") {
+                    Picker("Preset", selection: Binding(
+                        get: { player.equalizerConfiguration.presetID },
+                        set: { player.updateEqualizer(player.equalizerConfiguration.selectingPreset($0)) }
+                    )) {
+                        ForEach(PlayerEqualizerConfiguration.presets) { preset in
+                            Text(PlayerEqualizerDisplay.presetLabel(preset.id)).tag(preset.id)
+                        }
+                        if player.equalizerConfiguration.presetID == "custom" {
+                            Text("Custom").tag("custom")
+                        }
+                    }
+                    .pickerStyle(.menu)
+                }
+
+                Section("Frequency Bands") {
+                    ForEach(PlayerEqualizerConfiguration.frequencies.indices, id: \.self) { index in
+                        bandControl(index)
+                    }
+                }
+
+                Section("Preamp") {
+                    gainRow("Automatic Headroom", gain: -player.equalizerConfiguration.autoHeadroom)
+                    VStack(alignment: .leading, spacing: 6) {
+                        gainRow("Manual Attenuation", gain: player.equalizerConfiguration.userAttenuation)
+                        Slider(value: Binding(
+                            get: { Double(player.equalizerConfiguration.userAttenuation) },
+                            set: { value in update { $0.userAttenuation = Float(value) } }
+                        ), in: -12...0, step: 0.5)
+                        .accessibilityLabel(Text("Manual Attenuation"))
+                        .accessibilityValue(PlayerEqualizerDisplay.gainLabel(player.equalizerConfiguration.userAttenuation))
+                    }
+                    gainRow("Effective Preamp", gain: player.equalizerConfiguration.effectivePreamp)
+                }
+
+                Section {
+                    Button("Restore Defaults") {
+                        player.updateEqualizer(.defaults)
+                    }
+                }
+            }
+            .listRowBackground(AppFill.card)
+        }
+        .readableFormWidth()
+        .accentContentBoundary()
+        .navigationTitle("Equalizer")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func bandControl(_ index: Int) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(PlayerEqualizerDisplay.frequencyLabel(PlayerEqualizerConfiguration.frequencies[index]))
+                Spacer()
+                Text(PlayerEqualizerDisplay.gainLabel(player.equalizerConfiguration.bandGains[index]))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            Slider(value: Binding(
+                get: { Double(player.equalizerConfiguration.bandGains[index]) },
+                set: { value in
+                    update {
+                        $0.bandGains[index] = Float(value)
+                        $0.presetID = "custom"
+                    }
+                }
+            ), in: -12...12, step: 0.5)
+            .accessibilityLabel(PlayerEqualizerDisplay.frequencyLabel(PlayerEqualizerConfiguration.frequencies[index]))
+            .accessibilityValue(PlayerEqualizerDisplay.gainLabel(player.equalizerConfiguration.bandGains[index]))
+        }
+    }
+
+    private func update(_ edit: (inout PlayerEqualizerConfiguration) -> Void) {
+        var configuration = player.equalizerConfiguration
+        edit(&configuration)
+        player.updateEqualizer(configuration)
+    }
+
+    private func gainRow(_ title: LocalizedStringKey, gain: Float) -> some View {
+        LabeledContent(title) {
+            Text(PlayerEqualizerDisplay.gainLabel(gain)).monospacedDigit()
         }
     }
 }
@@ -157,7 +279,10 @@ struct PlayerMoreControl: View {
     var showsAnimeOptions = false
     var onDownload: (() -> Void)?
     var onReport: (() -> Void)?
+    var onHideVideo: (() -> Void)?
+    var onBlockOwner: (() -> Void)?
     var onDanmakuSettings: (() -> Void)?
+    var onSubtitleSettings: (() -> Void)?
     private let experiments = ExperimentalSettingsStore.shared
     @State private var presentation: Presentation?
 
@@ -183,7 +308,14 @@ struct PlayerMoreControl: View {
         PlayerOptionsMenu(
             player: player, showsAnimeOptions: includesAnimeOptions,
             onDownload: onDownload, onReport: onReport,
+            onHideVideo: onHideVideo, onBlockOwner: onBlockOwner,
             onDanmakuSettings: onDanmakuSettings.map { action in
+                {
+                    guard admit() else { return }
+                    action()
+                }
+            },
+            onSubtitleSettings: onSubtitleSettings.map { action in
                 {
                     guard admit() else { return }
                     action()

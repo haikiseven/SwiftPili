@@ -84,15 +84,23 @@ struct FullscreenDanmakuComposer: View {
     var onClose: () -> Void
     var onFocusLost: () -> Void
 
+    static let horizontalPortraitMargin: CGFloat = 20
+    static let restingBottomFloor: CGFloat = 14
+    static let restingExtraBottomSpacing: CGFloat = 6
+
     @FocusState private var isFocused: Bool
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
+        let safeInsets = AppWindowMetrics.safeAreaInsets
+        let screenFrame = AppWindowMetrics.frameInScreen ?? .zero
+        let isPortraitViewport = screenFrame.height >= screenFrame.width
+        let horizontalMargin = isPortraitViewport ? Self.horizontalPortraitMargin : AppSpacing.l
         field
             .frame(maxWidth: Self.maxFieldWidth)
             .frame(maxWidth: .infinity)
-            .padding(.leading, AppWindowMetrics.safeAreaInsets.left + AppSpacing.l)
-            .padding(.trailing, AppWindowMetrics.safeAreaInsets.right + AppSpacing.l)
+            .padding(.leading, max(0, safeInsets.left) + horizontalMargin)
+            .padding(.trailing, max(0, safeInsets.right) + horizontalMargin)
             .padding(.bottom, bottomInset)
             .ignoresSafeArea()
     }
@@ -106,13 +114,16 @@ struct FullscreenDanmakuComposer: View {
     }
 
     private var bottomInset: CGFloat {
-        let physical = AppWindowMetrics.safeAreaInsets.bottom
+        let physical = max(0, AppWindowMetrics.safeAreaInsets.bottom)
         let inset = LivePortraitKeyboardLayout.effectiveBottomInset(
             physicalBottomInset: physical,
             keyboardFrame: keyboardFrame,
             containerFrame: AppWindowMetrics.frameInScreen ?? .zero
         )
-        return inset > physical ? inset + IPadKeyboardComposerLayout.keyboardBottomSpacing : inset
+        if inset > physical {
+            return inset + IPadKeyboardComposerLayout.keyboardBottomSpacing
+        }
+        return max(physical, Self.restingBottomFloor) + Self.restingExtraBottomSpacing
     }
 
     private var field: some View {

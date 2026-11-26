@@ -59,6 +59,8 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     let session = PlayerSessionState()
     @ObservationIgnored
     let miniPlayer = InAppMiniPlayerState.shared
+    @ObservationIgnored
+    let sleepTimer = PlayerSleepTimer()
 
     var isMiniPlayerActive: Bool {
         miniPlayer.isActive
@@ -170,6 +172,45 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     var isPortraitContent: Bool {
         get { chrome.isPortraitContent }
         set { chrome.isPortraitContent = newValue }
+    }
+
+    var videoAspectRatio: CGFloat? {
+        get { chrome.videoAspectRatio }
+        set { chrome.videoAspectRatio = newValue }
+    }
+
+    var portraitPureViewEnabled: Bool {
+        get { chrome.portraitPureViewEnabled }
+        set { chrome.portraitPureViewEnabled = newValue }
+    }
+
+    var portraitFullscreenContext: PlayerPortraitFullscreenContext? {
+        get { chrome.portraitFullscreenContext }
+        set { chrome.portraitFullscreenContext = newValue }
+    }
+
+    var isInlinePortraitImmersiveActive: Bool {
+        get { chrome.isInlinePortraitImmersiveActive }
+        set { chrome.isInlinePortraitImmersiveActive = newValue }
+    }
+
+    var onRequestInlinePortraitImmersive: (@MainActor (Bool) -> Bool)? {
+        get { chrome.onRequestInlinePortraitImmersive }
+        set { chrome.onRequestInlinePortraitImmersive = newValue }
+    }
+
+    func applyAspectRatioHint(_ aspect: CGFloat?) {
+        guard let normalized = DetailPlayerGeometry.normalizedAspect(aspect) else { return }
+        guard !portraitPropagation.hasValidVideoGeometry else { return }
+        if let current = videoAspectRatio {
+            if abs(current - normalized) >= 0.005 {
+                videoAspectRatio = normalized
+            }
+        } else {
+            videoAspectRatio = normalized
+        }
+        isPortraitContent = DeviceCapability.usesCompactPortraitVideoFraming
+            && DetailPlayerGeometry.isPortraitAspect(normalized, fallback: isPortraitContent)
     }
 
     var danmakuPortraitHint: Bool? {
@@ -352,8 +393,12 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
                 }
             }
             session.mode = newValue
+            if newValue == .live {
+                sleepTimer.clearEndOfVideoIfUnsupported()
+            }
             retireRecoveryCoverIfAuthorityChanged()
             guard newValue != oldValue, newValue != .vod else { return }
+            clearPlaybackQueue()
             releaseDanmaku()
         }
     }
@@ -451,17 +496,24 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         get { routeOwnership.ownerKey }
         set {
             if newValue != routeOwnership.ownerKey {
+                cancelEndedAutoAdvance()
+                clearAllEndedRecommendations()
                 backgroundExecution.end(reason: "owner-change")
                 revokeEqualizerMaintenancePermission()
                 cancelLiveRecoveryTasks(resetAttempts: true, clearBackups: true)
             }
             routeOwnership.ownerKey = newValue
+            if newValue.isEmpty {
+                clearNowPlayingTrackCommands()
+            }
         }
     }
 
     var ownerLeaseGeneration: UInt64 {
         get { routeOwnership.ownerLeaseGeneration }
         set {
+            cancelEndedAutoAdvance()
+            clearAllEndedRecommendations()
             backgroundExecution.end(reason: "owner-lease-change")
             revokeEqualizerMaintenancePermission()
             cancelLiveRecoveryTasks(resetAttempts: true, clearBackups: true)
@@ -520,6 +572,7 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         get { session.currentAid }
         set {
             if newValue != session.currentAid {
+                cancelEndedAutoAdvance()
                 backgroundExecution.end(reason: "content-change")
                 revokeEqualizerMaintenancePermission()
             }
@@ -533,6 +586,7 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         set {
             let oldValue = session.currentCid
             if newValue != oldValue {
+                cancelEndedAutoAdvance()
                 backgroundExecution.end(reason: "part-change")
                 revokeEqualizerMaintenancePermission()
             }
@@ -693,6 +747,9 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     var playbackTerminalState: PlaybackTerminalState {
         get { session.playbackTerminalState }
         set {
+            if !newValue.isNaturalEnd {
+                cancelEndedAutoAdvance()
+            }
             if newValue.isTerminal {
                 backgroundExecution.end(reason: "terminal")
                 revokeEqualizerMaintenancePermission()
@@ -703,6 +760,20 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     }
 
     var playbackEnded: Bool { playbackTerminalState.isNaturalEnd }
+
+    var endedAutoAdvance: PlayerEndedAutoAdvanceState? {
+        get { session.endedAutoAdvance }
+        set { session.endedAutoAdvance = newValue }
+    }
+
+    var endedAutoAdvanceRemainingSeconds: Int? { endedAutoAdvance?.remainingSeconds }
+    var endedAutoAdvanceTitle: String? { endedAutoAdvance?.title }
+    var endedAutoAdvanceCoverURL: String? { endedAutoAdvance?.coverURL }
+
+    var endedRecommendations: [PlayerEndedRecommendation] {
+        get { session.endedRecommendations }
+        set { session.endedRecommendations = newValue }
+    }
 
     var currentPlaybackTerminalState: PlaybackTerminalState {
         if playbackTerminalState.isTerminal { return playbackTerminalState }
@@ -770,7 +841,8 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     @ObservationIgnored var lastLoadStartPosition: TimeInterval = 0
 
     @ObservationIgnored var resumeIsFromHistory = false
-    @ObservationIgnored var pendingRestartNotice = false
+    @ObservationIgnored var pendingHistoryResumeNotice: PendingHistoryResumeNotice?
+    @ObservationIgnored var pendingPartLocationNotice: Int?
 
     var recoveryPosition: TimeInterval {
         pendingSeekTarget ?? durableResumeTarget ?? resumeAtTime ?? mediaTime
@@ -907,9 +979,9 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
                 ? "\(String(format: "%.1f", timing.target))s"
                 : "n/a"
             self?.stats.lastSeek =
-                "\(timing.path) → \(target) · " +
-                "clk \(timing.settleMs) · " +
-                "vis \(timing.visibleMs.map(String.init) ?? "–") · " +
+                "\(timing.path) → \(target) | " +
+                "clk \(timing.settleMs), " +
+                "vis \(timing.visibleMs.map(String.init) ?? "–"), " +
                 "run \(timing.runUpMs.map(String.init) ?? "–") ms"
         }
         Self.startNetworkMonitor()
@@ -1193,6 +1265,23 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     let playbackTerminalSettlement = PlaybackTerminalSettlement()
     var nowPlayingMeta: (title: String, artist: String, cover: String?)?
 
+    struct NowPlayingTrackCommandSnapshot: Sendable, Equatable {
+        var owner: PlayerOwnerLease?
+        var canPlayNext: Bool
+        var canPlayPrevious: Bool
+    }
+
+    @ObservationIgnored
+    let nowPlayingTrackCommandState = OSAllocatedUnfairLock(
+        initialState: NowPlayingTrackCommandSnapshot(
+            owner: nil,
+            canPlayNext: false,
+            canPlayPrevious: false
+        )
+    )
+    @ObservationIgnored var nowPlayingNextTrackTarget: Any?
+    @ObservationIgnored var nowPlayingPreviousTrackTarget: Any?
+
     var nowPlayingCommandsAreActionable: Bool {
         currentOwnerLease != nil
             && currentURL != nil
@@ -1221,13 +1310,56 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         set {
             session.playbackOrder = newValue
             PlayerPlaybackPreferences.playbackOrder = newValue
+            if newValue != .playNext {
+                cancelEndedAutoAdvance()
+            }
         }
     }
 
-    var onPlaybackEnded: (() -> Void)?
+    var playbackQueue: PlaybackQueueContext? {
+        didSet {
+            syncNowPlayingTrackCommands()
+        }
+    }
 
-    var onPreviousEpisode: (() -> Void)?
-    var onNextEpisode: (() -> Void)?
+    @ObservationIgnored var liveQueueNavigationHandler: ((Int) -> Bool)?
+    @ObservationIgnored var liveQueueItemSelectionHandler: (@MainActor (PlaybackQueueItem) -> Bool)?
+    @ObservationIgnored var isSyncingQueueCallbacks = false
+    @ObservationIgnored var hasExternalPreviousEpisodeCallback = false
+    @ObservationIgnored var hasExternalNextEpisodeCallback = false
+    @ObservationIgnored var hasExternalPlaybackEndedCallback = false
+    @ObservationIgnored var isAutonomousQueueAdvanceInFlight = false
+    @ObservationIgnored var autonomousQueueAdvanceTask: Task<Void, Never>?
+    @ObservationIgnored var autonomousQueueAdvanceGeneration: UInt64 = 0
+    @ObservationIgnored var endedAutoAdvanceTask: Task<Void, Never>?
+    @ObservationIgnored var endedAutoAdvanceGeneration: UInt64 = 0
+    @ObservationIgnored var onSelectEndedRecommendation: ((PlayerEndedRecommendation) -> Void)?
+
+    var onPlaybackEnded: (() -> Void)? {
+        didSet {
+            if !isSyncingQueueCallbacks {
+                hasExternalPlaybackEndedCallback = onPlaybackEnded != nil
+            }
+        }
+    }
+
+    var onPreviousEpisode: (() -> Void)? {
+        didSet {
+            if !isSyncingQueueCallbacks {
+                hasExternalPreviousEpisodeCallback = onPreviousEpisode != nil
+            }
+            syncNowPlayingTrackCommands()
+        }
+    }
+
+    var onNextEpisode: (() -> Void)? {
+        didSet {
+            if !isSyncingQueueCallbacks {
+                hasExternalNextEpisodeCallback = onNextEpisode != nil
+            }
+            syncNowPlayingTrackCommands()
+        }
+    }
 
     var pgcSeasonContext: (sid: Int, type: Int?)?
 
@@ -1389,10 +1521,12 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     }
 
     var danmakuCanDoVisibleWork: Bool {
-        Self.danmakuVisibleWorkAdmits(currentPlaybackTerminalState) && danmakuServerAllowsVisibleWork
+        let sourceAdmitted = (mode.usesOnlineVODServices && currentURL?.isFileURL == false)
+            || (hasRegisteredOfflineDanmaku && currentURL?.isFileURL == true)
+        return Self.danmakuVisibleWorkAdmits(currentPlaybackTerminalState) && danmakuServerAllowsVisibleWork
             && danmakuApplicationActive && UIApplication.shared.applicationState == .active
             && danmakuSink != nil
-            && mode.usesOnlineVODServices && currentURL?.isFileURL == false
+            && sourceAdmitted
             && DanmakuFeatureGate.isEnabled()
             && danmakuSessionLedger.liveSession(for: currentCid)?.owner == ownerKey
     }
@@ -1435,8 +1569,9 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     }
 
     var skipSegments: [(label: String, start: Double, end: Double)] = []
-    var skipNotice: String?
-    var skipNoticeTask: Task<Void, Never>?
+    var activeNoticeBanner: PlayerNoticeBanner?
+    var skipNotice: String? { activeNoticeBanner?.text }
+    @ObservationIgnored var skipNoticeTask: Task<Void, Never>?
     @ObservationIgnored var lastAutoSkipAt: CFTimeInterval = 0
     @ObservationIgnored var autoSkippedSegmentKeys: Set<String> = []
 
@@ -1505,6 +1640,7 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     var loadGeneration: Int {
         get { session.loadGeneration }
         set {
+            cancelEndedAutoAdvance()
             revokeEqualizerMaintenancePermission()
             session.loadGeneration = newValue
         }
@@ -1659,6 +1795,11 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
     func pause() {
         playbackIntent = .pausedByUser
         updateDemandVideoLivenessContext()
+        if mode == .vod {
+            reportHistoryNow()
+        } else if mode == .offline {
+            persistOfflineProgressNow()
+        }
         suspendPlayback()
     }
 
@@ -1737,10 +1878,17 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
 
         advanceGeneration("stop:\(reason)")
         if !reason.preservesPresentation {
-            miniPlayer.clearAll()
+            let preservesMiniPlayerForQueueAdvance = isAutonomousQueueAdvanceInFlight
+                && reason == .newContentOwnership
+                && miniPlayer.activeSession.map { isCurrentOwner($0.ownerLease) } == true
+            if !preservesMiniPlayerForQueueAdvance {
+                miniPlayer.clearAll()
+            }
             hasRenderedFirstFrame = false
             fullscreenTransition = FullscreenTransitionCoalescer()
-            if isFullscreen { exitFullscreen() }
+            if isFullscreen, !isAutonomousQueueAdvanceInFlight {
+                exitFullscreen()
+            }
         }
         PlayerLog.log(
             "[Player] stop(reason=\(reason)) — tearing down old players " +
@@ -1815,6 +1963,7 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         }
         updateIsPlaying(transportRunning: false)
         isBuffering = false
+        cancelEndedAutoAdvance()
         clearNearEndStall()
         mediaTime = 0
         bufferedTime = 0
@@ -1830,7 +1979,9 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         needsReloadBeforeExplicitPlay = false
         isDASHMode = false
         skipSegments = []
-        skipNotice = nil
+        pendingHistoryResumeNotice = nil
+        pendingPartLocationNotice = nil
+        dismissNoticeBanner()
         pendingSponsorManualSegment = nil
         sponsorMutedUUID = nil
         releaseAllMute()
@@ -1845,16 +1996,31 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
         subtitleText = nil
         suspendDanmakuSession(reason: reason)
         currentBvid = nil
-        onPlaybackEnded = nil
-        onPreviousEpisode = nil
-        onNextEpisode = nil
+        if reason == .ownerExit {
+            session.decodeFallback = PlayerDecodeFallbackState()
+            clearPlaybackQueue()
+        }
+        if !reason.preservesPresentation {
+            clearAllEndedRecommendations()
+            onPlaybackEnded = nil
+            onPreviousEpisode = nil
+            onNextEpisode = nil
+            if reason == .ownerExit {
+                liveQueueNavigationHandler = nil
+                liveQueueItemSelectionHandler = nil
+            }
+        }
         if let stoppingOwner {
             _ = NowPlayingCenter.shared.deactivate(owner: stoppingOwner)
+        }
+        if !isAutonomousQueueAdvanceInFlight {
+            clearNowPlayingTrackCommands()
         }
     }
 
     var watchdogStandDownReason: String? {
         if streamRecoveryOwnsWork { return "standdown/stream-recovery" }
+        if cdnSwitchInFlight { return "standdown/cdn-switch" }
         if !mode.usesPlaybackWatchdog { return "standdown/mode-\(mode)" }
         if !userWantsPlaying { return "standdown/user-paused" }
         if audioSessionInterrupted { return "standdown/audio-interrupted" }

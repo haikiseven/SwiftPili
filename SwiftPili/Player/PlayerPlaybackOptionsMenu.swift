@@ -6,8 +6,10 @@ struct PlayerPlaybackOptionsMenu: View {
     let screenLease: PlayerOwnerLease?
     let presentationReceipt: PlayerPresentationReceipt?
     let fullscreenHostIdentity: UUID?
+    var onOpenSubtitleSettings: (() -> Void)? = nil
     private let experiments = ExperimentalSettingsStore.shared
     @State private var enhancementPresentation: EnhancementPresentation?
+    @State private var subtitleSheetPresented = false
 
     private struct EnhancementScope: Equatable {
         let screenLease: PlayerOwnerLease
@@ -41,6 +43,9 @@ struct PlayerPlaybackOptionsMenu: View {
                 canEdit: { canEditEnhancement(request) },
                 onClose: { closeEnhancement(request) }
             )
+        }
+        .sheet(isPresented: $subtitleSheetPresented) {
+            PlayerSubtitleSettingsSheet(player: player)
         }
         .onChange(of: enhancementPresentation.map(canEditEnhancement), initial: true) { _, _ in
             if let request = enhancementPresentation, !canEditEnhancement(request) {
@@ -141,6 +146,22 @@ struct PlayerPlaybackOptionsMenu: View {
                 codecMenu
             }
 
+            Divider()
+            PlayerSubtitleInlineMenu(
+                player: player,
+                actionAdmission: nil,
+                onOpenSettings: {
+                    if let onOpenSubtitleSettings {
+                        onOpenSubtitleSettings()
+                    } else {
+                        subtitleSheetPresented = true
+                    }
+                },
+                accessibilityID: "player.subtitles"
+            )
+
+            PlayerSleepTimerSubmenu(player: player)
+
             if experiments.isAllowed(.videoEnhancement) {
                 PlayerVideoEnhancementMenuItems(player: player, onOpen: onEnhancement)
             }
@@ -174,6 +195,11 @@ struct PlayerPlaybackOptionsMenu: View {
                     .font(.caption2.weight(.semibold))
                     .accessibilityLabel(Text("Enhanced"))
             }
+            if player.sleepTimerOption != .off {
+                Image(systemName: "moon.zzz.fill")
+                    .font(.caption2.weight(.semibold))
+                    .accessibilityLabel(Text("Sleep Timer"))
+            }
             if player.mode.usesOnlineVODServices, !player.availableQualities.isEmpty {
                 Text(PlayerViewModel.qualityMap[player.currentQuality] ?? "\(player.currentQuality)")
                     .lineLimit(1)
@@ -206,6 +232,160 @@ struct PlayerPlaybackOptionsMenu: View {
     }
 }
 
+private struct PlayerSubtitleInlineMenu: View {
+    let player: PlayerViewModel
+    let actionAdmission: (() -> Bool)?
+    let onOpenSettings: () -> Void
+    let accessibilityID: String
+
+    private func admit() -> Bool {
+        actionAdmission?() ?? true
+    }
+
+    var body: some View {
+        Menu {
+            Button {
+                guard admit() else { return }
+                player.turnOffAllSubtitles()
+            } label: {
+                HStack {
+                    Text("Off")
+                    if !player.hasAnyActiveSubtitle {
+                        Image(systemName: "checkmark")
+                    }
+                }
+            }
+
+            if !player.availableSubtitles.isEmpty {
+                Section("Bilibili Cloud Subtitles") {
+                    ForEach(Array(player.availableSubtitles.enumerated()), id: \.offset) { _, item in
+                        Button {
+                            guard admit() else { return }
+                            Task { await player.selectSubtitle(item) }
+                        } label: {
+                            HStack {
+                                Text(item.menuDisplayTitle)
+                                if let lan = item.lan,
+                                   lan == player.activeSubtitleLan || lan == player.secondarySubtitleLan {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+
+                    if player.availableSubtitles.count >= 2 {
+                        Menu {
+                            Button {
+                                guard admit() else { return }
+                                Task { await player.selectSecondarySubtitleTrack(id: nil) }
+                            } label: {
+                                HStack {
+                                    Text("Off")
+                                    if player.secondarySubtitleLan == nil {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                            ForEach(Array(player.availableSubtitles.enumerated()), id: \.offset) { _, item in
+                                if let lan = item.lan, lan != player.activeSubtitleLan {
+                                    Button {
+                                        guard admit() else { return }
+                                        Task { await player.selectSecondarySubtitleTrack(id: lan) }
+                                    } label: {
+                                        HStack {
+                                            Text(item.menuDisplayTitle)
+                                            if lan == player.secondarySubtitleLan {
+                                                Image(systemName: "checkmark")
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } label: {
+                            Label("Secondary Subtitle (Bilingual)", systemImage: "captions.bubble")
+                        }
+                    }
+                }
+            }
+
+            if !player.importedSubtitleTracks.isEmpty {
+                Section("Local Subtitle File (.srt / .vtt)") {
+                    ForEach(player.importedSubtitleTracks) { track in
+                        Button {
+                            guard admit() else { return }
+                            Task { await player.selectPrimarySubtitleTrack(id: track.id) }
+                        } label: {
+                            HStack {
+                                Text(track.displayName)
+                                if track.id == player.activeSubtitleLan || track.id == player.secondarySubtitleLan {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if ((player.activeSubtitleLan != nil || player.isAutoTranslationEnabled) && player.supportsAutoSubtitleTranslation)
+                || player.supportsSystemSpeechSubtitles {
+                Divider()
+            }
+
+            if (player.activeSubtitleLan != nil || player.isAutoTranslationEnabled), player.supportsAutoSubtitleTranslation {
+                Button {
+                    guard admit() else { return }
+                    player.setAutoSubtitleTranslationEnabled(!player.isAutoTranslationEnabled)
+                } label: {
+                    HStack {
+                        Label {
+                            Text("Offline Translation")
+                                + Text(verbatim: " (\(player.subtitleTranslationTargetLanguage.shortLabel))")
+                        } icon: {
+                            Image(systemName: "translate")
+                        }
+                        if player.isAutoTranslationEnabled {
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+            }
+
+            if player.supportsSystemSpeechSubtitles {
+                Button {
+                    guard admit() else { return }
+                    player.setSystemSpeechSubtitlesEnabled(!player.isSpeechSubtitleEnabled)
+                } label: {
+                    HStack {
+                        Label("Live Speech", systemImage: "waveform")
+                        if player.isSpeechSubtitleEnabled {
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+            }
+
+            Divider()
+            Button {
+                guard admit() else { return }
+                onOpenSettings()
+            } label: {
+                Label("Subtitle Settings & Bilingual…", systemImage: "slider.horizontal.3")
+            }
+        } label: {
+            Label {
+                if let summary = player.activeSubtitleSummaryLabel {
+                    Text("Subtitles") + Text(verbatim: " (\(summary))")
+                } else {
+                    Text("Subtitles")
+                }
+            } icon: {
+                Image(systemName: player.hasAnyActiveSubtitle ? "captions.bubble.fill" : "captions.bubble")
+            }
+        }
+        .accessibilityIdentifier(accessibilityID)
+    }
+}
+
 private struct PlayerVideoEnhancementMenuItems: View {
     let player: PlayerViewModel
     let onOpen: (() -> Void)?
@@ -216,7 +396,7 @@ private struct PlayerVideoEnhancementMenuItems: View {
         Button(action: onOpen ?? {}) {
             Label {
                 if let unavailableReason {
-                    Text("Video Enhancement") + Text(verbatim: " · \(unavailableReason)")
+                    Text("Video Enhancement") + Text(verbatim: " (\(unavailableReason))")
                 } else {
                     menuSummaryText
                 }
@@ -234,7 +414,7 @@ private struct PlayerVideoEnhancementMenuItems: View {
             return title
         }
         if player.videoEnhancementControlStatus.bypassReason != nil {
-            return title + Text(verbatim: " · ") + Text("Paused")
+            return title + Text(verbatim: " (") + Text("Paused") + Text(verbatim: ")")
         }
         var parts: [String] = []
         switch player.videoSuperResolutionMode {
@@ -254,21 +434,25 @@ private struct PlayerVideoEnhancementMenuItems: View {
                 parts.append(String(localized: "FRC"))
             }
         }
-        return title + Text(verbatim: " · \(parts.joined(separator: " + "))")
+        return title + Text(verbatim: " (\(parts.joined(separator: " + ")))")
     }
 }
 
 enum DetailDanmakuEntryPolicy {
-    static func chromeShowsToggle(usesOnlineVODServices: Bool) -> Bool {
-        usesOnlineVODServices
+    static func chromeShowsToggle(
+        usesOnlineVODServices: Bool,
+        hasOfflineDanmaku: Bool = false
+    ) -> Bool {
+        usesOnlineVODServices || hasOfflineDanmaku
     }
 
     static func chromeShowsSettings(
         usesOnlineVODServices: Bool,
+        hasOfflineDanmaku: Bool = false,
         danmakuEnabled: Bool,
         isFullscreen: Bool
     ) -> Bool {
-        usesOnlineVODServices && danmakuEnabled && isFullscreen
+        (usesOnlineVODServices || hasOfflineDanmaku) && danmakuEnabled && isFullscreen
     }
 
     static func chromeShowsSendEntry(
@@ -302,16 +486,21 @@ struct PlayerOptionsMenu: View {
     var showsAnimeOptions = false
     var onDownload: (() -> Void)?
     var onReport: (() -> Void)?
+    var onHideVideo: (() -> Void)?
+    var onBlockOwner: (() -> Void)?
     var onDanmakuSettings: (() -> Void)?
+    var onSubtitleSettings: (() -> Void)?
     var onEqualizer: (() -> Void)?
     let actionAdmission: () -> Bool
     var isPlayerChrome = false
     @State private var resumeOn = PlayerPlaybackPreferences.resumePlayback
     @State private var skipOn = PlayerPlaybackPreferences.animeSkipIntroOutro
+    @State private var subtitleSheetPresented = false
+    @State private var showChapterSheet = false
 
     var body: some View {
         Menu {
-            if onDownload != nil || onReport != nil {
+            if onDownload != nil || onReport != nil || onHideVideo != nil || onBlockOwner != nil {
                 if let onDownload {
                     Button {
                         guard actionAdmission() else { return }
@@ -328,6 +517,22 @@ struct PlayerOptionsMenu: View {
                         Label("Report Video", systemImage: "exclamationmark.triangle")
                     }
                 }
+                if let onHideVideo {
+                    Button(role: .destructive) {
+                        guard actionAdmission() else { return }
+                        onHideVideo()
+                    } label: {
+                        Label("Locally Hide Video & Exit", systemImage: "eye.slash")
+                    }
+                }
+                if let onBlockOwner {
+                    Button(role: .destructive) {
+                        guard actionAdmission() else { return }
+                        onBlockOwner()
+                    } label: {
+                        Label("Locally Block UP & Exit", systemImage: "person.slash")
+                    }
+                }
                 Divider()
             }
             if let onDanmakuSettings {
@@ -342,6 +547,29 @@ struct PlayerOptionsMenu: View {
                 }
                 .accessibilityIdentifier("player.equalizer")
             }
+            if !player.videoChapters.isEmpty {
+                Button {
+                    guard actionAdmission() else { return }
+                    player.hideControlsTask?.cancel()
+                    player.hideControlsTask = nil
+                    showChapterSheet = true
+                } label: {
+                    Label("Chapters", systemImage: "list.bullet.indent")
+                }
+                .accessibilityIdentifier("player.chapters")
+            }
+            PlayerSubtitleInlineMenu(
+                player: player,
+                actionAdmission: actionAdmission,
+                onOpenSettings: {
+                    if let onSubtitleSettings {
+                        onSubtitleSettings()
+                    } else {
+                        subtitleSheetPresented = true
+                    }
+                },
+                accessibilityID: "player.moreSubtitles"
+            )
             Toggle(isOn: Binding(
                 get: { player.showStats },
                 set: {
@@ -369,7 +597,10 @@ struct PlayerOptionsMenu: View {
             if player.mode.usesOnlineVODServices {
                 Divider()
                 Toggle(isOn: Binding(
-                    get: { resumeOn },
+                    get: {
+                        _ = resumeOn
+                        return PlayerPlaybackPreferences.resumePlayback
+                    },
                     set: {
                         guard actionAdmission() else { return }
                         resumeOn = $0
@@ -386,7 +617,10 @@ struct PlayerOptionsMenu: View {
             }
             if showsAnimeOptions {
                 Toggle(isOn: Binding(
-                    get: { skipOn },
+                    get: {
+                        _ = skipOn
+                        return PlayerPlaybackPreferences.animeSkipIntroOutro
+                    },
                     set: {
                         guard actionAdmission() else { return }
                         skipOn = $0
@@ -406,6 +640,34 @@ struct PlayerOptionsMenu: View {
                 .contentShape(Rectangle())
         }
         .accessibilityLabel(Text("More"))
+        .onAppear {
+            resumeOn = PlayerPlaybackPreferences.resumePlayback
+            skipOn = PlayerPlaybackPreferences.animeSkipIntroOutro
+        }
+        .sheet(isPresented: $subtitleSheetPresented) {
+            PlayerSubtitleSettingsSheet(player: player)
+        }
+        .sheet(isPresented: $showChapterSheet) {
+            PlayerChapterSheet(
+                chapters: player.videoChapters,
+                currentTime: player.displayTime
+            ) { chapter in
+                player.seek(to: chapter.from)
+                if !player.isPlaying {
+                    player.play()
+                }
+            }
+        }
+        .onChange(of: showChapterSheet) { _, presented in
+            if !presented {
+                player.scheduleHideControls()
+            }
+        }
+        .onChange(of: player.videoChapters.isEmpty) { _, isEmpty in
+            if isEmpty {
+                showChapterSheet = false
+            }
+        }
     }
 }
 

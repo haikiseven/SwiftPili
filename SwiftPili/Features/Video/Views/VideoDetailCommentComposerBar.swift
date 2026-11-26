@@ -68,6 +68,7 @@ struct VideoDetailCommentComposerOverlay: View {
                         commentPresentation: commentPresentation,
                         requestedVideoID: requestedVideoID,
                         usesFeedWidth: usesFeedWidth,
+                        ignoresContainerBottomSafeArea: isCompactOverlay,
                         showsCommentInput: { showsCommentInput(for: $0) },
                         isModelCurrent: isModelCurrent,
                         onRevealPostedComment: onRevealPostedComment
@@ -90,6 +91,7 @@ struct VideoDetailCommentComposerBar: View {
     let commentPresentation: CommentZoomPresentation
     let requestedVideoID: VideoID
     let usesFeedWidth: Bool
+    var ignoresContainerBottomSafeArea = false
     let showsCommentInput: @MainActor (Bool) -> Bool
     let isModelCurrent: @MainActor () -> Bool
     let onRevealPostedComment: @MainActor (
@@ -105,6 +107,7 @@ struct VideoDetailCommentComposerBar: View {
             isExpanded: composer.isExpanded,
             hasDraft: composer.hasDraft,
             sourceIdentity: AnyHashable(sourceIdentity),
+            ignoresContainerBottomSafeArea: ignoresContainerBottomSafeArea,
             onExpand: { composer.open(motion: motion) },
             expandedComposer: {
                 VideoDetailExpandedComposerView(

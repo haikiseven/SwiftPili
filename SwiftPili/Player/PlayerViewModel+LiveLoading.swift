@@ -9,6 +9,7 @@ extension PlayerViewModel {
         roomID: Int,
         quality: Int = LiveAPI.defaultLiveQuality,
         playInfo preloaded: LivePlayInfo? = nil,
+        aspectRatioHint: CGFloat? = nil,
         preservePlayState: Bool = false,
         owner: String? = nil,
         ownerLease: PlayerOwnerLease? = nil,
@@ -20,6 +21,7 @@ extension PlayerViewModel {
                 roomID: roomID,
                 quality: quality,
                 playInfo: preloaded,
+                aspectRatioHint: aspectRatioHint,
                 preservePlayState: preservePlayState,
                 owner: owner,
                 ownerLease: ownerLease,
@@ -57,6 +59,17 @@ extension PlayerViewModel {
             )
         }
         playURL(resolved.url, liveSource: resolved.demandSource(for: currentOwnerLease))
+        if SubtitleStylePreferences.shared.autoSpeechMode != .off {
+            let gen = loadGeneration
+            let lease = currentOwnerLease
+            Task { @MainActor [weak self] in
+                await self?.applyPersistedSubtitlePreferences(
+                    for: [],
+                    expectedGeneration: gen,
+                    ownerLease: lease
+                )
+            }
+        }
         return resolved.actualQn
     }
 
@@ -109,6 +122,7 @@ extension PlayerViewModel {
         roomID: Int,
         quality: Int,
         playInfo preloaded: LivePlayInfo?,
+        aspectRatioHint: CGFloat? = nil,
         preservePlayState: Bool,
         owner: String?,
         ownerLease: PlayerOwnerLease?,
@@ -145,6 +159,8 @@ extension PlayerViewModel {
         }
         retireStartupTraceBeforeNonVODLoad(.live)
         let sameContent = mode == .live && currentRoomID == roomID
+        let initialAspectHint = DetailPlayerGeometry.normalizedAspect(aspectRatioHint)
+        let retainedAspectRatio = sameContent ? videoAspectRatio : nil
         let teardownReason = PlayerReloadPresentationPolicy.reason(
             targetMode: .live,
             currentMode: mode,
@@ -154,6 +170,10 @@ extension PlayerViewModel {
         playbackTerminalState = .active
         if !sameContent {
             nowPlayingMeta = nil
+            portraitPureViewEnabled = false
+            if portraitFullscreenContext?.ownerLease != ownerLease {
+                portraitFullscreenContext = nil
+            }
         }
         stop(
             reason: teardownReason,
@@ -186,7 +206,12 @@ extension PlayerViewModel {
         playingAudioTier = nil
         stats.quality = 0
         stats.qualityDesc = ""
+        videoAspectRatio = sameContent ? (retainedAspectRatio ?? initialAspectHint) : initialAspectHint
         seedLivePortraitOrientation(from: preloaded, sameContent: sameContent)
+        if !sameContent, preloaded?.isPortrait == nil, let initialAspectHint {
+            isPortraitContent = DeviceCapability.usesCompactPortraitVideoFraming
+                && DetailPlayerGeometry.isPortraitAspect(initialAspectHint, fallback: isPortraitContent)
+        }
         inlineCondensed = false
         portraitCondenseLocked = false
 
