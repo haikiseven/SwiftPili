@@ -198,7 +198,7 @@ struct PlayerMultiConnectionMenu: View {
                     Text("Helper download: \(Self.rate(rate))")
                 }
                 ForEach(status.activeHelperHosts, id: \.self) { host in
-                    Text("Active download node: \(host)")
+                    Text("Active download node: \(CDNHostDisplay.formatted(host))")
                 }
                 Text("Speed counts completed helper downloads, excluding data still transferring.")
             }

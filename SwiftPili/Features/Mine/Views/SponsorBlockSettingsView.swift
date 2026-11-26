@@ -31,6 +31,7 @@ struct SponsorBlockSettingsView: View {
         Section {
             Toggle(isOn: $manager.isEnabled) {
                 Label {
+                    // Disambiguates master toggle from "SponsorBlock" title/menu labels in zh-Hans.
                     Text("Enable SponsorBlock")
                 } icon: {
                     SettingsIcon(symbol: "shield.lefthalf.filled")
@@ -95,14 +96,14 @@ struct SponsorBlockSettingsView: View {
         Section {
             Toggle(isOn: $manager.showOnProgressBar) {
                 Label {
-                    Text("Show Segments on Progress Bar")
+                    Text("Show on Progress Bar")
                 } icon: {
                     SettingsIcon(symbol: "chart.bar")
                 }
             }
             Toggle(isOn: $manager.showSkipNotice) {
                 Label {
-                    Text("Show Skip Notifications")
+                    Text("Skip Notice")
                 } icon: {
                     SettingsIcon(symbol: "bell.badge")
                 }

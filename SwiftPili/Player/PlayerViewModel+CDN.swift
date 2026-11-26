@@ -47,27 +47,63 @@ extension PlayerViewModel {
     }
 
     func selectReachableURL(
-        _ rawURLs: [String], resume: DemandDASHRouteResume? = nil,
+        _ rawURLs: [String],
+        resume: DemandDASHRouteResume? = nil,
+        failedHost: String? = nil,
         requestAdmission: @escaping @MainActor @Sendable () -> Bool = { true }
     ) async -> StreamURLSelection {
         let evidence = StreamProbeEvidence()
         let url = await pickReachableURL(
-            rawURLs, evidence: evidence, resume: resume, requestAdmission: requestAdmission
+            rawURLs,
+            evidence: evidence,
+            resume: resume,
+            failedHost: failedHost,
+            requestAdmission: requestAdmission
         )
         let cancelled = Task.isCancelled || !requestAdmission()
         return StreamURLSelection(url: cancelled ? nil : url, outcomes: evidence.outcomes, cancelled: cancelled)
     }
 
     private func pickReachableURL(
-        _ rawURLs: [String], evidence: StreamProbeEvidence, resume: DemandDASHRouteResume?,
+        _ rawURLs: [String],
+        evidence: StreamProbeEvidence,
+        resume: DemandDASHRouteResume?,
+        failedHost: String?,
         requestAdmission: @escaping @MainActor @Sendable () -> Bool
     ) async -> URL? {
         guard !Task.isCancelled, requestAdmission(),
               let urls = admittedVODCandidates(rawURLs, evidence: evidence) else { return nil }
+        let effectiveFailedHost = CDNHostPolicy.canonicalHost(failedHost ?? resume?.failedHost)
         if let resume, resume.startAt > DemandDASHRouteResume.minimumPosition {
-            return await pickResumeURL(urls, resume: resume, evidence: evidence, requestAdmission: requestAdmission)
+            let effectiveResume = effectiveFailedHost == resume.failedHost
+                ? resume
+                : DemandDASHRouteResume(
+                    startAt: resume.startAt,
+                    track: resume.track,
+                    failedHost: effectiveFailedHost
+                )
+            return await pickResumeURL(
+                urls, resume: effectiveResume, evidence: evidence, requestAdmission: requestAdmission
+            )
         }
-        return await pickLegacyReachableURL(urls, evidence: evidence)
+        return await pickLegacyReachableURL(urls, failedHost: effectiveFailedHost, evidence: evidence)
+    }
+
+    static func resolveLegacyExcludedHost(
+        failedHost: String?,
+        cdnFallbackActive: Bool,
+        statsVideoHost: String
+    ) -> String? {
+        if let failed = CDNHostPolicy.canonicalHost(failedHost) {
+            return failed
+        }
+        guard cdnFallbackActive else { return nil }
+        return CDNHostPolicy.canonicalHost(statsVideoHost)
+    }
+
+    static func isHardRejectedProbeOutcome(_ outcome: StreamProbeOutcome?) -> Bool {
+        guard let outcome, outcome.rejection == nil, let status = outcome.status else { return false }
+        return status == 403 || status == 404 || status == 410
     }
 
     private func admittedVODCandidates(_ rawURLs: [String], evidence: StreamProbeEvidence) -> [String]? {
@@ -106,33 +142,69 @@ extension PlayerViewModel {
         return urls
     }
 
-    private func pickLegacyReachableURL(_ urls: [String], evidence: StreamProbeEvidence) async -> URL? {
+    private func pickLegacyReachableURL(
+        _ urls: [String],
+        failedHost: String?,
+        evidence: StreamProbeEvidence
+    ) async -> URL? {
         guard let preferred = applyCDN(urls) else { return nil }
         guard let preferred = Self.admittedNetworkURL(preferred, stage: "preferred") else {
             return nil
         }
-        if !cdnFallbackActive,
-           let host = preferred.host(),
-           SmartCDNSelector.shared.hasSessionReachabilityEvidence(for: host) {
-            PlayerLog.log(
-                "[CDN] pre-open probe skipped — host=\(CDNHostPolicy.diagnosticHost(host)) " +
-                    "already answered this session (sweep/ramp)"
-            )
-            return preferred
-        }
-        if !cdnFallbackActive, await probeURL(preferred, evidence: evidence) { return preferred }
+        let excluded = Self.resolveLegacyExcludedHost(
+            failedHost: failedHost,
+            cdnFallbackActive: cdnFallbackActive,
+            statsVideoHost: stats.videoHost
+        )
+        let preferredHost = CDNHostPolicy.canonicalHost(preferred.host())
+        let preferredIsExcluded = excluded != nil && preferredHost == excluded
+        var failedPreferredHost: String?
 
-        let excluded = cdnFallbackActive ? stats.videoHost : nil
+        if !cdnFallbackActive, !preferredIsExcluded {
+            if let host = preferred.host(),
+               SmartCDNSelector.shared.hasSessionReachabilityEvidence(for: host) {
+                PlayerLog.log(
+                    "[CDN] pre-open probe skipped — host=\(CDNHostPolicy.diagnosticHost(host)) " +
+                        "already verified for media this session"
+                )
+                return preferred
+            }
+            let beforeCount = evidence.outcomes.count
+            if await probeURL(preferred, evidence: evidence) { return preferred }
+            guard !Task.isCancelled else { return nil }
+            let preferredOutcome = evidence.outcomes.dropFirst(beforeCount).last
+            if SmartCDNSelector.isEnabled, let preferredHost {
+                if Self.isHardRejectedProbeOutcome(preferredOutcome) {
+                    SmartCDNSelector.shared.reportPlaybackIssue(
+                        host: preferredHost, reason: "probe HTTP rejection"
+                    )
+                } else if preferredOutcome?.rejection == nil {
+                    failedPreferredHost = preferredHost
+                }
+            }
+        }
+
+        func finalizeFallback(_ candidate: URL) -> URL {
+            if let failedPreferredHost,
+               SmartCDNSelector.isEnabled,
+               CDNHostPolicy.canonicalHost(candidate.host()) != failedPreferredHost {
+                SmartCDNSelector.shared.reportPlaybackIssue(
+                    host: failedPreferredHost,
+                    reason: "probe failed while fallback succeeded"
+                )
+            }
+            return candidate
+        }
 
         if SmartCDNSelector.isEnabled {
-            if let excluded, !excluded.isEmpty {
+            if let excluded {
                 SmartCDNSelector.shared.reportPlaybackIssue(
                     host: excluded, reason: "playback failure/stutter fallback"
                 )
             }
-            let smartExcluded = (excluded?.isEmpty == false) ? excluded : preferred.host()
+            let smartExcluded = excluded ?? preferredHost
             if let smart = await smartRankedFallbackURL(from: urls, excluding: smartExcluded, evidence: evidence) {
-                return smart
+                return finalizeFallback(smart)
             }
             if SmartCDNSelector.shared.hasRanking {
                 for candidate in urls.compactMap({ URL(string: $0) }) where
@@ -143,20 +215,27 @@ extension PlayerViewModel {
                     }
                     if await probeURL(candidate, evidence: evidence), isVideoHostHealthyOrUnknown(candidate.host()) {
                         PlayerLog.log("[SmartCDN] ranking exhausted — using API-provided host=\(CDNHostPolicy.diagnosticHost(candidate.host()))")
-                        return candidate
+                        return finalizeFallback(candidate)
                     }
                 }
-                PlayerLog.log("[SmartCDN] ranking and API hosts exhausted — no candidate")
-                return nil
+                let isOffline = evidence.outcomes.last?.failure?.reason
+                    == .url(URLError.notConnectedToInternet.rawValue)
+                if isOffline || Task.isCancelled {
+                    PlayerLog.log("[SmartCDN] ranking and API hosts exhausted — no candidate")
+                    return nil
+                }
+                PlayerLog.log("[SmartCDN] ranking and API hosts exhausted — racing standard fallback mirrors")
+            } else {
+                PlayerLog.log("[SmartCDN] no sweep ranking yet — latency race as bootstrap")
             }
-            PlayerLog.log("[SmartCDN] no sweep ranking yet — latency race as bootstrap")
         }
 
-        if let best = await lowestLatencyURL(from: urls, excluding: excluded, evidence: evidence) {
+        let raceExcluded = excluded ?? (failedPreferredHost != nil ? preferredHost : nil)
+        if let best = await lowestLatencyURL(from: urls, excluding: raceExcluded, evidence: evidence) {
             if best.host() != preferred.host() {
                 PlayerLog.log("[Player] CDN fallback: \(preferred.host() ?? "") → \(best.host() ?? "")")
             }
-            return best
+            return finalizeFallback(best)
         }
         PlayerLog.log("[Player] no candidate URL probed OK — no reachable stream")
         return nil
@@ -178,16 +257,26 @@ extension PlayerViewModel {
         if !probes.isEmpty {
             services = Self.rankFallbackServicesByProbe(services, probes: probes)
         }
-        for service in services.prefix(4) {
+        for service in services.prefix(6) {
             guard let candidate = service.safeRewriteURL(base),
                   let admitted = Self.admittedNetworkURL(candidate, stage: "ranked-rewrite"),
                   CDNHostPolicy.canonicalHost(admitted.host()) != excludedKey,
                   isVideoHostHealthyOrUnknown(admitted.host())
             else { continue }
-            if await probeURL(admitted, evidence: evidence),
+            let probeEvidence = evidence ?? StreamProbeEvidence()
+            let beforeCount = probeEvidence.outcomes.count
+            if await probeURL(admitted, evidence: probeEvidence),
                isVideoHostHealthyOrUnknown(admitted.host()) {
                 PlayerLog.log("[Player] smart failover: \(CDNHostPolicy.diagnosticHost(excludedHost)) → \(CDNHostPolicy.diagnosticHost(admitted.host()) ) (rank order)")
                 return admitted
+            }
+            let outcome = probeEvidence.outcomes.dropFirst(beforeCount).last
+            if SmartCDNSelector.isEnabled,
+               let admittedHost = CDNHostPolicy.canonicalHost(admitted.host()),
+               Self.isHardRejectedProbeOutcome(outcome) {
+                SmartCDNSelector.shared.reportPlaybackIssue(
+                    host: admittedHost, reason: "probe HTTP rejection"
+                )
             }
             PlayerLog.log("[Player] smart failover host=\(CDNHostPolicy.diagnosticHost(admitted.host())) probe failed — trying next in rank")
         }
@@ -290,6 +379,9 @@ extension PlayerViewModel {
                 evidence?.outcomes.append(outcome)
                 if succeeded, !Task.isCancelled {
                     group.cancelAll()
+                    if let host = url.host() {
+                        SmartCDNSelector.shared.recordMediaReachable(host: host)
+                    }
                     PlayerLog.log("[Player] CDN race (\(candidates.count) hosts): \(url.host() ?? "") won in \(Int(latency * 1000))ms")
                     return url
                 }

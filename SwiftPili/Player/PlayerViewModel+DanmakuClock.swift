@@ -22,7 +22,9 @@ extension PlayerViewModel {
             danmakuRefillVisibleWindow = true
             danmakuAdmittedIDs.removeAll()
         }
-        guard DanmakuFeatureGate.isEnabled(), mode == .vod, currentCid != nil else { return }
+        guard DanmakuFeatureGate.isEnabled(),
+              (mode == .vod || hasRegisteredOfflineDanmaku),
+              currentCid != nil else { return }
         noteDanmakuClock(danmakuEdgeTime)
     }
 
@@ -102,7 +104,8 @@ extension PlayerViewModel {
     }
 
     func noteDanmakuClock(_ mediaTime: TimeInterval) {
-        guard DanmakuFeatureGate.isEnabled(), mode == .vod else {
+        let isOfflineDanmaku = hasRegisteredOfflineDanmaku
+        guard DanmakuFeatureGate.isEnabled(), (mode == .vod || isOfflineDanmaku) else {
             if danmakuStore != nil {
                 releaseDanmakuStore()
             }
@@ -116,10 +119,12 @@ extension PlayerViewModel {
         danmakuVisibleWorkSuspended = false
         guard let session = danmakuSessionLedger.liveSession(for: currentCid) else { return }
         let store: DanmakuSegmentStore
-        if let existing = danmakuStore {
+        if let existing = danmakuStore, existing.isOfflineOnly == isOfflineDanmaku {
             store = existing
         } else {
-            store = DanmakuSegmentStore()
+            if danmakuStore != nil { releaseDanmakuStore() }
+            let offlineDir = isOfflineDanmaku ? DanmakuSegmentStore.offlineDirectory(forOID: session.oid) : nil
+            store = DanmakuSegmentStore(offlineDirectoryURL: offlineDir, isOfflineOnly: isOfflineDanmaku)
             store.reset(oid: session.oid)
             danmakuStore = store
             wireDanmakuMetadataCallbacks(store)

@@ -219,6 +219,14 @@ final class SponsorBlockManager {
         Task { await SponsorBlockService.shared.reportViewed(uuid: uuid, server: server) }
     }
 
+    func revertSkip(seconds: Double) {
+        let delta = seconds.isFinite ? max(0, seconds) : 0
+        skippedCount = max(0, skippedCount - 1)
+        skippedSeconds = max(0, skippedSeconds - delta)
+        UserDefaults.standard.set(skippedCount, forKey: Key.skipCount)
+        UserDefaults.standard.set(skippedSeconds, forKey: Key.skipSeconds)
+    }
+
     func recordMute(uuid: String) {
         let server = customServer
         Task { await SponsorBlockService.shared.reportViewed(uuid: uuid, server: server) }
@@ -229,6 +237,21 @@ final class SponsorBlockManager {
         skippedSeconds = 0
         UserDefaults.standard.set(0, forKey: Key.skipCount)
         UserDefaults.standard.set(0.0, forKey: Key.skipSeconds)
+    }
+
+    func setLoadedSegmentsForTesting(videoID: String, cid: Int?, segments: [SponsorSegment]) {
+        let source = Source(videoID: videoID, cid: cid)
+        requestSerial &+= 1
+        requestedSource = source
+        published = PublishedSegments(source: source, segments: segments.sorted { $0.start < $1.start })
+        isLoading = false
+    }
+
+    func restoreStatsForTesting(count: Int, seconds: Double) {
+        skippedCount = max(0, count)
+        skippedSeconds = seconds.isFinite ? max(0, seconds) : 0
+        UserDefaults.standard.set(skippedCount, forKey: Key.skipCount)
+        UserDefaults.standard.set(skippedSeconds, forKey: Key.skipSeconds)
     }
 
     // MARK: User ID

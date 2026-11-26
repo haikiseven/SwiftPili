@@ -161,6 +161,9 @@ extension PlayerViewModel {
         }
 
         PlayerLog.log("[Player] 🔁 CDN switch \(budget.cdnSwitches)/\(RecoveryBudget.maxCDNSwitches) boundary=2 (\(reason))")
+        if let failedHost = CDNHostPolicy.canonicalHost(transaction.authority.videoURL?.host()) {
+            SmartCDNSelector.shared.reportPlaybackIssue(host: failedHost, reason: reason)
+        }
 
         if let inPlace = await attemptInPlaceCDNSwitch(transaction, reason: reason, resume: resume) {
             return inPlace
@@ -190,9 +193,6 @@ extension PlayerViewModel {
     ) async -> Bool? {
         if transaction.authority.dash, backendKind == .demandPaced,
            resume > DemandDASHRouteResume.minimumPosition {
-            if SmartCDNSelector.isEnabled, let failedHost = transaction.authority.videoURL?.host() {
-                SmartCDNSelector.shared.reportPlaybackIssue(host: failedHost, reason: reason)
-            }
             PlayerLog.log("[CDN] Demand DASH resume failover — refreshing both track routes")
             return nil
         }
@@ -200,9 +200,6 @@ extension PlayerViewModel {
            let url = Self.admittedNetworkURL(current, stage: "cdn-retry"),
            Self.urlStillFresh(url) {
             let failedHost = CDNHostPolicy.canonicalHost(url.host()) ?? ""
-            if SmartCDNSelector.isEnabled, !failedHost.isEmpty {
-                SmartCDNSelector.shared.reportPlaybackIssue(host: failedHost, reason: reason)
-            }
             let next: URL? = if SmartCDNSelector.isEnabled {
                 await smartRankedFallbackURL(from: [url.absoluteString], excluding: failedHost)
             } else {

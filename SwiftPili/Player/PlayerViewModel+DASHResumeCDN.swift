@@ -29,6 +29,9 @@ extension PlayerViewModel {
             shortlist, mode: .resume, evidence: preferenceEvidence, admits: admits
         ) {
             guard admits(winner.url) else { return nil }
+            if let host = winner.url.host() {
+                SmartCDNSelector.shared.recordMediaReachable(host: host)
+            }
             evidence.outcomes.append(contentsOf: preferenceEvidence.outcomes)
             let result = winner.evidence == .partial ? "partial" : "compatible-200"
             logResumeSelection(winner.url, track: resume.track, result: result)
@@ -44,6 +47,9 @@ extension PlayerViewModel {
                 batch, mode: .reachability, evidence: evidence, admits: admits
             ) {
                 guard admits(winner.url) else { return nil }
+                if let host = winner.url.host() {
+                    SmartCDNSelector.shared.recordMediaReachable(host: host)
+                }
                 logResumeSelection(winner.url, track: resume.track, result: "compatible-headers")
                 return winner.url
             }

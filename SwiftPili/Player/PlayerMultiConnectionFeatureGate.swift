@@ -10,14 +10,12 @@ enum MultiConnectionFeatureGate {
         defaults: UserDefaults = .standard,
         environment: [String: String] = processEnvironment
     ) -> Bool {
-        ExperimentalSettingsPolicy.isAllowed(.multiConnection)
-            && defaults.bool(forKey: defaultsKey)
+        defaults.bool(forKey: defaultsKey)
             && processEnabled(environment: environment)
     }
 
     static func processEnabled(environment: [String: String] = processEnvironment) -> Bool {
-        let helperPermitted = !ExperimentalSettingsPolicy.isAllowed(.multiConnection)
-            || environment[environmentKey] != "0"
+        let helperPermitted = environment[environmentKey] != "0"
         let storePermitted = !ExperimentalSettingsPolicy.diagnosticsEnabled || environment["PATHA_BYTE_CACHE"] != "0"
         return helperPermitted && storePermitted
     }

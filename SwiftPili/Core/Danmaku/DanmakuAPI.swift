@@ -60,6 +60,15 @@ enum DanmakuAPI {
             type: PostDanmakuResult.self
         )
     }
+
+    static func getUserFilters() async throws(BiliError) -> [CloudDanmakuFilterRule] {
+        guard AuthManager.shared.isLoggedIn else { throw .authRequired }
+        let result = try await BiliAPIClient.shared.request(
+            BiliEndpoint(path: "/x/dm/filter/user"),
+            type: CloudDanmakuFilterResult.self
+        )
+        return result.rule ?? []
+    }
 }
 
 struct PostDanmakuResult: Decodable, Sendable {

@@ -189,3 +189,144 @@ struct CDNTestResult: Sendable {
         return String(format: "%.0f KB/s", speed * 1000)
     }
 }
+
+enum CDNCloudVendor: String, CaseIterable, Sendable, Equatable {
+    case alibaba
+    case tencent
+    case huawei
+    case baidu
+    case ctyun
+    case kingsoft
+    case qiniu
+    case wangsu
+    case akamai
+    case equinix
+
+    var localizedName: String {
+        switch self {
+        case .alibaba: String(localized: "Alibaba Cloud")
+        case .tencent: String(localized: "Tencent Cloud")
+        case .huawei: String(localized: "Huawei Cloud")
+        case .baidu: String(localized: "Baidu Cloud")
+        case .ctyun: String(localized: "CTYun")
+        case .kingsoft: String(localized: "Kingsoft Cloud")
+        case .qiniu: String(localized: "Qiniu Cloud")
+        case .wangsu: String(localized: "Wangsu")
+        case .akamai: "Akamai"
+        case .equinix: "Equinix"
+        }
+    }
+}
+
+enum CDNHostDisplay {
+    private static let comparisonLocale = Locale(identifier: "en_US_POSIX")
+
+    static func normalizedDomain(_ rawAuthority: String) -> String {
+        var trimmed = rawAuthority.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        while trimmed.hasSuffix(".") {
+            trimmed.removeLast()
+        }
+        return trimmed.lowercased(with: comparisonLocale)
+    }
+
+    static func vendor(for rawAuthority: String) -> CDNCloudVendor? {
+        let domain = normalizedDomain(rawAuthority)
+        guard !domain.isEmpty else { return nil }
+
+        let hostOnly: String
+        if !domain.hasPrefix("["), let colon = domain.firstIndex(of: ":") {
+            hostOnly = String(domain[..<colon])
+        } else {
+            hostOnly = domain
+        }
+        guard !hostOnly.isEmpty else { return nil }
+
+        if hostOnly.contains("mirrorali")
+            || hostOnly.contains("estgoss")
+            || hostOnly.contains("upcdnali")
+            || hostOnly.contains("tf-all-ali")
+            || hostOnly == "alicdn.com"
+            || hostOnly.hasSuffix(".alicdn.com") {
+            return .alibaba
+        }
+
+        if hostOnly.contains("mirrorcos")
+            || hostOnly.contains("estgcos")
+            || hostOnly.contains("tf-all-tx")
+            || hostOnly.contains("upcdntx")
+            || hostOnly == "myqcloud.com"
+            || hostOnly.hasSuffix(".myqcloud.com") {
+            return .tencent
+        }
+
+        if hostOnly.contains("mirrorhw")
+            || hostOnly.contains("mirror08c")
+            || hostOnly.contains("mirror08h")
+            || hostOnly.contains("estghw")
+            || hostOnly.contains("tf-all-hw")
+            || hostOnly.contains("upcdnhw")
+            || hostOnly == "huaweicloud.com"
+            || hostOnly.hasSuffix(".huaweicloud.com") {
+            return .huawei
+        }
+
+        if hostOnly.contains("upcdnbd")
+            || hostOnly.contains("mirrorbd")
+            || hostOnly.contains("mirrorbos")
+            || hostOnly == "baidubce.com"
+            || hostOnly.hasSuffix(".baidubce.com")
+            || hostOnly == "bdydns.com"
+            || hostOnly.hasSuffix(".bdydns.com") {
+            return .baidu
+        }
+
+        if hostOnly.contains("mirrorzos")
+            || hostOnly.contains("ctyun")
+            || hostOnly.hasSuffix(".ctyunapi.cn") {
+            return .ctyun
+        }
+
+        if hostOnly.contains("mirrorks")
+            || hostOnly.contains("upcdnks")
+            || hostOnly.hasSuffix(".ksyun.com")
+            || hostOnly.hasSuffix(".ks-cdn.com") {
+            return .kingsoft
+        }
+
+        if hostOnly.contains("mirrorkodo")
+            || hostOnly.contains("upcdnqn")
+            || hostOnly.hasSuffix(".qiniucdn.com") {
+            return .qiniu
+        }
+
+        if hostOnly.contains("upcdnws")
+            || hostOnly.contains("mirrorws")
+            || hostOnly.hasSuffix(".wscdns.com") {
+            return .wangsu
+        }
+
+        if hostOnly.contains("mirrorakam")
+            || hostOnly.hasSuffix(".akamaized.net")
+            || hostOnly.hasSuffix(".akamaihd.net")
+            || hostOnly.hasSuffix(".akamai.net") {
+            return .akamai
+        }
+
+        if hostOnly.hasPrefix("cn-hk-eq-")
+            || hostOnly.contains(".equinix.") {
+            return .equinix
+        }
+
+        return nil
+    }
+
+    static func formatted(_ rawAuthority: String) -> String {
+        let domain = normalizedDomain(rawAuthority)
+        guard !domain.isEmpty else { return "" }
+        if let vendor = vendor(for: domain) {
+            return "\(domain) (\(vendor.localizedName))"
+        }
+        return domain
+    }
+}

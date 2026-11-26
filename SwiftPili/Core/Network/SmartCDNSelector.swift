@@ -274,6 +274,7 @@ final class SmartCDNSelector {
         if let previousBest,
            let bestReport = ranked.first(where: {
                CDNHostPolicy.canonicalHost($0.host) == CDNHostPolicy.canonicalHost(previousBest)
+                   && !isBlacklisted($0.host)
            }) {
             best = bestReport
         } else {
@@ -282,7 +283,9 @@ final class SmartCDNSelector {
     }
 
     func reportPlaybackIssue(host: String, reason: String) {
-        guard selectionEnabled, let key = admittedHost(host, stage: "blacklist") else { return }
+        guard let key = admittedHost(host, stage: "blacklist") else { return }
+        mediaVerifiedHosts.remove(key)
+        guard selectionEnabled else { return }
         blacklist[key] = Date().addingTimeInterval(blacklistDuration)
         let diagHost = CDNHostPolicy.diagnosticHost(key)
         let diagReason = CDNHostPolicy.diagnosticReason(reason)
@@ -302,11 +305,19 @@ final class SmartCDNSelector {
 
     private var rampEWMA: [String: (kBps: Double, samples: Int)] = [:]
     private var sweepReachableHosts: Set<String> = []
+    private var mediaVerifiedHosts: Set<String> = []
+
+    func recordMediaReachable(host: String) {
+        guard let key = admittedHost(host, stage: "media-reachability"),
+              !isBlacklisted(key) else { return }
+        mediaVerifiedHosts.insert(key)
+    }
 
     func hasSessionReachabilityEvidence(for host: String) -> Bool {
-        guard let key = admittedHost(host, stage: "reachability-evidence") else { return false }
+        guard let key = admittedHost(host, stage: "reachability-evidence"),
+              !isBlacklisted(key) else { return false }
         if let entry = rampEWMA[key], entry.samples >= 1 { return true }
-        return sweepReachableHosts.contains(key)
+        return mediaVerifiedHosts.contains(key)
     }
 
     func measuredRamp(for host: String) -> Int? {
@@ -443,7 +454,8 @@ final class SmartCDNSelector {
             UserDefaults.standard.removeObject(forKey: Self.seedStorageKey)
         }
         guard client != nil || best != nil || !ranked.isEmpty || !rampEWMA.isEmpty
-            || !sweepReachableHosts.isEmpty || !blacklist.isEmpty else { return }
+            || !sweepReachableHosts.isEmpty || !mediaVerifiedHosts.isEmpty
+            || !blacklist.isEmpty else { return }
         PlayerLog.log("[SmartCDN] cache invalidated reason=\(CDNHostPolicy.diagnosticReason(reason))")
         client = nil
         ranked = []
@@ -452,6 +464,7 @@ final class SmartCDNSelector {
         fakeIPDNSDetected = false
         rampEWMA = [:]
         sweepReachableHosts = []
+        mediaVerifiedHosts = []
         blacklist = [:]
         seedApplied = false
     }
@@ -723,7 +736,7 @@ final class SmartCDNSelector {
         }
     }
 
-    private func installValidatedSweepReports(_ reports: [NodeReport]) {
+    func installValidatedSweepReports(_ reports: [NodeReport]) {
         sweepReachableHosts = Set(reports.compactMap { CDNHostPolicy.canonicalHost($0.host) })
         guard !sweepReachableHosts.isEmpty else { return }
         ranked = sortByPreference(reports)

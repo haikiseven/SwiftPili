@@ -159,8 +159,19 @@ extension PlayerViewModel {
         danmakuMemoryWarningObserver = DanmakuGateObserverToken(token: token)
     }
 
+    var hasRegisteredOfflineDanmaku: Bool {
+        guard mode == .offline,
+              let cid = currentCid,
+              offlineAsset?.cid == cid else { return false }
+        return DanmakuSegmentStore.offlineDirectory(forOID: cid) != nil
+    }
+
+    var supportsDanmakuControls: Bool {
+        mode.usesOnlineVODServices || hasRegisteredOfflineDanmaku
+    }
+
     func admitDanmakuSession(openingAt startAt: TimeInterval) {
-        guard mode == .vod, let cid = currentCid else { return }
+        guard (mode == .vod || hasRegisteredOfflineDanmaku), let cid = currentCid else { return }
         let identity = DanmakuSessionIdentity(oid: cid, owner: ownerKey)
         let admission = danmakuSessionLedger.admit(identity, at: Self.danmakuUptime())
         danmakuRetentionExpiry?.cancel()

@@ -3,6 +3,29 @@ import QuartzCore
 
 @MainActor
 final class DanmakuSegmentStore {
+    private static var offlineDirectories: [Int: URL] = [:]
+
+    static func registerOfflineDirectory(_ directoryURL: URL, forOID oid: Int) {
+        guard oid > 0 else { return }
+        offlineDirectories[oid] = directoryURL
+    }
+
+    static func unregisterOfflineDirectory(forOID oid: Int, matching directoryURL: URL? = nil) {
+        if let directoryURL {
+            guard offlineDirectories[oid]?.standardizedFileURL == directoryURL.standardizedFileURL else {
+                return
+            }
+        }
+        offlineDirectories.removeValue(forKey: oid)
+    }
+
+    static func offlineDirectory(forOID oid: Int) -> URL? {
+        offlineDirectories[oid]
+    }
+
+    var offlineDirectoryURL: URL?
+    var isOfflineOnly: Bool
+
     private(set) var segments: [Int: DanmakuTimeIndex] = [:]
     private var inFlight: [Int: (request: UInt64, task: Task<Void, Never>)] = [:]
     private var nextRequest: UInt64 = 0
@@ -16,15 +39,22 @@ final class DanmakuSegmentStore {
     var onSpecialLoaded: (() -> Void)?
     var onSegmentsLoaded: (() -> Void)?
     private let metadataOwner = DanmakuMetadataStore()
+    private var localMetadataChecked = false
+    private var localMetadataTask: Task<Void, Never>?
     private var latestPosition: (mediaTime: TimeInterval, duration: TimeInterval)?
 
-    init() {
+    init(offlineDirectoryURL: URL? = nil, isOfflineOnly: Bool = false) {
+        self.offlineDirectoryURL = offlineDirectoryURL
+        self.isOfflineOnly = isOfflineOnly
         metadataOwner.onMetadata = { [weak self] in self?.acceptMetadata($0) }
         metadataOwner.onSpecialLoaded = { [weak self] in self?.onSpecialLoaded?() }
     }
 
     func reset(oid newOID: Int?) {
         cancelInFlight()
+        localMetadataTask?.cancel()
+        localMetadataTask = nil
+        localMetadataChecked = false
         segments.removeAll()
         failures.removeAll()
         selfSent.removeAll()
@@ -45,6 +75,8 @@ final class DanmakuSegmentStore {
 
     func suspend() {
         cancelInFlight()
+        localMetadataTask?.cancel()
+        localMetadataTask = nil
         metadataOwner.suspend()
         latestPosition = nil
     }
@@ -83,7 +115,15 @@ final class DanmakuSegmentStore {
     func advance(to mediaTime: TimeInterval, duration: TimeInterval) {
         guard let oid else { return }
         latestPosition = (mediaTime, duration)
-        metadataOwner.advance()
+        if let offlineDir = resolvedOfflineDirectory(for: oid) {
+            if !localMetadataChecked, localMetadataTask == nil {
+                localMetadataTask = Task { [weak self] in
+                    await self?.loadLocalMetadata(oid: oid, directory: offlineDir)
+                }
+            }
+        } else if !isOfflineOnly {
+            metadataOwner.advance()
+        }
         guard !isServerClosed else { return }
         let now = CACurrentMediaTime()
         if windowIsQuiet(mediaTime: mediaTime, duration: duration, now: now) { return }
@@ -255,11 +295,122 @@ final class DanmakuSegmentStore {
 
     // MARK: - Loading
 
+    private func resolvedOfflineDirectory(for oid: Int) -> URL? {
+        offlineDirectoryURL ?? Self.offlineDirectories[oid]
+    }
+
+    private func loadLocalMetadata(oid: Int, directory: URL) async {
+        defer { localMetadataTask = nil }
+        let data = await Self.readOfflineMetadataData(in: directory)
+        guard !Task.isCancelled, self.oid == oid else { return }
+        localMetadataChecked = true
+        guard let data, !data.isEmpty else { return }
+        let decoded: DanmakuMetadata? = await Task.detached(priority: .utility) {
+            try? DanmakuMetadataDecoder.decode(data)
+        }.value
+        guard !Task.isCancelled, self.oid == oid, let decoded else { return }
+        acceptMetadata(decoded)
+    }
+
+    nonisolated static func resolveOfflineSegmentFileURL(
+        in directory: URL,
+        segmentIndex: Int
+    ) -> URL? {
+        guard segmentIndex >= 1 else { return nil }
+        let nested = DownloadStore.danmakuSegmentURL(in: directory, segmentIndex: segmentIndex)
+        if isUsableLocalFile(nested) {
+            return nested
+        }
+        let direct = directory.appendingPathComponent("seg_\(segmentIndex).pb")
+        if isUsableLocalFile(direct) {
+            return direct
+        }
+        return nil
+    }
+
+    nonisolated static func resolveOfflineMetadataFileURL(in directory: URL) -> URL? {
+        let nested = DownloadStore.danmakuMetadataURL(in: directory)
+        if isUsableLocalFile(nested) {
+            return nested
+        }
+        let direct = directory.appendingPathComponent("metadata.pb")
+        if isUsableLocalFile(direct) {
+            return direct
+        }
+        return nil
+    }
+
+    private nonisolated static func isUsableLocalFile(_ url: URL) -> Bool {
+        guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+              values.isRegularFile == true,
+              (values.fileSize ?? 0) > 0 else {
+            return false
+        }
+        return true
+    }
+
+    private nonisolated static func readOfflineSegmentData(
+        in directory: URL,
+        segmentIndex: Int
+    ) async -> Data? {
+        await Task.detached(priority: .utility) {
+            guard let fileURL = resolveOfflineSegmentFileURL(
+                in: directory,
+                segmentIndex: segmentIndex
+            ) else { return nil }
+            return try? Data(contentsOf: fileURL)
+        }.value
+    }
+
+    private nonisolated static func readOfflineMetadataData(in directory: URL) async -> Data? {
+        await Task.detached(priority: .utility) {
+            guard let fileURL = resolveOfflineMetadataFileURL(in: directory) else { return nil }
+            return try? Data(contentsOf: fileURL)
+        }.value
+    }
+
     private func load(oid: Int, segmentIndex: Int, request: UInt64) async {
         defer {
             if inFlight[segmentIndex]?.request == request {
                 inFlight.removeValue(forKey: segmentIndex)
             }
+        }
+        if let offlineDir = resolvedOfflineDirectory(for: oid) {
+            let localData = await Self.readOfflineSegmentData(
+                in: offlineDir,
+                segmentIndex: segmentIndex
+            )
+            guard accepts(oid: oid, segmentIndex: segmentIndex, request: request) else { return }
+            if let localData, !localData.isEmpty {
+                let decoded = await Self.decode(localData, segmentIndex: segmentIndex)
+                guard accepts(oid: oid, segmentIndex: segmentIndex, request: request) else { return }
+                switch decoded {
+                case .success(let index):
+                    failures.removeValue(forKey: segmentIndex)
+                    segments[segmentIndex] = index
+                    PlayerLog.log(
+                        "[Danmaku] segment \(segmentIndex): \(index.count) bullets "
+                            + "bytes=\(localData.count) source=offline-disk"
+                    )
+                    onSegmentsLoaded?()
+                case .failure(let error):
+                    recordFailure(
+                        .malformed,
+                        segmentIndex: segmentIndex,
+                        evidence: "source=offline-disk bytes=\(localData.count) error=\(error)"
+                    )
+                }
+                return
+            }
+            if isOfflineOnly {
+                failures.removeValue(forKey: segmentIndex)
+                segments[segmentIndex] = DanmakuTimeIndex([])
+                return
+            }
+        } else if isOfflineOnly {
+            failures.removeValue(forKey: segmentIndex)
+            segments[segmentIndex] = DanmakuTimeIndex([])
+            return
         }
         let response: DanmakuSegmentResponse
         do {

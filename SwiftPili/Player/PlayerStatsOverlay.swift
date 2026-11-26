@@ -151,9 +151,16 @@ struct PlayerStatsOverlay: View {
     @ViewBuilder
     private func enhancementGroup(statistics: PlaybackStats, labelWidth: CGFloat) -> some View {
         if let enhancement = statistics.videoEnhancement {
+            let liveConfig = snapshot == nil ? player.effectiveVideoEnhancementConfiguration : nil
             statsGroup("Enhancement") {
                 if let modeText = enhancementModeText(enhancement) {
                     statsRow("Mode", modeText, labelWidth: labelWidth)
+                }
+                if let engineText = Self.interpolationEngineSummary(
+                    for: enhancement,
+                    configuration: liveConfig
+                ) {
+                    statsRow("FRC Engine", engineText, labelWidth: labelWidth)
                 }
                 statsRow("Status", enhancementStatusText(enhancement), labelWidth: labelWidth)
                 if enhancement.outputWidth > 0, enhancement.outputHeight > 0 {
@@ -254,6 +261,25 @@ struct PlayerStatsOverlay: View {
         return requestedEnhancementModeText(player.effectiveVideoEnhancementConfiguration)
     }
 
+    nonisolated static func interpolationEngineSummary(
+        for enhancement: VideoEnhancementTelemetry,
+        configuration: VideoEnhancementConfiguration? = nil
+    ) -> String? {
+        let backendLabel: String?
+        if let resolved = enhancement.resolvedFrameInterpolationBackendLabel {
+            backendLabel = resolved
+        } else if let configuration, configuration.frameInterpolationEnabled {
+            backendLabel = configuration.resolvedFrameInterpolationBackend.telemetryLabel
+        } else {
+            backendLabel = nil
+        }
+        guard let backendLabel else { return nil }
+        if let configuration, configuration.frameInterpolationEnabled {
+            return "\(backendLabel) (\(configuration.interpolationRate.shortStatsLabel))"
+        }
+        return backendLabel
+    }
+
     private func activeEnhancementModeText(_ enhancement: VideoEnhancementTelemetry) -> String? {
         func withShare(_ name: String, _ share: Double?) -> String {
             guard let share, share < 0.995 else { return name }
@@ -264,7 +290,7 @@ struct PlayerStatsOverlay: View {
             switch token {
             case "VT ML SR": return withShare(String(localized: "VideoToolbox ML"), enhancement.superResolutionShare)
             case "MetalFX SR": return withShare("MetalFX", enhancement.superResolutionShare)
-            case "VT FI", "Vision FI":
+            case "VT FI", "VT System", "Vision FI", "Vision Flow":
                 return withShare(String(localized: "Frame Interpolation"), enhancement.interpolationShare)
             default: return token
             }
@@ -289,10 +315,10 @@ struct PlayerStatsOverlay: View {
         if enhancement.isActive {
             var text = String(localized: "Active")
             if let partial = enhancement.partialReason {
-                text += " · " + VideoEnhancementBypassDisplay.shortLabel(for: partial)
+                text += " (" + VideoEnhancementBypassDisplay.shortLabel(for: partial) + ")"
             }
             if let note = enhancement.degradationNote {
-                text += " " + String(format: String(localized: "(Reduced · %@)"),
+                text += " " + String(format: String(localized: "(Reduced: %@)"),
                                      VideoEnhancementBypassDisplay.shortLabel(for: note))
             }
             return text
@@ -362,30 +388,12 @@ struct PlayerCDNSourceDisplay: Equatable {
     var multiConnection: MultiConnectionDisplay?
     var helperHosts: [String]
 
-    var helperSummary: String {
-        let groups = Dictionary(grouping: helperHosts) { host in
-            CDNService.allCases.first(where: { $0.host == host })?.provider ?? .other
-        }
-        return CDNProvider.allCases.compactMap { provider in
-            guard let count = groups[provider]?.count else { return nil }
-            let label: String
-            switch provider {
-            case .alibaba: label = String(localized: "Ali")
-            case .tencent: label = String(localized: "TX")
-            case .huawei: label = String(localized: "HW")
-            case .other: label = String(localized: "Other")
-            case .overseas: label = String(localized: "Overseas")
-            }
-            return "\(label)×\(count)"
-        }.joined(separator: " ")
+    static func formattedAuthority(_ authority: String) -> String {
+        CDNHostDisplay.formatted(authority)
     }
 
-    static func compactAuthority(_ authority: String) -> String {
-        if let service = CDNService.allCases.first(where: { $0.host == authority }) { return service.label }
-        let domain = ".bilivideo.com"
-        guard authority.hasSuffix(domain) else { return authority }
-        let node = String(authority.dropLast(domain.count))
-        return node.hasPrefix("upos-") ? String(node.dropFirst(5)) : node
+    var formattedHelperHosts: [String] {
+        helperHosts.map(Self.formattedAuthority)
     }
 
     init(stats: PlaybackStats, status: MultiConnectionDisplay, enabled: Bool, onlineVOD: Bool) {
@@ -441,20 +449,28 @@ struct PlayerCDNSourceRows: View {
                 if !source.primaryAudioHost.isEmpty { row("Main Audio") { host(source.primaryAudioHost) } }
             }
             if !source.helperHosts.isEmpty {
-                row("Helpers") { Text(verbatim: source.helperSummary).lineLimit(1) }
-                    .accessibilityLabel(Text("Helpers"))
-                    .accessibilityValue(Text(verbatim: source.helperHosts.joined(separator: ", ")))
+                row("Helpers") {
+                    VStack(alignment: .leading, spacing: 1) {
+                        ForEach(source.helperHosts, id: \.self) { helper in
+                            host(helper)
+                        }
+                    }
+                }
+                .accessibilityLabel(Text("Helpers"))
+                .accessibilityValue(Text(verbatim: source.formattedHelperHosts.joined(separator: ", ")))
             }
         } else {
             if !source.cdnSetting.isEmpty { row("CDN") { Text(source.cdnSetting) } }
-            if !source.primaryVideoHost.isEmpty { row("Video Host") { Text(source.primaryVideoHost) } }
-            if !source.primaryAudioHost.isEmpty { row("Audio Host") { Text(source.primaryAudioHost) } }
+            if !source.primaryVideoHost.isEmpty { row("Video Host") { host(source.primaryVideoHost) } }
+            if !source.primaryAudioHost.isEmpty { row("Audio Host") { host(source.primaryAudioHost) } }
         }
     }
 
     private func host(_ authority: String) -> some View {
-        Text(PlayerCDNSourceDisplay.compactAuthority(authority)).lineLimit(1).truncationMode(.middle)
-            .accessibilityLabel(Text(verbatim: authority))
+        let formatted = PlayerCDNSourceDisplay.formattedAuthority(authority)
+        return Text(verbatim: formatted)
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityLabel(Text(verbatim: formatted))
     }
 
     private func row<Content: View>(_ label: LocalizedStringKey, @ViewBuilder content: () -> Content) -> some View {

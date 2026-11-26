@@ -221,7 +221,9 @@ struct CDNSettingsView: View {
         if let client = smart.client {
             statusRow(
                 title: Text("My Network"),
-                value: "\(client.ip) · \(client.isp) · \(client.province)"
+                value: [client.ip, client.isp, client.province]
+                    .filter { !$0.isEmpty }
+                    .joined(separator: " / ")
             )
         }
 
@@ -252,12 +254,11 @@ struct CDNSettingsView: View {
                         .monospacedDigit()
                         .foregroundStyle(best.latencyMs < 100 ? .green : best.latencyMs < 300 ? .orange : .red)
                 }
-                Text(best.host)
+                Text(verbatim: CDNHostDisplay.formatted(best.host))
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.65)
-                Text(verbatim: "IP: \(best.ip)\(best.isp.isEmpty ? "" : " · \(best.isp)")\(best.province.isEmpty ? "" : " · \(best.province)")")
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(verbatim: "IP: \(best.ip)\(best.isp.isEmpty ? "" : " / \(best.isp)")\(best.province.isEmpty ? "" : " / \(best.province)")")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
