@@ -22,7 +22,8 @@ extension MediaEngineSession {
     }
 
     var tracksDrainedAtEOF: Bool {
-        guard demuxReachedEOF else { return false }
+        let allEOF = demuxReachedEOF || (videoTrackReachedEOF && audioTrackReachedEOF)
+        guard allEOF else { return false }
         let videoDrained = !videoDecoderOpened || isVideoLaneWarmSuspended || (
             videoPacketQueue.contentSeconds <= 0
                 && pendingVideoContentSeconds <= 0
@@ -46,15 +47,17 @@ extension MediaEngineSession {
         var audioEnd = audioDeliveryRunway.map { time + $0 }
         let duration = clock.duration
         let hasFiniteDuration = duration.isFinite && duration > 0
-        if demuxReachedEOF, hasFiniteDuration {
-            if videoDecoderOpened, !isVideoLaneWarmSuspended,
+        if hasFiniteDuration {
+            if videoTrackReachedEOF,
+               videoDecoderOpened, !isVideoLaneWarmSuspended,
                videoPacketQueue.contentSeconds <= 0,
                pendingVideoContentSeconds <= 0,
                cachedVideoRunwaySeconds <= 0,
                videoRender.enqueuedAheadSeconds(from: time) <= 0 {
                 videoEnd = max(time, duration)
             }
-            if hasAudioTrack,
+            if audioTrackReachedEOF,
+               hasAudioTrack,
                audioPacketQueue.contentSeconds <= 0,
                pendingAudioContentSeconds <= 0,
                cachedAudioRunwaySeconds <= 0,
@@ -67,7 +70,7 @@ extension MediaEngineSession {
             audioEnd = audioEnd.map { min($0, duration) }
         }
         var bufferedThrough = bindingDeliveryRunway(video: videoEnd, audio: audioEnd)
-        if demuxReachedEOF, hasFiniteDuration, tracksDrainedAtEOF {
+        if hasFiniteDuration, tracksDrainedAtEOF {
             bufferedThrough = max(bufferedThrough ?? time, duration)
         }
         if let through = bufferedThrough, hasFiniteDuration {
@@ -348,6 +351,7 @@ extension MediaEngineSession {
         resetCachedRunway()
         videoStarvedSince = nil
         bufferingForVideoStarvation = false
+        resetTrackEOFState()
     }
 
     func beginVideoReadGeneration() -> UInt64 {
@@ -376,6 +380,35 @@ extension MediaEngineSession {
             videoFrameSeconds: pendingVideoContentSeconds,
             sourceUnderflows: nativeAudio?.sourceUnderflowCount
         )
+    }
+
+    func syncTrackEOFFromDemux(
+        generation gen: Int,
+        audioDecodeOperationID: UInt64?
+    ) async -> Bool {
+        let reachedEOF = await demux.isEOF
+        var videoEOF = reachedEOF
+        var audioEOF = reachedEOF
+        if !reachedEOF, let fmp4 = demux as? PathAFMP4Demuxer {
+            videoEOF = await fmp4.isVideoEOF
+            audioEOF = await fmp4.isAudioEOF
+        }
+        guard !Task.isCancelled,
+              isCurrentGeneration(gen),
+              isCurrentAudioDecodeOperation(audioDecodeOperationID),
+              warmPreparationTransaction.orphan == nil else {
+            return false
+        }
+        if reachedEOF {
+            demuxReachedEOF = true
+            noteTrackEOF(video: true, audio: true)
+        } else if videoEOF || audioEOF {
+            noteTrackEOF(video: videoEOF, audio: audioEOF)
+            if videoTrackReachedEOF, audioTrackReachedEOF {
+                demuxReachedEOF = true
+            }
+        }
+        return demuxReachedEOF
     }
 
     func fillQueuesToHighWater(
@@ -480,9 +513,9 @@ extension MediaEngineSession {
 
             let videoAtMemoryCap = !isVideoLaneWarmSuspended && holdsPassThroughVideo
                 && !canAcceptAnotherPassThroughVideoPacket()
-            let videoNeeds = !videoAtMemoryCap && !residualBlockingVideo
+            let videoNeeds = !videoTrackReachedEOF && !videoAtMemoryCap && !residualBlockingVideo
                 && (videoTarget - videoDepth) >= minTrackFillRoom
-            let audioNeeds = hasAudioTrack && !residualBlockingAudio
+            let audioNeeds = hasAudioTrack && !audioTrackReachedEOF && !residualBlockingAudio
                 && (audioTarget - audioDepth) >= minTrackFillRoom
             let needsMore: Bool
             if isPriming || holdsPassThroughVideo {
@@ -492,7 +525,10 @@ extension MediaEngineSession {
             }
             guard needsMore else { break }
 
-            let reachedEOF = await demux.isEOF
+            let reachedEOF = await syncTrackEOFFromDemux(
+                generation: gen,
+                audioDecodeOperationID: audioDecodeOperationID
+            )
             guard !Task.isCancelled, isCurrentGeneration(gen),
                   isCurrentAudioDecodeOperation(audioDecodeOperationID),
                   warmPreparationTransaction.orphan == nil else {
@@ -511,16 +547,18 @@ extension MediaEngineSession {
             } else {
                 currentVideoTarget = videoTarget
             }
-            let videoBudget = videoNeeds
+            let videoBudget = (videoNeeds && !videoTrackReachedEOF)
                 ? min(max(0, currentVideoTarget - videoDepth), pumpCallBudgetCapSeconds)
                 : 0
-            let audioBudget = audioNeeds
+            let audioBudget = (audioNeeds && !audioTrackReachedEOF)
                 ? min(max(0, audioTarget - audioDepth), pumpCallBudgetCapSeconds)
                 : 0
             guard videoBudget > 0.000_5 || audioBudget > 0.000_5 else { break }
 
             let packets: [MediaPacket]
             let acceptedPacketsBeforePump = totalVideoPacketsIngested + totalAudioPacketsIngested
+            let videoIngestedBefore = totalVideoPacketsIngested + residualVideoPackets.count
+            let audioIngestedBefore = totalAudioPacketsIngested + residualAudioPackets.count
             let videoReadGeneration = videoBudget > 0.000_5
                 ? beginVideoReadGeneration()
                 : nil
@@ -661,9 +699,36 @@ extension MediaEngineSession {
             guard isCurrentGeneration(gen),
                   isCurrentAudioDecodeOperation(audioDecodeOperationID),
                   warmPreparationTransaction.orphan == nil else { return }
+            drainRelayedPackets()
+            let returnedVideo = packets.contains { $0.track == .video }
+            let returnedAudio = packets.contains { $0.track == .audio }
+            let relayedVideo = (totalVideoPacketsIngested + residualVideoPackets.count) > videoIngestedBefore
+            let relayedAudio = (totalAudioPacketsIngested + residualAudioPackets.count) > audioIngestedBefore
+            let producedVideo = returnedVideo || relayedVideo
+            let producedAudio = returnedAudio || relayedAudio
+            if producedVideo || producedAudio {
+                unresolvedPrimaryTransportFailure = nil
+            }
+            if supportsIndependentTrackEOF, sourceWaitBudget?.isCancelled != true {
+                let inferredVideoEOF = videoBudget > 0.000_5
+                    && !producedVideo
+                    && (videoContinuityTopology != .unsupported || videoBudget >= 0.5)
+                let inferredAudioEOF = audioBudget > 0.000_5
+                    && !producedAudio
+                    && (videoContinuityTopology != .unsupported || audioBudget >= minTrackFillRoom)
+                if inferredVideoEOF || inferredAudioEOF {
+                    noteTrackEOF(video: inferredVideoEOF, audio: inferredAudioEOF)
+                    if inferredVideoEOF {
+                        resolveVideoStarvationIfRecovered()
+                    }
+                }
+            }
             if packets.isEmpty {
                 if diagnostics.isCapturing { pace?.outcome = .empty }
-                let reachedEOF = await demux.isEOF
+                let reachedEOF = await syncTrackEOFFromDemux(
+                    generation: gen,
+                    audioDecodeOperationID: audioDecodeOperationID
+                )
                 guard isCurrentGeneration(gen),
                       isCurrentAudioDecodeOperation(audioDecodeOperationID),
                       warmPreparationTransaction.orphan == nil else {
@@ -671,6 +736,22 @@ extension MediaEngineSession {
                 }
                 if reachedEOF {
                     demuxReachedEOF = true
+                    break
+                }
+                if !producedVideo, !producedAudio {
+                    let remainingVideoCanPump = !videoTrackReachedEOF
+                        && videoBudget <= 0.000_5
+                        && !videoAtMemoryCap
+                        && !residualBlockingVideo
+                        && (videoTarget - videoDepth) >= minTrackFillRoom
+                    let remainingAudioCanPump = hasAudioTrack
+                        && !audioTrackReachedEOF
+                        && audioBudget <= 0.000_5
+                        && !residualBlockingAudio
+                        && (audioTarget - audioDepth) >= minTrackFillRoom
+                    if remainingVideoCanPump || remainingAudioCanPump {
+                        continue
+                    }
                 }
                 break
             }
@@ -709,7 +790,10 @@ extension MediaEngineSession {
         if isCurrentGeneration(gen),
            isCurrentAudioDecodeOperation(audioDecodeOperationID) {
             await refreshCachedRunway(generation: gen)
-            let reachedEOF = await demux.isEOF
+            let reachedEOF = await syncTrackEOFFromDemux(
+                generation: gen,
+                audioDecodeOperationID: audioDecodeOperationID
+            )
             guard isCurrentGeneration(gen),
                   isCurrentAudioDecodeOperation(audioDecodeOperationID),
                   warmPreparationTransaction.orphan == nil else {
@@ -719,6 +803,13 @@ extension MediaEngineSession {
                 demuxReachedEOF = true
             }
             if isReady, !isSeekInFlight {
+                if videoTrackReachedEOF {
+                    resolveVideoStarvationIfRecovered()
+                }
+                if isPlaying,
+                   audioSupplyExhausted(ignoringAudioDecodeOperationID: audioDecodeOperationID) {
+                    beginAudioDrainToEnd()
+                }
                 onEvent?(.tick(
                     mediaTime: clock.mediaTime,
                     duration: clock.duration,

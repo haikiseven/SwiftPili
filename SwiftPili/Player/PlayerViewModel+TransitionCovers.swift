@@ -1,6 +1,41 @@
 import AVFoundation
+import CoreImage
+import CoreVideo
 import Foundation
 import UIKit
+
+private final class TransitionStillContextBox: @unchecked Sendable {
+    let context = CIContext(options: [
+        .useSoftwareRenderer: false,
+        .cacheIntermediates: false,
+    ])
+}
+
+private enum TransitionStillRenderer {
+    private static let contextBox = TransitionStillContextBox()
+    private static let maxDimension: CGFloat = 480
+
+    static func render(from source: DisplayedFrameCaptureSource) -> UIImage? {
+        let image = CIImage(cvPixelBuffer: source.pixelBuffer)
+        let extent = image.extent.integral
+        guard extent.width > 0, extent.height > 0 else { return nil }
+        let scale = min(1, maxDimension / max(extent.width, extent.height))
+        let scaled = scale < 1
+            ? image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            : image
+        guard let cgImage = contextBox.context.createCGImage(
+            scaled,
+            from: scaled.extent.integral
+        ) else {
+            return nil
+        }
+        return UIImage(
+            cgImage: cgImage,
+            scale: max(source.displayScale, 1),
+            orientation: .up
+        )
+    }
+}
 
 extension PlayerViewModel {
     private static let transitionCoverTimeout: Duration = .seconds(8)
@@ -10,6 +45,28 @@ extension PlayerViewModel {
         releaseDepartedRouteStills()
         let owner = ownerKey
         guard !owner.isEmpty else { return nil }
+        if let source = backend.currentDisplayedFrameCaptureSource() {
+            routeOwnership.outgoingRouteStillTasks[owner]?.cancel()
+            routeOwnership.outgoingRouteStillTasks[owner] = Task.detached(priority: .userInitiated) { [weak self] in
+                guard !Task.isCancelled else { return }
+                let image = TransitionStillRenderer.render(from: source)
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    guard !Task.isCancelled, let self else { return }
+                    guard !self.departedRouteStillOwners.contains(owner) else {
+                        self.routeOwnership.outgoingRouteStillTasks.removeValue(forKey: owner)
+                        return
+                    }
+                    guard let image, image.size.width > 0, image.size.height > 0 else {
+                        self.clearOutgoingRouteStill(owner: owner)
+                        PlayerLog.log("[Player] outgoing route still capture missed owner=\(owner)")
+                        return
+                    }
+                    self.storeOutgoingRouteStill(image, owner: owner)
+                }
+            }
+            return owner
+        }
         guard let frame = backend.currentDisplayedFrameForTransition(),
               frame.size.width > 0,
               frame.size.height > 0 else {
@@ -17,6 +74,11 @@ extension PlayerViewModel {
             PlayerLog.log("[Player] outgoing route still capture missed owner=\(owner)")
             return owner
         }
+        storeOutgoingRouteStill(frame, owner: owner)
+        return owner
+    }
+
+    private func storeOutgoingRouteStill(_ frame: UIImage, owner: String) {
         var stored = outgoingRouteStills
         stored[owner] = frame
         outgoingRouteStills = stored
@@ -32,7 +94,6 @@ extension PlayerViewModel {
             "[Player] outgoing route still parked owner=\(owner) " +
                 "\(Int(frame.size.width))×\(Int(frame.size.height))"
         )
-        return owner
     }
 
     func outgoingRouteStill(for owner: String) -> UIImage? {

@@ -75,6 +75,9 @@ extension PlayerViewModel {
     }
 
     private func surfaceDemandRuntimeFault(_ fault: MediaRuntimeFault) {
+        if attemptDemandDecodeFallback(reason: fault.diagnostics.summary) {
+            return
+        }
         settleTerminalFailure(TerminalFailurePayload(
             message: MediaRuntimeFaultPresentation.message(for: fault),
             retireStreamRecoveryReason: "decoder-fault",
@@ -98,15 +101,22 @@ extension PlayerViewModel {
             )
             return .rejected(.noAuthority)
         }
-        if trigger == .manualRetry,
-           decoderRecoveryAdmission.inFlight == nil,
-           decoderRecoveryAdmission.context != context {
-            PlayerLog.log(
-                "[Recovery] installing manual retry authority owner=\(context.owner) " +
-                    "backendGen=\(context.backendGeneration) " +
-                    "hadContext=\(decoderRecoveryAdmission.context != nil ? 1 : 0)"
-            )
-            decoderRecoveryAdmission.install(context)
+        if trigger == .manualRetry {
+            let hadContext = decoderRecoveryAdmission.context != nil
+            let contextChanged = decoderRecoveryAdmission.context != context
+            if let priorToken = decoderRecoveryAdmission.prepareForManualRetry(
+                context: context,
+                now: CACurrentMediaTime()
+            ) {
+                clearSupersededRecoveryState(for: priorToken)
+            }
+            if contextChanged {
+                PlayerLog.log(
+                    "[Recovery] installing manual retry authority owner=\(context.owner) " +
+                        "backendGen=\(context.backendGeneration) " +
+                        "hadContext=\(hadContext ? 1 : 0)"
+                )
+            }
         }
         let request = DecoderRecoveryAdmission.Request(
             context: context,
@@ -180,6 +190,13 @@ extension PlayerViewModel {
             )
             return
         }
+        if (fault.subsystem == .videoDecoder || fault.subsystem == .audioDecoder || fault.subsystem == .demux),
+           (fault.classification == .unsupportedFormat
+               || fault.classification == .badData
+               || fault.stage == .open),
+           attemptDemandDecodeFallback(reason: fault.diagnostics.summary) {
+            return
+        }
         if usesDemandPresentationContinuity,
            (fault.subsystem == .videoDecoder || fault.subsystem == .videoRenderer) {
             let inputs = DemandContinuationInputs(phase: lifecycleRecovery.presentationPhase)
@@ -243,14 +260,28 @@ extension PlayerViewModel {
         if let unavailability {
             PlayerLog.log("[Player] retry accepted — \(unavailability.rawValue) is transient")
         }
+        let failedHost = CDNHostPolicy.canonicalHost(currentURL?.host() ?? stats.videoHost)
+        if let failedHost {
+            SmartCDNSelector.shared.reportPlaybackIssue(
+                host: failedHost,
+                reason: "manual retry after failure"
+            )
+        }
         cancelLiveRecoveryTasks(resetAttempts: true, clearBackups: true)
+        nonLifecycleRecoveryTask?.task.cancel()
+        nonLifecycleRecoveryTask = nil
+        lifecycleRecoveryTask?.cancel()
+        lifecycleRecoveryTask = nil
+        relinquishLifecycleAuthority(takenOverBy: "manual retry", reason: "user retry")
+        lifecycleRecovery.invalidate()
+        invalidateLifecycleReadiness()
         self.unavailability = nil
         playbackTerminalState = .active
         terminalOpenFailure = false
         error = nil
         isBuffering = true
         resetRecoveryBudget()
-        cdnFallbackActive = false
+        cdnFallbackActive = !SmartCDNSelector.isEnabled && failedHost != nil
         switch admitRecovery(
             trigger: .manualRetry,
             position: clampedDecoderRecoveryPosition
@@ -259,7 +290,7 @@ extension PlayerViewModel {
             terminalOpenFailure = true
             playbackIntent = .playing
         case .coalesced:
-            break
+            playbackIntent = .playing
         case .rejected:
             settleTerminalFailure(TerminalFailurePayload(
                 message: String(localized: "Playback failed. Tap Retry.")

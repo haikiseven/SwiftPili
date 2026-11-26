@@ -15,6 +15,8 @@ private struct PlayerTransportReadoutKey: Equatable {
     let playerGeneration: Int
     let mode: PlayerMode
     let currentURL: URL?
+    let currentAid: Int?
+    let currentCid: Int?
     let showsNetworkSpeed: Bool
     let localeIdentifier: String
     let isSeeking: Bool
@@ -61,6 +63,8 @@ struct PlayerTransportTimeRow: View {
             playerGeneration: player.playerGeneration,
             mode: player.mode,
             currentURL: player.currentURL,
+            currentAid: player.currentAid,
+            currentCid: player.currentCid,
             showsNetworkSpeed: showNetworkSpeed,
             localeIdentifier: locale.identifier,
             isSeeking: isSeeking
@@ -120,7 +124,11 @@ struct PlayerTransportTimeRow: View {
             let elapsedText = FormatUtils.duration(Int(elapsed))
             let network = captureNetworkText(for: key)
             let duration = FormatUtils.duration(Int(player.duration))
-            return .finite(elapsed: elapsedText, duration: duration, network: network)
+            return .finite(
+                elapsed: elapsedText,
+                duration: duration,
+                network: network
+            )
         }
         return .live(network: captureNetworkText(for: key))
     }

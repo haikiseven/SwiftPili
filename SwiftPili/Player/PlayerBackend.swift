@@ -1,4 +1,11 @@
+import CoreVideo
 import UIKit
+
+struct DisplayedFrameCaptureSource: @unchecked Sendable {
+    let pixelBuffer: CVPixelBuffer
+    let displayScale: CGFloat
+}
+
 enum PlayerStateEvent: Sendable {
     case readyToPlay
     case buffering
@@ -116,6 +123,8 @@ protocol PlayerBackend: AnyObject {
     var videoEnhancementTelemetry: VideoEnhancementTelemetry { get }
     var audioMaintenanceAdmission: (@MainActor () -> AudioMaintenancePermit?)? { get set }
     func revokeAudioMaintenancePermission()
+    var supportsSystemSubtitleGeneration: Bool { get }
+    func setSubtitlePCMTap(_ tap: AudioPCMSubtitleTap?)
 
     var playbackRate: Float { get set }
     var effectivePlaybackRate: Float { get }
@@ -127,6 +136,7 @@ protocol PlayerBackend: AnyObject {
     var renderViewController: UIViewController? { get }
 
     func currentDisplayedFrameForTransition() -> UIImage?
+    func currentDisplayedFrameCaptureSource() -> DisplayedFrameCaptureSource?
     func currentAmbientSampleImage(targetSize: CGSize) -> UIImage?
 
     func setScaleMode(_ mode: VideoScaleMode)
@@ -240,10 +250,13 @@ extension PlayerBackend {
         set { _ = newValue }
     }
     func revokeAudioMaintenancePermission() {}
+    var supportsSystemSubtitleGeneration: Bool { false }
+    func setSubtitlePCMTap(_: AudioPCMSubtitleTap?) {}
 
     var bufferDisplaySample: MediaBufferDisplaySample? { nil }
 
     func currentDisplayedFrameForTransition() -> UIImage? { nil }
+    func currentDisplayedFrameCaptureSource() -> DisplayedFrameCaptureSource? { nil }
     func currentAmbientSampleImage(targetSize: CGSize) -> UIImage? {
         _ = targetSize
         return nil

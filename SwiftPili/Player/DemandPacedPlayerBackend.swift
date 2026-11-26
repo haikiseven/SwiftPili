@@ -137,6 +137,8 @@ final class DemandPacedPlayerBackend: PlayerBackend {
         set { session.audioMaintenanceAdmission = newValue }
     }
     func revokeAudioMaintenancePermission() { session.revokeAudioMaintenancePermission() }
+    var supportsSystemSubtitleGeneration: Bool { true }
+    func setSubtitlePCMTap(_ tap: AudioPCMSubtitleTap?) { session.setSubtitlePCMTap(tap) }
 
     var playbackRate: Float {
         get { session.playbackRate }
@@ -193,6 +195,9 @@ final class DemandPacedPlayerBackend: PlayerBackend {
     var renderViewController: UIViewController? { session.videoHost }
     func currentDisplayedFrameForTransition() -> UIImage? {
         session.currentDisplayedFrameForTransition()
+    }
+    func currentDisplayedFrameCaptureSource() -> DisplayedFrameCaptureSource? {
+        session.currentDisplayedFrameCaptureSource()
     }
     func currentAmbientSampleImage(targetSize: CGSize) -> UIImage? {
         session.currentAmbientSampleImage(targetSize: targetSize)

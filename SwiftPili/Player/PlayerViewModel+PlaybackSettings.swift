@@ -199,11 +199,22 @@ extension PlayerViewModel {
         guard CACurrentMediaTime() - lastSponsorSkipAt > 1.0 else { return }
         guard let seg = manager.autoSkipSegment(at: time, excluding: sponsorSkippedUUIDs) else { return }
         lastSponsorSkipAt = CACurrentMediaTime()
+        let originTime = max(0, seg.start)
+        let segDuration = seg.duration
+        let skipLoadGen = loadGeneration
         sponsorSkippedUUIDs.insert(seg.uuid)
-        manager.recordSkip(seconds: seg.duration, uuid: seg.uuid)
+        manager.recordSkip(seconds: segDuration, uuid: seg.uuid)
         PlayerLog.log("[SponsorBlock] auto-skip \(seg.category.apiValue) (\(Int(seg.start))s → \(Int(seg.end))s)")
         if manager.showSkipNotice {
-            showNotice(String(format: String(localized: "Skipped %@"), seg.category.displayName))
+            showInteractiveNotice(
+                text: String(format: String(localized: "Skipped %@"), seg.category.displayName),
+                actionTitle: String(localized: "Undo"),
+                duration: 5.0
+            ) { [weak self] in
+                guard let self, self.loadGeneration == skipLoadGen else { return }
+                SponsorBlockManager.shared.revertSkip(seconds: segDuration)
+                self.seek(to: originTime)
+            }
         }
         Task { @MainActor [weak self] in
             self?.seek(to: seg.end)

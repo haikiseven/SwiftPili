@@ -144,6 +144,87 @@ struct AudioTimelineBuffer: Sendable {
         return AudioSupplyPull(frames: framesToCopy)
     }
 
+    /// Copies currently unread buffered PCM starting at the read head (`readHeadPTS`),
+    /// downmixed to mono Float32 chunks suitable for seeding live speech recognition
+    /// immediately upon mid-playback activation.
+    func snapshotUnreadMonoChunks(
+        maxSeconds: TimeInterval = 12.0,
+        chunkFrames: Int = 8_192
+    ) -> [AudioPCMSubtitleChunk] {
+        guard channels > 0,
+              sampleRate.isFinite,
+              sampleRate > 0,
+              let endPTS,
+              endPTS.isFinite else {
+            return []
+        }
+        let samplesLeft = samples.count - readIndex
+        guard samplesLeft >= channels else { return [] }
+
+        let totalUnreadFrames = samplesLeft / channels
+        let framesToCopy: Int
+        if maxSeconds.isFinite, maxSeconds > 0 {
+            let maxFrames = Int((maxSeconds * sampleRate).rounded(.down))
+            framesToCopy = min(totalUnreadFrames, max(0, maxFrames))
+        } else {
+            framesToCopy = totalUnreadFrames
+        }
+        guard framesToCopy > 0 else { return [] }
+
+        let readHeadPTS = max(0, endPTS - Double(totalUnreadFrames) / sampleRate)
+        let strideFrames = max(256, chunkFrames)
+        let ch = channels
+        let sr = sampleRate
+
+        var chunks: [AudioPCMSubtitleChunk] = []
+        chunks.reserveCapacity((framesToCopy + strideFrames - 1) / strideFrames)
+
+        samples.withUnsafeBufferPointer { source in
+            guard let base = source.baseAddress else { return }
+            var frameOffset = 0
+            while frameOffset < framesToCopy {
+                let count = min(strideFrames, framesToCopy - frameOffset)
+                let startSample = readIndex + frameOffset * ch
+                let mono: [Float]
+                if ch == 1 {
+                    mono = Array(UnsafeBufferPointer(start: base.advanced(by: startSample), count: count))
+                } else {
+                    mono = [Float](unsafeUninitializedCapacity: count) { out, initializedCount in
+                        if ch == 2 {
+                            var src = startSample
+                            for i in 0..<count {
+                                out[i] = (base[src] + base[src + 1]) * 0.5
+                                src += 2
+                            }
+                        } else {
+                            let invCh = 1.0 / Float(ch)
+                            var src = startSample
+                            for i in 0..<count {
+                                var sum: Float = 0
+                                for c in 0..<ch {
+                                    sum += base[src + c]
+                                }
+                                out[i] = sum * invCh
+                                src += ch
+                            }
+                        }
+                        initializedCount = count
+                    }
+                }
+                let chunkPTS = readHeadPTS + Double(frameOffset) / sr
+                chunks.append(
+                    AudioPCMSubtitleChunk(
+                        monoSamples: mono,
+                        pts: chunkPTS,
+                        sampleRate: sr
+                    )
+                )
+                frameOffset += count
+            }
+        }
+        return chunks
+    }
+
     private func rejected(_ rejection: Rejection) -> AppendResult {
         AppendResult(
             appendedFrameCount: 0,

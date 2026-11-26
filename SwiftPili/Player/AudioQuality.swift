@@ -87,6 +87,47 @@ enum AudioStreamSelection {
         return AudioQualityTier.byRankDescending.filter { offered.contains($0) && decodable($0) }
     }
 
+    static func fallbackCandidates(
+        in dash: PlayURLResult.DashInfo,
+        preference: AudioQualityTier,
+        excludingID: Int,
+        decodable: (AudioQualityTier) -> Bool
+    ) -> [DashStream] {
+        var pool = candidates(dash).filter { stream in
+            guard stream.id != excludingID else { return false }
+            return AudioQualityTier(rawValue: stream.id).map(decodable) ?? true
+        }
+        var ordered: [DashStream] = []
+        while let next = select(from: pool, preference: preference, decodable: decodable) {
+            ordered.append(next)
+            pool.removeAll { $0.id == next.id }
+        }
+        for stream in pool.sorted(by: { $0.bandwidth > $1.bandwidth })
+            where !ordered.contains(where: { $0.id == stream.id }) {
+            ordered.append(stream)
+        }
+        return ordered
+    }
+
+    static func rewriteStreamURL(_ rawURLs: [String], toHostOf provenURL: URL) -> URL? {
+        guard let provenHost = CDNHostPolicy.canonicalHost(provenURL.host()) else { return nil }
+        for raw in rawURLs {
+            guard let parsed = URL(string: raw),
+                  CDNHostPolicy.allows(parsed),
+                  let rewritten = CDNHostPolicy.replacingAuthority(
+                      of: parsed,
+                      withHost: provenHost,
+                      scheme: provenURL.scheme
+                  ),
+                  CDNHostPolicy.allows(rewritten),
+                  CDNHostPolicy.admitsVODHost(rewritten) else {
+                continue
+            }
+            return rewritten
+        }
+        return nil
+    }
+
     static func trackName(codecs: String, tier: AudioQualityTier?) -> String {
         let codecName = codecs.lowercased().hasPrefix("flac") ? "FLAC" : codecs
         return [codecName, tier?.statsLabel ?? ""]

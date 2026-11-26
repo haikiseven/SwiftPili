@@ -260,6 +260,26 @@ extension PlayerViewModel {
     }
 
     func applyVideoGeometry(_ size: CGSize) {
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else {
+            return
+        }
+        let decodedAspect = DetailPlayerGeometry.normalizedAspect(size.width / size.height)
+        if let decodedAspect {
+            if let current = videoAspectRatio {
+                if abs(current - decodedAspect) >= 0.005 {
+                    videoAspectRatio = decodedAspect
+                }
+            } else {
+                videoAspectRatio = decodedAspect
+            }
+        }
+        if mode == .offline, let aid = currentAid, let cid = currentCid {
+            let w = Int(size.width.rounded())
+            let h = Int(size.height.rounded())
+            if w > 0, h > 0 {
+                OfflineProgressStore.shared.recordDimensions(width: w, height: h, aid: aid, cid: cid)
+            }
+        }
         var state = portraitPropagation
         let changed = state.applyVideoGeometry(
             width: Double(size.width),
@@ -267,7 +287,7 @@ extension PlayerViewModel {
             isPad: !DeviceCapability.usesCompactPortraitVideoFraming
         )
         portraitPropagation = state
-        if changed {
+        if changed || isPortraitContent != state.isPortrait {
             isPortraitContent = state.isPortrait
         }
     }
@@ -302,7 +322,10 @@ struct PlayerPortraitPropagationState: Equatable, Sendable {
         } else if let apiHint, mode == .vod {
             nextPortrait = apiHint
         } else {
-            nextPortrait = height > width
+            nextPortrait = DetailPlayerGeometry.isPortraitAspect(
+                CGFloat(width / height),
+                fallback: height > width
+            )
         }
 
         guard nextPortrait != isPortrait else { return false }

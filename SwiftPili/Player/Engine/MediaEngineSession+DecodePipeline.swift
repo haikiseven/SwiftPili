@@ -191,11 +191,7 @@ extension MediaEngineSession {
             return "video decoder \(type(of: videoDecoder)) did not open" +
                 (lastVideoDecoderOpenError.map { " (\($0))" } ?? "")
         }
-        guard hasAudioTrack else {
-            return "no audio track (video-only input) — mediaTime advances only " +
-                "from rendered audio, so this session would have no media clock"
-        }
-        if !audioDecoderOpened {
+        if hasAudioTrack, !audioDecoderOpened {
             return "audio decoder \(type(of: audioDecoder)) did not open" +
                 (lastAudioDecoderOpenError.map { " (\($0))" } ?? "")
         }
@@ -273,7 +269,10 @@ extension MediaEngineSession {
         do {
             logVideoDecoderOpen(track)
             try await openingDecoder.open(format: .codecConfig(
-                codec: codec, config: config, codedDimensions: track?.codedDimensions
+                codec: codec,
+                config: config,
+                codedDimensions: track?.codedDimensions,
+                extensionAtoms: track?.extensionAtoms ?? [:]
             ))
             if let warmOpenStartedAt, warmDiagnosticAttemptIsCurrent(warmPreparationAttempt),
                var state = activeWarmDiagnostics {
@@ -597,7 +596,7 @@ extension MediaEngineSession {
     }
 
     func startAudioRenderIfNeeded(reconcileAuthorizedOutput: Bool = false) {
-        guard isPlaying, audioDecoderOpened else { return }
+        guard isPlaying, drivesAudioClockPipeline else { return }
         if audioRender.isRunning {
             if reconcileAuthorizedOutput {
                 do {
@@ -1250,6 +1249,17 @@ extension MediaEngineSession {
                 outputFloor: outputMediaFloor
             )
         )
+        if let tap = subtitlePCMTap,
+           result.rejection == nil,
+           result.appendedFrameCount > 0 {
+            tap.ingest(
+                pcm: frame.pcm,
+                pts: frame.pts,
+                sampleRate: frame.sampleRate,
+                channels: frame.channelCount,
+                trimmedLeadingFrames: result.trimmedPrerollSampleFrameCount
+            )
+        }
         if let timing = frame.decodeTiming, audioDecodeTimingLogCount < 8 {
             audioDecodeTimingLogCount += 1
             diagnostics.log(

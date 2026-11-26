@@ -97,6 +97,9 @@ extension PlayerViewModel {
         }
         let replacesStreamRecovery = !isRestore && streamRecoveryOwnsWork
         if !isRestore {
+            pendingHistoryResumeNotice = nil
+            pendingPartLocationNotice = nil
+            dismissNoticeBanner(onlyIfResume: true)
             retireStreamRecovery(reason: "seek")
             retireCDNSwitchForNewIntent()
         }
@@ -147,6 +150,7 @@ extension PlayerViewModel {
             resumeAtTime = time
             resumeIsFromHistory = false
             pendingSeekTarget = time
+            handleSpeechSubtitlesSeek(to: time)
             settlement?(.handedOff)
             return
         }
@@ -177,6 +181,7 @@ extension PlayerViewModel {
         reopenSeekTask?.cancel()
         reopenSeekTask = nil
         pendingSeekTarget = time
+        handleSpeechSubtitlesSeek(to: time)
         pendingSeekTask?.cancel()
         pendingSeekTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(10))
@@ -253,6 +258,11 @@ extension PlayerViewModel {
                 if self.rebaseDemandVideoSuspensionAfterSeek(resumesPlayback: self.canAutoRevive) {
                 } else if self.canAutoRevive {
                     self.backend.play()
+                    if wasNaturallyEnded {
+                        self.updateIsPlaying(transportRunning: self.backend.isPlaying)
+                        self.resumePollingTasks()
+                        self.scheduleHideControls()
+                    }
                 }
                 self.resumeDeferredDemandVideoSuspensionIfNeeded()
                 self.handleNativeAudioOutputChange()
@@ -273,7 +283,10 @@ extension PlayerViewModel {
         pendingSeekTask?.cancel()
         pendingSeekTask = nil
         setMute(.seekTravel, false)
-        if arrived != nil { refreshBufferedDisplayAfterSeek() }
+        if let arrived {
+            refreshBufferedDisplayAfterSeek()
+            updateSubtitle(at: arrived)
+        }
         refreshAmbientSelection()
         if arrived != nil {
             sampleAmbientLiveFrameIfNeeded(at: CACurrentMediaTime(), force: true)
@@ -329,6 +342,7 @@ extension PlayerViewModel {
         pendingSeekTarget = time
         resumeAtTime = time
         resumeIsFromHistory = false
+        handleSpeechSubtitlesSeek(to: time)
         isBuffering = true
         syncDanmakuTransport()
         let token = SeekSettlementToken(

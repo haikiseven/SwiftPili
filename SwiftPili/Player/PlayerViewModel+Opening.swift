@@ -207,7 +207,9 @@ extension PlayerViewModel {
                 generation: backend.runtimeGeneration)
         }
         installEqualizerMaintenanceAdmission()
-        isDASHMode = audioURL != nil
+        if audioURL != nil {
+            isDASHMode = true
+        }
         if let context = decoderRecoveryContext() {
             decoderRecoveryAdmission.install(context)
         } else {
@@ -236,6 +238,7 @@ extension PlayerViewModel {
         if let meta = nowPlayingMeta {
             setNowPlaying(title: meta.title, artist: meta.artist, cover: meta.cover)
         }
+        flushPendingDecodeFallbackNoticeIfNeeded()
     }
 
     private func resetStreamDisplayForOpen(videoURL: URL, audioURL: URL?, isSeekReopen: Bool) {

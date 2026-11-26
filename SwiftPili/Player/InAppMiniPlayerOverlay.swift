@@ -40,7 +40,8 @@ struct InAppMiniPlayerOverlay: View {
                 let cardSize = InAppMiniPlayerLayoutPolicy.cardSize(
                     isPortrait: isPortrait,
                     isPad: DeviceCapability.supportsPadDetailSplit,
-                    containerSize: proxy.size
+                    containerSize: proxy.size,
+                    videoAspectRatio: player.chrome.videoAspectRatio
                 )
                 let anchor = InAppMiniPlayerLayoutPolicy.anchorCenter(
                     for: miniPlayer.dockPosition,
@@ -123,6 +124,10 @@ struct InAppMiniPlayerOverlay: View {
         .animation(
             motion.feedbackAnimation(normal: .smooth(duration: 0.25, extraBounce: 0)),
             value: bottomBarClearance
+        )
+        .animation(
+            motion.feedbackAnimation(normal: .smooth(duration: 0.22, extraBounce: 0)),
+            value: PlayerViewModel.existingShared?.chrome.videoAspectRatio
         )
     }
 

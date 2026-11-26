@@ -30,6 +30,11 @@ extension PlayerViewModel {
             deferredPiPOwnerExit.cancel()
             PlayerLog.log("[Player] render view claimed by \(owner) (was \(ownerKey.isEmpty ? "-" : ownerKey))")
             ownerKey = owner
+            videoAspectRatio = nil
+            portraitPureViewEnabled = false
+            portraitFullscreenContext = nil
+            isInlinePortraitImmersiveActive = false
+            onRequestInlinePortraitImmersive = nil
             ambientCoverURL = nil
             ambientStoryboardRequest = nil
             ambientStoryboardLoader.retire(keepingArtwork: false)
@@ -216,6 +221,11 @@ extension PlayerViewModel {
             stop(reason: .ownerExit, preservingParkedBackend: true)
             ownerKey = ""
             routeOwnership.activeSceneID = nil
+            videoAspectRatio = nil
+            portraitPureViewEnabled = false
+            portraitFullscreenContext = nil
+            isInlinePortraitImmersiveActive = false
+            onRequestInlinePortraitImmersive = nil
             ambientCoverURL = nil
             ambientOwnerLease = nil
             ambientStoryboard = []
@@ -229,6 +239,11 @@ extension PlayerViewModel {
         stop(reason: .ownerExit)
         ownerKey = ""
         routeOwnership.activeSceneID = nil
+        videoAspectRatio = nil
+        portraitPureViewEnabled = false
+        portraitFullscreenContext = nil
+        isInlinePortraitImmersiveActive = false
+        onRequestInlinePortraitImmersive = nil
         ambientCoverURL = nil
         ambientOwnerLease = nil
         ambientStoryboard = []

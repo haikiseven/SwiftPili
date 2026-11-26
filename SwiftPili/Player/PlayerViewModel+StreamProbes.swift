@@ -13,7 +13,12 @@ extension PlayerViewModel {
         guard !Task.isCancelled else { return false }
         let result = await Self.probeStatus(url, timeout: 5)
         evidence?.outcomes.append(result.outcome)
-        if result.evidence == .reachable, !Task.isCancelled { return true }
+        if result.evidence == .reachable, !Task.isCancelled {
+            if let host = url.host() {
+                SmartCDNSelector.shared.recordMediaReachable(host: host)
+            }
+            return true
+        }
         PlayerLog.log(
             "[Player] probe \(result.outcome.diagnostic) host=\(CDNHostPolicy.diagnosticHost(url.host()))"
         )

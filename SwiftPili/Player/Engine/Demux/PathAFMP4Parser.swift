@@ -164,12 +164,14 @@ enum PathAFMP4 {
         var defaultSampleDurationWasDeclared: Bool = false
         var defaultSampleSize: UInt32 = 0
         var defaultSampleFlags: UInt32? = nil
+        var extensionAtoms: [String: Data] = [:]
 
         var videoTrackConfiguration: MediaVideoTrackConfiguration? {
             guard kind == .video else { return nil }
             return MediaVideoTrackConfiguration(
                 codec: codec, config: config,
-                codedDimensions: MediaVideoCodedDimensions(width: width, height: height)
+                codedDimensions: MediaVideoCodedDimensions(width: width, height: height),
+                extensionAtoms: extensionAtoms
             )
         }
     }
@@ -685,6 +687,9 @@ enum PathAFMP4 {
     private static let configFourCCs: Set<String> = [
         "avcC", "hvcC", "av1C", "vpcC", "esds", "dec3", "dfLa", "dOps"
     ]
+    private static let videoExtensionAtomFourCCs: Set<String> = [
+        "avcC", "hvcC", "av1C", "vpcC", "dvcC", "dvvC", "dvwC", "colr", "pasp"
+    ]
     private static let containerFourCCs: Set<String> = [
         "sinf", "schi", "wave", "wavl", "enca", "encv",
         "avc1", "avc3", "hvc1", "hev1", "dvh1", "dvhe",
@@ -788,7 +793,34 @@ enum PathAFMP4 {
         case .malformed(let failure): return .malformed(failure)
         case .unsupported(let unsupported): return .unsupported(unsupported)
         }
+        if isVideo {
+            track.extensionAtoms = collectVideoExtensionAtoms(data, range: childStart..<entryEnd, depth: 0)
+        }
         return .success(track)
+    }
+
+    private static func collectVideoExtensionAtoms(
+        _ data: Data,
+        range: Range<Int>,
+        depth: Int
+    ) -> [String: Data] {
+        guard depth <= maxConfigNestingDepth,
+              case .success(let boxes) = parseBoxesResult(data, range: range) else {
+            return [:]
+        }
+        var atoms: [String: Data] = [:]
+        for box in boxes {
+            if videoExtensionAtomFourCCs.contains(box.type), atoms[box.type] == nil {
+                atoms[box.type] = data.subdata(in: box.payload)
+            }
+            if containerFourCCs.contains(box.type) {
+                let nested = collectVideoExtensionAtoms(data, range: box.payload, depth: depth + 1)
+                for (key, value) in nested where atoms[key] == nil {
+                    atoms[key] = value
+                }
+            }
+        }
+        return atoms
     }
 
     private static func findConfigResult(

@@ -3,6 +3,7 @@ import Foundation
 enum PlayerPlaybackPreferences {
     static let ambientModeDefaultsKey = "player_ambient_mode_enabled"
     static let inAppMiniPlayerDefaultsKey = "in_app_mini_player_enabled"
+    static let portraitVideoModeKey = "player_portrait_video_mode"
     static let defaultWifiAudioQuality: AudioQualityTier = .hiRes
     static let defaultCellularAudioQuality: AudioQualityTier = .k192
 
@@ -101,6 +102,26 @@ enum PlayerPlaybackPreferences {
             )
         }
         set { UserDefaults.standard.set(newValue, forKey: inAppMiniPlayerDefaultsKey) }
+    }
+
+    static var portraitVideoMode: PortraitVideoPresentationMode {
+        get { portraitVideoMode(from: .standard) }
+        set { setPortraitVideoMode(newValue, in: .standard) }
+    }
+
+    static func portraitVideoMode(from defaults: UserDefaults) -> PortraitVideoPresentationMode {
+        guard let raw = defaults.string(forKey: portraitVideoModeKey),
+              let mode = PortraitVideoPresentationMode(rawValue: raw) else {
+            return .inlineExpandable
+        }
+        return mode
+    }
+
+    static func setPortraitVideoMode(
+        _ mode: PortraitVideoPresentationMode,
+        in defaults: UserDefaults
+    ) {
+        defaults.set(mode.rawValue, forKey: portraitVideoModeKey)
     }
 
     static var playbackContinuationConfiguration: PlaybackContinuationConfiguration {

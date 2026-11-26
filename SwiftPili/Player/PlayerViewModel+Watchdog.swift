@@ -173,8 +173,13 @@ extension PlayerViewModel {
         case 2 where mode.usesOnlineVODServices
                 && PlayerPlaybackPreferences.cdnFallbackEnabled
                 && budget.canSwitchCDN:
-            PlayerLog.log("[Player] 🔁 \(fault.rawValue) #2 at t=\(String(format: "%.1f", position)) — same spot on a second CDN, skipping past the undecodable region to \(String(format: "%.1f", position + 10))")
-            scheduleCDNSwitch(reason: "skip past undecodable region", resumeOverride: position + 10)
+            if fault == .stalledPipeline, !isStartup {
+                PlayerLog.log("[Player] 🔁 \(fault.rawValue) #2 at t=\(String(format: "%.1f", position)) — same spot on a second CDN, skipping past the undecodable region to \(String(format: "%.1f", position + 10))")
+                scheduleCDNSwitch(reason: "skip past undecodable region", resumeOverride: position + 10)
+            } else {
+                PlayerLog.log("[Player] 🔁 \(fault.rawValue) #2 at t=\(String(format: "%.1f", position)) — switching to another CDN at same position")
+                scheduleCDNSwitch(reason: "\(fault.rawValue) #2")
+            }
         default:
             let lowerEncode = availableQualities.map(\.id).filter { $0 < currentQuality }.max()
             let trigger: DecoderRecoveryAdmission.Trigger = lowerEncode.map {

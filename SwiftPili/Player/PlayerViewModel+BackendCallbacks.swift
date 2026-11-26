@@ -128,7 +128,10 @@ extension PlayerViewModel {
                                     self.markAmbientVideoLoaded()
                                     self.acknowledgeLifecycleReadiness(.transportReady)
                                     self.finishNonLifecycleRecoveryIfNeeded(outcome: .backendReady)
+                                    self.presentPendingHistoryResumeNoticeIfNeeded()
                                 case .failed:
+                                    self.pendingHistoryResumeNotice = nil
+                                    self.pendingPartLocationNotice = nil
                                     self.acknowledgeLifecycleReadiness(.terminalFailure)
                                     self.finishNonLifecycleRecoveryIfNeeded(outcome: .backendError)
                                 case .handedOff:
@@ -148,6 +151,7 @@ extension PlayerViewModel {
                     self.handleNativeAudioOutputChange()
                     self.acknowledgeLifecycleReadiness(.transportReady)
                     self.finishNonLifecycleRecoveryIfNeeded(outcome: .backendReady)
+                    self.presentPendingHistoryResumeNoticeIfNeeded()
                 } else {
                     self.refreshAmbientSelection()
                 }
@@ -237,6 +241,16 @@ extension PlayerViewModel {
                     return
                 }
                 let hostIndependent = (error as? MediaEngineError)?.isHostIndependent ?? false
+                if let engineError = error as? MediaEngineError {
+                    switch engineError {
+                    case .decodeFailed, .notImplemented, .fMP4InputRejected, .demuxFailed, .renderFailed:
+                        if self.attemptDemandDecodeFallback(reason: engineError.localizedDescription) {
+                            return
+                        }
+                    case .transportFailed, .unsupportedLiveSource, .liveInputRejected, .stopped:
+                        break
+                    }
+                }
                 if self.mode == .live, !hostIndependent,
                    self.attemptLiveErrorRecovery(error) {
                     return
@@ -348,7 +362,7 @@ extension PlayerViewModel {
                 self.backend.playableTime, display: { self.backend.bufferDisplaySample }, at: now
             )
 
-            self.updateSubtitle(at: currentTime)
+            self.updateSubtitle(at: seeking ? (self.pendingSeekTarget ?? currentTime) : currentTime)
             self.autoSkipIfNeeded(at: currentTime)
             self.autoSkipSponsorIfNeeded(at: currentTime)
             // Faster cadence while the stats overlay is visible; enhancement telemetry is a cheap

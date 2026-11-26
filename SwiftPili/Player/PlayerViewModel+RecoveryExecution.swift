@@ -56,7 +56,8 @@ extension PlayerViewModel {
                 await loadVOD(
                     aid: aid,
                     cid: cid,
-                    quality: request.trigger.replacementQuality ?? retainedQuality,
+                    quality: request.trigger.replacementQuality
+                        ?? (retainedQuality > 0 ? retainedQuality : Self.preferredQuality),
                     source: streamRecovery?.source ?? currentSource,
                     resumeAt: streamRequestID != nil ? position : nil,
                     preservePlayState: request.trigger != .manualRetry,

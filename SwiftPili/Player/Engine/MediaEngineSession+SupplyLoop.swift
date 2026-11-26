@@ -1,6 +1,130 @@
 import Foundation
 
+@MainActor
+struct MediaSessionTrackEOFState {
+    var generation: Int
+    var videoReachedEOF = false
+    var audioReachedEOF = false
+    var videoTailDrainTask: Task<Void, Never>?
+
+    mutating func cancelVideoTailDrain() {
+        videoTailDrainTask?.cancel()
+        videoTailDrainTask = nil
+    }
+
+    mutating func reset(generation: Int) {
+        cancelVideoTailDrain()
+        self.generation = generation
+        videoReachedEOF = false
+        audioReachedEOF = false
+    }
+}
+
+@MainActor
+enum MediaSessionTrackEOFStore {
+    @MainActor
+    private final class Entry {
+        weak var owner: MediaEngineSession?
+        var state: MediaSessionTrackEOFState
+
+        init(owner: MediaEngineSession, state: MediaSessionTrackEOFState) {
+            self.owner = owner
+            self.state = state
+        }
+    }
+
+    private static var entries: [ObjectIdentifier: Entry] = [:]
+
+    static func state(for session: MediaEngineSession) -> MediaSessionTrackEOFState {
+        let key = ObjectIdentifier(session)
+        if let entry = entries[key], entry.owner === session {
+            if entry.state.generation != session.generation {
+                entry.state.reset(generation: session.generation)
+            }
+            return entry.state
+        }
+        return MediaSessionTrackEOFState(generation: session.generation)
+    }
+
+    static func mutate(
+        _ session: MediaEngineSession,
+        _ body: (inout MediaSessionTrackEOFState) -> Void
+    ) {
+        let key = ObjectIdentifier(session)
+        let entry: Entry
+        if let existing = entries[key], existing.owner === session {
+            entry = existing
+            if entry.state.generation != session.generation {
+                entry.state.reset(generation: session.generation)
+            }
+        } else {
+            entries[key]?.state.cancelVideoTailDrain()
+            pruneDeadEntries()
+            let created = Entry(
+                owner: session,
+                state: MediaSessionTrackEOFState(generation: session.generation)
+            )
+            entries[key] = created
+            entry = created
+        }
+        body(&entry.state)
+    }
+
+    private static func pruneDeadEntries() {
+        entries = entries.filter { _, entry in
+            if entry.owner == nil {
+                entry.state.cancelVideoTailDrain()
+                return false
+            }
+            return true
+        }
+    }
+}
+
 extension MediaEngineSession {
+    var videoTrackReachedEOF: Bool {
+        demuxReachedEOF || MediaSessionTrackEOFStore.state(for: self).videoReachedEOF
+    }
+
+    var audioTrackReachedEOF: Bool {
+        demuxReachedEOF || !hasAudioTrack || MediaSessionTrackEOFStore.state(for: self).audioReachedEOF
+    }
+
+    var isVideoTailDraining: Bool {
+        MediaSessionTrackEOFStore.state(for: self).videoTailDrainTask != nil
+    }
+
+    var supportsIndependentTrackEOF: Bool {
+        switch videoContinuityTopology {
+        case .splitTrack, .localFileIndex:
+            true
+        case .muxedCurrentGOP:
+            false
+        case .unsupported:
+            clock.duration.isFinite && clock.duration > 0
+        }
+    }
+
+    func noteTrackEOF(video: Bool = false, audio: Bool = false) {
+        guard video || audio else { return }
+        MediaSessionTrackEOFStore.mutate(self) { state in
+            if video { state.videoReachedEOF = true }
+            if audio { state.audioReachedEOF = true }
+        }
+    }
+
+    func resetTrackEOFState() {
+        MediaSessionTrackEOFStore.mutate(self) { state in
+            state.reset(generation: generation)
+        }
+    }
+
+    func cancelVideoTailDrain() {
+        MediaSessionTrackEOFStore.mutate(self) { state in
+            state.cancelVideoTailDrain()
+        }
+    }
+
     func pullPCM(
         frameCount: Int,
         sampleRate: Double,
@@ -47,7 +171,7 @@ extension MediaEngineSession {
     }
 
     func renderedContentDidAdvance(bySeconds seconds: TimeInterval) {
-        guard !isSeekInFlight else {
+        guard !isSeekInFlight, !isVideoTailDraining else {
             return
         }
         guard isPlaying, !videoStarvationHoldIsActive(), seconds > 0 else {
@@ -95,7 +219,10 @@ extension MediaEngineSession {
             emitEndedIfNeeded()
             return
         }
-        guard hasAudioTrack, audioDecoderOpened else { return }
+        if isVideoTailDraining {
+            return
+        }
+        guard drivesAudioClockPipeline else { return }
 
         let underrun = written < requested
         if !underrun {
@@ -129,21 +256,50 @@ extension MediaEngineSession {
         scheduleAudioDecodeIfNeeded()
     }
 
-    func audioSupplyExhausted() -> Bool {
-        demuxReachedEOF
+    func audioSupplyExhausted(
+        ignoringAudioDecodeOperationID: UInt64? = nil
+    ) -> Bool {
+        if usesSyntheticSilenceClock {
+            if audioTimelineBuffer.contentSeconds < 0.000_5 {
+                return true
+            }
+            let decodeIdle = decodeTask == nil
+                && videoDecodeLaneOwners == 0
+                && activeVideoDecodeOperationID == nil
+            return videoTrackReachedEOF
+                && videoPackets.isEmpty
+                && residualVideoPackets.isEmpty
+                && pendingVideoFrames.isEmpty
+                && decodeIdle
+                && videoRender.enqueuedAheadSeconds(from: clock.mediaTime) <= 0.05
+        }
+        guard hasAudioTrack, audioDecoderOpened else { return false }
+        let decodeIdle: Bool
+        if let ignored = ignoringAudioDecodeOperationID,
+           activeAudioDecodeOperationID == ignored {
+            decodeIdle = audioDecodeLaneOwners == 0
+        } else {
+            decodeIdle = audioDecodeTask == nil
+                && audioDecodeLaneOwners == 0
+                && activeAudioDecodeOperationID == nil
+        }
+        return audioTrackReachedEOF
             && audioPackets.isEmpty
             && residualAudioPackets.isEmpty
             && pendingAudioContentSeconds < 0.000_5
-            && audioDecodeTask == nil
-            && audioDecodeLaneOwners == 0
-            && activeAudioDecodeOperationID == nil
+            && decodeIdle
     }
 
     func beginAudioDrainToEnd() {
+        guard !hasEmittedEnded, !isVideoTailDraining else { return }
+        if usesSyntheticSilenceClock {
+            audioTimelineBuffer.markSyntheticSilenceExhausted()
+        }
         if !audioEOFDrain.isDraining {
             audioEOFDrain.isDraining = true
             diagnostics.log(
-                "[PathA] audio EOF draining ring pending=\(audioRender.hasPendingOutput)"
+                "[PathA] audio EOF draining ring pending=\(audioRender.hasPendingOutput) " +
+                "vEOF=\(videoTrackReachedEOF ? 1 : 0) dEOF=\(demuxReachedEOF ? 1 : 0)"
             )
         }
         if isBuffering, !videoStarvationHoldIsActive() {
@@ -157,7 +313,8 @@ extension MediaEngineSession {
     }
 
     func maybeFinishAudioDrain() {
-        guard audioEOFDrain.isDraining, isPlaying, !isSeekInFlight, !hasEmittedEnded else { return }
+        guard audioEOFDrain.isDraining, isPlaying, !isSeekInFlight, !hasEmittedEnded,
+              !isVideoTailDraining else { return }
         if let deadline = audioEOFDrain.playoutDeadline {
             guard ContinuousClock.now >= deadline else { return }
             finishAudioDrain()
@@ -184,6 +341,23 @@ extension MediaEngineSession {
         }
     }
 
+    var hasRemainingVideoTailToDrain: Bool {
+        guard !isVideoLaneWarmSuspended,
+              videoDecoderOpened,
+              !clock.isAtEnd else {
+            return false
+        }
+        let hasQueuedVideo = !videoPackets.isEmpty
+            || !residualVideoPackets.isEmpty
+            || !pendingVideoFrames.isEmpty
+            || videoRender.enqueuedAheadSeconds(from: clock.mediaTime) > 0.05
+        if hasQueuedVideo { return true }
+        if !videoTrackReachedEOF, clock.duration > 0, clock.mediaTime < clock.duration - 0.05 {
+            return true
+        }
+        return false
+    }
+
     func finishAudioDrain() {
         if let emptiedAt = audioEOFDrain.emptiedAt, let deadline = audioEOFDrain.playoutDeadline {
             let elapsedMs = Int(emptiedAt.duration(to: ContinuousClock.now) / .milliseconds(1))
@@ -192,7 +366,128 @@ extension MediaEngineSession {
                 "[PathA] audio EOF played out after \(elapsedMs)ms (latency \(latencyMs)ms)"
             )
         }
+        if hasRemainingVideoTailToDrain {
+            startVideoTailDrainIfNeeded()
+            return
+        }
         emitEndedIfNeeded()
+    }
+
+    func startVideoTailDrainIfNeeded() {
+        guard !hasEmittedEnded, isPlaying, !isSeekInFlight, !isVideoTailDraining else { return }
+        audioEOFDrain.reset()
+        if isBuffering {
+            bufferingForVideoStarvation = false
+            isBuffering = false
+            onEvent?(.playing)
+        }
+        let gen = generation
+        diagnostics.log(
+            "[PathA] audio EOF before video — draining remaining video tail from " +
+            "mt=\(String(format: "%.2f", clock.mediaTime))s dur=\(String(format: "%.2f", clock.duration))s " +
+            "vEOF=\(videoTrackReachedEOF ? 1 : 0) vPkts=\(videoPackets.count) pendV=\(pendingVideoFrames.count)"
+        )
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var previousTickAt = ContinuousClock.now
+            var lastProgressAt = previousTickAt
+            var lastPresentedCount = self.presentedVideoFrameCount
+            var lastVideoIngestedCount = self.totalVideoPacketsIngested
+            let startedAt = previousTickAt
+
+            self.applyDisplayPlayback(rate: max(0, self.clock.playbackRate))
+            self.armPresentFeedIfNeeded()
+            self.presentDueVideoFrames()
+            if !self.videoTrackReachedEOF, self.needsPacketFill() {
+                self.requestSupplyWake()
+            }
+            self.scheduleVideoDecodeIfNeeded()
+
+            while !Task.isCancelled,
+                  self.isCurrentGeneration(gen),
+                  self.isPlaying,
+                  !self.isSeekInFlight,
+                  !self.hasEmittedEnded {
+                do {
+                    try await Task.sleep(for: .milliseconds(33))
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled,
+                      self.isCurrentGeneration(gen),
+                      self.isPlaying,
+                      !self.isSeekInFlight,
+                      !self.hasEmittedEnded else {
+                    return
+                }
+                if self.isVideoLaneWarmSuspended || !self.videoDecoderOpened {
+                    self.emitEndedIfNeeded()
+                    return
+                }
+                let now = ContinuousClock.now
+                let elapsed = previousTickAt.duration(to: now)
+                previousTickAt = now
+                let wallDelta = Double(elapsed.components.seconds)
+                    + Double(elapsed.components.attoseconds) / 1e18
+                if wallDelta > 0 {
+                    self.clock.advanceContent(by: self.clock.contentSeconds(forWallDelta: wallDelta))
+                }
+                self.drainResidualPackets()
+                if !self.videoTrackReachedEOF, self.needsPacketFill() {
+                    self.requestSupplyWake()
+                }
+                self.scheduleVideoDecodeIfNeeded()
+                self.presentDueVideoFrames()
+                self.maybeResyncDisplaySlave()
+                self.onEvent?(.tick(
+                    mediaTime: self.clock.mediaTime,
+                    duration: self.clock.duration,
+                    buffered: self.bufferedTime
+                ))
+                self.notifyMultiConnectionPlaybackProgressIfNeeded()
+
+                if self.clock.isAtEnd {
+                    self.emitEndedIfNeeded()
+                    return
+                }
+                let videoQueuesEmpty = self.videoPackets.isEmpty
+                    && self.residualVideoPackets.isEmpty
+                    && self.pendingVideoFrames.isEmpty
+                    && self.decodeTask == nil
+                    && self.videoDecodeLaneOwners == 0
+                let rendererAhead = self.videoRender.enqueuedAheadSeconds(from: self.clock.mediaTime)
+                if self.videoTrackReachedEOF, videoQueuesEmpty, rendererAhead <= 0.05 {
+                    self.emitEndedIfNeeded()
+                    return
+                }
+                let hasVideoActivity = self.presentedVideoFrameCount > lastPresentedCount
+                    || self.totalVideoPacketsIngested > lastVideoIngestedCount
+                    || rendererAhead > 0.05
+                    || !self.pendingVideoFrames.isEmpty
+                    || !self.videoPackets.isEmpty
+                    || self.decodeTask != nil
+                if hasVideoActivity {
+                    lastProgressAt = now
+                    lastPresentedCount = self.presentedVideoFrameCount
+                    lastVideoIngestedCount = self.totalVideoPacketsIngested
+                } else if lastProgressAt.duration(to: now) >= .seconds(2) {
+                    self.diagnostics.log(
+                        "[PathA] video tail drain reached idle horizon at " +
+                        "mt=\(String(format: "%.2f", self.clock.mediaTime))s — emitting ended"
+                    )
+                    self.emitEndedIfNeeded()
+                    return
+                }
+                if self.clock.duration <= 0, startedAt.duration(to: now) >= .seconds(5) {
+                    self.emitEndedIfNeeded()
+                    return
+                }
+            }
+        }
+        MediaSessionTrackEOFStore.mutate(self) { state in
+            state.videoTailDrainTask?.cancel()
+            state.videoTailDrainTask = task
+        }
     }
 
     func emitEndedIfNeeded() {
@@ -202,7 +497,10 @@ extension MediaEngineSession {
         hasEmittedEnded = true
         isPlaying = false
         isBuffering = false
+        bufferingForVideoStarvation = false
+        videoStarvedSince = nil
         audioEOFDrain.reset()
+        resetTrackEOFState()
         audioRender.stop()
         cancelPausedRunwayRefresh()
         cancelSupplyLoop()
@@ -222,15 +520,18 @@ extension MediaEngineSession {
     }
 
     func needsPacketFill() -> Bool {
+        let videoCanFill = !videoTrackReachedEOF
+        let audioCanFill = hasAudioTrack && !audioTrackReachedEOF
         if isVideoLaneWarmSuspended {
             if !residualAudioPackets.isEmpty { return true }
-            if !warmVideoImageHoldWithholdsVideoSupply,
+            if videoCanFill,
+               !warmVideoImageHoldWithholdsVideoSupply,
                suspendedVideoSupplyTarget > 0,
                (suspendedVideoSupplyTarget - suspendedVideoRunway)
                     >= minTrackFillRoom {
                 return true
             }
-            return hasAudioTrack
+            return audioCanFill
                 && (audioPacketQueue.highWater - audioPacketQueue.contentSeconds)
                     >= minTrackFillRoom
         }
@@ -238,7 +539,7 @@ extension MediaEngineSession {
             if !residualAudioPackets.isEmpty { return true }
             if !warmVideoImageHoldWithholdsVideoSupply { return true }
         }
-        if warmVideoImageHoldWithholdsVideoSupply {
+        if !videoCanFill || warmVideoImageHoldWithholdsVideoSupply {
         } else if holdsPassThroughVideo {
             let videoTarget = min(
                 videoPacketQueue.highWater,
@@ -251,7 +552,7 @@ extension MediaEngineSession {
         } else if (videoPacketQueue.highWater - videoPacketQueue.contentSeconds) >= minTrackFillRoom {
             return true
         }
-        if hasAudioTrack,
+        if audioCanFill,
            (audioPacketQueue.highWater - audioPacketQueue.contentSeconds) >= minTrackFillRoom {
             return true
         }
@@ -336,18 +637,21 @@ extension MediaEngineSession {
     }
 
     func supplyBelowLowWater() -> Bool {
+        let videoCanFill = !videoTrackReachedEOF
+        let audioCanFill = hasAudioTrack && !audioTrackReachedEOF
         if isVideoLaneWarmSuspended {
-            if !warmVideoImageHoldWithholdsVideoSupply,
+            if videoCanFill,
+               !warmVideoImageHoldWithholdsVideoSupply,
                suspendedVideoSupplyTarget > 0,
                suspendedVideoRunway
                     < suspendedVideoSupplyTarget * supplyLowWaterFraction {
                 return true
             }
-            return hasAudioTrack
+            return audioCanFill
                 && audioPacketQueue.contentSeconds
                     < audioPacketQueue.highWater * supplyLowWaterFraction
         }
-        if !warmVideoImageHoldWithholdsVideoSupply {
+        if videoCanFill, !warmVideoImageHoldWithholdsVideoSupply {
             let videoHigh = holdsPassThroughVideo
                 ? min(videoPacketQueue.highWater, runtimePassThroughVideoContentHWM)
                 : videoPacketQueue.highWater
@@ -358,7 +662,7 @@ extension MediaEngineSession {
                 return true
             }
         }
-        if hasAudioTrack,
+        if audioCanFill,
            audioPacketQueue.contentSeconds < audioPacketQueue.highWater * supplyLowWaterFraction {
             return true
         }
@@ -366,18 +670,21 @@ extension MediaEngineSession {
     }
 
     func canPumpNow() -> Bool {
+        let videoCanFill = !videoTrackReachedEOF
+        let audioCanFill = hasAudioTrack && !audioTrackReachedEOF
         if isVideoLaneWarmSuspended {
-            if !warmVideoImageHoldWithholdsVideoSupply,
+            if videoCanFill,
+               !warmVideoImageHoldWithholdsVideoSupply,
                suspendedVideoSupplyTarget > 0,
                suspendedVideoRunway < suspendedVideoSupplyTarget {
                 return true
             }
-            return hasAudioTrack
+            return audioCanFill
                 && residualAudioPackets.isEmpty
                 && (audioPacketQueue.highWater - audioPacketQueue.contentSeconds)
                     >= minTrackFillRoom
         }
-        if !warmVideoImageHoldWithholdsVideoSupply {
+        if videoCanFill, !warmVideoImageHoldWithholdsVideoSupply {
             let videoTarget = holdsPassThroughVideo
                 ? min(videoPacketQueue.highWater, runtimePassThroughVideoContentHWM)
                 : videoPacketQueue.highWater
@@ -388,7 +695,7 @@ extension MediaEngineSession {
                 return true
             }
         }
-        if hasAudioTrack, residualAudioPackets.isEmpty,
+        if audioCanFill, residualAudioPackets.isEmpty,
            (audioPacketQueue.highWater - audioPacketQueue.contentSeconds) >= minTrackFillRoom {
             return true
         }
@@ -396,6 +703,7 @@ extension MediaEngineSession {
     }
 
     func cancelSupplyLoop() {
+        cancelVideoTailDrain()
         invalidateSourceWaitBudget()
         supplyLoopTask?.cancel()
         supplyLoopTask = nil
@@ -463,7 +771,8 @@ extension MediaEngineSession {
         let burstFirstPTS = diagnostics.isCapturing ? pendingVideoFrames.first?.pts : nil
         var burstEnqueued = 0
         defer { reportLateVideoPresentBurst(firstPTS: burstFirstPTS, enqueued: burstEnqueued) }
-        let due = videoPresentationDueTime
+        let activeMediaTime = isVideoTailDraining ? clock.mediaTime : audioPresentationMediaTime
+        let due = activeMediaTime + videoPresentLeadSeconds
         switch releaseWarmVideoImageHoldIfDue(due) {
         case .waiting, .refreshRequired:
             pipeWindowNotDue += 1
@@ -482,7 +791,7 @@ extension MediaEngineSession {
             }
             do {
                 let result = try renderer.presentDemandFrame(
-                    head, mediaTime: audioPresentationMediaTime,
+                    head, mediaTime: activeMediaTime,
                     playbackRate: Double(playbackRate)
                 ) { [weak self, weak renderer] in
                     guard let self, let renderer,
@@ -590,7 +899,7 @@ extension MediaEngineSession {
             return
         }
         pipeWindowPresentCalls += 1
-        let due = videoPresentationDueTime
+        let due = isVideoTailDraining ? (clock.mediaTime + videoPresentLeadSeconds) : videoPresentationDueTime
         switch releaseWarmVideoImageHoldIfDue(due) {
         case .waiting, .refreshRequired:
             pipeWindowNotDue += 1
@@ -641,6 +950,14 @@ extension MediaEngineSession {
     }
 
     func applyDisplayPlayback(rate: Float, presentation: MediaAudioPresentationSnapshot? = nil) {
+        if isVideoTailDraining {
+            audioOutputDisplayHold = nil
+            let drainRate: Float = isPlaying && !isBuffering && !isSeekInFlight && !isVideoLaneWarmSuspended
+                ? max(0, clock.playbackRate)
+                : 0
+            pinDisplay(rate: drainRate, time: clock.mediaTime, offset: nil)
+            return
+        }
         let sample = presentation ?? sampleAudioPresentation()
         if hasAudioTrack {
             switch audioRender.outputAvailability {
@@ -700,6 +1017,17 @@ extension MediaEngineSession {
     func maybeResyncDisplaySlave() {
         guard isPlaying, !isBuffering, !isSeekInFlight else { return }
         let displayClock = (videoRender as? SampleBufferVideoRenderer)?.displayClockSeconds
+        if isVideoTailDraining {
+            let t = clock.mediaTime
+            if let displayClock, displayClock.isFinite {
+                if abs(displayClock - t) >= displayDriftResyncSeconds {
+                    applyDisplayPlayback(rate: max(0, clock.playbackRate))
+                }
+            } else {
+                applyDisplayPlayback(rate: max(0, clock.playbackRate))
+            }
+            return
+        }
         let sample = sampleAudioPresentation()
         if effectiveDisplayRate == 0 {
             applyDisplayPlayback(rate: 0, presentation: sample)
@@ -867,7 +1195,7 @@ extension MediaEngineSession {
     func evaluateVideoStarvation() {
         guard isPlaying, !isSeekInFlight, !isBuffering,
               !isVideoLaneWarmSuspended,
-              videoDecoderOpened, !demuxReachedEOF,
+              videoDecoderOpened, !videoTrackReachedEOF, !isVideoTailDraining,
               let runway = queuedVideoRunway else {
             videoStarvedSince = nil
             return
@@ -913,7 +1241,7 @@ extension MediaEngineSession {
         guard videoStarvationHoldIsActive(), !isSeekInFlight else { return }
         let runway = queuedVideoRunway ?? 0
         let recovered = runway >= min(videoPacketQueue.lowWater, videoPacketQueue.highWater)
-        guard recovered || demuxReachedEOF else { return }
+        guard recovered || videoTrackReachedEOF else { return }
         bufferingForVideoStarvation = false
         isBuffering = false
         applyPipelineDemand()
@@ -921,10 +1249,11 @@ extension MediaEngineSession {
         presentDueVideoFrames()
         diagnostics.log(
             "[PathA] video starvation cleared — resuming at " +
-            "vQ=\(String(format: "%.2f", runway))s"
+            "vQ=\(String(format: "%.2f", runway))s vEOF=\(videoTrackReachedEOF ? 1 : 0)"
         )
         onEvent?(.playing)
         scheduleVideoDecodeIfNeeded()
+        scheduleAudioDecodeIfNeeded()
     }
 
     static let videoStarvationRunwayFloor: TimeInterval = 0.001

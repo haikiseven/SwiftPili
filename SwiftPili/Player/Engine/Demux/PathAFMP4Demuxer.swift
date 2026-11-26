@@ -295,6 +295,8 @@ actor PathAFMP4Demuxer: MediaDemuxing {
 
     var duration: TimeInterval { _duration }
     var isEOF: Bool { (video?.eof ?? true) && (audio?.eof ?? true) }
+    var isVideoEOF: Bool { video?.eof ?? true }
+    var isAudioEOF: Bool { audio?.eof ?? true }
     var providesAudioTrack: Bool { audio != nil }
 
     func videoTrackConfiguration() async -> MediaVideoTrackConfiguration? {
@@ -1286,6 +1288,12 @@ actor PathAFMP4Demuxer: MediaDemuxing {
                 }
                 r.cursor = nextCursorResult.partialValue
             }
+        }
+        if continuityReferenceEnd == nil,
+           r.activeFragment == nil,
+           readEnd > 0,
+           r.cursor > readEnd || readEnd - r.cursor < 8 {
+            r.eof = true
         }
         if let pacing {
             let wallMs = Int(pacing.start.duration(to: ContinuousClock.now) / .milliseconds(1))

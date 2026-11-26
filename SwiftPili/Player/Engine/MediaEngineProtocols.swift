@@ -27,6 +27,7 @@ struct MediaVideoTrackConfiguration: Sendable {
     let codec: String
     let config: Data
     let codedDimensions: MediaVideoCodedDimensions?
+    var extensionAtoms: [String: Data] = [:]
 }
 
 struct MediaAudioPacketTiming: Sendable, Equatable {
@@ -509,7 +510,12 @@ extension MediaDemuxing {
 
 enum MediaVideoFormat: @unchecked Sendable {
     case description(CMFormatDescription)
-    case codecConfig(codec: String?, config: Data, codedDimensions: MediaVideoCodedDimensions? = nil)
+    case codecConfig(
+        codec: String?,
+        config: Data,
+        codedDimensions: MediaVideoCodedDimensions? = nil,
+        extensionAtoms: [String: Data] = [:]
+    )
 }
 
 protocol MediaVideoDecoding: AnyObject, Sendable {
@@ -598,7 +604,7 @@ extension MediaVideoDecoding {
             throw MediaEngineError.notImplemented(
                 "\(type(of: self)) cannot open from a CMFormatDescription"
             )
-        case .codecConfig(_, let config, _):
+        case .codecConfig(_, let config, _, _):
             try await open(formatHint: config.isEmpty ? nil : config)
         }
     }

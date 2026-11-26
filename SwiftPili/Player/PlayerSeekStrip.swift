@@ -7,6 +7,7 @@ struct PlayerSeekStrip: View {
     let gestureDisplay: PlayerGestureDisplay
     let chromeInsets: PlayerChromeInsets
     var inlineCornerRadius: CGFloat = 0
+    var suppressScrubPreview = false
     let controlAnimation: Animation?
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.displayScale) private var displayScale
@@ -23,17 +24,27 @@ struct PlayerSeekStrip: View {
                 sceneIsActive: scenePhase == .active, isVisible: isVisible,
                 width: stripWidth, displayScale: displayScale
             )
+            let chapterFractions = VideoChapter.tickFractions(
+                for: player.videoChapters,
+                duration: player.duration
+            )
             TimelineView(.animation(minimumInterval: interval ?? 0.25, paused: interval == nil)) { _ in
                 let shown = projection(samplingClock: interval != nil)
                 CompactSeekBar(
                     progress: shown.progress,
                     buffered: shown.buffered,
                     segments: cachedSponsorSegments,
+                    chapterFractions: chapterFractions,
                     isScrubbing: gestureDisplay.isSeeking,
                     prominent: player.showControls,
                     onScrub: updateScrub,
                     onCommit: finishScrub
                 )
+            }
+            .overlay(alignment: .bottomLeading) {
+                if gestureDisplay.isSeeking, !suppressScrubPreview, stripWidth > 0 {
+                    scrubPreviewOverlay
+                }
             }
             .onChange(of: sponsorCacheKey, initial: true) { _, _ in
                 cachedSponsorSegments = sponsorBarSegments
@@ -71,6 +82,24 @@ struct PlayerSeekStrip: View {
             .animation(controlAnimation, value: gestureDisplay.isSeeking)
             .transition(.opacity)
         }
+    }
+
+    private var scrubPreviewOverlay: some View {
+        let fraction = player.duration > 0
+            ? min(max(gestureDisplay.seekValue / player.duration, 0), 1)
+            : 0
+        let halfWidth: CGFloat = player.isFullscreen ? 96 : 74
+        let minCenter = min(halfWidth + 4, stripWidth * 0.5)
+        let maxCenter = max(minCenter, stripWidth - halfWidth - 4)
+        let clampedCenter = min(max(fraction * stripWidth, minCenter), maxCenter)
+        let previewOffsetY: CGFloat = player.isFullscreen
+            ? -92
+            : (player.showControls ? -72 : -34)
+        return PlayerScrubPreviewBubble(player: player, seekTime: gestureDisplay.seekValue)
+            .frame(width: halfWidth * 2, alignment: .center)
+            .offset(x: clampedCenter - halfWidth, y: previewOffsetY)
+            .allowsHitTesting(false)
+            .transition(.opacity)
     }
 
     private struct ScrubSource: Equatable {

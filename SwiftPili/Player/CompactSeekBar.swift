@@ -12,6 +12,7 @@ struct CompactSeekBar: View {
     let progress: Double
     var buffered: Double = 0
     var segments: [SeekBarSegment] = []
+    var chapterFractions: [Double] = []
     let isScrubbing: Bool
     var prominent = true
     let onScrub: (Double) -> Void
@@ -44,6 +45,10 @@ struct CompactSeekBar: View {
                 timingFills(fills)
                 ForEach(segments) { seg in
                     sponsorBand(seg, width: width)
+                }
+                .transaction(value: width) { $0.animation = nil }
+                ForEach(chapterFractions.indices, id: \.self) { index in
+                    chapterTick(chapterFractions[index], width: width)
                 }
                 .transaction(value: width) { $0.animation = nil }
             }
@@ -148,6 +153,18 @@ struct CompactSeekBar: View {
             chromeAnimated(Capsule().fill(seg.color.opacity(prominent || isScrubbing ? 0.95 : 0.75)))
                 .frame(width: max(end - start, 1.5))
                 .offset(x: start)
+        }
+    }
+
+    @ViewBuilder
+    private func chapterTick(_ fraction: Double, width: CGFloat) -> some View {
+        let clamped = min(max(fraction, 0), 1)
+        if clamped > 0.005, clamped < 0.995 {
+            let tickWidth: CGFloat = isScrubbing ? 2 : 1.5
+            Rectangle()
+                .fill(Color.black.opacity(prominent || isScrubbing ? 0.7 : 0.48))
+                .frame(width: tickWidth)
+                .offset(x: clamped * width - tickWidth * 0.5)
         }
     }
 }

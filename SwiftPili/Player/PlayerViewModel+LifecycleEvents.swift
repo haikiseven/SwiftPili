@@ -26,6 +26,11 @@ extension PlayerViewModel {
         noteDanmakuApplicationActivityChanged(isActive: false)
         synchronizeTerminalAdmissionFromBackend()
         snapshotNowPlayingForBackground()
+        if mode == .vod {
+            reportHistoryNow()
+        } else if mode == .offline {
+            persistOfflineProgressNow()
+        }
         guard !standDownLifecycleForTerminalPlayback() else { return }
         markDemandBackgroundStage("enterBG")
         updateDemandVideoLivenessContext()

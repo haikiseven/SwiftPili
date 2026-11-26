@@ -559,6 +559,25 @@ struct DecoderRecoveryAdmission: Equatable {
         lastLifecycleEpoch = nil
     }
 
+    mutating func prepareForManualRetry(context: Context, now: TimeInterval) -> UInt64? {
+        let supersededToken = inFlight?.token
+        if let prior = inFlight {
+            let finished = finishAuthoritatively(
+                token: prior.token,
+                matchingAuthority: prior.request.context,
+                now: now,
+                outcome: .terminalLoaderFailure
+            )
+            if !finished || inFlight != nil {
+                invalidate()
+            }
+        }
+        if self.context != context {
+            install(context)
+        }
+        return supersededToken
+    }
+
     mutating func admit(
         _ request: Request,
         now: TimeInterval,

@@ -353,6 +353,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         defaultChannels: EnginePCM.channelCount,
         timelineEpsilon: EnginePCM.aacOutputQuantumSeconds
     )
+    var subtitlePCMTap: AudioPCMSubtitleTap?
 
     nonisolated var audioSupply: any AudioSupplySource { audioTimelineBuffer }
     var hasAudioTrack = false
@@ -504,6 +505,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
     func beginSeekTransaction(token: MediaAudioSeekToken) {
         seekTransaction.begin(token: token)
         invalidateSourceWaitBudget()
+        subtitlePCMTap?.notifyDiscontinuity(reason: .seek, targetPTS: nil)
     }
 
     func clearSeekTransaction() {
@@ -634,8 +636,16 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
     var lastPresentBurstLogAt: TimeInterval = 0
     let flowStallThresholdMs = 700
 
+    var usesSyntheticSilenceClock: Bool {
+        !hasAudioTrack && audioRender.reportsRenderedContent
+    }
+
+    var drivesAudioClockPipeline: Bool {
+        (hasAudioTrack && audioDecoderOpened) || usesSyntheticSilenceClock
+    }
+
     var usesAudioMasterForVideo: Bool {
-        hasAudioTrack && audioDecoderOpened
+        drivesAudioClockPipeline
     }
 
     var mediaTime: TimeInterval { clock.mediaTime }
@@ -719,7 +729,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
 
     var effectiveDisplayRate: Float {
         guard isPlaying, !isBuffering, !isSeekInFlight, !isVideoLaneWarmSuspended else { return 0 }
-        if hasAudioTrack {
+        if drivesAudioClockPipeline {
             switch audioRender.outputAvailability {
             case .available, .fillOnly: break
             case .stopped, .pending, .unavailable: return 0
@@ -735,7 +745,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
     func sampleAudioPresentation() -> MediaAudioPresentationSnapshot {
         MediaAudioPresentationSnapshot(
             contentTime: clock.mediaTime,
-            timing: hasAudioTrack ? audioRender.presentationTiming : .logical
+            timing: drivesAudioClockPipeline ? audioRender.presentationTiming : .logical
         )
     }
 
@@ -809,7 +819,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
                 state: .pausedReady
             )
         }
-        guard supplyLoopTask != nil, !hasAudioTrack || audioRender.isRunning else {
+        guard supplyLoopTask != nil, !drivesAudioClockPipeline || audioRender.isRunning else {
             return RetainedPipelineHealth(
                 backendGeneration: backendGeneration,
                 state: .requiresRecovery(.missingProducer)
@@ -928,6 +938,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         resetVideoContinuationState()
         clearPendingVideoFrames()
         clearPendingPCM()
+        subtitlePCMTap?.notifyDiscontinuity(reason: .streamReset, targetPTS: request.startPosition)
         pendingPiPPresentationSnapshot = nil
         resetOutputMediaFloor(to: request.startPosition)
         if outputMediaFloor > outputMediaFloorEpsilon {
@@ -991,6 +1002,17 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
             }
             let d = await demux.duration
             clock.setDuration(d)
+            if !hasAudioTrack {
+                audioTimelineBuffer.configureSyntheticSilence(
+                    enabled: audioRender.reportsRenderedContent,
+                    startPTS: request.startPosition,
+                    duration: d
+                )
+                diagnostics.log(
+                    "[PathA] video-only stream configured syntheticSilence=" +
+                    "\(audioRender.reportsRenderedContent ? 1 : 0) duration=\(String(format: "%.1f", d))s"
+                )
+            }
             updatePiPPlaybackState()
             let priming = try await primeOpenLaunchReserve(generation: gen)
             guard isCurrentGeneration(gen) else { return }
@@ -1114,6 +1136,9 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         startSupplyLoop()
         scheduleVideoDecodeIfNeeded()
         scheduleAudioDecodeIfNeeded()
+        if !hasAudioTrack, !drivesAudioClockPipeline {
+            startVideoTailDrainIfNeeded()
+        }
     }
 
     func resumeAudioWhileVideoSuspended(_ token: DemandVideoSuspendToken) -> Bool {
@@ -1266,6 +1291,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         resetOutputMediaFloor(to: 0)
         clearPendingVideoFrames()
         clearPendingPCM()
+        subtitlePCMTap?.notifyDiscontinuity(reason: .sessionStopped, targetPTS: nil)
         enqueueResourceClose()
         videoRender.invalidate()
         clock.reset()
@@ -1445,6 +1471,27 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         audioRender.isMuted = muted
     }
 
+    func setSubtitlePCMTap(_ tap: AudioPCMSubtitleTap?) {
+        if let previous = subtitlePCMTap, previous !== tap {
+            previous.setOnStreamActivated(nil)
+        }
+        subtitlePCMTap = tap
+        guard let tap else { return }
+        tap.setOnStreamActivated { [weak supply = audioTimelineBuffer] activatedTap in
+            guard let supply else { return }
+            let chunks = supply.snapshotUnreadMonoChunks(maxSeconds: 12.0)
+            if !chunks.isEmpty {
+                activatedTap.seedChunks(chunks)
+            }
+        }
+        if tap.isActive {
+            let chunks = audioTimelineBuffer.snapshotUnreadMonoChunks(maxSeconds: 12.0)
+            if !chunks.isEmpty {
+                tap.seedChunks(chunks)
+            }
+        }
+    }
+
     var audioOutputAvailability: MediaAudioOutputAvailability { audioRender.outputAvailability }
 
     func setAudioOutputStateChangeHandler(_ handler: (@MainActor () -> Void)?) {
@@ -1498,6 +1545,7 @@ final class MediaEngineSession: MediaEnginePresentation, AudioPullSource, Engine
         clearPacketBuffers()
         clearPendingVideoFrames()
         clearPendingPCM()
+        subtitlePCMTap?.notifyDiscontinuity(reason: .sessionStopped, targetPTS: nil)
         if emitPaused {
             onEvent?(.paused)
         }

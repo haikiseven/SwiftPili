@@ -1,12 +1,109 @@
 import AVFoundation
 import Foundation
+import MediaPlayer
 import UIKit
+import os
 
 extension PlayerViewModel {
+
+    var canPlayNextTrack: Bool {
+        mode.usesOnlineVODServices && (onNextEpisode != nil || playbackQueue?.hasNext == true)
+    }
+
+    var canPlayPreviousTrack: Bool {
+        mode.usesOnlineVODServices && (onPreviousEpisode != nil || playbackQueue?.hasPrevious == true)
+    }
+
+    private var nowPlayingTrackCommandsAreActionable: Bool {
+        currentOwnerLease != nil
+            && currentURL != nil
+            && !terminalOpenFailure
+            && error == nil
+            && unavailability == nil
+    }
+
+    func syncNowPlayingTrackCommands(
+        center: MPRemoteCommandCenter = .shared()
+    ) {
+        let owner = currentOwnerLease
+        let actionable = nowPlayingTrackCommandsAreActionable
+        let canNext = actionable && canPlayNextTrack
+        let canPrevious = actionable && canPlayPreviousTrack
+
+        nowPlayingTrackCommandState.withLock { state in
+            state = NowPlayingTrackCommandSnapshot(
+                owner: owner,
+                canPlayNext: canNext,
+                canPlayPrevious: canPrevious
+            )
+        }
+
+        if owner != nil, canNext || canPrevious {
+            ensureNowPlayingTrackCommandTargets(on: center)
+        }
+
+        center.nextTrackCommand.isEnabled = canNext
+        center.previousTrackCommand.isEnabled = canPrevious
+    }
+
+    func clearNowPlayingTrackCommands(
+        center: MPRemoteCommandCenter = .shared()
+    ) {
+        nowPlayingTrackCommandState.withLock { state in
+            state = NowPlayingTrackCommandSnapshot(
+                owner: nil,
+                canPlayNext: false,
+                canPlayPrevious: false
+            )
+        }
+        center.nextTrackCommand.isEnabled = false
+        center.previousTrackCommand.isEnabled = false
+        if let target = nowPlayingNextTrackTarget {
+            center.nextTrackCommand.removeTarget(target)
+            nowPlayingNextTrackTarget = nil
+        }
+        if let target = nowPlayingPreviousTrackTarget {
+            center.previousTrackCommand.removeTarget(target)
+            nowPlayingPreviousTrackTarget = nil
+        }
+    }
+
+    private func ensureNowPlayingTrackCommandTargets(on center: MPRemoteCommandCenter) {
+        let state = nowPlayingTrackCommandState
+        if nowPlayingNextTrackTarget == nil {
+            nowPlayingNextTrackTarget = center.nextTrackCommand.addTarget { @Sendable _ in
+                let snapshot = state.withLock { $0 }
+                guard let owner = snapshot.owner, snapshot.canPlayNext else {
+                    return .noSuchContent
+                }
+                Task { @MainActor in
+                    let vm = PlayerViewModel.shared
+                    guard vm.isCurrentOwner(owner), vm.canPlayNextTrack else { return }
+                    _ = vm.playNextInQueue()
+                }
+                return .success
+            }
+        }
+        if nowPlayingPreviousTrackTarget == nil {
+            nowPlayingPreviousTrackTarget = center.previousTrackCommand.addTarget { @Sendable _ in
+                let snapshot = state.withLock { $0 }
+                guard let owner = snapshot.owner, snapshot.canPlayPrevious else {
+                    return .noSuchContent
+                }
+                Task { @MainActor in
+                    let vm = PlayerViewModel.shared
+                    guard vm.isCurrentOwner(owner), vm.canPlayPreviousTrack else { return }
+                    _ = vm.playPreviousInQueue()
+                }
+                return .success
+            }
+        }
+    }
 
     func setNowPlaying(title: String, artist: String, cover: String?) {
         guard let owner = currentOwnerLease else {
             nowPlayingMeta = nil
+            clearNowPlayingTrackCommands()
             PlayerLog.log("[NowPlaying] metadata ignored — no current owner")
             return
         }
@@ -23,6 +120,7 @@ extension PlayerViewModel {
             isPlaying: isPlaying,
             isActionable: nowPlayingCommandsAreActionable
         )
+        syncNowPlayingTrackCommands()
     }
 
     func makeNowPlayingEdgeFence(
@@ -119,7 +217,7 @@ extension PlayerViewModel {
     ) -> Bool {
         lastNowPlayingPushAt = CACurrentMediaTime()
         guard let edgeFence = fence ?? makeNowPlayingEdgeFence() else { return false }
-        return nowPlayingStateEdgeAdapter.publish(
+        let published = nowPlayingStateEdgeAdapter.publish(
             edge: edge,
             fence: edgeFence,
             projection: NowPlayingEdgeProjection(
@@ -130,6 +228,10 @@ extension PlayerViewModel {
                 isActionable: isActionable ?? nowPlayingCommandsAreActionable
             )
         )
+        if published {
+            syncNowPlayingTrackCommands()
+        }
+        return published
     }
 
     func pushNowPlayingPlayback(edge explicitEdge: NowPlayingStateEdge? = nil) {

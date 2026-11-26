@@ -57,6 +57,7 @@ extension PlayerViewModel {
         source: StreamSource = .ugc,
         resumeAt: TimeInterval? = nil,
         portraitHint: Bool? = nil,
+        aspectRatioHint: CGFloat? = nil,
         preservePlayState: Bool = false,
         owner: String? = nil,
         ownerLease: PlayerOwnerLease? = nil,
@@ -76,6 +77,7 @@ extension PlayerViewModel {
                 source: source,
                 resumeAt: resumeAt,
                 portraitHint: portraitHint,
+                aspectRatioHint: aspectRatioHint,
                 preservePlayState: preservePlayState,
                 owner: owner,
                 ownerLease: ownerLease,
@@ -124,11 +126,25 @@ extension PlayerViewModel {
     func selectVideoStream(
         from streams: [PlayURLResult.DashInfo.DashStream],
         quality: Int,
-        hardwareCapabilities: VideoHardwareCapabilities.Snapshot
+        hardwareCapabilities: VideoHardwareCapabilities.Snapshot,
+        requiresHardwareSupport: Bool = false,
+        rejectedCodecKeys: Set<String> = []
     ) -> PlayURLResult.DashInfo.DashStream? {
         let pref = PlayerPlaybackPreferences.preferredCodec
         let hardwareDecodeEnabled = PlayerPlaybackPreferences.hardwareDecodeEnabled
+        let eligibleStreams = streams.filter { stream in
+            guard !rejectedCodecKeys.contains(Self.decodeFallbackCodecKey(for: stream.codecs)) else {
+                return false
+            }
+            if requiresHardwareSupport {
+                return hardwareCapabilities.supports(codecs: stream.codecs)
+            }
+            return true
+        }
+        guard !eligibleStreams.isEmpty else { return nil }
+
         func pick(_ candidates: [PlayURLResult.DashInfo.DashStream]) -> PlayURLResult.DashInfo.DashStream? {
+            guard !candidates.isEmpty else { return nil }
             if pref != .auto, let match = candidates.first(where: { pref.matches($0.codecs) }) {
                 return match
             }
@@ -138,12 +154,12 @@ extension PlayerViewModel {
             }
             return candidates.first
         }
-        if let s = pick(streams.filter { $0.id == quality }) { return s }
-        if let lowerID = streams.filter({ $0.id <= quality }).map(\.id).max(),
-           let s = pick(streams.filter { $0.id == lowerID }) {
+        if let s = pick(eligibleStreams.filter { $0.id == quality }) { return s }
+        if let lowerID = eligibleStreams.filter({ $0.id <= quality }).map(\.id).max(),
+           let s = pick(eligibleStreams.filter { $0.id == lowerID }) {
             return s
         }
-        return pick(streams)
+        return pick(eligibleStreams)
     }
 
     func codecsOffered(
@@ -301,7 +317,183 @@ extension PlayerViewModel {
     }
 
     func restorePreferredBackendForLoad(_ reason: String) {
-        handOffBackend(to: preferredBackendKind, reason: reason)
+        let targetKind = session.decodeFallback.engineOverride ?? preferredBackendKind
+        handOffBackend(to: targetKind, reason: reason)
+    }
+
+    nonisolated static func vodDecodeFallbackContentKey(
+        aid: Int,
+        cid: Int,
+        source: StreamSource
+    ) -> String {
+        switch source {
+        case .ugc: "vod:ugc:\(aid):\(cid)"
+        case .pgc(let epID): "vod:pgc:\(epID):\(aid):\(cid)"
+        }
+    }
+
+    nonisolated static func offlineDecodeFallbackContentKey(asset: OfflinePlaybackAsset) -> String {
+        "offline:\(asset.aid):\(asset.cid):\(asset.videoURL.lastPathComponent)"
+    }
+
+    nonisolated static func decodeFallbackCodecKey(for codecs: String) -> String {
+        let normalized = codecs.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return "" }
+        if normalized.hasPrefix("avc") || normalized.hasPrefix("h264") { return "avc" }
+        if normalized.hasPrefix("dvh") || normalized.hasPrefix("dvhe") { return "dvh" }
+        if normalized.hasPrefix("hev") || normalized.hasPrefix("hvc") { return "hevc" }
+        if normalized.hasPrefix("av01") || normalized.hasPrefix("av1") { return "av1" }
+        return String(normalized.split(separator: ".").first ?? Substring(normalized))
+    }
+
+    nonisolated static func decodeFallbackCodecKey(forPreference pref: VideoCodecPreference) -> String {
+        switch pref {
+        case .auto: ""
+        case .avc: "avc"
+        case .hevc: "hevc"
+        case .av1: "av1"
+        }
+    }
+
+    func queueDecodeFallbackNoticeIfNeeded(switchedEngine: Bool) {
+        if switchedEngine {
+            guard !session.decodeFallback.shownEngineNotice else { return }
+            session.decodeFallback.shownEngineNotice = true
+            session.decodeFallback.pendingNoticeText = String(
+                localized: "Switched to compatible decoder engine"
+            )
+        } else {
+            guard !session.decodeFallback.shownCodecNotice else { return }
+            session.decodeFallback.shownCodecNotice = true
+            session.decodeFallback.pendingNoticeText = String(
+                localized: "Switched to compatible video codec"
+            )
+        }
+    }
+
+    func flushPendingDecodeFallbackNoticeIfNeeded() {
+        guard let text = session.decodeFallback.pendingNoticeText else { return }
+        session.decodeFallback.pendingNoticeText = nil
+        showNotice(text)
+    }
+
+    @discardableResult
+    func attemptDemandDecodeFallback(reason: String, allowMockBackend: Bool = false) -> Bool {
+        guard activeBackendKind == .demandPaced,
+              activeBackend is DemandPacedPlayerBackend || allowMockBackend,
+              mode == .vod || mode == .offline else {
+            return false
+        }
+        let resumeCandidate = max(mediaTime, resumeTargetTime)
+        let effectiveResume = resumeCandidate > 1.0 ? resumeCandidate : 0
+
+        switch mode {
+        case .vod:
+            guard let aid = currentAid, let cid = currentCid else { return false }
+            let key = Self.vodDecodeFallbackContentKey(aid: aid, cid: cid, source: currentSource)
+            if session.decodeFallback.contentKey != key {
+                session.decodeFallback = PlayerDecodeFallbackState(contentKey: key)
+            }
+            let failedCodec = Self.decodeFallbackCodecKey(for: stats.codec)
+            if !failedCodec.isEmpty {
+                session.decodeFallback.rejectedCodecKeys.insert(failedCodec)
+            }
+            let hasRemainingCodecCandidate = availableCodecs.contains { pref in
+                let prefKey = Self.decodeFallbackCodecKey(forPreference: pref)
+                return !prefKey.isEmpty && !session.decodeFallback.rejectedCodecKeys.contains(prefKey)
+            }
+            if hasRemainingCodecCandidate, session.decodeFallback.codecFallbackCount < 2 {
+                session.decodeFallback.codecFallbackCount += 1
+                queueDecodeFallbackNoticeIfNeeded(switchedEngine: false)
+                PlayerLog.log(
+                    "[Player] decode fallback tier-1 → alternate DASH codec " +
+                    "(rejected=\(session.decodeFallback.rejectedCodecKeys.sorted().joined(separator: ","))) " +
+                    "at=\(String(format: "%.1f", effectiveResume))s reason=\(reason)"
+                )
+                let reloadLease = currentOwnerLease
+                let reloadQuality = currentQuality > 0 ? currentQuality : nil
+                let reloadBvid = currentBvid
+                let reloadSource = currentSource
+                let wantsPlay = userWantsPlaying
+                Task { @MainActor [weak self] in
+                    await self?.loadVOD(
+                        aid: aid,
+                        cid: cid,
+                        bvid: reloadBvid,
+                        quality: reloadQuality,
+                        source: reloadSource,
+                        resumeAt: effectiveResume > 1.0 ? effectiveResume : nil,
+                        preservePlayState: wantsPlay,
+                        ownerLease: reloadLease
+                    )
+                }
+                return true
+            }
+
+            guard session.decodeFallback.engineOverride != .vlc else { return false }
+            session.decodeFallback.engineOverride = .vlc
+            session.decodeFallback.rejectedCodecKeys.removeAll()
+            guard handOffBackend(to: .vlc, reason: "vod decode fallback (\(reason))")
+                    || activeBackendKind == .vlc else {
+                session.decodeFallback.engineOverride = nil
+                return false
+            }
+            queueDecodeFallbackNoticeIfNeeded(switchedEngine: true)
+            PlayerLog.log(
+                "[Player] decode fallback tier-2 → VLC handoff at=" +
+                "\(String(format: "%.1f", effectiveResume))s reason=\(reason)"
+            )
+            if let url = currentURL {
+                playURL(
+                    url,
+                    audioURL: isDASHMode ? currentDASHAudioURL : nil,
+                    startAt: effectiveResume
+                )
+                return true
+            }
+            let reloadLease = currentOwnerLease
+            let reloadQuality = currentQuality > 0 ? currentQuality : nil
+            let reloadBvid = currentBvid
+            let reloadSource = currentSource
+            let wantsPlay = userWantsPlaying
+            Task { @MainActor [weak self] in
+                await self?.loadVOD(
+                    aid: aid,
+                    cid: cid,
+                    bvid: reloadBvid,
+                    quality: reloadQuality,
+                    source: reloadSource,
+                    resumeAt: effectiveResume > 1.0 ? effectiveResume : nil,
+                    preservePlayState: wantsPlay,
+                    ownerLease: reloadLease
+                )
+            }
+            return true
+
+        case .offline:
+            guard let asset = offlineAsset,
+                  session.decodeFallback.engineOverride != .vlc else { return false }
+            let key = Self.offlineDecodeFallbackContentKey(asset: asset)
+            if session.decodeFallback.contentKey != key {
+                session.decodeFallback = PlayerDecodeFallbackState(contentKey: key)
+            }
+            session.decodeFallback.engineOverride = .vlc
+            guard handOffBackend(to: .vlc, reason: "offline decode fallback (\(reason))")
+                    || activeBackendKind == .vlc else {
+                session.decodeFallback.engineOverride = nil
+                return false
+            }
+            queueDecodeFallbackNoticeIfNeeded(switchedEngine: true)
+            PlayerLog.log(
+                "[Player] offline decode fallback → VLC handoff at=" +
+                "\(String(format: "%.1f", effectiveResume))s reason=\(reason)"
+            )
+            playURL(asset.videoURL, audioURL: asset.audioURL, startAt: effectiveResume)
+            return true
+
+        case .live:
+            return false
+        }
     }
 
     static func prewarmPlaybackEngine() {

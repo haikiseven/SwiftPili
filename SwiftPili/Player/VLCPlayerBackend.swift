@@ -694,6 +694,12 @@ final class VLCPlayerBackend: PlayerBackend {
         set { player.isMuted = newValue }
     }
 
+    var supportsSystemSubtitleGeneration: Bool { false }
+
+    func setSubtitlePCMTap(_ tap: AudioPCMSubtitleTap?) {
+        _ = tap
+    }
+
     // MARK: - Rendering
 
     var renderViewController: UIViewController? {
@@ -746,10 +752,11 @@ final class VLCPlayerBackend: PlayerBackend {
                 case .didStart:
                     self.updateObservedPiPLease(true)
                     PlayerLog.log("[PiP] observed lease started hostRevision=\(revision)")
-                    if !PlayerPlaybackPreferences.playbackContinuationConfiguration.allowsAutomaticPiP {
+                    if !PlayerPlaybackPreferences.playbackContinuationConfiguration.allowsAutomaticPiP
+                        || !self.isPlaying {
                         PlayerLog.log(
-                            "[PiP] ASSERT disabled configuration reached didStart " +
-                            "hostRevision=\(revision)"
+                            "[PiP] stopping unexpected PiP didStart " +
+                            "hostRevision=\(revision) playing=\(self.isPlaying ? 1 : 0)"
                         )
                         self.stopPiP()
                     }
@@ -764,8 +771,9 @@ final class VLCPlayerBackend: PlayerBackend {
     }
 
     func startPiP() {
-        guard PlayerPlaybackPreferences.playbackContinuationConfiguration.allowsAutomaticPiP else {
-            PlayerLog.log("[PiP] start ignored — continuation setting disabled")
+        guard PlayerPlaybackPreferences.playbackContinuationConfiguration.allowsAutomaticPiP,
+              isPlaying else {
+            PlayerLog.log("[PiP] start ignored — continuation disabled or playback not active")
             return
         }
         videoHosting.pictureInPictureController.start()
@@ -956,13 +964,16 @@ final class VLCPlayerBackend: PlayerBackend {
         case .endReached:
             if pendingSeekTarget != nil {
                 PlayerLog.log("[VLC] event: endReached SWALLOWED (seek pending → false EOF)")
-            } else if lastKnownDuration > 0, lastKnownDuration - lastTickTime > 5 {
+            } else if lastKnownDuration > 0, lastKnownDuration - lastTickTime > NearEndClockPolicy.stallWindow {
                 PlayerLog.log("[VLC] ⚠️ premature endReached at \(String(format: "%.1f", lastTickTime))s of \(String(format: "%.1f", lastKnownDuration))s — treating as stream failure, not end-of-media")
                 onStateChanged?(.error(VLCError.playbackFailed(
                     reason: "stream ended early at \(String(format: "%.1f", lastTickTime))s of \(String(format: "%.1f", lastKnownDuration))s"
                 )))
             } else {
                 PlayerLog.log("[VLC] event: endReached (at \(String(format: "%.1f", lastTickTime))s of \(String(format: "%.1f", lastKnownDuration))s)")
+                if isPiPActive || hasObservedPiPLease {
+                    stopPiP()
+                }
                 onStateChanged?(.playedToTheEnd)
             }
 

@@ -340,11 +340,14 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
         switch format {
         case .description(let description):
             try await open(formatDescription: description)
-        case .codecConfig(let codec, let config, let codedDimensions):
+        case .codecConfig(let codec, let config, let codedDimensions, let extensionAtoms):
             if let bootstrap = PathACodecConfig.inBandBootstrap(codec: codec, config: config) {
                 if !config.isEmpty,
                    let description = try? Self.makeFormatDescription(
-                       codec: codec, config: config, codedDimensions: codedDimensions
+                       codec: codec,
+                       config: config,
+                       codedDimensions: codedDimensions,
+                       extensionAtoms: extensionAtoms
                    ) {
                     try await open(formatDescription: description)
                     return
@@ -362,7 +365,8 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
             try await open(formatDescription: try Self.makeFormatDescription(
                 codec: codec,
                 config: config,
-                codedDimensions: codedDimensions
+                codedDimensions: codedDimensions,
+                extensionAtoms: extensionAtoms
             ))
         }
     }
@@ -370,11 +374,15 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
     private static func makeFormatDescription(
         codec: String?,
         config: Data,
-        codedDimensions: MediaVideoCodedDimensions?
+        codedDimensions: MediaVideoCodedDimensions?,
+        extensionAtoms: [String: Data] = [:]
     ) throws -> CMFormatDescription {
         if let codec {
             return try PathACodecConfig.makeVideoFormatDescription(
-                codec: codec, config: config, codedDimensions: codedDimensions
+                codec: codec,
+                config: config,
+                codedDimensions: codedDimensions,
+                extensionAtoms: extensionAtoms
             )
         }
         do {
@@ -485,7 +493,8 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
     private static func preferredPixelFormatType(for formatDescription: CMFormatDescription) -> OSType {
         let extensions = CMFormatDescriptionGetExtensions(formatDescription) as? [CFString: Any]
         let fullRange = (extensions?[kCMFormatDescriptionExtension_FullRangeVideo] as? NSNumber)?.boolValue == true
-        if is10BitOrHDR(extensions: extensions) {
+        let isDolbyVision = CMFormatDescriptionGetMediaSubType(formatDescription) == kCMVideoCodecType_DolbyVisionHEVC
+        if isDolbyVision || is10BitOrHDR(extensions: extensions) {
             return fullRange
                 ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
                 : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
@@ -510,6 +519,9 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
             }
         }
         if let atoms = extensions[kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms] as? [String: Any] {
+            if atoms["dvcC"] != nil || atoms["dvvC"] != nil || atoms["dvwC"] != nil {
+                return true
+            }
             if let hvcC = atoms["hvcC"] as? Data {
                 let bytes = [UInt8](hvcC)
                 if bytes.count >= 2 && (bytes[1] & 0x1F) == 2 { return true }
@@ -618,7 +630,7 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
                 parameterSetCountOut: nil,
                 nalUnitHeaderLengthOut: &length
             )
-        case kCMVideoCodecType_HEVC:
+        case kCMVideoCodecType_HEVC, kCMVideoCodecType_DolbyVisionHEVC:
             status = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
                 formatDescription,
                 parameterSetIndex: 0,
@@ -627,6 +639,14 @@ final class VideoToolboxDecoder: MediaVideoDecoding, MediaVideoDecodeTimingRepor
                 parameterSetCountOut: nil,
                 nalUnitHeaderLengthOut: &length
             )
+            if status != noErr,
+               let extensions = CMFormatDescriptionGetExtensions(formatDescription) as? [CFString: Any],
+               let atoms = extensions[kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms] as? [String: Any],
+               let hvcC = atoms["hvcC"] as? Data,
+               hvcC.count >= 22 {
+                let fallbackLen = Int(hvcC[21] & 0x03) + 1
+                if (1...4).contains(fallbackLen) { return fallbackLen }
+            }
         default:
             return nil
         }

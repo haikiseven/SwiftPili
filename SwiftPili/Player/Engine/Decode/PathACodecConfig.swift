@@ -108,12 +108,22 @@ enum PathACodecConfig {
     static func makeVideoFormatDescription(
         codec: String,
         config: Data,
-        codedDimensions: MediaVideoCodedDimensions? = nil
+        codedDimensions: MediaVideoCodedDimensions? = nil,
+        extensionAtoms: [String: Data] = [:]
     ) throws -> CMFormatDescription {
         switch codec.lowercased() {
         case "avc1", "avc3":
             return try h264FormatDescription(avcC: config)
-        case "hvc1", "hev1", "dvh1", "dvhe":
+        case "hvc1", "hev1":
+            return try hevcFormatDescription(hvcC: config)
+        case "dvh1", "dvhe":
+            if let dvDescription = try? dolbyVisionFormatDescription(
+                hvcC: config,
+                codedDimensions: codedDimensions,
+                extensionAtoms: extensionAtoms
+            ) {
+                return dvDescription
+            }
             return try hevcFormatDescription(hvcC: config)
         case "av01":
             guard let codedDimensions else {
@@ -516,6 +526,50 @@ enum PathACodecConfig {
             }
             return formatOut
         }
+    }
+
+    // MARK: - Dolby Vision HEVC
+
+    private static func dolbyVisionFormatDescription(
+        hvcC: Data,
+        codedDimensions: MediaVideoCodedDimensions?,
+        extensionAtoms: [String: Data]
+    ) throws -> CMFormatDescription {
+        guard !hvcC.isEmpty, let codedDimensions else {
+            throw MediaEngineError.decodeFailed("Dolby Vision missing hvcC or codedDimensions")
+        }
+        let hasDVConfig = extensionAtoms["dvcC"] != nil
+            || extensionAtoms["dvvC"] != nil
+            || extensionAtoms["dvwC"] != nil
+        guard hasDVConfig else {
+            throw MediaEngineError.decodeFailed("Dolby Vision missing dvcC/dvvC atom")
+        }
+        var atoms: [CFString: CFData] = [
+            "hvcC" as CFString: hvcC as CFData
+        ]
+        for key in ["dvcC", "dvvC", "dvwC", "colr", "pasp"] {
+            if let data = extensionAtoms[key], !data.isEmpty {
+                atoms[key as CFString] = data as CFData
+            }
+        }
+        let extensions: [CFString: Any] = [
+            kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: atoms
+        ]
+        var formatOut: CMFormatDescription?
+        let status = CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            codecType: kCMVideoCodecType_DolbyVisionHEVC,
+            width: codedDimensions.width,
+            height: codedDimensions.height,
+            extensions: extensions as CFDictionary,
+            formatDescriptionOut: &formatOut
+        )
+        guard status == noErr, let formatOut else {
+            throw MediaEngineError.decodeFailed(
+                "CMVideoFormatDescriptionCreate DolbyVisionHEVC status=\(status)"
+            )
+        }
+        return formatOut
     }
 
     // MARK: - AV1

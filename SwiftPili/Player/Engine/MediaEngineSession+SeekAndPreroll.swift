@@ -265,7 +265,14 @@ extension MediaEngineSession {
             }
 
             let audioPreparation: MediaAudioSeekPreparation
-            if hasAudioTrack, audioDecoderOpened {
+            if usesSyntheticSilenceClock {
+                audioTimelineBuffer.configureSyntheticSilence(
+                    enabled: true,
+                    startPTS: clock.mediaTime,
+                    duration: clock.duration
+                )
+            }
+            if drivesAudioClockPipeline {
                 audioPreparation = audioRender.prepareSeekTransition(
                     token,
                     source: self
@@ -430,6 +437,9 @@ extension MediaEngineSession {
             startSupplyLoop()
             scheduleVideoDecodeIfNeeded()
             scheduleAudioDecodeIfNeeded()
+            if !hasAudioTrack, !drivesAudioClockPipeline {
+                startVideoTailDrainIfNeeded()
+            }
         } else {
             applyDisplayPlayback(rate: 0)
             startPausedRunwayRefreshIfNeeded()

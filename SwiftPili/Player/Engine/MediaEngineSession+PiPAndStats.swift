@@ -49,8 +49,10 @@ extension MediaEngineSession {
     @discardableResult
     func startPiP() -> Bool {
         guard isAutomaticPiPEnabled,
+              isPlaying,
+              !hasEmittedEnded,
               activePiPEventBindingToken != nil else {
-            diagnostics.log("[PathA] startPiP: capability disabled or unbound")
+            diagnostics.log("[PathA] startPiP: capability disabled, not playing, or unbound")
             return false
         }
         if let pipHost = videoRender as? any MediaPiPLeaseEventSource {
@@ -255,6 +257,13 @@ extension MediaEngineSession {
         return renderer.currentDisplayedImage()
     }
 
+    func currentDisplayedFrameCaptureSource() -> DisplayedFrameCaptureSource? {
+        guard let renderer = videoRender as? SampleBufferVideoRenderer else {
+            return nil
+        }
+        return renderer.currentDisplayedFrameCaptureSource()
+    }
+
     func currentAmbientSampleImage(targetSize: CGSize) -> UIImage? {
         guard let renderer = videoRender as? SampleBufferVideoRenderer else {
             return nil
@@ -360,7 +369,7 @@ extension MediaEngineSession {
         pipHost.updatePiPPlaybackState(
             currentTime: clock.mediaTime,
             duration: clock.duration,
-            isPlaying: isPlaying
+            isPlaying: isPlaying && !hasEmittedEnded
         )
     }
 

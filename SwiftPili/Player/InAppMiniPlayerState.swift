@@ -52,15 +52,56 @@ struct MiniPlayerReturnHandoff: Equatable {
     let offlineAsset: OfflinePlaybackAsset?
 }
 
+struct PendingMiniPlayerReturnVOD: Equatable, Sendable {
+    let aid: Int
+    let cid: Int
+    let source: PlayerViewModel.StreamSource
+}
+
 @MainActor
 @Observable
 final class InAppMiniPlayerState {
     static let shared = InAppMiniPlayerState()
 
+    static let dockEdgeDefaultsKey = "in_app_mini_player_dock_edge"
+    static let dockProgressDefaultsKey = "in_app_mini_player_dock_progress"
+
+    @ObservationIgnored
+    private let defaults: UserDefaults
+    @ObservationIgnored
+    private var isInitialized = false
+
     private(set) var activeSession: InAppMiniPlayerSession?
     @ObservationIgnored
     var returnHandoff: MiniPlayerReturnHandoff?
-    var dockPosition: MiniPlayerDockPosition = .bottomTrailing
+    var dockPosition: MiniPlayerDockPosition = .bottomTrailing {
+        didSet {
+            guard isInitialized else { return }
+            persistDockPosition(dockPosition)
+        }
+    }
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        self.dockPosition = Self.loadDockPosition(from: defaults)
+        self.isInitialized = true
+    }
+
+    private static func loadDockPosition(from defaults: UserDefaults) -> MiniPlayerDockPosition {
+        guard let rawEdge = defaults.string(forKey: dockEdgeDefaultsKey),
+              let edge = MiniPlayerEdge(rawValue: rawEdge),
+              let rawProgress = defaults.object(forKey: dockProgressDefaultsKey),
+              let progress = rawProgress as? Double,
+              progress.isFinite else {
+            return .bottomTrailing
+        }
+        return MiniPlayerDockPosition(edge: edge, progress: CGFloat(progress))
+    }
+
+    private func persistDockPosition(_ position: MiniPlayerDockPosition) {
+        defaults.set(position.edge.rawValue, forKey: Self.dockEdgeDefaultsKey)
+        defaults.set(Double(position.progress), forKey: Self.dockProgressDefaultsKey)
+    }
 
     var isActive: Bool {
         activeSession != nil
@@ -82,6 +123,27 @@ final class InAppMiniPlayerState {
         activeSession = session
     }
 
+    func updateActiveSession(
+        matching ownerLease: PlayerOwnerLease,
+        title: String,
+        coverURL: String?,
+        originRoute: Route,
+        originScreenRoute: PlayerScreenRoute,
+        isPortrait: Bool? = nil
+    ) {
+        guard let existing = activeSession, existing.ownerLease == ownerLease else { return }
+        activeSession = InAppMiniPlayerSession(
+            originRoute: originRoute.withoutZoom,
+            originScreenRoute: originScreenRoute,
+            originPosition: existing.originPosition,
+            ownerLease: existing.ownerLease,
+            title: title,
+            coverURL: coverURL,
+            mode: existing.mode,
+            isPortrait: isPortrait ?? existing.isPortrait
+        )
+    }
+
     func transitionToReturnHandoff(_ handoff: MiniPlayerReturnHandoff) {
         activeSession = nil
         returnHandoff = handoff
@@ -90,6 +152,41 @@ final class InAppMiniPlayerState {
     func markReturnHandoffAdopted(by lease: PlayerOwnerLease) {
         guard returnHandoff != nil else { return }
         returnHandoff?.adoptedOwnerLease = lease
+    }
+
+    func pendingReturnVOD(
+        forSeasonId seasonId: Int,
+        ownerLease: PlayerOwnerLease? = nil
+    ) -> PendingMiniPlayerReturnVOD? {
+        guard let handoff = returnHandoff,
+              handoff.mode == .vod,
+              handoff.originScreenRoute == .bangumi(seasonId),
+              let aid = handoff.aid,
+              let cid = handoff.cid else {
+            return nil
+        }
+        if let ownerLease,
+           handoff.adoptedOwnerLease != ownerLease && handoff.previousOwnerLease != ownerLease {
+            return nil
+        }
+        return PendingMiniPlayerReturnVOD(aid: aid, cid: cid, source: handoff.source)
+    }
+
+    func pendingReturnVOD(
+        forAid aid: Int,
+        ownerLease: PlayerOwnerLease? = nil
+    ) -> PendingMiniPlayerReturnVOD? {
+        guard let handoff = returnHandoff,
+              handoff.mode == .vod,
+              handoff.aid == aid,
+              let cid = handoff.cid else {
+            return nil
+        }
+        if let ownerLease,
+           handoff.adoptedOwnerLease != ownerLease && handoff.previousOwnerLease != ownerLease {
+            return nil
+        }
+        return PendingMiniPlayerReturnVOD(aid: aid, cid: cid, source: handoff.source)
     }
 
     func clearActiveSession() {
@@ -112,6 +209,8 @@ enum InAppMiniPlayerLayoutPolicy {
     static let padHorizontalSize = CGSize(width: 256, height: 144)
     static let phonePortraitSize = CGSize(width: 116, height: 196)
     static let padPortraitSize = CGSize(width: 144, height: 244)
+    static let minCardAspect: CGFloat = 9.0 / 16.0
+    static let maxCardAspect: CGFloat = 2.2
 
     struct SafeCenterBounds: Equatable, Sendable {
         let minX: CGFloat
@@ -136,12 +235,28 @@ enum InAppMiniPlayerLayoutPolicy {
     static func cardSize(
         isPortrait: Bool,
         isPad: Bool,
-        containerSize: CGSize
+        containerSize: CGSize,
+        videoAspectRatio: CGFloat? = nil
     ) -> CGSize {
-        let base: CGSize = if isPortrait {
-            isPad ? padPortraitSize : phonePortraitSize
+        let base: CGSize
+        if let normalizedAspect = DetailPlayerGeometry.normalizedAspect(videoAspectRatio) {
+            let clampedAspect = min(max(normalizedAspect, minCardAspect), maxCardAspect)
+            let reference = isPad ? padHorizontalSize : phoneHorizontalSize
+            let targetArea = reference.width * reference.height
+            let maxBaseWidth = isPad ? padHorizontalSize.width : phoneHorizontalSize.width
+            let maxBaseHeight = isPad ? padPortraitSize.height : phonePortraitSize.height
+            var width = (targetArea * clampedAspect).squareRoot()
+            var height = width / clampedAspect
+            let fitScale = min(1, min(maxBaseWidth / width, maxBaseHeight / height))
+            width = (width * fitScale).rounded()
+            height = (height * fitScale).rounded()
+            base = CGSize(width: max(80, width), height: max(60, height))
         } else {
-            isPad ? padHorizontalSize : phoneHorizontalSize
+            base = if isPortrait {
+                isPad ? padPortraitSize : phonePortraitSize
+            } else {
+                isPad ? padHorizontalSize : phoneHorizontalSize
+            }
         }
         guard containerSize.width.isFinite, containerSize.height.isFinite,
               containerSize.width > 80, containerSize.height > 80 else {
@@ -408,6 +523,7 @@ extension PlayerViewModel {
     }
 
     func canEnterMiniPlayer(for lease: PlayerOwnerLease) -> Bool {
+        synchronizeTerminalAdmissionFromBackend()
         guard PlayerPlaybackPreferences.inAppMiniPlayerEnabled else { return false }
         guard isCurrentOwner(lease) else { return false }
         guard playbackIntent == .playing else { return false }
@@ -452,9 +568,11 @@ extension PlayerViewModel {
 
     func handleMiniPlayerIncomingRoute(_ incoming: PlayerRouteDestination) {
         guard let session = miniPlayer.activeSession else { return }
+        synchronizeTerminalAdmissionFromBackend()
         if incoming.route == session.originScreenRoute,
            isCurrentOwner(session.ownerLease),
            currentURL != nil,
+           !currentPlaybackTerminalState.isTerminal,
            error == nil,
            unavailability == nil,
            !terminalOpenFailure {
@@ -500,6 +618,7 @@ extension PlayerViewModel {
               handoff.adoptedOwnerLease == nil,
               currentOwnerLease == handoff.previousOwnerLease,
               currentURL != nil,
+              !currentPlaybackTerminalState.isTerminal,
               error == nil,
               unavailability == nil,
               !terminalOpenFailure else {
@@ -508,19 +627,84 @@ extension PlayerViewModel {
         return ownerMatchesScreenRoute(incomingOwner, route: handoff.originScreenRoute)
     }
 
+    func pendingMiniPlayerReturnVOD(
+        forSeasonId seasonId: Int,
+        ownerLease: PlayerOwnerLease? = nil
+    ) -> PendingMiniPlayerReturnVOD? {
+        if let pending = miniPlayer.pendingReturnVOD(forSeasonId: seasonId, ownerLease: ownerLease),
+           matchesLiveMiniPlayerReturnVOD(
+               aid: pending.aid,
+               cid: pending.cid,
+               source: pending.source,
+               ownerLease: ownerLease
+           ) {
+            return pending
+        }
+        if let ownerLease,
+           isCurrentOwner(ownerLease),
+           mode == .vod,
+           currentURL != nil,
+           !currentPlaybackTerminalState.isTerminal,
+           error == nil,
+           unavailability == nil,
+           !terminalOpenFailure,
+           let queue = playbackQueue,
+           case .bangumiSeason(let queueSeasonId) = queue.kind,
+           queueSeasonId == seasonId,
+           let item = queue.currentItem,
+           currentAid == item.aid,
+           currentCid == item.cid,
+           currentSource == item.source {
+            return PendingMiniPlayerReturnVOD(aid: item.aid, cid: item.cid, source: item.source)
+        }
+        return nil
+    }
+
+    func pendingMiniPlayerReturnVOD(
+        forAid aid: Int,
+        ownerLease: PlayerOwnerLease? = nil
+    ) -> PendingMiniPlayerReturnVOD? {
+        if let pending = miniPlayer.pendingReturnVOD(forAid: aid, ownerLease: ownerLease),
+           matchesLiveMiniPlayerReturnVOD(
+               aid: pending.aid,
+               cid: pending.cid,
+               source: pending.source,
+               ownerLease: ownerLease
+           ) {
+            return pending
+        }
+        if let ownerLease,
+           isCurrentOwner(ownerLease),
+           mode == .vod,
+           currentAid == aid,
+           let cid = currentCid,
+           currentSource == .ugc,
+           currentURL != nil,
+           !currentPlaybackTerminalState.isTerminal,
+           error == nil,
+           unavailability == nil,
+           !terminalOpenFailure {
+            return PendingMiniPlayerReturnVOD(aid: aid, cid: cid, source: currentSource)
+        }
+        return nil
+    }
+
     func matchesLiveMiniPlayerReturnVOD(
         aid: Int,
         cid: Int,
+        source: StreamSource? = nil,
         ownerLease: PlayerOwnerLease?
     ) -> Bool {
         guard let handoff = miniPlayer.returnHandoff,
               handoff.mode == .vod,
               handoff.aid == aid,
               handoff.cid == cid,
+              source == nil || (handoff.source == source && currentSource == source),
               mode == .vod,
               currentAid == aid,
               currentCid == cid,
               currentURL != nil,
+              !currentPlaybackTerminalState.isTerminal,
               error == nil,
               unavailability == nil,
               !terminalOpenFailure else {
@@ -569,6 +753,7 @@ extension PlayerViewModel {
               currentCid == cid,
               currentSource == source,
               currentURL != nil,
+              !currentPlaybackTerminalState.isTerminal,
               error == nil,
               unavailability == nil,
               !terminalOpenFailure else {
@@ -659,6 +844,7 @@ extension PlayerViewModel {
               mode == .offline,
               offlineAsset == asset,
               currentURL == asset.videoURL,
+              !currentPlaybackTerminalState.isTerminal,
               error == nil,
               unavailability == nil,
               !terminalOpenFailure else {

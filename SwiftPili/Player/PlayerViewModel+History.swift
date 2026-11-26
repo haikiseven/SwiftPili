@@ -10,6 +10,20 @@ extension PlayerViewModel {
         duration: TimeInterval = 0,
         ownerLease: PlayerOwnerLease? = nil
     ) async -> ServerResumeLookup {
+        await serverResumeMetadata(
+            aid: aid,
+            cid: cid,
+            duration: duration,
+            ownerLease: ownerLease
+        ).lookup
+    }
+
+    static func serverResumeMetadata(
+        aid: Int,
+        cid: Int,
+        duration: TimeInterval = 0,
+        ownerLease: PlayerOwnerLease? = nil
+    ) async -> ServerResumeMetadata {
         if shared.matchesLiveMiniPlayerReturnVOD(aid: aid, cid: cid, ownerLease: ownerLease) {
             PlayerLog.log("[MiniPlayer] skipping serverResumePoint for live return aid=\(aid) cid=\(cid)")
             return .noHistory
@@ -46,27 +60,32 @@ extension PlayerViewModel {
                 lastPlayTimeMs: info.lastPlayTime,
                 duration: duration
             )
+            let lastCidText = info.lastPlayCid.map { " last_play_cid=\($0)" } ?? ""
             switch lookup {
             case .resume(let t):
-                PlayerLog.log("[Player] resume: aid=\(aid) cid=\(cid) → \(String(format: "%.0f", t))s (server history)")
+                PlayerLog.log("[Player] resume: aid=\(aid) cid=\(cid)\(lastCidText) → \(String(format: "%.0f", t))s (server history)")
             case .watchedToEnd where info.lastPlayTime == -1:
-                PlayerLog.log("[Player] resume: aid=\(aid) cid=\(cid) was watched to the end (-1) — playing from beginning")
+                PlayerLog.log("[Player] resume: aid=\(aid) cid=\(cid)\(lastCidText) was watched to the end (-1) — playing from beginning")
             case .watchedToEnd:
                 let t = TimeInterval(info.lastPlayTime ?? 0) / 1000
-                PlayerLog.log("[Player] resume: aid=\(aid) cid=\(cid) history \(String(format: "%.0f", t))s is at the end of \(String(format: "%.0f", duration))s — playing from beginning")
+                PlayerLog.log("[Player] resume: aid=\(aid) cid=\(cid)\(lastCidText) history \(String(format: "%.0f", t))s is at the end of \(String(format: "%.0f", duration))s — playing from beginning")
             case .noHistory, .cancelled:
-                PlayerLog.log("[Player] resume: no usable history for aid=\(aid) cid=\(cid) (last_play_time=\(info.lastPlayTime.map(String.init) ?? "nil")ms)")
+                PlayerLog.log("[Player] resume: no usable history for aid=\(aid) cid=\(cid)\(lastCidText) (last_play_time=\(info.lastPlayTime.map(String.init) ?? "nil")ms)")
             }
-            return lookup
+            return ServerResumeMetadata(
+                lookup: lookup,
+                lastPlayCid: info.lastPlayCid,
+                lastPlayTimeMs: info.lastPlayTime
+            )
         } catch {
             shared.clearPlayerInfoHandoff(matching: ownerLease)
             let lookup = ServerResumeLookup.failed(callerIsCancelled: Task.isCancelled)
             if lookup == .cancelled {
                 PlayerLog.log("[Player] resume: history lookup cancelled for aid=\(aid) cid=\(cid) — caller aborts its load")
-            } else {
-                PlayerLog.log("[Player] ⚠️ resume: history lookup failed for aid=\(aid) cid=\(cid): \(error) — starting from 0")
+                return .cancelled
             }
-            return lookup
+            PlayerLog.log("[Player] ⚠️ resume: history lookup failed for aid=\(aid) cid=\(cid): \(error) — starting from 0")
+            return .noHistory
         }
     }
 
@@ -174,6 +193,24 @@ extension PlayerViewModel {
             position: seconds, aid: asset.aid, cid: asset.cid
         )
     }
+}
+
+struct ServerResumeMetadata: Equatable, Sendable {
+    let lookup: ServerResumeLookup
+    let lastPlayCid: Int?
+    let lastPlayTimeMs: Int?
+
+    static let noHistory = ServerResumeMetadata(
+        lookup: .noHistory,
+        lastPlayCid: nil,
+        lastPlayTimeMs: nil
+    )
+
+    static let cancelled = ServerResumeMetadata(
+        lookup: .cancelled,
+        lastPlayCid: nil,
+        lastPlayTimeMs: nil
+    )
 }
 
 enum ServerResumeLookup: Equatable, Sendable {

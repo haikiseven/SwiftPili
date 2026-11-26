@@ -185,7 +185,8 @@ extension MediaEngineSession {
         resumesPlayback: Bool
     ) -> DemandVideoSuspensionResult {
         guard isReady, !isSeekInFlight else { return .deferred }
-        guard hasAudioTrack, videoContinuityTopology != .unsupported else { return .unsupported }
+        guard hasAudioTrack || usesSyntheticSilenceClock,
+              videoContinuityTopology != .unsupported else { return .unsupported }
         if let activeVideoSuspendToken,
            isVideoLaneWarmSuspended,
            activeVideoSuspendToken.sessionGeneration == runtimeGeneration,
