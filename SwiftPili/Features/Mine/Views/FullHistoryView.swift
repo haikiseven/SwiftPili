@@ -208,7 +208,12 @@ struct FullHistoryView: View {
                 title: String(localized: "Share"),
                 image: UIImage(systemName: "square.and.arrow.up")
             ) { [weak sourceView] _ in
-                ActivitySharePresenter.present(items: [url], sourceView: sourceView)
+                let source = SwiftPiliLinkActivityItemSource(
+                    url: url,
+                    title: item.title,
+                    uploader: item.authorName
+                )
+                ActivitySharePresenter.present(items: [source], sourceView: sourceView)
             })
             children.append(UIAction(
                 title: String(localized: "Copy Link"),

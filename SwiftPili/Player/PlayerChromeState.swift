@@ -52,6 +52,7 @@ final class PlayerPortraitFullscreenContext {
     var onRequestFavoriteSheet: (@MainActor () async -> [FavoriteFolderResult.FavoriteFolder])?
     var onCommitFavoriteFolders: (@MainActor (Set<Int>) async -> Void)?
     var onRecordShare: (@MainActor () async -> Void)?
+    var makeShareSheetView: (@MainActor () -> AnyView)?
     var onRequestLogin: (@MainActor () -> Void)?
     var makeCommentsSheetView: (@MainActor () -> AnyView)?
     var onOpenDetailsSheet: (@MainActor () -> Void)?

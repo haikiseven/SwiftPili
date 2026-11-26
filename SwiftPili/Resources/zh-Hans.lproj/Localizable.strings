@@ -1763,3 +1763,15 @@
 "Switch to Standard View" = "切换至普通模式";
 "Description" = "简介";
 "Video Description" = "视频简介";
+"Share Video" = "分享视频";
+"Video Share Card" = "原生 Bilibili 客户端";
+"Shared via SwiftPili" = "来自 SwiftPili 分享";
+"Light Card" = "浅色杂志";
+"Dark Glow" = "暗色流光";
+"Include Intro" = "附带简介";
+"Share Poster" = "分享海报";
+"Share Link" = "分享链接";
+"Save Poster" = "保存海报";
+"Copy Poster" = "复制海报";
+"Saved" = "已保存";
+"Saved to Photos" = "海报已保存到相册";

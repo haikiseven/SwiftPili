@@ -953,6 +953,31 @@ extension VideoDetailView {
             await viewModel.shareVideo()
             syncPortraitFullscreenContext()
         }
+        context.makeShareSheetView = {
+            let payload: VideoSharePayload = if let loadedInfo = viewModel.matchesLoadedVideo(videoID) ? viewModel.videoInfo : nil {
+                VideoSharePayload.from(info: loadedInfo)
+            } else {
+                VideoSharePayload(
+                    bvid: context.bvid,
+                    aid: context.aid,
+                    title: context.title,
+                    uploader: context.upName,
+                    avatarURL: context.upAvatarURL,
+                    coverURL: activeTarget.preview.coverSource.desktopURL,
+                    description: "",
+                    durationSeconds: activeTarget.preview.durationSeconds,
+                    viewCount: 0,
+                    likeCount: context.likeCount,
+                    isPortraitCover: activeTarget.preview.isPortraitHint ?? false
+                )
+            }
+            return AnyView(
+                VideoShareStudioSheet(payload: payload) {
+                    await viewModel.shareVideo()
+                    syncPortraitFullscreenContext()
+                }
+            )
+        }
         context.onRequestLogin = {
             coordinator.presentLogin()
         }
@@ -1054,47 +1079,9 @@ extension VideoDetailView {
         }
     }
 
-    func shareItems(for info: VideoInfo) -> [Any] {
-        if let shareImage = shareState.image { return [shareImage] }
-        if let url = URL(string: "https://www.bilibili.com/video/\(info.bvid)") { return [url] }
-        return [info.title]
-    }
-
     func prepareShareCard(_ info: VideoInfo) {
-        guard shareState.requestID == nil, !shareState.isPresenting, isActiveVideoRoute else { return }
-        let id = UUID()
-        let model = viewModel
-        let request = ShareCardRenderer.Request(
-            coverURL: info.pic, title: info.title, uploader: info.owner.name, description: info.desc,
-            linkURL: "https://www.bilibili.com/video/\(info.bvid)",
-            linkDisplay: "bilibili.com/video/\(info.bvid)",
-            accent: UIColor(Color.biliAccent).resolvedColor(with: UITraitCollection.current)
-        )
-        shareState.requestID = id
-        shareState.preparation = Task {
-            defer {
-                if shareState.requestID == id {
-                    shareState.requestID = nil
-                    shareState.preparation = nil
-                }
-            }
-            guard let image = try? await ShareCardRenderer.prepare(request),
-                  !Task.isCancelled, shareState.requestID == id,
-                  isActiveVideoRoute, viewModel === model, model.videoInfo?.bvid == info.bvid else { return }
-            shareState.image = image
-            shareState.isPresenting = true
-            ActivitySharePresenter.present(items: shareItems(for: info)) { completed in
-                shareState.isPresenting = false
-                guard completed else { return }
-                Task { await viewModel.shareVideo() }
-            }
-        }
-    }
-
-    func cancelSharePreparation() {
-        shareState.preparation?.cancel()
-        shareState.preparation = nil
-        shareState.requestID = nil
+        guard isActiveVideoRoute else { return }
+        activeSheet = .share(VideoSharePayload.from(info: info))
     }
 
     func startDownload(_ info: VideoInfo, cid: Int, quality: Int) {

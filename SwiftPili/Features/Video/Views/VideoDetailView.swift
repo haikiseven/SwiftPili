@@ -98,6 +98,7 @@ struct VideoDetailView: View {
             case download(UUID)
             case batchDownload(UUID)
             case playlist
+            case share(UUID)
         }
 
         case report(aid: Int)
@@ -106,6 +107,7 @@ struct VideoDetailView: View {
         case download(DownloadQualityPresentation)
         case batchDownload(BatchDownloadPresentation)
         case playlist
+        case share(VideoSharePayload)
 
         var id: ID {
             switch self {
@@ -115,15 +117,9 @@ struct VideoDetailView: View {
             case .download(let presentation): .download(presentation.id)
             case .batchDownload(let presentation): .batchDownload(presentation.id)
             case .playlist: .playlist
+            case .share(let payload): .share(payload.id)
             }
         }
-    }
-
-    struct VideoShareState {
-        var isPresenting = false
-        var image: UIImage?
-        var requestID: UUID?
-        var preparation: Task<Void, Never>?
     }
 
     final class PageOffsetStore {
@@ -141,7 +137,6 @@ struct VideoDetailView: View {
     @State var replyPresentation = CommentZoomPresentation()
     @State var composer = VideoCommentComposerState()
     @State var activeSheet: DetailSheet?
-    @State var shareState = VideoShareState()
     @State var showThread: CommentThreadTarget?
     @State var commentTargetRpid: Int?
     @State var highlightedCommentRpid: Int?
@@ -754,7 +749,6 @@ struct VideoDetailView: View {
                     lastActiveExpandedVideoHeight = pageOffsetStore.lastActiveExpandedVideoHeight
                         ?? computedExpandedInlineVideoHeight
                 }
-                cancelSharePreparation()
                 downloadRequestSerial &+= 1
                 clearPlaylistSelectionHandlerIfOwned()
                 clearInlinePortraitImmersiveBindingIfOwned()
@@ -848,12 +842,12 @@ struct VideoDetailView: View {
             applyModeDPortraitFullscreenIfNeeded()
         }
         .onDisappear {
-            cancelSharePreparation()
             downloadRequestSerial &+= 1
             clearPlaylistSelectionHandlerIfOwned()
             if case .download = activeSheet { activeSheet = nil }
             if case .batchDownload = activeSheet { activeSheet = nil }
             if case .playlist = activeSheet { activeSheet = nil }
+            if case .share = activeSheet { activeSheet = nil }
             if scenePhase == .active, !isActiveVideoRoute {
                 coordinator.cancelVideoNavigation(routeVideoID)
             }
@@ -910,6 +904,11 @@ struct VideoDetailView: View {
                 }
             case .playlist:
                 PlayerPlaylistDrawerSheet(player: player)
+            case .share(let payload):
+                VideoShareStudioSheet(payload: payload) {
+                    await viewModel.shareVideo()
+                    syncPortraitFullscreenContext()
+                }
             }
         }
         .modifier(CommentSourceChange(model: viewModel) { source in

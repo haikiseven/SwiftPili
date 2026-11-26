@@ -1657,4 +1657,121 @@ struct DynamicAspectAndPortraitModeTests {
         #expect(vm.isInlinePortraitImmersiveActive == false)
         #expect(vm.onRequestInlinePortraitImmersive == nil)
     }
+
+    // MARK: - SwiftPili Branded Share Studio & Poster Renderer
+
+    @Test("SwiftPiliBrandArt renders vector app icon emblem in light and dark variants")
+    func swiftPiliBrandArtRendersAppIcon() {
+        let lightIcon = SwiftPiliBrandArt.appIconImage(side: 128, accent: .systemPink, isDark: false)
+        let darkIcon = SwiftPiliBrandArt.appIconImage(side: 128, accent: .systemBlue, isDark: true)
+        #expect(lightIcon.size == CGSize(width: 128, height: 128))
+        #expect(darkIcon.size == CGSize(width: 128, height: 128))
+        #expect(lightIcon.pngData()?.isEmpty == false)
+        #expect(darkIcon.pngData()?.isEmpty == false)
+    }
+
+    @Test("ShareCardRenderer renders 1080px branded posters across themes, cover aspects, and intro toggles")
+    func shareCardRendererPosterVariants() {
+        let landscapeCover = UIGraphicsImageRenderer(size: CGSize(width: 640, height: 360)).image { ctx in
+            UIColor.systemTeal.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 640, height: 360))
+        }
+        let portraitCover = UIGraphicsImageRenderer(size: CGSize(width: 360, height: 640)).image { ctx in
+            UIColor.systemIndigo.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 360, height: 640))
+        }
+
+        let baseRequest = ShareCardRenderer.Request(
+            coverURL: "",
+            avatarURL: "",
+            title: "SwiftPili Branded Share Poster Verification",
+            uploader: "SwiftPiliCreator",
+            description: "Detailed introduction text for testing description quote block height.",
+            bvid: "BV1ShareTest",
+            durationSeconds: 245,
+            viewCount: 128_000,
+            likeCount: 9_600,
+            isPortraitCover: false,
+            linkURL: "https://www.bilibili.com/video/BV1ShareTest",
+            linkDisplay: "bilibili.com/video/BV1ShareTest",
+            accent: .systemPink,
+            style: .ambientDark,
+            includesDescription: true
+        )
+
+        let darkWithDesc = ShareCardRenderer.renderSynchronously(
+            request: baseRequest,
+            cover: landscapeCover
+        )
+        #expect(darkWithDesc.size.width == 1080)
+        #expect(darkWithDesc.size.height > 1100)
+
+        var lightWithoutDescReq = baseRequest
+        lightWithoutDescReq.style = .editorialLight
+        lightWithoutDescReq.includesDescription = false
+        let lightWithoutDesc = ShareCardRenderer.renderSynchronously(
+            request: lightWithoutDescReq,
+            cover: landscapeCover
+        )
+        #expect(lightWithoutDesc.size.width == 1080)
+        #expect(darkWithDesc.size.height > lightWithoutDesc.size.height)
+
+        var portraitReq = baseRequest
+        portraitReq.isPortraitCover = true
+        let portraitPoster = ShareCardRenderer.renderSynchronously(
+            request: portraitReq,
+            cover: portraitCover
+        )
+        #expect(portraitPoster.size.width == 1080)
+        #expect(portraitPoster.size.height > darkWithDesc.size.height)
+    }
+
+    @Test("VideoSharePayload formats BV and AV fallback URLs and Rich ActivityItemSources build LinkMetadata")
+    @MainActor
+    func videoSharePayloadAndLinkMetadata() {
+        let bvPayload = VideoSharePayload(
+            bvid: "BV1abc123",
+            aid: 42,
+            title: "Demo Title",
+            uploader: "UploaderName",
+            avatarURL: "",
+            coverURL: "",
+            description: "Hello",
+            durationSeconds: 90,
+            viewCount: 100,
+            likeCount: 10,
+            isPortraitCover: false
+        )
+        #expect(bvPayload.shareURLString == "https://www.bilibili.com/video/BV1abc123")
+        #expect(bvPayload.linkDisplay == "bilibili.com/video/BV1abc123")
+
+        let avFallbackPayload = VideoSharePayload(
+            bvid: "",
+            aid: 987654,
+            title: "AV Only",
+            uploader: "",
+            avatarURL: "",
+            coverURL: "",
+            description: "",
+            durationSeconds: 0,
+            viewCount: 0,
+            likeCount: 0,
+            isPortraitCover: true
+        )
+        #expect(avFallbackPayload.shareURLString == "https://www.bilibili.com/video/av987654")
+        #expect(avFallbackPayload.linkDisplay == "bilibili.com/video/av987654")
+
+        let url = URL(string: bvPayload.shareURLString)!
+        let linkSource = SwiftPiliLinkActivityItemSource(
+            url: url,
+            title: bvPayload.title,
+            uploader: bvPayload.uploader,
+            accent: .systemPink
+        )
+        let dummyVC = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        let metadata = linkSource.activityViewControllerLinkMetadata(dummyVC)
+        #expect(metadata?.title == "Demo Title (@UploaderName) — SwiftPili")
+        #expect(metadata?.originalURL == url)
+        #expect(metadata?.iconProvider != nil)
+    }
 }

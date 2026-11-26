@@ -845,31 +845,9 @@ struct VideoDetailActionBarView: View {
     }
 
     private var shareMenu: some View {
-        Menu {
-            Button {
-                onShareCard(info)
-            } label: {
-                Label("System Share", systemImage: "square.and.arrow.up")
-            }
-
-            Button {
-                UIPasteboard.general.string = "https://www.bilibili.com/video/\(info.bvid)"
-                Task { await model.shareVideo() }
-            } label: {
-                Label("Copy Link", systemImage: "link")
-            }
-
-            Button {
-                UIPasteboard.general.string = info.bvid
-            } label: {
-                Label("Copy BV ID", systemImage: "doc.on.doc")
-            }
-
-            Button {
-                UIPasteboard.general.string = String(info.aid)
-            } label: {
-                Label("Copy AV ID", systemImage: "number")
-            }
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            onShareCard(info)
         } label: {
             DetailActionButtonLabel(
                 compact: compact,
@@ -885,6 +863,8 @@ struct VideoDetailActionBarView: View {
                     .foregroundStyle(Color.primary)
             }
         }
+        .buttonStyle(.appControl)
+        .accessibilityIdentifier("videoDetail.share")
         .accessibilityLabel(Text("Share"))
         .accessibilityValue(Text(info.stat.share, format: .number))
     }

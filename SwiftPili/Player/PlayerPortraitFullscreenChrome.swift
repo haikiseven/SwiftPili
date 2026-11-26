@@ -98,6 +98,7 @@ struct PlayerPortraitFullscreenChrome: View {
     @State private var favoriteSheetFolders: [FavFolderListResult.FavFolder] = []
     @State private var favoriteSheetInitialSelection: Set<Int> = []
     @State private var showCommentsSheet = false
+    @State private var showShareSheet = false
     @State private var showChapterSheet = false
     @State private var enhancementPresentation: EnhancementPresentation?
     @State private var inlineDanmakuDraft = ""
@@ -296,6 +297,12 @@ struct PlayerPortraitFullscreenChrome: View {
         .sheet(isPresented: $showCommentsSheet) {
             if let makeComments = context?.makeCommentsSheetView {
                 makeComments()
+                    .preferredColorScheme(preferredSheetColorScheme)
+            }
+        }
+        .sheet(isPresented: $showShareSheet) {
+            if let makeShare = context?.makeShareSheetView {
+                makeShare()
                     .preferredColorScheme(preferredSheetColorScheme)
             }
         }
@@ -972,43 +979,28 @@ struct PlayerPortraitFullscreenChrome: View {
     }
 
     private func railShareMenu(context: PlayerPortraitFullscreenContext) -> some View {
-        let shareURLString = context.bvid.portraitNonEmpty.map { "https://www.bilibili.com/video/\($0)" }
         let caption = context.shareCount > 0
             ? FormatUtils.viewCount(context.shareCount)
             : String(localized: "Share")
 
-        return Menu {
-            Button {
-                let items: [Any]
+        return Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            if context.makeShareSheetView != nil {
+                showShareSheet = true
+            } else {
+                let shareURLString = context.bvid.portraitNonEmpty.map { "https://www.bilibili.com/video/\($0)" }
                 if let shareURLString, let url = URL(string: shareURLString) {
-                    items = [url]
-                } else if let title = resolvedTitle {
-                    items = [title]
-                } else {
-                    items = ["https://www.bilibili.com"]
-                }
-                ActivitySharePresenter.present(items: items) { completed in
-                    guard completed else { return }
-                    Task { await context.onRecordShare?() }
-                }
-            } label: {
-                Label("System Share", systemImage: "square.and.arrow.up")
-            }
-
-            if let shareURLString {
-                Button {
-                    UIPasteboard.general.string = shareURLString
-                    Task { await context.onRecordShare?() }
-                } label: {
-                    Label("Copy Link", systemImage: "link")
-                }
-            }
-
-            if let bvid = context.bvid.portraitNonEmpty {
-                Button {
-                    UIPasteboard.general.string = bvid
-                } label: {
-                    Label("Copy BV ID", systemImage: "doc.on.doc")
+                    let accent = UIColor(Color.biliAccent).resolvedColor(with: UITraitCollection.current)
+                    let source = SwiftPiliLinkActivityItemSource(
+                        url: url,
+                        title: resolvedTitle ?? "",
+                        uploader: resolvedUpName ?? "",
+                        accent: accent
+                    )
+                    ActivitySharePresenter.present(items: [source]) { completed in
+                        guard completed else { return }
+                        Task { await context.onRecordShare?() }
+                    }
                 }
             }
         } label: {
@@ -1028,6 +1020,7 @@ struct PlayerPortraitFullscreenChrome: View {
             .frame(minWidth: 44, minHeight: 44)
             .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
         .accessibilityIdentifier("player.portrait.share")
         .accessibilityLabel(Text("Share"))
         .accessibilityValue(Text(context.shareCount, format: .number))

@@ -324,7 +324,8 @@ private struct FavoriteDetailContent: View {
 
     @MainActor
     private func presentShareSheet(url: URL, sourceView: UIView?) {
-        ActivitySharePresenter.present(items: [url], sourceView: sourceView)
+        let source = SwiftPiliLinkActivityItemSource(url: url, title: title)
+        ActivitySharePresenter.present(items: [source], sourceView: sourceView)
     }
 
     private func playAll() {
