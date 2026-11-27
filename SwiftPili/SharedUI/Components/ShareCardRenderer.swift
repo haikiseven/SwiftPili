@@ -209,7 +209,7 @@ enum ShareCardRenderer {
         let canvasW: CGFloat = 1080
         let outerPad: CGFloat = 44
         let cardW = canvasW - outerPad * 2
-        let innerPad: CGFloat = 48
+        let innerPad: CGFloat = 42
         let contentW = cardW - innerPad * 2
 
         let coverIsPortrait: Bool = {
@@ -222,17 +222,15 @@ enum ShareCardRenderer {
             ? (contentW * 1.06).rounded()
             : (contentW * 9.0 / 16.0).rounded()
 
-        let brandBarH: CGFloat = 68
-        let gapAfterBrand: CGFloat = 32
-        let gapAfterCover: CGFloat = 38
+        let gapAfterCover: CGFloat = 36
 
-        let titleFont = UIFont.systemFont(ofSize: 44, weight: .bold)
-        let upFont = UIFont.systemFont(ofSize: 30, weight: .semibold)
-        let statFont = UIFont.monospacedDigitSystemFont(ofSize: 25, weight: .medium)
-        let descFont = UIFont.systemFont(ofSize: 28, weight: .regular)
-        let scanFont = UIFont.systemFont(ofSize: 31, weight: .bold)
-        let linkFont = UIFont.monospacedSystemFont(ofSize: 23, weight: .medium)
-        let viaFont = UIFont.systemFont(ofSize: 23, weight: .semibold)
+        let titleFont = UIFont.systemFont(ofSize: 42, weight: .bold)
+        let upFont = UIFont.systemFont(ofSize: 29, weight: .semibold)
+        let statFont = UIFont.monospacedDigitSystemFont(ofSize: 24, weight: .medium)
+        let descFont = UIFont.systemFont(ofSize: 27, weight: .regular)
+        let scanFont = UIFont.systemFont(ofSize: 29, weight: .semibold)
+        let linkFont = UIFont.monospacedSystemFont(ofSize: 22, weight: .regular)
+        let viaFont = UIFont.systemFont(ofSize: 21, weight: .medium)
 
         let titlePara = paragraph(lineBreak: .byTruncatingTail, lineSpacing: 6)
         let descPara = paragraph(lineBreak: .byTruncatingTail, lineSpacing: 6)
@@ -242,28 +240,26 @@ enum ShareCardRenderer {
             : request.title
         let titleH = height(safeTitle, font: titleFont, width: contentW, maxLines: 3, para: titlePara)
 
-        let creatorRowH: CGFloat = 54
-        let gapAfterTitle: CGFloat = 24
+        let creatorRowH: CGFloat = 52
+        let gapAfterTitle: CGFloat = 22
 
         let normalizedDesc = request.description
             .components(separatedBy: .whitespacesAndNewlines)
             .filter { !$0.isEmpty }
             .joined(separator: " ")
         let hasDesc = request.includesDescription && !normalizedDesc.isEmpty && normalizedDesc != "-"
-        let descInnerW = contentW - 44
+        let descInnerW = contentW - 40
         let descTextH = hasDesc
             ? height(normalizedDesc, font: descFont, width: descInnerW, maxLines: 4, para: descPara)
             : 0
-        let descBoxH = hasDesc ? (descTextH + 36) : 0
-        let gapBeforeDesc: CGFloat = hasDesc ? 26 : 0
+        let descBoxH = hasDesc ? (descTextH + 34) : 0
+        let gapBeforeDesc: CGFloat = hasDesc ? 24 : 0
 
-        let gapBeforeDivider: CGFloat = 36
-        let dividerGapAfter: CGFloat = 34
-        let qrBoxSide: CGFloat = 204
+        let gapBeforeDivider: CGFloat = 34
+        let dividerGapAfter: CGFloat = 32
+        let qrBoxSide: CGFloat = 192
 
         let cardH = innerPad
-            + brandBarH
-            + gapAfterBrand
             + coverH
             + gapAfterCover
             + titleH
@@ -280,11 +276,12 @@ enum ShareCardRenderer {
         let canvasH = (cardH + outerPad * 2).rounded()
         let canvasSize = CGSize(width: canvasW, height: canvasH)
 
-        let primaryInk = isDark ? UIColor(white: 0.97, alpha: 1) : UIColor(white: 0.09, alpha: 1)
-        let secondaryInk = isDark ? UIColor(white: 0.70, alpha: 1) : UIColor(white: 0.42, alpha: 1)
+        let primaryInk = isDark ? UIColor(white: 0.96, alpha: 1) : UIColor(white: 0.10, alpha: 1)
+        let secondaryInk = isDark ? UIColor(white: 0.66, alpha: 1) : UIColor(white: 0.44, alpha: 1)
+        let tertiaryInk = isDark ? UIColor(white: 0.44, alpha: 1) : UIColor(white: 0.58, alpha: 1)
         let subtleFill = isDark
-            ? UIColor.white.withAlphaComponent(0.07)
-            : UIColor.black.withAlphaComponent(0.045)
+            ? UIColor.white.withAlphaComponent(0.06)
+            : UIColor.black.withAlphaComponent(0.04)
 
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
@@ -294,7 +291,7 @@ enum ShareCardRenderer {
             let cg = ctx.cgContext
             let fullRect = CGRect(origin: .zero, size: canvasSize)
 
-            // 1. Outer Canvas & Ambient Glow
+            // 1. Outer Canvas & Restrained Ambient Glow
             drawOuterBackdrop(in: fullRect, cg: cg, cover: cover, accent: accent, isDark: isDark)
 
             // 2. Elevated Main Card Surface
@@ -304,18 +301,18 @@ enum ShareCardRenderer {
             cg.setShadow(
                 offset: CGSize(width: 0, height: 14),
                 blur: 34,
-                color: UIColor.black.withAlphaComponent(isDark ? 0.42 : 0.09).cgColor
+                color: UIColor.black.withAlphaComponent(isDark ? 0.42 : 0.08).cgColor
             )
             let cardFill = isDark
-                ? UIColor(red: 0.09, green: 0.10, blue: 0.135, alpha: 0.90)
-                : UIColor(white: 1.0, alpha: 0.97)
+                ? UIColor(red: 0.09, green: 0.10, blue: 0.13, alpha: 0.92)
+                : UIColor(white: 1.0, alpha: 0.98)
             cardFill.setFill()
             cardPath.fill()
             cg.restoreGState()
 
             let cardBorder = isDark
-                ? UIColor.white.withAlphaComponent(0.13)
-                : UIColor.black.withAlphaComponent(0.06)
+                ? UIColor.white.withAlphaComponent(0.11)
+                : UIColor.black.withAlphaComponent(0.055)
             cardBorder.setStroke()
             cardPath.lineWidth = 2
             cardPath.stroke()
@@ -323,60 +320,7 @@ enum ShareCardRenderer {
             let leftX = cardRect.minX + innerPad
             var y = cardRect.minY + innerPad
 
-            // 3. Top SwiftPili Brand Header Row
-            let iconRect = CGRect(x: leftX, y: y + 2, width: 64, height: 64)
-            SwiftPiliBrandArt.drawAppIcon(in: iconRect, cg: cg, accent: accent, isDark: isDark)
-
-            let brandNameFont = UIFont.systemFont(ofSize: 33, weight: .bold)
-            let brandTagFont = UIFont.systemFont(ofSize: 21, weight: .medium)
-            let brandX = iconRect.maxX + 18
-            draw(
-                "SwiftPili",
-                font: brandNameFont,
-                color: primaryInk,
-                para: paragraph(lineBreak: .byTruncatingTail, lineSpacing: 0),
-                in: CGRect(x: brandX, y: y + 2, width: 360, height: 38)
-            )
-            draw(
-                String(localized: "Video Share Card"),
-                font: brandTagFont,
-                color: secondaryInk,
-                para: paragraph(lineBreak: .byTruncatingTail, lineSpacing: 0),
-                in: CGRect(x: brandX, y: y + 40, width: 380, height: 28)
-            )
-
-            let bvidDisplay = request.bvid.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !bvidDisplay.isEmpty {
-                let bvFont = UIFont.monospacedSystemFont(ofSize: 23, weight: .semibold)
-                let bvSize = (bvidDisplay as NSString).size(withAttributes: [.font: bvFont])
-                let pillW = ceil(bvSize.width) + 32
-                let pillH: CGFloat = 44
-                let pillRect = CGRect(
-                    x: leftX + contentW - pillW,
-                    y: y + (brandBarH - pillH) * 0.5,
-                    width: pillW,
-                    height: pillH
-                )
-                let pillPath = UIBezierPath(roundedRect: pillRect, cornerRadius: pillH * 0.5)
-                accent.withAlphaComponent(isDark ? 0.20 : 0.12).setFill()
-                pillPath.fill()
-                draw(
-                    bvidDisplay,
-                    font: bvFont,
-                    color: accent,
-                    para: centeredParagraph(),
-                    in: CGRect(
-                        x: pillRect.minX,
-                        y: pillRect.minY + (pillH - ceil(bvFont.lineHeight)) * 0.5,
-                        width: pillW,
-                        height: ceil(bvFont.lineHeight)
-                    )
-                )
-            }
-
-            y += brandBarH + gapAfterBrand
-
-            // 4. Hero Video Cover with Adaptive Framing & Duration Pill
+            // 3. Hero Video Cover Directly at Top (Clean Editorial Framing)
             let coverRect = CGRect(x: leftX, y: y, width: contentW, height: coverH)
             drawHeroCover(
                 cover: cover,
@@ -389,7 +333,7 @@ enum ShareCardRenderer {
 
             y += coverH + gapAfterCover
 
-            // 5. Video Title
+            // 4. Video Title
             draw(
                 safeTitle,
                 font: titleFont,
@@ -399,7 +343,7 @@ enum ShareCardRenderer {
             )
             y += titleH + gapAfterTitle
 
-            // 6. Creator Avatar + Name + Stats Pills
+            // 5. Creator Avatar + Name + Stats Pills
             drawCreatorAndStatsRow(
                 uploader: request.uploader,
                 avatar: avatar,
@@ -416,22 +360,22 @@ enum ShareCardRenderer {
             )
             y += creatorRowH
 
-            // 7. Optional Description Quote Card
+            // 6. Optional Description Quote Card
             if hasDesc {
                 y += gapBeforeDesc
                 let boxRect = CGRect(x: leftX, y: y, width: contentW, height: descBoxH)
-                let boxPath = UIBezierPath(roundedRect: boxRect, cornerRadius: 22)
+                let boxPath = UIBezierPath(roundedRect: boxRect, cornerRadius: 20)
                 subtleFill.setFill()
                 boxPath.fill()
 
                 let quoteBarRect = CGRect(
                     x: boxRect.minX + 16,
                     y: boxRect.minY + 18,
-                    width: 6,
-                    height: max(20, boxRect.height - 36)
+                    width: 4,
+                    height: max(18, boxRect.height - 36)
                 )
-                accent.withAlphaComponent(0.85).setFill()
-                UIBezierPath(roundedRect: quoteBarRect, cornerRadius: 3).fill()
+                accent.withAlphaComponent(isDark ? 0.55 : 0.45).setFill()
+                UIBezierPath(roundedRect: quoteBarRect, cornerRadius: 2).fill()
 
                 draw(
                     normalizedDesc,
@@ -439,8 +383,8 @@ enum ShareCardRenderer {
                     color: secondaryInk,
                     para: descPara,
                     in: CGRect(
-                        x: boxRect.minX + 34,
-                        y: boxRect.minY + 18,
+                        x: boxRect.minX + 32,
+                        y: boxRect.minY + 17,
                         width: descInnerW,
                         height: descTextH
                     )
@@ -448,23 +392,23 @@ enum ShareCardRenderer {
                 y += descBoxH
             }
 
-            // 8. Hairline Divider
+            // 7. Hairline Divider
             y += gapBeforeDivider
             let dividerColor = isDark
-                ? UIColor.white.withAlphaComponent(0.10)
-                : UIColor.black.withAlphaComponent(0.07)
+                ? UIColor.white.withAlphaComponent(0.09)
+                : UIColor.black.withAlphaComponent(0.06)
             dividerColor.setFill()
             cg.fill(CGRect(x: leftX, y: y, width: contentW, height: 2))
             y += 2 + dividerGapAfter
 
-            // 9. Branded QR Footer with Embedded SwiftPili Emblem
+            // 8. Restrained QR Footer (QR Center Brand Badge + Clean Plain Typography)
             let qrPadRect = CGRect(
                 x: leftX + contentW - qrBoxSide,
                 y: y,
                 width: qrBoxSide,
                 height: qrBoxSide
             )
-            let qrPadPath = UIBezierPath(roundedRect: qrPadRect, cornerRadius: 26)
+            let qrPadPath = UIBezierPath(roundedRect: qrPadRect, cornerRadius: 24)
             UIColor.white.setFill()
             qrPadPath.fill()
             if !isDark {
@@ -473,11 +417,11 @@ enum ShareCardRenderer {
                 qrPadPath.stroke()
             }
 
-            let qrInset: CGFloat = 14
+            let qrInset: CGFloat = 13
             let qrDrawRect = qrPadRect.insetBy(dx: qrInset, dy: qrInset)
             if let qrImg = qrImage(from: request.linkURL, side: qrDrawRect.width) {
                 qrImg.draw(in: qrDrawRect)
-                let badgeSide: CGFloat = 44
+                let badgeSide: CGFloat = 40
                 let badgePadRect = CGRect(
                     x: qrDrawRect.midX - (badgeSide + 8) * 0.5,
                     y: qrDrawRect.midY - (badgeSide + 8) * 0.5,
@@ -492,9 +436,9 @@ enum ShareCardRenderer {
 
             let footerTextW = qrPadRect.minX - leftX - 28
             let scanLineH = ceil(scanFont.lineHeight)
-            let linkLineH = ceil(linkFont.lineHeight * 1.4)
-            let viaPillH: CGFloat = 40
-            let footerStackH = scanLineH + 12 + linkLineH + 18 + viaPillH
+            let linkLineH = ceil(linkFont.lineHeight * 1.25)
+            let viaLineH = ceil(viaFont.lineHeight)
+            let footerStackH = scanLineH + 10 + linkLineH + 14 + viaLineH
             var fy = y + max(0, (qrBoxSide - footerStackH) * 0.5)
 
             draw(
@@ -504,7 +448,7 @@ enum ShareCardRenderer {
                 para: paragraph(lineBreak: .byTruncatingTail, lineSpacing: 0),
                 in: CGRect(x: leftX, y: fy, width: footerTextW, height: scanLineH)
             )
-            fy += scanLineH + 12
+            fy += scanLineH + 10
 
             draw(
                 request.linkDisplay,
@@ -513,25 +457,18 @@ enum ShareCardRenderer {
                 para: paragraph(lineBreak: .byTruncatingMiddle, lineSpacing: 0),
                 in: CGRect(x: leftX, y: fy, width: footerTextW, height: linkLineH)
             )
-            fy += linkLineH + 18
+            fy += linkLineH + 14
 
-            let viaText = String(localized: "Shared via SwiftPili")
-            let viaTextSize = (viaText as NSString).size(withAttributes: [.font: viaFont])
-            let viaPillW = min(footerTextW, ceil(viaTextSize.width) + 36)
-            let viaPillRect = CGRect(x: leftX, y: fy, width: viaPillW, height: viaPillH)
-            accent.withAlphaComponent(isDark ? 0.20 : 0.12).setFill()
-            UIBezierPath(roundedRect: viaPillRect, cornerRadius: viaPillH * 0.5).fill()
+            let bvidTrimmed = request.bvid.trimmingCharacters(in: .whitespacesAndNewlines)
+            let signatureText = bvidTrimmed.isEmpty
+                ? "SwiftPili"
+                : "SwiftPili  /  \(bvidTrimmed)"
             draw(
-                viaText,
+                signatureText,
                 font: viaFont,
-                color: accent,
-                para: centeredParagraph(),
-                in: CGRect(
-                    x: viaPillRect.minX + 12,
-                    y: viaPillRect.minY + (viaPillH - ceil(viaFont.lineHeight)) * 0.5,
-                    width: viaPillW - 24,
-                    height: ceil(viaFont.lineHeight)
-                )
+                color: tertiaryInk,
+                para: paragraph(lineBreak: .byTruncatingTail, lineSpacing: 0),
+                in: CGRect(x: leftX, y: fy, width: footerTextW, height: viaLineH)
             )
         }
     }
@@ -562,7 +499,7 @@ enum ShareCardRenderer {
         }
 
         let colorSpace = CGColorSpaceCreateDeviceRGB()
-        let glowAlpha: CGFloat = isDark ? 0.28 : 0.14
+        let glowAlpha: CGFloat = isDark ? 0.18 : 0.07
         if let glow = CGGradient(
             colorsSpace: colorSpace,
             colors: [accent.withAlphaComponent(glowAlpha).cgColor, accent.withAlphaComponent(0).cgColor] as CFArray,
@@ -1013,20 +950,22 @@ struct VideoShareStudioSheet: View {
 
     var body: some View {
         ZStack(alignment: .bottom) {
-            VStack(spacing: 14) {
+            VStack(spacing: 0) {
                 headerBar
-                    .padding(.horizontal, 18)
+                    .padding(.horizontal, 20)
                     .padding(.top, 16)
-
-                styleToolbar
-                    .padding(.horizontal, 18)
+                    .padding(.bottom, 8)
 
                 posterPreviewStage
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .padding(.horizontal, 20)
+                    .padding(.horizontal, 24)
+
+                floatingStyleCapsule
+                    .padding(.top, 10)
+                    .padding(.bottom, 16)
 
                 actionDock
-                    .padding(.horizontal, 18)
+                    .padding(.horizontal, 20)
                     .padding(.bottom, 14)
             }
 
@@ -1038,27 +977,58 @@ struct VideoShareStudioSheet: View {
         }
         .animation(motion.feedbackAnimation(normal: .spring(duration: 0.28)), value: toastMessage)
         .accentContentBoundary()
-        .appAdaptiveSheet(compactDetents: [.fraction(0.82), .large], padSizing: .form)
+        .appAdaptiveSheet(compactDetents: [.fraction(0.85), .large], padSizing: .form)
         .task(id: renderFingerprint) {
             await renderCurrentPoster()
         }
     }
 
-    // MARK: - Header & Style Controls
+    // MARK: - Header & Floating Appearance Controls
 
     private var headerBar: some View {
         HStack(spacing: 10) {
-            Image(uiImage: SwiftPiliBrandArt.appIconImage(
-                side: 60,
-                accent: resolvedAccentUIColor,
-                isDark: selectedStyle == .ambientDark
-            ))
-            .resizable()
-            .frame(width: 28, height: 28)
-
             Text("Share Video")
                 .font(.headline)
                 .foregroundStyle(.primary)
+
+            if !payload.bvid.isEmpty {
+                Button {
+                    UIPasteboard.general.string = payload.bvid
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    showToast(String(localized: "Copied"), style: .success)
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(payload.bvid)
+                            .font(.caption2.monospaced().weight(.medium))
+                        Image(systemName: "doc.on.doc")
+                            .font(.system(size: 9, weight: .semibold))
+                    }
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(AppFill.inset, in: Capsule())
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .contextMenu {
+                    Button {
+                        UIPasteboard.general.string = payload.bvid
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        showToast(String(localized: "Copied"), style: .success)
+                    } label: {
+                        Label("Copy BV ID", systemImage: "doc.on.doc")
+                    }
+                    if payload.aid > 0 {
+                        Button {
+                            UIPasteboard.general.string = "av\(payload.aid)"
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            showToast(String(localized: "Copied"), style: .success)
+                        } label: {
+                            Label("Copy AV ID", systemImage: "number")
+                        }
+                    }
+                }
+            }
 
             Spacer(minLength: 8)
 
@@ -1077,8 +1047,8 @@ struct VideoShareStudioSheet: View {
         }
     }
 
-    private var styleToolbar: some View {
-        HStack(spacing: 8) {
+    private var floatingStyleCapsule: some View {
+        HStack(spacing: 4) {
             ForEach(ShareCardStyle.allCases) { style in
                 let isSelected = selectedStyle == style
                 Button {
@@ -1092,19 +1062,15 @@ struct VideoShareStudioSheet: View {
                         Text(style.labelKey)
                             .font(.caption.weight(isSelected ? .semibold : .medium))
                     }
-                    .foregroundStyle(isSelected ? Color.biliAccent : .primary)
+                    .foregroundStyle(isSelected ? .primary : .secondary)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 7)
-                    .background(
-                        isSelected ? Color.biliAccent.opacity(0.15) : AppFill.inset,
-                        in: Capsule()
-                    )
-                    .overlay {
-                        Capsule()
-                            .strokeBorder(
-                                isSelected ? Color.biliAccent.opacity(0.45) : Color.primary.opacity(0.08),
-                                lineWidth: 0.8
-                            )
+                    .background {
+                        if isSelected {
+                            Capsule()
+                                .fill(.background)
+                                .shadow(color: .black.opacity(0.08), radius: 4, y: 1)
+                        }
                     }
                     .contentShape(Capsule())
                 }
@@ -1112,54 +1078,73 @@ struct VideoShareStudioSheet: View {
             }
 
             if hasDescription {
+                Rectangle()
+                    .fill(Color.primary.opacity(0.10))
+                    .frame(width: 1, height: 14)
+                    .padding(.horizontal, 3)
+
                 Button {
                     UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     includesDescription.toggle()
                 } label: {
                     HStack(spacing: 4) {
-                        Image(systemName: includesDescription ? "checkmark" : "text.quote")
+                        Image(systemName: includesDescription ? "checkmark.circle.fill" : "circle")
                             .font(.caption2.weight(.semibold))
                         Text("Include Intro")
                             .font(.caption.weight(includesDescription ? .semibold : .medium))
                     }
                     .foregroundStyle(includesDescription ? Color.biliAccent : .secondary)
-                    .padding(.horizontal, 11)
+                    .padding(.horizontal, 10)
                     .padding(.vertical, 7)
-                    .background(
-                        includesDescription ? Color.biliAccent.opacity(0.15) : AppFill.inset,
-                        in: Capsule()
-                    )
-                    .overlay {
-                        Capsule()
-                            .strokeBorder(
-                                includesDescription ? Color.biliAccent.opacity(0.45) : Color.primary.opacity(0.08),
-                                lineWidth: 0.8
-                            )
-                    }
                     .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
             }
-
-            Spacer(minLength: 0)
+        }
+        .padding(4)
+        .background(AppFill.inset, in: Capsule())
+        .overlay {
+            Capsule()
+                .strokeBorder(Color.primary.opacity(0.06), lineWidth: 0.5)
         }
     }
 
-    // MARK: - Live Poster Preview Stage
+    // MARK: - Frameless Poster Preview Stage
 
     private var posterPreviewStage: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: AppRadius.panel, style: .continuous)
-                .fill(AppFill.inset.opacity(0.65))
-
             if let renderedPoster {
                 Image(uiImage: renderedPoster)
                     .resizable()
                     .scaledToFit()
-                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                    .shadow(color: .black.opacity(0.18), radius: 14, y: 6)
-                    .padding(14)
-                    .transition(.opacity)
+                    .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 20, style: .continuous)
+                            .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+                    }
+                    .shadow(color: .black.opacity(0.20), radius: 18, y: 8)
+                    .padding(.vertical, 4)
+                    .contextMenu {
+                        Button {
+                            sharePosterImage()
+                        } label: {
+                            Label("Share Poster", systemImage: "square.and.arrow.up")
+                        }
+                        Button {
+                            savePosterToPhotos()
+                        } label: {
+                            Label("Save Poster", systemImage: "arrow.down.to.line")
+                        }
+                        Button {
+                            UIPasteboard.general.image = renderedPoster
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            showToast(String(localized: "Copied"), style: .success)
+                            recordShareIfNeeded()
+                        } label: {
+                            Label("Copy Poster", systemImage: "photo.on.rectangle")
+                        }
+                    }
+                    .transition(.opacity.combined(with: .scale(scale: 0.98)))
             } else {
                 ProgressView()
                     .controlSize(.regular)
@@ -1171,62 +1156,46 @@ struct VideoShareStudioSheet: View {
                     .padding(8)
                     .background(.ultraThinMaterial, in: Circle())
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                    .padding(20)
+                    .padding(10)
             }
         }
-        .animation(motion.animation(normal: .easeOut(duration: 0.2)), value: renderedPoster != nil)
+        .animation(motion.animation(normal: .spring(duration: 0.28)), value: renderedPoster != nil)
     }
 
-    // MARK: - Action Dock
+    // MARK: - Action Dock (Primary Poster CTA + 4 Circular Utility Actions)
 
     private var actionDock: some View {
-        VStack(spacing: 10) {
-            HStack(spacing: 10) {
-                Button {
-                    sharePosterImage()
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "square.and.arrow.up")
-                            .font(.subheadline.weight(.semibold))
-                        Text("Share Poster")
-                            .font(.subheadline.weight(.semibold))
-                    }
-                    .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 46)
-                    .background(Color.biliAccent, in: Capsule())
-                    .contentShape(Capsule())
+        VStack(spacing: 14) {
+            Button {
+                sharePosterImage()
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "square.and.arrow.up")
+                        .font(.subheadline.weight(.semibold))
+                    Text("Share Poster")
+                        .font(.subheadline.weight(.semibold))
                 }
-                .buttonStyle(.appControl)
-                .disabled(renderedPoster == nil)
-                .opacity(renderedPoster == nil ? 0.55 : 1.0)
-                .accessibilityIdentifier("shareStudio.sharePoster")
-
-                Button {
-                    shareRichLink()
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "paperplane.fill")
-                            .font(.subheadline.weight(.semibold))
-                        Text("Share Link")
-                            .font(.subheadline.weight(.semibold))
-                    }
-                    .foregroundStyle(Color.biliAccent)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 46)
-                    .background(Color.biliAccent.opacity(0.14), in: Capsule())
-                    .overlay {
-                        Capsule()
-                            .strokeBorder(Color.biliAccent.opacity(0.35), lineWidth: 0.8)
-                    }
-                    .contentShape(Capsule())
-                }
-                .buttonStyle(.appControl)
-                .accessibilityIdentifier("shareStudio.shareLink")
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .frame(height: 48)
+                .background(Color.biliAccent, in: Capsule())
+                .contentShape(Capsule())
             }
+            .buttonStyle(.appControl)
+            .disabled(renderedPoster == nil)
+            .opacity(renderedPoster == nil ? 0.55 : 1.0)
+            .accessibilityIdentifier("shareStudio.sharePoster")
 
-            HStack(spacing: 8) {
-                quickUtilityButton(
+            HStack(alignment: .top, spacing: 0) {
+                circularActionItem(
+                    title: "Share Link",
+                    symbol: "paperplane.fill"
+                ) {
+                    shareRichLink()
+                }
+                .accessibilityIdentifier("shareStudio.shareLink")
+
+                circularActionItem(
                     title: saveSucceeded ? "Saved" : "Save Poster",
                     symbol: saveSucceeded ? "checkmark" : "arrow.down.to.line",
                     isHighlighted: saveSucceeded,
@@ -1235,7 +1204,7 @@ struct VideoShareStudioSheet: View {
                     savePosterToPhotos()
                 }
 
-                quickUtilityButton(
+                circularActionItem(
                     title: "Copy Poster",
                     symbol: "photo.on.rectangle",
                     disabled: renderedPoster == nil
@@ -1247,7 +1216,7 @@ struct VideoShareStudioSheet: View {
                     recordShareIfNeeded()
                 }
 
-                quickUtilityButton(
+                circularActionItem(
                     title: "Copy Link",
                     symbol: "link"
                 ) {
@@ -1256,25 +1225,23 @@ struct VideoShareStudioSheet: View {
                     showToast(String(localized: "Link copied"), style: .success)
                     recordShareIfNeeded()
                 }
-
-                if !payload.bvid.isEmpty {
-                    quickUtilityButton(
-                        title: "Copy BV ID",
-                        symbol: "doc.on.doc"
-                    ) {
-                        UIPasteboard.general.string = payload.bvid
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        showToast(String(localized: "Copied"), style: .success)
+                .contextMenu {
+                    if !payload.bvid.isEmpty {
+                        Button {
+                            UIPasteboard.general.string = payload.bvid
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            showToast(String(localized: "Copied"), style: .success)
+                        } label: {
+                            Label("Copy BV ID", systemImage: "doc.on.doc")
+                        }
                     }
-                    .contextMenu {
-                        if payload.aid > 0 {
-                            Button {
-                                UIPasteboard.general.string = "av\(payload.aid)"
-                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                showToast(String(localized: "Copied"), style: .success)
-                            } label: {
-                                Label("Copy AV ID", systemImage: "number")
-                            }
+                    if payload.aid > 0 {
+                        Button {
+                            UIPasteboard.general.string = "av\(payload.aid)"
+                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            showToast(String(localized: "Copied"), style: .success)
+                        } label: {
+                            Label("Copy AV ID", systemImage: "number")
                         }
                     }
                 }
@@ -1282,7 +1249,7 @@ struct VideoShareStudioSheet: View {
         }
     }
 
-    private func quickUtilityButton(
+    private func circularActionItem(
         title: LocalizedStringKey,
         symbol: String,
         isHighlighted: Bool = false,
@@ -1290,21 +1257,32 @@ struct VideoShareStudioSheet: View {
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
-            VStack(spacing: 5) {
-                Image(systemName: symbol)
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(isHighlighted ? Color.biliAccent : .primary)
-                    .frame(height: 18)
+            VStack(spacing: 6) {
+                ZStack {
+                    Circle()
+                        .fill(isHighlighted ? Color.biliAccent.opacity(0.16) : AppFill.inset)
+                        .frame(width: 48, height: 48)
+                        .overlay {
+                            Circle()
+                                .strokeBorder(
+                                    isHighlighted ? Color.biliAccent.opacity(0.45) : Color.primary.opacity(0.07),
+                                    lineWidth: 0.6
+                                )
+                        }
+
+                    Image(systemName: symbol)
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(isHighlighted ? Color.biliAccent : .primary)
+                }
+
                 Text(title)
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(isHighlighted ? Color.biliAccent : .secondary)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.78)
+                    .minimumScaleFactor(0.8)
             }
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 9)
-            .background(AppFill.inset, in: RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous))
-            .contentShape(RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous))
+            .contentShape(Rectangle())
         }
         .buttonStyle(.appControl)
         .disabled(disabled)
