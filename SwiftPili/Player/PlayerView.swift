@@ -437,6 +437,13 @@ struct PlayerView: View {
     }
 
     var body: some View {
+        let stage = applyBottomOverlaysAndSheets(to: playerStageCore)
+        let viewportLayered = applyViewportAndHUD(to: stage)
+        let seekObserved = applyLifecycleAndSeekObservers(to: viewportLayered)
+        return applyOwnershipAndOrientationObservers(to: seekObserved)
+    }
+
+    private var playerStageCore: some View {
         let isFullscreenTransitioning = surfaceRole == .fullscreen
             && PlayerFullscreenTransitionState.shared.isGeometryTransitioning
         let effectiveCornerRadius: CGFloat = if isImmersiveStagePresentation {
@@ -456,7 +463,7 @@ struct PlayerView: View {
             && activeFreezeFrame == nil
             && !isPlaybackUnavailable
         let showsCoverProgress = showsLoadingIndicator && (!isOwner || vm.playbackIntent != .pausedByUser)
-        ZStack {
+        return ZStack {
             if isImmersiveStagePresentation {
                 Color.black
             } else if surfaceRole == .inline {
@@ -764,8 +771,14 @@ struct PlayerView: View {
                 style: .continuous
             )
         )
-        .overlay(alignment: .bottom) {
-            PlayerSubtitleOverlay(
+    }
+
+    private func applyBottomOverlaysAndSheets<Content: View>(to content: Content) -> some View {
+        let isFullscreenTransitioning = surfaceRole == .fullscreen
+            && PlayerFullscreenTransitionState.shared.isGeometryTransitioning
+        return content
+            .overlay(alignment: .bottom) {
+                PlayerSubtitleOverlay(
                 player: vm,
                 isFullscreenSurface: surfaceRole == .fullscreen || isInlinePortraitImmersive,
                 portraitChromeBottomInset: isPortraitImmersiveFullscreen ? chromeInsets.bottom : 0
@@ -884,8 +897,12 @@ struct PlayerView: View {
                 vm.setDanmakuSettingsHold(presented || (danmakuPanelPresented && danmakuEnabled))
             }
         }
-        .modifier(
-            PlayerViewportFrameModifier(
+    }
+
+    private func applyViewportAndHUD<Content: View>(to content: Content) -> some View {
+        content
+            .modifier(
+                PlayerViewportFrameModifier(
                 surfaceRole: surfaceRole,
                 containerAspect: containerAspect,
                 allocatedInlineViewport: allocatedInlineViewport,
@@ -957,8 +974,12 @@ struct PlayerView: View {
         }
         .ignoresSafeArea(.keyboard, edges: .all)
         .allowsHitTesting(isOwner && surfaceLease != nil)
-        .onAppear {
-            claimScreenSurfaceIfCurrent()
+    }
+
+    private func applyLifecycleAndSeekObservers<Content: View>(to content: Content) -> some View {
+        content
+            .onAppear {
+                claimScreenSurfaceIfCurrent()
             syncInlineEndedRecommendationsIfNeeded()
             scheduleHideControls()
         }
@@ -1042,8 +1063,12 @@ struct PlayerView: View {
             vm.hideControlsTask = nil
             vm.showControls = true
         }
-        .onChange(of: vm.ownerKey) { _, _ in
-            claimScreenSurfaceIfCurrent()
+    }
+
+    private func applyOwnershipAndOrientationObservers<Content: View>(to content: Content) -> some View {
+        content
+            .onChange(of: vm.ownerKey) { _, _ in
+                claimScreenSurfaceIfCurrent()
             syncInlineEndedRecommendationsIfNeeded()
         }
         .onChange(of: vm.activeSurfaceLease) { _, _ in
