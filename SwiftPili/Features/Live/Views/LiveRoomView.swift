@@ -141,6 +141,7 @@ struct LiveRoomView: View {
                 )
             }
         }
+        .ignoresSafeArea(.keyboard, edges: usesImmersivePortraitLayout ? .all : [])
         .onPreferenceChange(LivePortraitInputBarHeightKey.self) { measuredHeight in
             guard measuredHeight > 0,
                   abs(measuredHeight - portraitInputBarHeight) > 0.5

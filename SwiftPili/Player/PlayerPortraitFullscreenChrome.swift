@@ -243,8 +243,8 @@ struct PlayerPortraitFullscreenChrome: View {
                     }
 
                     bottomDanmakuDock
-                        .opacity(chromeInteractionOpacity)
-                        .allowsHitTesting(!shouldFadeChromeForInteraction)
+                        .opacity(mountsInlineDanmakuComposer ? 0 : chromeInteractionOpacity)
+                        .allowsHitTesting(!mountsInlineDanmakuComposer && !shouldFadeChromeForInteraction)
                         .animation(interactionFadeAnimation, value: shouldFadeChromeForInteraction)
                 }
             }
@@ -254,15 +254,35 @@ struct PlayerPortraitFullscreenChrome: View {
         .ignoresSafeArea(.keyboard, edges: .all)
         .overlay(alignment: .bottom) {
             if mountsInlineDanmakuComposer {
-                FullscreenDanmakuComposer(
-                    draft: $inlineDanmakuDraft,
-                    notice: nil,
-                    isSending: inlineDanmakuSend.isSending,
-                    keyboardFrame: inlineKeyboardFrame,
-                    onSubmit: submitInlineImmersiveDanmaku,
-                    onClose: { dismissInlineImmersiveDanmakuComposer(clearDraft: true) },
-                    onFocusLost: inlineImmersiveDanmakuFocusLost
-                )
+                ZStack(alignment: .bottom) {
+                    Color.white.opacity(0.001)
+                        .ignoresSafeArea()
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            AppWindowMetrics.current?.endEditing(true)
+                            dismissInlineImmersiveDanmakuComposer(clearDraft: false)
+                        }
+                        .gesture(
+                            DragGesture(minimumDistance: 6)
+                                .onEnded { _ in
+                                    AppWindowMetrics.current?.endEditing(true)
+                                    dismissInlineImmersiveDanmakuComposer(clearDraft: false)
+                                }
+                        )
+
+                    FullscreenDanmakuComposer(
+                        draft: $inlineDanmakuDraft,
+                        notice: nil,
+                        isSending: inlineDanmakuSend.isSending,
+                        keyboardFrame: inlineKeyboardFrame,
+                        onSubmit: submitInlineImmersiveDanmaku,
+                        onClose: {
+                            AppWindowMetrics.current?.endEditing(true)
+                            dismissInlineImmersiveDanmakuComposer(clearDraft: true)
+                        },
+                        onFocusLost: inlineImmersiveDanmakuFocusLost
+                    )
+                }
             }
         }
         .danmakuNoticeToast($inlineDanmakuNotice)
@@ -664,7 +684,7 @@ struct PlayerPortraitFullscreenChrome: View {
             }
         }
         .padding(.horizontal, 16)
-        .padding(.bottom, showsSeekBar ? 6 : 12)
+        .padding(.bottom, showsSeekBar ? 8 : 12)
     }
 
     private var bottomMetadataStack: some View {
@@ -1035,15 +1055,20 @@ struct PlayerPortraitFullscreenChrome: View {
             HStack(spacing: 10) {
                 if player.mode.usesOnlineVODServices {
                     if AuthManager.shared.isLoggedIn {
+                        let draftPreview = inlineDanmakuDraft.portraitNonEmpty
                         Button {
                             if !danmakuEnabled {
                                 danmakuEnabled = true
                             }
                             player.fullscreenDanmakuComposerPresented = true
                         } label: {
-                            danmakuDockCapsuleLabel(
-                                text: danmakuEnabled ? "Send a friendly danmaku..." : "Danmaku Off"
-                            )
+                            if let draftPreview {
+                                danmakuDockDraftCapsuleLabel(draft: draftPreview)
+                            } else {
+                                danmakuDockCapsuleLabel(
+                                    text: danmakuEnabled ? "Send a friendly danmaku..." : "Danmaku Off"
+                                )
+                            }
                         }
                         .buttonStyle(.plain)
                         .accessibilityIdentifier("player.portrait.sendDanmaku")
@@ -1087,15 +1112,34 @@ struct PlayerPortraitFullscreenChrome: View {
                 }
             }
             .padding(.horizontal, PlayerPortraitChromePolicy.bottomDockHorizontalPadding)
-            .padding(.top, 2)
+            .padding(.top, 4)
             .padding(.bottom, bottomPadding)
         } else {
             Color.clear
                 .frame(height: PlayerPortraitChromePolicy.bottomDockHeight)
                 .allowsHitTesting(false)
-                .padding(.top, 2)
+                .padding(.top, 4)
                 .padding(.bottom, bottomPadding)
         }
+    }
+
+    private func danmakuDockDraftCapsuleLabel(draft: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "pencil.line")
+                .font(.system(size: 12.5, weight: .semibold))
+                .foregroundStyle(Color.biliAccent)
+            Text(verbatim: draft)
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(0.92))
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .frame(maxWidth: .infinity)
+        .frame(height: 38)
+        .background { danmakuDockSurface(Capsule()) }
+        .frame(minHeight: PlayerPortraitChromePolicy.bottomDockHeight)
+        .contentShape(Rectangle())
     }
 
     private func danmakuDockCapsuleLabel(text: LocalizedStringKey) -> some View {
@@ -1195,9 +1239,7 @@ struct PlayerPortraitFullscreenChrome: View {
               context?.isInRouteImmersiveStage == true,
               !inlineDanmakuSend.isSending,
               player.fullscreenDanmakuComposerPresented else { return }
-        let text = inlineDanmakuDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard text.isEmpty else { return }
-        dismissInlineImmersiveDanmakuComposer(clearDraft: true)
+        dismissInlineImmersiveDanmakuComposer(clearDraft: false)
     }
 
     private func dismissInlineImmersiveDanmakuComposer(clearDraft: Bool) {
@@ -1499,6 +1541,7 @@ private struct PortraitHairlineSeekBar: View {
     @State private var barWidth: CGFloat = 0
     @State private var isVisible = false
     @State private var scrubInteraction: ScrubInteraction?
+    @State private var scrubBaseProgress: Double?
     @State private var lastScrubFraction: Double?
     @GestureState private var isTouchingBar = false
 
@@ -1545,6 +1588,7 @@ private struct PortraitHairlineSeekBar: View {
         .onChange(of: scrubSource) { _, current in
             guard case .active(let source) = scrubInteraction, source != current else { return }
             scrubInteraction = .retired
+            scrubBaseProgress = nil
             lastScrubFraction = nil
             isDraggingBar = false
             gestureDisplay.cancelSeek()
@@ -1555,6 +1599,7 @@ private struct PortraitHairlineSeekBar: View {
                 gestureDisplay.cancelSeek()
             }
             scrubInteraction = nil
+            scrubBaseProgress = nil
             lastScrubFraction = nil
             isDraggingBar = false
         }
@@ -1612,10 +1657,18 @@ private struct PortraitHairlineSeekBar: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             .contentShape(Rectangle())
             .gesture(
-                DragGesture(minimumDistance: 0)
+                DragGesture(minimumDistance: 8)
                     .updating($isTouchingBar) { _, touching, _ in touching = true }
                     .onChanged { gesture in
-                        let fraction = Double(min(max(gesture.location.x / width, 0), 1))
+                        if scrubInteraction == nil {
+                            let dx = abs(gesture.translation.width)
+                            let dy = abs(gesture.translation.height)
+                            guard dx >= dy else { return }
+                            scrubBaseProgress = clampedProgress
+                        }
+                        let base = scrubBaseProgress ?? clampedProgress
+                        let delta = Double(gesture.translation.width / width)
+                        let fraction = min(max(base + delta, 0), 1)
                         updateScrub(fraction, chapterFractions: chapterFractions)
                     }
             )
@@ -1748,6 +1801,7 @@ private struct PortraitHairlineSeekBar: View {
     private func finishScrub() {
         defer {
             scrubInteraction = nil
+            scrubBaseProgress = nil
             lastScrubFraction = nil
             isDraggingBar = false
         }

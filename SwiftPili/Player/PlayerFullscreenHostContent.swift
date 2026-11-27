@@ -83,7 +83,13 @@ struct PlayerFullscreenHostContent: View {
                 ? proxy.size
                 : geometry.containerSize
             let viewportAspect = PlayerFullscreenViewportPolicy.aspect(for: resolvedSize)
-            let isPortraitImmersive = player.isPortraitContent && player.mode != .live
+            let isLandscapeLocked = DeviceCapability.supportsOrientationLock
+                && AppOrientation.shared.mask.contains(.landscape)
+            let isLandscapeViewport = resolvedSize.width > resolvedSize.height * 1.02
+            let isPortraitImmersive = player.isPortraitContent
+                && player.mode != .live
+                && !isLandscapeLocked
+                && !isLandscapeViewport
             let resolvedTopInset = isPortraitImmersive
                 ? max(geometry.safeAreaInsets.top, AppWindowMetrics.safeAreaInsets.top)
                 : max(0, geometry.safeAreaInsets.top)
@@ -112,15 +118,30 @@ struct PlayerFullscreenHostContent: View {
         .overlay(alignment: .bottom) {
             if isCurrentContext, player.mode.usesOnlineVODServices, player.fullscreenDanmakuComposerPresented,
                !keepsVODFullscreenDraft || isCurrentVODFullscreenDraft {
-                FullscreenDanmakuComposer(
-                    draft: $fullscreenDanmakuDraft,
-                    notice: nil,
-                    isSending: fullscreenDanmakuSendInFlight,
-                    keyboardFrame: fullscreenKeyboardFrame,
-                    onSubmit: submitFullscreenDanmaku,
-                    onClose: clearFullscreenDanmakuComposer,
-                    onFocusLost: fullscreenDanmakuComposerFocusLost
-                )
+                ZStack(alignment: .bottom) {
+                    Color.white.opacity(0.001)
+                        .ignoresSafeArea()
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            collapseFullscreenDanmakuComposerKeepingDraft()
+                        }
+                        .gesture(
+                            DragGesture(minimumDistance: 6)
+                                .onEnded { _ in
+                                    collapseFullscreenDanmakuComposerKeepingDraft()
+                                }
+                        )
+
+                    FullscreenDanmakuComposer(
+                        draft: $fullscreenDanmakuDraft,
+                        notice: nil,
+                        isSending: fullscreenDanmakuSendInFlight,
+                        keyboardFrame: fullscreenKeyboardFrame,
+                        onSubmit: submitFullscreenDanmaku,
+                        onClose: clearFullscreenDanmakuComposer,
+                        onFocusLost: fullscreenDanmakuComposerFocusLost
+                    )
+                }
             }
         }
         .ignoresSafeArea()
@@ -244,9 +265,22 @@ struct PlayerFullscreenHostContent: View {
         guard isCurrentContext else { return }
         guard !fullscreenDanmakuSendInFlight else { return }
         guard player.fullscreenDanmakuComposerPresented else { return }
+        collapseFullscreenDanmakuComposerKeepingDraft()
+    }
+
+    private func collapseFullscreenDanmakuComposerKeepingDraft() {
+        guard !fullscreenDanmakuSendInFlight else { return }
+        AppWindowMetrics.current?.endEditing(true)
         let text = fullscreenDanmakuDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard text.isEmpty else { return }
-        clearFullscreenDanmakuComposer()
+        if text.isEmpty {
+            clearFullscreenDanmakuComposer()
+        } else {
+            handOffUnsentFullscreenDanmakuDraft()
+            fullscreenDanmakuNotice = nil
+            if isCurrentContext {
+                player.fullscreenDanmakuComposerPresented = false
+            }
+        }
     }
 
     private func presentFullscreenDanmakuNotice(_ message: String) {
