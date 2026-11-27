@@ -10,6 +10,10 @@ struct PortraitPagerCoverBackdrop: View {
     private var coverURL: String { coverSource.url(preferring: .mobileVariant) }
 
     var body: some View {
+        let bottomSafe = AppWindowMetrics.safeAreaInsets.bottom
+        let dockBottom = PlayerPortraitChromePolicy.bottomDockBottomPadding(bottomSafeArea: bottomSafe)
+            + PlayerPortraitChromePolicy.bottomDockHeight
+            + 36
         ZStack(alignment: .bottomLeading) {
             Color.black
             if !coverURL.isEmpty,
@@ -17,31 +21,56 @@ struct PortraitPagerCoverBackdrop: View {
                resolutionBudget.height > 1,
                pageSize.width > 1,
                pageSize.height > 1 {
-                coverLayers
+                PortraitPagerCoverLayers(
+                    coverURL: coverURL,
+                    pageSize: pageSize,
+                    resolutionBudget: resolutionBudget
+                )
             }
             LinearGradient(
-                colors: [.clear, .black.opacity(0.72)],
-                startPoint: .center,
+                stops: [
+                    .init(color: .clear, location: 0.0),
+                    .init(color: .black.opacity(0.32), location: 0.55),
+                    .init(color: .black.opacity(0.58), location: 1.0),
+                ],
+                startPoint: .top,
                 endPoint: .bottom
             )
-            VStack(alignment: .leading, spacing: 6) {
-                Text(title)
-                    .font(.headline)
-                    .foregroundStyle(.white)
-                    .lineLimit(2)
+            .frame(height: PlayerPortraitChromePolicy.bottomGradientBaseHeight + max(0, bottomSafe - 12))
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            .allowsHitTesting(false)
+
+            VStack(alignment: .leading, spacing: 8) {
                 if !ownerName.isEmpty {
-                    Text(ownerName)
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.8))
+                    Text(verbatim: ownerName.hasPrefix("@") ? ownerName : "@\(ownerName)")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
                         .lineLimit(1)
+                        .shadow(color: .black.opacity(0.45), radius: 2, y: 1)
+                }
+                if !title.isEmpty {
+                    Text(verbatim: title)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.white.opacity(0.95))
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                        .shadow(color: .black.opacity(0.45), radius: 2, y: 1)
                 }
             }
-            .padding(20)
+            .padding(.leading, 16)
+            .padding(.trailing, 76)
+            .padding(.bottom, dockBottom)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
+}
 
-    private var coverLayers: some View {
+struct PortraitPagerCoverLayers: View {
+    let coverURL: String
+    let pageSize: CGSize
+    let resolutionBudget: CGSize
+
+    var body: some View {
         ZStack {
             decorativeFill
             artwork

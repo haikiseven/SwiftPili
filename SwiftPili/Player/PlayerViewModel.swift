@@ -1886,7 +1886,10 @@ final class PlayerViewModel: DemandContinuationEffectSink, DemandContinuationOpe
             }
             hasRenderedFirstFrame = false
             fullscreenTransition = FullscreenTransitionCoalescer()
-            if isFullscreen, !isAutonomousQueueAdvanceInFlight {
+            let preservesFullscreenForSameOwnerLoad = reason == .newContentOwnership
+                && !presentationResetPendingForOwnerChange
+                && fullscreenPresentationReceipt.map { isCurrentOwner($0.context.ownerLease) } == true
+            if isFullscreen, !isAutonomousQueueAdvanceInFlight, !preservesFullscreenForSameOwnerLoad {
                 exitFullscreen()
             }
         }

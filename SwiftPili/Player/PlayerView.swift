@@ -162,6 +162,8 @@ struct PlayerView: View {
     @State private var pendingTapTask: Task<Void, Never>?
     @State private var surfaceDrag = PlayerSurfaceDragStore()
     @State private var surfaceStartLocation: CGPoint = .zero
+    @State private var surfaceGlobalStartLocation: CGPoint = .zero
+    @State private var surfaceGlobalOrigin: CGPoint = .zero
     @State private var showSponsorBlock = false
 
     private var allocatedInlineViewport: CGSize? {
@@ -184,8 +186,19 @@ struct PlayerView: View {
         isFullscreenPresentation || isInlinePortraitImmersive
     }
 
+    private var isFullscreenLandscapePresentation: Bool {
+        guard isFullscreenPresentation else { return false }
+        if DeviceCapability.supportsOrientationLock, AppOrientation.shared.mask.contains(.landscape) {
+            return true
+        }
+        if let aspect = fullscreenViewportAspect, aspect > 1.02 {
+            return true
+        }
+        return false
+    }
+
     private var isPortraitImmersiveFullscreen: Bool {
-        (isInlinePortraitImmersive || (isFullscreenPresentation && vm.isPortraitContent))
+        (isInlinePortraitImmersive || (isFullscreenPresentation && vm.isPortraitContent && !isFullscreenLandscapePresentation))
             && vm.mode != .live
     }
 
@@ -243,15 +256,11 @@ struct PlayerView: View {
 
     private var portraitStageOffsetY: CGFloat {
         guard isPortraitImmersiveFullscreen, portraitVerticalDragOffset != 0 else { return 0 }
-        if portraitVerticalDragOffset > 0 {
-            return portraitVerticalDragOffset * 0.56
-        }
         return portraitVerticalDragOffset * 0.18
     }
 
     private var portraitStageScale: CGFloat {
-        guard isPortraitImmersiveFullscreen, portraitVerticalDragOffset > 0 else { return 1.0 }
-        return max(0.88, 1.0 - portraitVerticalDragOffset / 2200)
+        1.0
     }
 
     private var containerAspect: CGFloat {
@@ -376,9 +385,6 @@ struct PlayerView: View {
         }
         return { recommendation in
             vm.cancelEndedAutoAdvance()
-            if isFullscreenPresentation, vm.isFullscreen {
-                vm.requestFullscreenTransition(target: false, source: .button)
-            }
             handler(recommendation)
         }
     }
@@ -509,8 +515,9 @@ struct PlayerView: View {
                 if showsFirstFrameCover {
                     PlayerFirstFrameCoverOverlay(
                         coverURL: resolvedPlaceholderCoverURL,
-                        viewportSize: usableCoverViewportSize,
-                        showsProgress: showsCoverProgress
+                        viewportSize: usableCoverViewportSize ?? (surfaceSize.width > 1 && surfaceSize.height > 1 ? surfaceSize : nil),
+                        showsProgress: showsCoverProgress,
+                        isPortraitImmersive: isPortraitImmersiveFullscreen
                     )
                     .transition(.opacity)
                 }
@@ -892,6 +899,11 @@ struct PlayerView: View {
         .onGeometryChange(for: CGSize.self) { $0.size } action: { newValue in
             publishSurfaceSizeIfAllowed(newValue)
         }
+        .onGeometryChange(for: CGPoint.self) { $0.frame(in: .global).origin } action: { origin in
+            if origin.x.isFinite, origin.y.isFinite, !verticalPagingActive, !portraitDismissDragActive {
+                surfaceGlobalOrigin = origin
+            }
+        }
         .overlay(alignment: .top) {
             let noticeTopPadding: CGFloat = if isPortraitImmersiveFullscreen {
                 chromeInsets.top + 56
@@ -1045,6 +1057,21 @@ struct PlayerView: View {
         .onChange(of: endedRecommendations) { _, _ in
             syncInlineEndedRecommendationsIfNeeded()
         }
+        .onChange(of: vm.currentURL) { _, newURL in
+            guard newURL != nil,
+                  isOwner,
+                  surfaceRole == .inline,
+                  DeviceCapability.supportsOrientationLock,
+                  !vm.isFullscreen,
+                  !vm.isPortraitContent else { return }
+            let orientation = UIDevice.current.orientation
+            guard orientation.isLandscape,
+                  !FullscreenOrientationLatch.shared.shouldIgnoreDeviceOrientation(
+                      orientation,
+                      currentFullscreen: false
+                  ) else { return }
+            vm.requestFullscreenTransition(target: true, source: .deviceOrientation)
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
             guard isOwner, DeviceCapability.supportsOrientationLock else { return }
             let orientation = UIDevice.current.orientation
@@ -1191,13 +1218,13 @@ struct PlayerView: View {
     }
 
     private var surfaceGesture: some Gesture {
-        DragGesture(minimumDistance: 0, coordinateSpace: .named(Self.surfaceCoordinateSpace))
+        DragGesture(minimumDistance: 0, coordinateSpace: .global)
             .updating($isSurfacePressing) { _, pressing, _ in
                 pressing = true
             }
             .onChanged { gesture in
                 guard isOwner, surfaceLease != nil, !pinchTransitionLatched else { return }
-                if surfaceTouchInFlight, gesture.startLocation != surfaceStartLocation {
+                if surfaceTouchInFlight, gesture.startLocation != surfaceGlobalStartLocation {
                     resetSurfaceTouch(reason: "stale touch — previous one was system-cancelled")
                 }
 
@@ -1206,7 +1233,11 @@ struct PlayerView: View {
 
                 if !surfaceTouchInFlight {
                     surfaceTouchInFlight = true
-                    surfaceStartLocation = gesture.startLocation
+                    surfaceGlobalStartLocation = gesture.startLocation
+                    surfaceStartLocation = CGPoint(
+                        x: gesture.startLocation.x - surfaceGlobalOrigin.x,
+                        y: gesture.startLocation.y - surfaceGlobalOrigin.y
+                    )
                     surfaceDrag.reset()
                     surfaceHoldEngaged = false
                     swipeSeekRejected = false
@@ -1236,14 +1267,10 @@ struct PlayerView: View {
                         swipeSeekRejected = true
                         return
                     }
-                    if abs(dx) > Self.swipeEngageDistance, abs(dx) > abs(dy) * 1.2 {
+                    if !isPortraitImmersiveFullscreen,
+                       abs(dx) > Self.swipeEngageDistance,
+                       abs(dx) > abs(dy) * 1.2 {
                         surfaceHoldTask?.cancel()
-                        if isPortraitImmersiveFullscreen,
-                           surfaceStartLocation.x <= Self.portraitBackEdgeRejectLimit,
-                           dx > 0 {
-                            swipeSeekRejected = true
-                            return
-                        }
                         guard vm.mode.isSeekable, vm.currentURL != nil, vm.duration > 0 else {
                             swipeSeekRejected = true
                             return
@@ -1257,8 +1284,7 @@ struct PlayerView: View {
                               abs(dy) > Self.portraitDismissEngageDistance,
                               abs(dy) > abs(dx) * 1.15 {
                         surfaceHoldTask?.cancel()
-                        if let verticalPagingGestureSink,
-                           dy < 0 || verticalPagingGestureSink.canPagePrevious() {
+                        if let verticalPagingGestureSink {
                             guard verticalPagingGestureSink.begin() else {
                                 swipeSeekRejected = true
                                 return
@@ -1270,7 +1296,12 @@ struct PlayerView: View {
                         }
                         portraitDismissDragActive = true
                         portraitVerticalDragOffset = dy
-                        PlayerLog.log("[PlayerGesture] portrait immersive pull-to-standard engaged")
+                        return
+                    } else if isPortraitImmersiveFullscreen,
+                              abs(dx) > Self.swipeEngageDistance,
+                              abs(dx) > abs(dy) * 1.2 {
+                        surfaceHoldTask?.cancel()
+                        swipeSeekRejected = true
                         return
                     } else if !isPortraitImmersiveFullscreen,
                               abs(dy) > Self.scrollRejectDistance,
@@ -1364,24 +1395,8 @@ struct PlayerView: View {
                 }
                 if portraitDismissDragActive {
                     portraitDismissDragActive = false
-                    let dragY = gesture.translation.height
-                    let predictedY = gesture.predictedEndTranslation.height
-                    let shouldCollapseToStandard = dragY > 84 || predictedY > 175
-                    if shouldCollapseToStandard {
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                        withAnimation(reduceMotion ? nil : .spring(duration: 0.28, bounce: 0.03)) {
-                            portraitVerticalDragOffset = 0
-                        }
-                        PlayerLog.log("[PlayerGesture] portrait pull-down → collapse to standard view")
-                        if let collapse = activePortraitFullscreenContext?.onCollapseToDetail {
-                            collapse()
-                        } else {
-                            vm.requestFullscreenTransition(target: false, source: .button)
-                        }
-                    } else {
-                        withAnimation(reduceMotion ? nil : .spring(duration: 0.25)) {
-                            portraitVerticalDragOffset = 0
-                        }
+                    withAnimation(reduceMotion ? nil : .spring(duration: 0.25)) {
+                        portraitVerticalDragOffset = 0
                     }
                     return
                 }
@@ -1408,7 +1423,11 @@ struct PlayerView: View {
                             pendingTapTask = nil
                             if let onDoubleTapLike = activePortraitFullscreenContext?.onDoubleTapLike {
                                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                triggerDoubleTapLikePulse(at: gesture.location)
+                                let localTapLocation = CGPoint(
+                                    x: gesture.location.x - surfaceGlobalOrigin.x,
+                                    y: gesture.location.y - surfaceGlobalOrigin.y
+                                )
+                                triggerDoubleTapLikePulse(at: localTapLocation)
                                 PlayerLog.log("[PlayerGesture] portrait double-tap → like")
                                 Task { await onDoubleTapLike() }
                             } else {
@@ -1512,22 +1531,44 @@ private struct PlayerFirstFrameCoverOverlay: View {
     let coverURL: String?
     let viewportSize: CGSize?
     let showsProgress: Bool
+    var isPortraitImmersive: Bool = false
+
+    @State private var delayedSpinnerVisible = false
+
+    private static func quantizedBudget(for size: CGSize) -> CGSize {
+        let quantum: CGFloat = 128
+        return CGSize(
+            width: (size.width / quantum).rounded(.up) * quantum,
+            height: (size.height / quantum).rounded(.up) * quantum
+        )
+    }
 
     var body: some View {
         ZStack {
             Color.black
             if let coverURL, !coverURL.isEmpty {
-                CoverImage(
-                    urlString: coverURL,
-                    displaySize: viewportSize,
-                    contentMode: .fit,
-                    groundColor: .black,
-                    isDecorative: true,
-                    fillsOfferedBox: viewportSize != nil
-                )
+                if isPortraitImmersive,
+                   let pageSize = viewportSize,
+                   pageSize.width > 1,
+                   pageSize.height > 1 {
+                    PortraitPagerCoverLayers(
+                        coverURL: coverURL,
+                        pageSize: pageSize,
+                        resolutionBudget: Self.quantizedBudget(for: pageSize)
+                    )
+                } else {
+                    CoverImage(
+                        urlString: coverURL,
+                        displaySize: viewportSize,
+                        contentMode: .fit,
+                        groundColor: .black,
+                        isDecorative: true,
+                        fillsOfferedBox: viewportSize != nil
+                    )
+                    Color.black.opacity(0.18)
+                }
             }
-            Color.black.opacity(0.18)
-            if showsProgress {
+            if showsProgress && (!isPortraitImmersive || delayedSpinnerVisible) {
                 ProgressView()
                     .controlSize(.large)
                     .tint(.white)
@@ -1535,6 +1576,16 @@ private struct PlayerFirstFrameCoverOverlay: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipped()
+        .task(id: isPortraitImmersive && showsProgress) {
+            guard isPortraitImmersive, showsProgress else {
+                delayedSpinnerVisible = false
+                return
+            }
+            delayedSpinnerVisible = false
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled else { return }
+            delayedSpinnerVisible = true
+        }
     }
 }
 

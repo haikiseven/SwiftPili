@@ -247,8 +247,8 @@ struct OfflinePlayerView: View {
             player.portraitPureViewEnabled = false
             withAnimation(motion.animation(normal: .spring(duration: 0.32, bounce: 0.04))) {
                 isPortraitImmersiveStageActive = true
+                player.isInlinePortraitImmersiveActive = true
             }
-            player.isInlinePortraitImmersiveActive = true
             syncOfflinePortraitFullscreenContext()
             return true
         } else {
@@ -262,11 +262,16 @@ struct OfflinePlayerView: View {
         userCollapsedImmersiveDownloadID = currentRouteItem.downloadID
         player.portraitPureViewEnabled = false
         dragOffsetBox.y = 0
+        let ownsPlayer: Bool = if let lease = ownerLease {
+            player.isCurrentOwner(lease)
+        } else {
+            false
+        }
         withAnimation(motion.animation(normal: .spring(duration: 0.32, bounce: 0.04))) {
             isPortraitImmersiveStageActive = false
-        }
-        if let lease = ownerLease, player.isCurrentOwner(lease) {
-            player.isInlinePortraitImmersiveActive = false
+            if ownsPlayer {
+                player.isInlinePortraitImmersiveActive = false
+            }
         }
         syncOfflinePortraitFullscreenContext()
     }
@@ -343,6 +348,9 @@ struct OfflinePlayerView: View {
         dragOffsetBox.y = 0
         withAnimation(motion.animation(normal: .spring(duration: 0.3))) {
             isPortraitImmersiveStageActive = true
+            if let lease = ownerLease, player.isCurrentOwner(lease) {
+                player.isInlinePortraitImmersiveActive = true
+            }
         }
         syncOfflineInlinePortraitImmersiveBinding()
         syncOfflinePortraitFullscreenContext()

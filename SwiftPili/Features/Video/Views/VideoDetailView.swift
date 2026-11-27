@@ -216,7 +216,7 @@ struct VideoDetailView: View {
             on: .onlineDetail,
             isImmersiveStage: showsInRoutePortraitImmersive,
             itemCount: immersiveFeedSession.entries.count
-        ) && !player.isFullscreenPresentationActive
+        ) && !player.isFullscreenPresentationActive && !player.fullscreenDanmakuComposerPresented
     }
 
     var immersivePagingSink: PlayerVerticalPagingCoordinator? {
@@ -681,6 +681,7 @@ struct VideoDetailView: View {
             .zIndex(10)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        .ignoresSafeArea(.keyboard, edges: isImmersiveStage ? .all : (!isWideLayout ? .bottom : []))
         .playerDetailChrome(
             isFullscreenPresentationActive: player.isFullscreenPresentationActive,
             isStatusBarHidden: player.isFullscreen || showsInRoutePortraitImmersive,
@@ -989,19 +990,25 @@ struct VideoDetailView: View {
     }
 
     private func handleSelectEndedRecommendation(_ recommendation: PlayerEndedRecommendation) {
-        if let matched = viewModel.relatedVideos.first(where: { $0.bvid == recommendation.bvid }) {
-            coordinator.navigateToVideo(VideoDetailRouteTargetFactory.relatedTarget(for: matched).withoutZoom)
+        let nextTarget: VideoRouteTarget? = if let matched = viewModel.relatedVideos.first(where: { $0.bvid == recommendation.bvid }) {
+            VideoDetailRouteTargetFactory.relatedTarget(for: matched).withoutZoom
+        } else {
+            VideoRouteTarget.make(
+                bvid: recommendation.bvid,
+                aid: nil,
+                title: recommendation.title,
+                coverURL: recommendation.coverURL ?? "",
+                ownerName: recommendation.authorName,
+                durationSeconds: recommendation.durationSeconds ?? 0
+            )?.withoutZoom
+        }
+        guard let nextTarget else { return }
+
+        if isActiveVideoRoute, player.isFullscreen || isPortraitImmersiveStageActive {
+            switchToRecommendedVideoInline(nextTarget)
             return
         }
-        guard let fallback = VideoRouteTarget.make(
-            bvid: recommendation.bvid,
-            aid: nil,
-            title: recommendation.title,
-            coverURL: recommendation.coverURL ?? "",
-            ownerName: recommendation.authorName,
-            durationSeconds: recommendation.durationSeconds ?? 0
-        ) else { return }
-        coordinator.navigateToVideo(fallback.withoutZoom)
+        coordinator.navigateToVideo(nextTarget)
     }
 
     @ViewBuilder

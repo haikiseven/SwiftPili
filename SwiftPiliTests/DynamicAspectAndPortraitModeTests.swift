@@ -1775,4 +1775,78 @@ struct DynamicAspectAndPortraitModeTests {
         #expect(metadata?.originalURL == url)
         #expect(metadata?.iconProvider != nil)
     }
+
+    // MARK: - Landscape Fullscreen Continuation & First-Video Rubber-Band Paging
+
+    @Test("Same-owner VOD reload in landscape fullscreen preserves isFullscreen while new-owner or ownerExit exits fullscreen")
+    @MainActor
+    func sameOwnerReloadPreservesLandscapeFullscreen() {
+        let vm = PlayerViewModel.shared
+        let savedFullscreen = vm.isFullscreen
+        let savedReceipt = vm.fullscreenPresentationReceipt
+        let savedMask = AppOrientation.shared.mask
+        let savedResetPending = vm.presentationResetPendingForOwnerChange
+        defer {
+            vm.isFullscreen = savedFullscreen
+            vm.fullscreenPresentationReceipt = savedReceipt
+            vm.presentationResetPendingForOwnerChange = savedResetPending
+            AppOrientation.shared.set(savedMask)
+        }
+
+        let leaseA = vm.claimOwnerLease(owner: "vod-BV1fsKeepA")
+        vm.presentationResetPendingForOwnerChange = false
+        let contextA = PlayerScreenPresentationContext(
+            screenID: UUID(),
+            ownerLease: leaseA,
+            route: .video(.bvid("BV1fsKeepA")),
+            position: PlayerRoutePosition(tab: .home, sidebarID: nil, depth: 1),
+            source: .vod(aid: 1001, cid: 2001, source: .ugc)
+        )
+        vm.fullscreenPresentationReceipt = PlayerPresentationReceipt(id: UUID(), context: contextA)
+        vm.isFullscreen = true
+        AppOrientation.shared.set(.landscape)
+
+        // Same-owner part/episode/inline recommendation switch (.newContentOwnership, !newOwner) keeps fullscreen
+        vm.stop(reason: .newContentOwnership)
+        #expect(vm.isFullscreen == true)
+
+        // New-owner takeover (.newContentOwnership with presentationResetPendingForOwnerChange == true) exits fullscreen
+        _ = vm.claimOwnerLease(owner: "vod-BV1fsNewOwnerB")
+        #expect(vm.presentationResetPendingForOwnerChange == true)
+        vm.stop(reason: .newContentOwnership)
+        #expect(vm.isFullscreen == false)
+
+        // Explicit .ownerExit also exits fullscreen
+        let leaseC = vm.claimOwnerLease(owner: "vod-BV1fsExitC")
+        vm.presentationResetPendingForOwnerChange = false
+        let contextC = PlayerScreenPresentationContext(
+            screenID: UUID(),
+            ownerLease: leaseC,
+            route: .video(.bvid("BV1fsExitC")),
+            position: PlayerRoutePosition(tab: .home, sidebarID: nil, depth: 1),
+            source: .vod(aid: 1003, cid: 2003, source: .ugc)
+        )
+        vm.fullscreenPresentationReceipt = PlayerPresentationReceipt(id: UUID(), context: contextC)
+        vm.isFullscreen = true
+        vm.stop(reason: .ownerExit)
+        #expect(vm.isFullscreen == false)
+        _ = vm.endOwnerPlayback(lease: leaseC)
+    }
+
+    @Test("PortraitPagingReducer first-item pull-down applies boundary damping and rebounds without exiting Story")
+    func portraitPagingFirstItemPullDownRebounds() {
+        var reducer = PortraitPagingReducer(itemCount: 5, initialIndex: 0)
+        reducer.updateContainerHeight(840)
+        #expect(reducer.beginDrag() == true)
+
+        let dampedOffset = reducer.drag(translation: 120)
+        #expect(dampedOffset > 0)
+        #expect(dampedOffset < 120)
+
+        let settlement = reducer.endDrag(translation: 120, predictedEndTranslation: 320)
+        #expect(settlement?.kind == .rebound)
+        #expect(reducer.offset == 0)
+        #expect(reducer.completeSettlement(token: settlement!.token) == nil)
+        #expect(reducer.currentIndex == 0)
+    }
 }

@@ -635,8 +635,8 @@ extension VideoDetailView {
             syncImmersiveFeedSessionForEntry()
             withAnimation(motion.animation(normal: .spring(duration: 0.32, bounce: 0.04))) {
                 isPortraitImmersiveStageActive = true
+                player.isInlinePortraitImmersiveActive = true
             }
-            player.isInlinePortraitImmersiveActive = true
             syncPortraitFullscreenContext()
             triggerImmersiveRefillIfNeeded(forceSmallPool: true)
             return true
@@ -651,11 +651,16 @@ extension VideoDetailView {
         userCollapsedImmersiveVideoID = videoID
         player.portraitPureViewEnabled = false
         immersiveDragOffsetBox.y = 0
+        let ownsPlayer: Bool = if let lease = viewModel.playerLease {
+            player.isCurrentOwner(lease)
+        } else {
+            false
+        }
         withAnimation(motion.animation(normal: .spring(duration: 0.32, bounce: 0.04))) {
             isPortraitImmersiveStageActive = false
-        }
-        if let lease = viewModel.playerLease, player.isCurrentOwner(lease) {
-            player.isInlinePortraitImmersiveActive = false
+            if ownsPlayer {
+                player.isInlinePortraitImmersiveActive = false
+            }
         }
         syncPortraitFullscreenContext()
     }
@@ -809,10 +814,55 @@ extension VideoDetailView {
         syncImmersiveFeedSessionForEntry()
         withAnimation(motion.animation(normal: .spring(duration: 0.3))) {
             isPortraitImmersiveStageActive = true
+            if let lease = viewModel.playerLease, player.isCurrentOwner(lease) {
+                player.isInlinePortraitImmersiveActive = true
+            }
         }
         syncInlinePortraitImmersiveBinding()
         syncPortraitFullscreenContext()
         triggerImmersiveRefillIfNeeded(forceSmallPool: true)
+    }
+
+    func switchToRecommendedVideoInline(_ nextTarget: VideoRouteTarget) {
+        guard isActiveVideoRoute, let lease = claimPlayerLeaseIfNeeded() else { return }
+
+        composer.collapse(motion: motion)
+        replyPresentation.cancelPendingAction()
+        replyPresentation.isPresented = false
+        showThread = nil
+        composer.replyCommentSource = nil
+        replyPresentation.anchors.sourceProvider = nil
+
+        isRouteTransitionSettled = true
+        userCollapsedImmersiveVideoID = nil
+        activePlaylistTarget = nextTarget
+        inlineScrollOffset = 0
+        detailScrollToTopTick &+= 1
+        player.setPlaybackQueue(nil)
+        immersiveFeedSession.reset(
+            initialTarget: nextTarget,
+            preferredCid: nil,
+            activeQueue: nil
+        )
+        syncImmersiveViewportReducerMetrics()
+        syncPortraitFullscreenContext()
+
+        Task { @MainActor in
+            guard isActiveVideoRoute, player.isCurrentOwner(lease) else { return }
+            _ = await viewModel.load(
+                id: nextTarget.videoID,
+                preferredCid: nil,
+                owner: screenOwner,
+                lease: lease,
+                initialAspectRatioHint: nextTarget.preview.aspectRatioHint
+            )
+            guard isActiveVideoRoute, player.isCurrentOwner(lease) else { return }
+            installPlaylistSelectionHandlerIfNeeded()
+            syncInlinePortraitImmersiveBinding()
+            syncPortraitFullscreenContext()
+            immersiveFeedSession.ingestRelatedVideos(viewModel.relatedVideos)
+            prewarmAdjacentImmersiveCovers()
+        }
     }
 
     func syncPortraitFullscreenContext() {
@@ -834,17 +884,17 @@ extension VideoDetailView {
         context.upMid = info?.owner.mid ?? 0
         context.upName = info?.owner.name ?? activeTarget.preview.ownerName
         context.upAvatarURL = info?.owner.face ?? ""
-        context.isFollowing = viewModel.isFollowingUp
-        context.isLiked = viewModel.isLiked
+        context.isFollowing = info != nil ? viewModel.isFollowingUp : nil
+        context.isLiked = info != nil ? viewModel.isLiked : false
         context.likeCount = info?.stat.like ?? 0
-        context.isCoined = viewModel.isCoined
+        context.isCoined = info != nil ? viewModel.isCoined : false
         context.coinCount = info?.stat.coin ?? 0
-        context.canGiveTwoCoins = (viewModel.maxCoins - viewModel.coinCount) >= 2
-        context.isFavorited = viewModel.isFavorited
+        context.canGiveTwoCoins = info != nil ? ((viewModel.maxCoins - viewModel.coinCount) >= 2) : true
+        context.isFavorited = info != nil ? viewModel.isFavorited : false
         context.favoriteCount = info?.stat.favorite ?? 0
         context.replyCount = info?.stat.reply ?? 0
         context.shareCount = info?.stat.share ?? 0
-        context.commentsClosed = viewModel.commentsClosed
+        context.commentsClosed = info != nil ? viewModel.commentsClosed : false
         context.bvid = info?.bvid ?? ""
         context.aid = info?.aid ?? 0
         context.isInRouteImmersiveStage = showsInRoutePortraitImmersive
