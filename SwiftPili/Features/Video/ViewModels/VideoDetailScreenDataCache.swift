@@ -6,15 +6,56 @@ struct VideoDetailScreenDataSnapshot: Sendable {
         let values: [VideoTag]
     }
 
+    struct PreviewComments: Sendable {
+        let items: [CommentResult.CommentItem]
+        let total: Int
+        let commentsClosed: Bool
+    }
+
+    struct InteractionSnapshot: Sendable, Equatable {
+        let isFollowingUp: Bool?
+        let isLiked: Bool
+        let coinCount: Int
+        let isFavorited: Bool
+        let isInWatchLater: Bool
+        let defaultFolderId: Int?
+    }
+
     let id: VideoID
     let accountSession: UUID
     let fetchedAt: ContinuousClock.Instant
     let info: VideoInfo
+    let cid: Int?
     let related: [VideoCard]
     let tags: Tags?
+    let previewComments: PreviewComments?
+    let interaction: InteractionSnapshot?
+
+    init(
+        id: VideoID,
+        accountSession: UUID,
+        fetchedAt: ContinuousClock.Instant,
+        info: VideoInfo,
+        cid: Int? = nil,
+        related: [VideoCard],
+        tags: Tags?,
+        previewComments: PreviewComments? = nil,
+        interaction: InteractionSnapshot? = nil
+    ) {
+        self.id = id
+        self.accountSession = accountSession
+        self.fetchedAt = fetchedAt
+        self.info = info
+        self.cid = cid
+        self.related = related
+        self.tags = tags
+        self.previewComments = previewComments
+        self.interaction = interaction
+    }
 
     var fitsCacheBudget: Bool {
         guard related.count <= 100, (tags?.values.count ?? 0) <= 100,
+              (previewComments?.items.count ?? 0) <= 4,
               (info.pages?.count ?? 0) <= 100, (info.descV2?.count ?? 0) <= 512,
               info.descLinks.count <= 256 else { return false }
         var budget = TextBudget()
@@ -30,6 +71,10 @@ struct VideoDetailScreenDataSnapshot: Sendable {
         }
         for tag in tags?.values ?? [] {
             guard budget.admit([tag.tagName, tag.tagType ?? "", tag.musicId ?? "", tag.jumpUrl ?? ""])
+            else { return false }
+        }
+        for comment in previewComments?.items ?? [] {
+            guard budget.admit([comment.member.uname, comment.member.avatar, comment.content.message])
             else { return false }
         }
         return true

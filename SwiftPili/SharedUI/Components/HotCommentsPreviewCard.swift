@@ -24,16 +24,58 @@ struct HotCommentsPreviewCard: View {
                     .foregroundStyle(.secondary)
                 }
                 if previewComments.isEmpty {
-                    HStack(spacing: 8) {
-                        if isLoading {
-                            ProgressView()
-                            Text("Loading comments…")
-                        } else {
-                            Text("No Comments Yet")
+                    if isLoading, total > 0 {
+                        let skeletonRows = min(2, max(1, total))
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(0..<skeletonRows, id: \.self) { index in
+                                if index > 0 {
+                                    Divider()
+                                        .opacity(0.35)
+                                        .padding(.leading, 38)
+                                }
+                                HStack(alignment: .top, spacing: 10) {
+                                    Circle()
+                                        .fill(AppFill.inset)
+                                        .frame(width: 28, height: 28)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(verbatim: "PlaceholderAuthor")
+                                            .appFont(.cardMeta)
+                                            .fontWeight(.semibold)
+                                            .lineLimit(1)
+                                            .hidden()
+                                            .overlay(alignment: .leading) {
+                                                Capsule()
+                                                    .fill(AppFill.inset)
+                                                    .frame(width: index == 0 ? 84 : 72, height: 11)
+                                            }
+                                        Text(verbatim: "Placeholder comment preview line")
+                                            .appFont(.cardMeta)
+                                            .lineLimit(1)
+                                            .hidden()
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .overlay(alignment: .leading) {
+                                                Capsule()
+                                                    .fill(AppFill.nested)
+                                                    .frame(maxWidth: index == 0 ? 220 : 176)
+                                                    .frame(height: 11)
+                                            }
+                                    }
+                                }
+                            }
                         }
+                        .accessibilityHidden(true)
+                    } else {
+                        HStack(spacing: 8) {
+                            if isLoading {
+                                ProgressView()
+                                Text("Loading comments…")
+                            } else {
+                                Text("No Comments Yet")
+                            }
+                        }
+                        .appFont(.cardMeta)
+                        .foregroundStyle(.secondary)
                     }
-                    .appFont(.cardMeta)
-                    .foregroundStyle(.secondary)
                 } else {
                     VStack(alignment: .leading, spacing: 8) {
                         ForEach(Array(previewComments.enumerated()), id: \.element.id) { index, comment in

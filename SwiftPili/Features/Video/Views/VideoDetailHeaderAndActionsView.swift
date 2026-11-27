@@ -576,6 +576,17 @@ struct VideoDetailOwnerRowView: View {
                 }
                 .buttonStyle(.appControl)
                 .disabled(followRequestInFlight)
+            } else if AuthManager.shared.isLoggedIn,
+                      info.owner.mid > 0,
+                      String(info.owner.mid) != AuthManager.shared.dedeUserID {
+                Text("+ Follow")
+                    .appFont(.controlLabel)
+                    .fontWeight(.semibold)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .hidden()
+                    .background(Color(.tertiarySystemFill).opacity(0.55), in: Capsule())
+                    .accessibilityHidden(true)
             }
         }
     }

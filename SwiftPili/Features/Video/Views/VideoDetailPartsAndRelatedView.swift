@@ -623,11 +623,18 @@ struct VideoDetailHotCommentsPreviewView: View {
     @ViewBuilder
     var body: some View {
         if !model.commentsClosed {
+            let displayedComments: [CommentResult.CommentItem] = if !model.comments.isEmpty {
+                Array(model.comments.prefix(2))
+            } else {
+                model.cachedPreviewComments?.items ?? []
+            }
+            let showsLoadingSkeleton = (model.isLoadingComments || model.commentsAwaitingInitialResponse)
+                && displayedComments.isEmpty
             CommentZoomSource(anchors: commentPresentation.anchors) {
                 HotCommentsPreviewCard(
-                    comments: Array(model.comments.prefix(2)),
-                    total: info.stat.reply,
-                    isLoading: model.isLoadingComments || model.commentsAwaitingInitialResponse,
+                    comments: displayedComments,
+                    total: max(info.stat.reply, model.commentTotal),
+                    isLoading: showsLoadingSkeleton,
                     isRegularWidth: sizeClass == .regular,
                     action: onOpenComments
                 )

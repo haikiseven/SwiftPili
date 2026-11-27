@@ -57,10 +57,51 @@ final class VideoDetailViewModel {
     var toast: ToastMessage?
     var currentCid: Int?
     var onlineCount: String?
+    var cachedPreviewComments: VideoDetailScreenDataSnapshot.PreviewComments?
+    @ObservationIgnored var prehydratedScreenSnapshot: VideoDetailScreenDataSnapshot?
 
-    init() {
+    init(
+        prehydratedSnapshot: VideoDetailScreenDataSnapshot? = nil,
+        initialAspectRatioHint: CGFloat? = nil
+    ) {
+        self.initialAspectRatioHint = initialAspectRatioHint
         LocalContentFilterStore.shared.addObserver(self) { model in
             model.applyRelatedVideoContentFilters()
+        }
+        if let snapshot = prehydratedSnapshot,
+           VideoDetailReactivationPolicy.retainsScreenData,
+           snapshot.accountSession == AuthManager.shared.sessionGeneration {
+            self.prehydratedScreenSnapshot = snapshot
+            self.videoInfo = snapshot.info
+            self.loadedID = snapshot.id
+            self.metadataAccountSession = snapshot.accountSession
+            let resolvedCid = snapshot.cid.flatMap { cid in
+                if let pages = snapshot.info.pages, !pages.isEmpty {
+                    return pages.contains(where: { $0.cid == cid }) ? cid : snapshot.info.cid
+                }
+                return cid == snapshot.info.cid ? cid : snapshot.info.cid
+            } ?? snapshot.info.cid
+            self.currentCid = resolvedCid
+            self.setRawRelatedVideos(snapshot.related)
+            if let tags = snapshot.tags, tags.cid == resolvedCid {
+                let source = TagSource(aid: snapshot.info.aid, cid: resolvedCid, serial: tagRequestSerial)
+                self.tagPublication = TagPublication(source: source, tags: tags.values)
+            }
+            if let preview = snapshot.previewComments {
+                self.cachedPreviewComments = preview
+                self.commentTotal = preview.total
+                self.commentsClosed = preview.commentsClosed
+            } else {
+                self.commentTotal = snapshot.info.stat.reply
+            }
+            if let interaction = snapshot.interaction {
+                self.isFollowingUp = interaction.isFollowingUp
+                self.isLiked = interaction.isLiked
+                self.coinCount = interaction.coinCount
+                self.isFavorited = interaction.isFavorited
+                self.isInWatchLater = interaction.isInWatchLater
+                self.defaultFolderId = interaction.defaultFolderId
+            }
         }
     }
 
@@ -70,7 +111,7 @@ final class VideoDetailViewModel {
         loadedID == id && videoInfo != nil
     }
     @ObservationIgnored var startupTraceToken: StartupTrace.Token?
-    @ObservationIgnored private var initialAspectRatioHint: CGFloat?
+    @ObservationIgnored var initialAspectRatioHint: CGFloat?
     private var loadAdmission = VideoDetailLoadAdmission()
     @ObservationIgnored private var loadAccountSession: UUID?
     @ObservationIgnored var metadataAccountSession: UUID?
@@ -349,7 +390,27 @@ final class VideoDetailViewModel {
         let accountSession = AuthManager.shared.sessionGeneration
         loadAccountSession = accountSession
         interactionStateReceipt = nil
-        retireTags()
+        if cachedData == nil {
+            retireTags()
+            cachedPreviewComments = nil
+            isFollowingUp = nil
+            isLiked = false
+            coinCount = 0
+            isFavorited = false
+            isInWatchLater = false
+        } else {
+            if let preview = cachedData?.previewComments {
+                cachedPreviewComments = preview
+            }
+            if let interaction = cachedData?.interaction {
+                isFollowingUp = interaction.isFollowingUp
+                isLiked = interaction.isLiked
+                coinCount = interaction.coinCount
+                isFavorited = interaction.isFavorited
+                isInWatchLater = interaction.isInWatchLater
+                defaultFolderId = interaction.defaultFolderId
+            }
+        }
         commentUpload.retire()
         commentRevocationWitness = nil
         retireCommentRequests()
@@ -386,7 +447,9 @@ final class VideoDetailViewModel {
                 StartupTrace.abort("stale-page-request", token: traceToken)
                 return false
             }
-            self.videoInfo = info
+            if self.videoInfo?.aid != info.aid || self.loadedID != id {
+                self.videoInfo = info
+            }
             metadataAccountSession = accountSession
             let fetchedAt = metadata.fetchedAt
             StartupTrace.mark(metadata.readyMark, token: traceToken)
@@ -402,7 +465,7 @@ final class VideoDetailViewModel {
             let initialCid = Self.resolvedInitialCid(
                 info: info,
                 pendingReturn: pendingReturn,
-                preferredCid: preferredCid
+                preferredCid: preferredCid ?? cachedData?.cid
             )
             let initialPage = info.pages?.first(where: { $0.cid == initialCid })
             self.currentCid = initialCid
@@ -410,12 +473,16 @@ final class VideoDetailViewModel {
             comments = []
             commentPage = 1
             commentsHaveMore = true
-            commentsClosed = false
+            commentsClosed = cachedData?.previewComments?.commentsClosed ?? false
             commentsLoadedAid = nil
             PlayerViewModel.shared.setAmbientCoverURL(info.pic, ownerLease: lease)
 
             Task { await SponsorBlockManager.shared.load(videoID: info.bvid, cid: initialCid) }
-            let tagRequest = prepareTags(aid: info.aid, cid: initialCid) { [weak self] in
+            let tagRequest = prepareTags(
+                aid: info.aid,
+                cid: initialCid,
+                retainsDisplay: cachedData != nil
+            ) { [weak self] in
                 guard let self else { return false }
                 return self.ownsCurrentLoad(request, lease: lease)
                     && self.partAdmission.admits(initialPartBaseline)
@@ -677,6 +744,9 @@ final class VideoDetailViewModel {
         let response = await fetchCommentResponse(initial)
         guard !Task.isCancelled, ownsCurrentLoad(request, lease: lease) else { return }
         succeeded = consumeCommentResponse(response, for: initial)
+        if succeeded || commentsClosed {
+            cachedPreviewComments = nil
+        }
     }
 
     // MARK: - Multi-P parts
@@ -1033,18 +1103,24 @@ final class VideoDetailViewModel {
                   request.map({ loadAdmission.admits($0) }) ?? true,
                   lease.map(PlayerViewModel.shared.isCurrentOwner) ?? true
             else { return }
-            isFollowingUp = relation?.isFollowing
+            let nextFollowing = relation?.isFollowing
+            if isFollowingUp != nextFollowing {
+                isFollowingUp = nextFollowing
+            }
         }
 
-        isLiked = likedValue == 1
-        coinCount = coinValue
-        isFavorited = favoriteValue
-        defaultFolderId = folderValue
-        isInWatchLater = watchLaterValue?.list?.contains { $0.aid == aid } ?? false
+        let nextLiked = likedValue == 1
+        let nextWatchLater = watchLaterValue?.list?.contains { $0.aid == aid } ?? false
+        if isLiked != nextLiked { isLiked = nextLiked }
+        if coinCount != coinValue { coinCount = coinValue }
+        if isFavorited != favoriteValue { isFavorited = favoriteValue }
+        if defaultFolderId != folderValue { defaultFolderId = folderValue }
+        if isInWatchLater != nextWatchLater { isInWatchLater = nextWatchLater }
         if let request {
             interactionStateReceipt = InteractionStateReceipt(
                 dataRequest: request, aid: aid, accountSession: accountSession
             )
+            cacheCompletedScreenData()
         }
     }
 

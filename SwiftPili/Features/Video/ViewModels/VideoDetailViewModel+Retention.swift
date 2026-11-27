@@ -182,9 +182,13 @@ extension VideoDetailViewModel {
               case .load(let resumeAt) = resumeLookup.loadDecision() else { return false }
         StartupTrace.mark("resume-point-ready", token: request.traceToken)
         player.setAmbientCoverURL(info.pic, ownerLease: lease)
+        let resolvedAspectRatioHint = page?.dimension?.effectiveAspectRatio
+            ?? info.dimension?.effectiveAspectRatio
+            ?? initialAspectRatioHint
         await player.loadVOD(
             aid: data.aid, cid: data.cid, bvid: info.bvid, resumeAt: resumeAt,
             portraitHint: page?.dimension?.isPortrait ?? info.dimension?.isPortrait,
+            aspectRatioHint: resolvedAspectRatioHint,
             owner: owner, ownerLease: lease, startupTraceToken: request.traceToken,
             requestAdmission: { [weak self] in self?.ownsRetainedPlayback(request) == true }
         )
@@ -254,8 +258,13 @@ extension VideoDetailViewModel {
 
     func initialScreenDataCandidate(for id: VideoID) -> VideoDetailScreenDataSnapshot? {
         guard VideoDetailReactivationPolicy.retainsScreenData,
-              videoInfo == nil, currentCommentSource == nil,
+              currentCommentSource == nil,
               error == nil, unavailability == nil else { return nil }
+        if let prehydrated = prehydratedScreenSnapshot, prehydrated.id == id {
+            prehydratedScreenSnapshot = nil
+            return prehydrated
+        }
+        guard videoInfo == nil else { return nil }
         return VideoDetailScreenDataCache.snapshot(for: id)
     }
 
@@ -290,9 +299,31 @@ extension VideoDetailViewModel {
         let tags = currentTagSource.flatMap { source in
             tagPublication.map { VideoDetailScreenDataSnapshot.Tags(cid: source.cid, values: $0.tags) }
         }
+        let previewComments: VideoDetailScreenDataSnapshot.PreviewComments? = if commentsClosed || !comments.isEmpty {
+            VideoDetailScreenDataSnapshot.PreviewComments(
+                items: Array(comments.prefix(2)),
+                total: max(commentTotal, info.stat.reply),
+                commentsClosed: commentsClosed
+            )
+        } else {
+            cachedPreviewComments
+        }
+        let interaction: VideoDetailScreenDataSnapshot.InteractionSnapshot? = if interactionStateReceipt?.aid == info.aid {
+            VideoDetailScreenDataSnapshot.InteractionSnapshot(
+                isFollowingUp: isFollowingUp,
+                isLiked: isLiked,
+                coinCount: coinCount,
+                isFavorited: isFavorited,
+                isInWatchLater: isInWatchLater,
+                defaultFolderId: defaultFolderId
+            )
+        } else {
+            nil
+        }
         VideoDetailScreenDataCache.store(.init(
             id: data.id, accountSession: data.accountSession, fetchedAt: data.fetchedAt,
-            info: info, related: relatedVideos, tags: tags
+            info: info, cid: data.cid, related: relatedVideos, tags: tags,
+            previewComments: previewComments, interaction: interaction
         ))
     }
 }

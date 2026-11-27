@@ -15,14 +15,32 @@ enum PlayerDetailSurfacePolicy {
 }
 
 struct PlayerDetailContainerMetrics: Equatable, Sendable {
+    @MainActor
+    private static var lastMeasuredSizeForWindow: (windowSize: CGSize, detailSize: CGSize)?
+
     var containerSize: CGSize
     var wideContainerHeight: CGFloat
     var isKeyboardDocked = false
 
     @MainActor
-    init(initialBounds: CGRect = WindowMetricsFallback.currentBounds) {
-        containerSize = initialBounds.size
-        wideContainerHeight = initialBounds.height
+    init(initialBounds: CGRect? = nil) {
+        if let explicitBounds = initialBounds {
+            containerSize = explicitBounds.size
+            wideContainerHeight = explicitBounds.height
+            return
+        }
+        let windowBounds = WindowMetricsFallback.currentBounds
+        if let cached = Self.lastMeasuredSizeForWindow,
+           abs(cached.windowSize.width - windowBounds.width) < 1,
+           abs(cached.windowSize.height - windowBounds.height) < 1,
+           cached.detailSize.width > 0,
+           cached.detailSize.height > 0 {
+            containerSize = cached.detailSize
+            wideContainerHeight = cached.detailSize.height
+        } else {
+            containerSize = windowBounds.size
+            wideContainerHeight = windowBounds.height
+        }
     }
 
     var containerWidth: CGFloat { containerSize.width }
@@ -59,6 +77,10 @@ struct PlayerDetailContainerMetrics: Equatable, Sendable {
         guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else { return }
         if containerSize != size {
             containerSize = size
+        }
+        let windowSize = WindowMetricsFallback.currentSize
+        if windowSize.width > 0, windowSize.height > 0 {
+            Self.lastMeasuredSizeForWindow = (windowSize: windowSize, detailSize: size)
         }
         let wide = DetailSplitPolicy.usesSplit(
             isRegularWidth: isRegularWidth,
