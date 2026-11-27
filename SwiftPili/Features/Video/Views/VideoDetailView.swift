@@ -603,9 +603,15 @@ struct VideoDetailView: View {
     }
 
     var body: some View {
+        let base = applyRouteAndImmersiveObservers(to: rootStageStack)
+        let observed = applyPlaybackAndQueueObservers(to: base)
+        return applySheetsAndAlerts(to: observed)
+    }
+
+    private var rootStageStack: some View {
         let inlineCornerRadius = showsWideChrome ? DetailStageLayout.playerCornerRadius : 0
         let isImmersiveStage = rendersFullBleedImmersiveStage
-        ZStack(alignment: .bottom) {
+        return ZStack(alignment: .bottom) {
             PlayerDetailGeometryProbes(
                 isWideLayout: isWideLayout,
                 restingHeight: containerMetrics.restingHeight,
@@ -631,38 +637,10 @@ struct VideoDetailView: View {
                 .accessibilityHidden(true)
             }
 
-            ZStack(alignment: .topLeading) {
-                if isWideLayout {
-                    wideContent(bottomInset: pagerBottomInset)
-                } else {
-                    compactContent()
-                        .padding(.top, AppWindowMetrics.safeAreaInsets.top)
-                        .opacity(isImmersiveStage ? 0 : 1)
-                        .allowsHitTesting(!isImmersiveStage)
-                        .accessibilityHidden(isImmersiveStage)
-                }
-
-                if isImmersiveStage {
-                    immersivePagingNeighbourPreviews
-                }
-
-                inlinePlayerSlot(cornerRadius: isImmersiveStage ? 0 : inlineCornerRadius)
-                    .padding(
-                        .top,
-                        (!isWideLayout && !isImmersiveStage) ? AppWindowMetrics.safeAreaInsets.top : 0
-                    )
-                    .modifier(PortraitDragOffset(box: immersiveDragOffsetBox))
-            }
-            .frame(
-                minWidth: 0,
-                maxWidth: .infinity,
-                maxHeight: isWideLayout ? nil : .infinity,
-                alignment: .topLeading
+            mainStageContentStack(
+                isImmersiveStage: isImmersiveStage,
+                inlineCornerRadius: inlineCornerRadius
             )
-            .animation(inlineAspectAnimation, value: effectiveInlineAspectRatioKey)
-            .animation(inlinePlayerHeightAnimation, value: inlineManualCondenseKey)
-            .ignoresSafeArea(.container, edges: isWideLayout ? [] : .all)
-            .ignoresSafeArea(.keyboard, edges: isImmersiveStage ? .all : .bottom)
 
             if !isWideLayout {
                 floatingPlaylistCapsuleOverlay
@@ -722,209 +700,278 @@ struct VideoDetailView: View {
                 )
             }
         }
-        .onChange(of: activeCompactHeightSnapshot, initial: true) { _, snapshot in
-            guard let snapshot else { return }
-            pageOffsetStore.lastActivePlayerVideoHeight = snapshot.playerHeight
-            pageOffsetStore.lastActiveExpandedVideoHeight = snapshot.expandedHeight
+    }
+
+    private func mainStageContentStack(
+        isImmersiveStage: Bool,
+        inlineCornerRadius: CGFloat
+    ) -> some View {
+        ZStack(alignment: .topLeading) {
+            if isWideLayout {
+                wideContent(bottomInset: pagerBottomInset)
+            } else {
+                compactContent()
+                    .padding(.top, AppWindowMetrics.safeAreaInsets.top)
+                    .opacity(isImmersiveStage ? 0 : 1)
+                    .allowsHitTesting(!isImmersiveStage)
+                    .accessibilityHidden(isImmersiveStage)
+            }
+
+            if isImmersiveStage {
+                immersivePagingNeighbourPreviews
+            }
+
+            inlinePlayerSlot(cornerRadius: isImmersiveStage ? 0 : inlineCornerRadius)
+                .padding(
+                    .top,
+                    (!isWideLayout && !isImmersiveStage) ? AppWindowMetrics.safeAreaInsets.top : 0
+                )
+                .modifier(PortraitDragOffset(box: immersiveDragOffsetBox))
         }
-        .onChange(of: isActiveVideoRoute, initial: true) { oldActive, active in
-            if active {
-                frozenDepartureImmersiveActive = nil
-                if lastActivePlayerVideoHeight != nil { lastActivePlayerVideoHeight = nil }
-                if lastActiveExpandedVideoHeight != nil { lastActiveExpandedVideoHeight = nil }
-                _ = claimPlayerLeaseIfNeeded()
-                ensureImmersiveFeedSessionInitialized()
-                installPlaylistSelectionHandlerIfNeeded()
+        .frame(
+            minWidth: 0,
+            maxWidth: .infinity,
+            maxHeight: isWideLayout ? nil : .infinity,
+            alignment: .topLeading
+        )
+        .animation(inlineAspectAnimation, value: effectiveInlineAspectRatioKey)
+        .animation(inlinePlayerHeightAnimation, value: inlineManualCondenseKey)
+        .ignoresSafeArea(.container, edges: isWideLayout ? [] : .all)
+        .ignoresSafeArea(.keyboard, edges: isImmersiveStage ? .all : .bottom)
+    }
+
+    private func applyRouteAndImmersiveObservers<Content: View>(to content: Content) -> some View {
+        content
+            .onChange(of: activeCompactHeightSnapshot, initial: true) { _, snapshot in
+                guard let snapshot else { return }
+                pageOffsetStore.lastActivePlayerVideoHeight = snapshot.playerHeight
+                pageOffsetStore.lastActiveExpandedVideoHeight = snapshot.expandedHeight
+            }
+            .onChange(of: isActiveVideoRoute, initial: true) { oldActive, active in
+                handleRouteActivationChange(oldActive: oldActive, active: active)
+            }
+            .onChange(of: showsInRoutePortraitImmersive) { _, active in
+                guard isActiveVideoRoute else { return }
+                syncInlinePortraitImmersiveBinding()
+                syncPortraitFullscreenContext()
+                if active {
+                    syncImmersiveFeedSessionForEntry()
+                    triggerImmersiveRefillIfNeeded(forceSmallPool: true)
+                } else {
+                    immersiveDragOffsetBox.y = 0
+                }
+            }
+            .onChange(of: portraitContextSyncFingerprint, initial: true) { _, fingerprint in
+                guard isActiveVideoRoute, fingerprint != nil else { return }
+                syncPortraitFullscreenContext()
+            }
+            .onChange(of: effectiveInlineAspectRatioKey) { _, _ in
+                guard isActiveVideoRoute else { return }
+                syncInlineScrollOffsetAfterAspectChange()
+                applyModeDPortraitFullscreenIfNeeded()
+            }
+            .onChange(of: viewModel.playerLease) { _, _ in
+                guard isActiveVideoRoute else { return }
                 syncInlinePortraitImmersiveBinding()
                 syncPortraitFullscreenContext()
                 applyModeDPortraitFullscreenIfNeeded()
-                if showsInRoutePortraitImmersive {
-                    triggerImmersiveRefillIfNeeded(forceSmallPool: true)
-                }
-            } else {
-                if oldActive, !isWideLayout {
-                    frozenDepartureImmersiveActive = isPortraitImmersiveStageActive
-                    lastActivePlayerVideoHeight = pageOffsetStore.lastActivePlayerVideoHeight
-                        ?? computedPlayerVideoHeight
-                    lastActiveExpandedVideoHeight = pageOffsetStore.lastActiveExpandedVideoHeight
-                        ?? computedExpandedInlineVideoHeight
-                }
-                downloadRequestSerial &+= 1
-                clearPlaylistSelectionHandlerIfOwned()
-                clearInlinePortraitImmersiveBindingIfOwned()
-                clearPortraitFullscreenContextIfOwned()
-                if oldActive {
-                    viewModel.revokeLoadForRouteDeparture()
-                    player.pauseForRouteDeparture(lease: viewModel.playerLease)
-                }
-                coordinator.cancelVideoNavigation(routeVideoID)
             }
-        }
-        .onChange(of: showsInRoutePortraitImmersive) { _, active in
-            guard isActiveVideoRoute else { return }
-            syncInlinePortraitImmersiveBinding()
-            syncPortraitFullscreenContext()
-            if active {
-                syncImmersiveFeedSessionForEntry()
-                triggerImmersiveRefillIfNeeded(forceSmallPool: true)
-            } else {
-                immersiveDragOffsetBox.y = 0
+    }
+
+    private func applyPlaybackAndQueueObservers<Content: View>(to content: Content) -> some View {
+        let firstGroup = content
+            .onChange(of: player.currentURL) { _, _ in
+                guard isActiveVideoRoute else { return }
+                applyModeDPortraitFullscreenIfNeeded()
             }
-        }
-        .onChange(of: portraitContextSyncFingerprint, initial: true) { _, fingerprint in
-            guard isActiveVideoRoute, fingerprint != nil else { return }
-            syncPortraitFullscreenContext()
-        }
-        .onChange(of: effectiveInlineAspectRatioKey) { _, _ in
-            guard isActiveVideoRoute else { return }
-            syncInlineScrollOffsetAfterAspectChange()
-            applyModeDPortraitFullscreenIfNeeded()
-        }
-        .onChange(of: viewModel.playerLease) { _, _ in
-            guard isActiveVideoRoute else { return }
-            syncInlinePortraitImmersiveBinding()
-            syncPortraitFullscreenContext()
-            applyModeDPortraitFullscreenIfNeeded()
-        }
-        .onChange(of: player.currentURL) { _, _ in
-            guard isActiveVideoRoute else { return }
-            applyModeDPortraitFullscreenIfNeeded()
-        }
-        .onChange(of: player.hasRenderedFirstFrame) { _, _ in
-            guard isActiveVideoRoute else { return }
-            applyModeDPortraitFullscreenIfNeeded()
-        }
-        .onChange(of: videoID) { _, _ in
-            inlineScrollOffset = 0
-            userCollapsedImmersiveVideoID = nil
-        }
-        .onChange(of: viewModel.relatedVideos.map(\.bvid)) { _, _ in
-            guard isActiveVideoRoute else { return }
+            .onChange(of: player.hasRenderedFirstFrame) { _, _ in
+                guard isActiveVideoRoute else { return }
+                applyModeDPortraitFullscreenIfNeeded()
+            }
+            .onChange(of: videoID) { _, _ in
+                inlineScrollOffset = 0
+                userCollapsedImmersiveVideoID = nil
+            }
+            .onChange(of: viewModel.relatedVideos.map(\.bvid)) { _, _ in
+                guard isActiveVideoRoute else { return }
+                ensureImmersiveFeedSessionInitialized()
+                immersiveFeedSession.ingestRelatedVideos(viewModel.relatedVideos)
+                prewarmAdjacentImmersiveCovers()
+            }
+            .tint(Color.primary)
+            .task(id: isActiveVideoRoute) { await activateIfNeeded(settlesNavigationAdmission: true) }
+            .task(id: isActiveVideoRoute) {
+                await settleRouteTransitionIfNeeded()
+            }
+
+        return firstGroup
+            .onChange(of: coordinator.pendingCommentNavigation?.sequence) { _, _ in
+                Task { await handlePendingCommentNavigationIfNeeded() }
+            }
+            .onChange(of: player.isFullscreen) { wasFullscreen, isFullscreen in
+                guard wasFullscreen, !isFullscreen, isActiveVideoRoute else { return }
+                syncVideoDetailAfterExternalPlaylistSwitch()
+            }
+            .onChange(of: player.playbackQueue) { _, _ in
+                handlePlaybackQueueChange()
+            }
+            .onChange(of: viewModel.currentCid) { oldCid, newCid in
+                guard let oldCid, let newCid, oldCid != newCid else { return }
+                inlineScrollOffset = 0
+                detailScrollToTopTick &+= 1
+                syncPortraitFullscreenContext()
+                applyModeDPortraitFullscreenIfNeeded()
+            }
+            .onDisappear(perform: handleRootDisappear)
+            .onChange(of: player.fullscreenVODDanmakuSendFailure) { _, _ in
+                guard !player.isFullscreen,
+                      let message = player.takeFullscreenDanmakuFailure(ownerLease: viewModel.playerLease)
+                else { return }
+                viewModel.showToast(message, style: .error)
+            }
+    }
+
+    private func applySheetsAndAlerts<Content: View>(to content: Content) -> some View {
+        content
+            .modifier(VideoDetailErrorAlertObserver(model: viewModel))
+            .imagePreview(item: $previewImages)
+            .sheet(item: $activeSheet, content: detailSheetView)
+            .modifier(CommentSourceChange(model: viewModel) { source in
+                composer.collapseImmediatelyIfSourceCleared(source)
+                if let showThread,
+                   showThread.type != 1
+                    || showThread.oid != source?.aid
+                    || composer.replyCommentSource != source {
+                    commentPresentation.cancelPendingAction()
+                    replyPresentation.cancelPendingAction()
+                    replyPresentation.isPresented = false
+                    self.showThread = nil
+                    composer.replyCommentSource = nil
+                    replyPresentation.anchors.sourceProvider = nil
+                }
+            })
+    }
+
+    private func handleRouteActivationChange(oldActive: Bool, active: Bool) {
+        if active {
+            frozenDepartureImmersiveActive = nil
+            if lastActivePlayerVideoHeight != nil { lastActivePlayerVideoHeight = nil }
+            if lastActiveExpandedVideoHeight != nil { lastActiveExpandedVideoHeight = nil }
+            _ = claimPlayerLeaseIfNeeded()
             ensureImmersiveFeedSessionInitialized()
-            immersiveFeedSession.ingestRelatedVideos(viewModel.relatedVideos)
-            prewarmAdjacentImmersiveCovers()
-        }
-        .tint(Color.primary)
-        .task(id: isActiveVideoRoute) { await activateIfNeeded(settlesNavigationAdmission: true) }
-        .task(id: isActiveVideoRoute) {
-            guard isActiveVideoRoute, !isRouteTransitionSettled else { return }
-            if motion.reducesGeometry {
-                isRouteTransitionSettled = true
-                return
-            }
-            try? await Task.sleep(for: .milliseconds(280))
-            guard !Task.isCancelled, isActiveVideoRoute else { return }
-            isRouteTransitionSettled = true
-        }
-        .onChange(of: coordinator.pendingCommentNavigation?.sequence) { _, _ in
-            Task { await handlePendingCommentNavigationIfNeeded() }
-        }
-        .onChange(of: player.isFullscreen) { wasFullscreen, isFullscreen in
-            guard wasFullscreen, !isFullscreen, isActiveVideoRoute else { return }
-            syncVideoDetailAfterExternalPlaylistSwitch()
-        }
-        .onChange(of: player.playbackQueue) { _, _ in
-            if player.activePlaylistQueue != nil {
-                installPlaylistSelectionHandlerIfNeeded()
-            } else if case .playlist = activeSheet {
-                activeSheet = nil
-            }
-            guard isActiveVideoRoute else { return }
-            immersiveFeedSession.syncPlaybackQueue(player.activePlaylistQueue)
-            syncImmersiveViewportReducerMetrics()
-            prewarmAdjacentImmersiveCovers()
-        }
-        .onChange(of: viewModel.currentCid) { oldCid, newCid in
-            guard let oldCid, let newCid, oldCid != newCid else { return }
-            inlineScrollOffset = 0
-            detailScrollToTopTick &+= 1
+            installPlaylistSelectionHandlerIfNeeded()
+            syncInlinePortraitImmersiveBinding()
             syncPortraitFullscreenContext()
             applyModeDPortraitFullscreenIfNeeded()
-        }
-        .onDisappear {
+            if showsInRoutePortraitImmersive {
+                triggerImmersiveRefillIfNeeded(forceSmallPool: true)
+            }
+        } else {
+            if oldActive, !isWideLayout {
+                frozenDepartureImmersiveActive = isPortraitImmersiveStageActive
+                lastActivePlayerVideoHeight = pageOffsetStore.lastActivePlayerVideoHeight
+                    ?? computedPlayerVideoHeight
+                lastActiveExpandedVideoHeight = pageOffsetStore.lastActiveExpandedVideoHeight
+                    ?? computedExpandedInlineVideoHeight
+            }
             downloadRequestSerial &+= 1
             clearPlaylistSelectionHandlerIfOwned()
-            if case .download = activeSheet { activeSheet = nil }
-            if case .batchDownload = activeSheet { activeSheet = nil }
-            if case .playlist = activeSheet { activeSheet = nil }
-            if case .share = activeSheet { activeSheet = nil }
-            if scenePhase == .active, !isActiveVideoRoute {
-                coordinator.cancelVideoNavigation(routeVideoID)
-            }
-            guard scenePhase == .active else {
-                PlayerLog.log("[Detail] playback release deferred scenePhase=\(scenePhase)")
-                return
-            }
             clearInlinePortraitImmersiveBindingIfOwned()
             clearPortraitFullscreenContextIfOwned()
-            viewModel.releasePlayback()
+            if oldActive {
+                viewModel.revokeLoadForRouteDeparture()
+                player.pauseForRouteDeparture(lease: viewModel.playerLease)
+            }
+            coordinator.cancelVideoNavigation(routeVideoID)
         }
-        .onChange(of: player.fullscreenVODDanmakuSendFailure) { _, _ in
-            guard !player.isFullscreen,
-                  let message = player.takeFullscreenDanmakuFailure(ownerLease: viewModel.playerLease)
-            else { return }
-            viewModel.showToast(message, style: .error)
+    }
+
+    private func settleRouteTransitionIfNeeded() async {
+        guard isActiveVideoRoute, !isRouteTransitionSettled else { return }
+        if motion.reducesGeometry {
+            isRouteTransitionSettled = true
+            return
         }
-        .modifier(VideoDetailErrorAlertObserver(model: viewModel))
-        .imagePreview(item: $previewImages)
-        .sheet(item: $activeSheet) { sheet in
-            switch sheet {
-            case .report(let aid):
-                VideoReportSheet(aid: aid)
-            case .favorite:
-                FavoriteFolderSheet(
-                    folders: viewModel.favFolders,
-                    selection: Set(viewModel.favFolders.filter(\.containsVideo).map(\.id))
-                ) { selected in
-                    Task {
-                        favoriteRequestInFlight = true
-                        await viewModel.applyFavorite(selectedIds: selected)
-                        favoriteRequestInFlight = false
-                    }
-                }
-            case .music(let destination):
-                MusicDetailSheet(destination: destination) { activeSheet = nil }
-            case .download(let presentation):
-                DownloadQualitySheet(qualities: presentation.qualities) { quality in
-                    activeSheet = nil
-                    startDownload(presentation.info, cid: presentation.cid, quality: quality)
-                }
-                .appAdaptiveSheet(compactDetents: [.medium], padSizing: .form)
-            case .batchDownload(let presentation):
-                BatchEpisodeDownloadSheet(
-                    title: presentation.title,
-                    items: presentation.items,
-                    qualities: presentation.qualities,
-                    initialSelectedID: presentation.initialSelectedID
-                ) { count in
-                    viewModel.showToast(
-                        String(format: String(localized: "Added %lld downloads"), count),
-                        style: .progress
-                    )
-                }
-            case .playlist:
-                PlayerPlaylistDrawerSheet(player: player)
-            case .share(let payload):
-                VideoShareStudioSheet(payload: payload) {
-                    await viewModel.shareVideo()
-                    syncPortraitFullscreenContext()
+        try? await Task.sleep(for: .milliseconds(280))
+        guard !Task.isCancelled, isActiveVideoRoute else { return }
+        isRouteTransitionSettled = true
+    }
+
+    private func handlePlaybackQueueChange() {
+        if player.activePlaylistQueue != nil {
+            installPlaylistSelectionHandlerIfNeeded()
+        } else if case .playlist = activeSheet {
+            activeSheet = nil
+        }
+        guard isActiveVideoRoute else { return }
+        immersiveFeedSession.syncPlaybackQueue(player.activePlaylistQueue)
+        syncImmersiveViewportReducerMetrics()
+        prewarmAdjacentImmersiveCovers()
+    }
+
+    private func handleRootDisappear() {
+        downloadRequestSerial &+= 1
+        clearPlaylistSelectionHandlerIfOwned()
+        if case .download = activeSheet { activeSheet = nil }
+        if case .batchDownload = activeSheet { activeSheet = nil }
+        if case .playlist = activeSheet { activeSheet = nil }
+        if case .share = activeSheet { activeSheet = nil }
+        if scenePhase == .active, !isActiveVideoRoute {
+            coordinator.cancelVideoNavigation(routeVideoID)
+        }
+        guard scenePhase == .active else {
+            PlayerLog.log("[Detail] playback release deferred scenePhase=\(scenePhase)")
+            return
+        }
+        clearInlinePortraitImmersiveBindingIfOwned()
+        clearPortraitFullscreenContextIfOwned()
+        viewModel.releasePlayback()
+    }
+
+    @ViewBuilder
+    private func detailSheetView(_ sheet: DetailSheet) -> some View {
+        switch sheet {
+        case .report(let aid):
+            VideoReportSheet(aid: aid)
+        case .favorite:
+            FavoriteFolderSheet(
+                folders: viewModel.favFolders,
+                selection: Set(viewModel.favFolders.filter(\.containsVideo).map(\.id))
+            ) { selected in
+                Task {
+                    favoriteRequestInFlight = true
+                    await viewModel.applyFavorite(selectedIds: selected)
+                    favoriteRequestInFlight = false
                 }
             }
-        }
-        .modifier(CommentSourceChange(model: viewModel) { source in
-            composer.collapseImmediatelyIfSourceCleared(source)
-            if let showThread,
-               showThread.type != 1
-                || showThread.oid != source?.aid
-                || composer.replyCommentSource != source {
-                commentPresentation.cancelPendingAction()
-                replyPresentation.cancelPendingAction()
-                replyPresentation.isPresented = false
-                self.showThread = nil
-                composer.replyCommentSource = nil
-                replyPresentation.anchors.sourceProvider = nil
+        case .music(let destination):
+            MusicDetailSheet(destination: destination) { activeSheet = nil }
+        case .download(let presentation):
+            DownloadQualitySheet(qualities: presentation.qualities) { quality in
+                activeSheet = nil
+                startDownload(presentation.info, cid: presentation.cid, quality: quality)
             }
-        })
+            .appAdaptiveSheet(compactDetents: [.medium], padSizing: .form)
+        case .batchDownload(let presentation):
+            BatchEpisodeDownloadSheet(
+                title: presentation.title,
+                items: presentation.items,
+                qualities: presentation.qualities,
+                initialSelectedID: presentation.initialSelectedID
+            ) { count in
+                viewModel.showToast(
+                    String(format: String(localized: "Added %lld downloads"), count),
+                    style: .progress
+                )
+            }
+        case .playlist:
+            PlayerPlaylistDrawerSheet(player: player)
+        case .share(let payload):
+            VideoShareStudioSheet(payload: payload) {
+                await viewModel.shareVideo()
+                syncPortraitFullscreenContext()
+            }
+        }
     }
 
     private var endedPlayerRecommendations: [PlayerEndedRecommendation] {
