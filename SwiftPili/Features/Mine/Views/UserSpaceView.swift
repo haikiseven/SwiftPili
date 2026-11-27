@@ -239,7 +239,14 @@ struct UserSpaceFeedTrigger: Equatable {
                 let pic = item.pic ?? "", owner = item.owner?.name ?? ""
                 let title = item.title ?? "", secs = item.duration ?? 0
                 let target = VideoRouteTarget.make(
-                    bvid: item.bvid, aid: item.aid, title: title, coverURL: pic, ownerName: owner, durationSeconds: secs
+                    bvid: item.bvid,
+                    aid: item.aid,
+                    title: title,
+                    coverURL: pic,
+                    ownerName: owner,
+                    durationSeconds: secs,
+                    isPortraitHint: item.dimension?.isPortrait,
+                    aspectRatioHint: item.dimension?.effectiveAspectRatio
                 )
                 add("\(prefix):\(item.aid)", title: title, sources: VideoCoverSources(widescreen: pic),
                     duration: secs, owner: owner, views: item.stat?.view ?? 0, action: .video(target))

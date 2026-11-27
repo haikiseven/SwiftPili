@@ -173,12 +173,33 @@ struct VideoDetailView: View {
         self.target = target
         _routePosition = State(initialValue: routePosition)
         _screenOwner = State(initialValue: "vod-detail-\(UUID().uuidString)")
+        let cachedSnapshot = VideoDetailReactivationPolicy.retainsScreenData
+            ? VideoDetailScreenDataCache.snapshot(for: target.videoID)
+            : nil
+        let cachedPage: VideoInfo.VideoPage? = cachedSnapshot.flatMap { snap in
+            let cid = snap.cid ?? snap.info.cid
+            return snap.info.pages?.first(where: { $0.cid == cid })
+        }
+        let resolvedInitialAspect = cachedPage?.dimension?.effectiveAspectRatio
+            ?? cachedSnapshot?.info.dimension?.effectiveAspectRatio
+            ?? target.preview.aspectRatioHint
+        let resolvedInitialPortrait = cachedPage?.dimension?.isPortrait
+            ?? cachedSnapshot?.info.dimension?.isPortrait
+            ?? target.preview.isPortraitHint
+            ?? false
+        _viewModel = State(
+            initialValue: VideoDetailViewModel(
+                prehydratedSnapshot: cachedSnapshot,
+                initialAspectRatioHint: resolvedInitialAspect
+            )
+        )
+        _isRouteTransitionSettled = State(initialValue: cachedSnapshot != nil)
         let initialImmersive = PortraitImmersiveStagePolicy.shouldEnterOnInitialOpen(
             mode: PlayerPlaybackPreferences.portraitVideoMode,
             isWideLayout: false,
             usesCompactFraming: DeviceCapability.usesCompactPortraitVideoFraming,
-            aspectRatio: target.preview.aspectRatioHint,
-            isPortraitFallback: target.preview.isPortraitHint ?? false
+            aspectRatio: resolvedInitialAspect,
+            isPortraitFallback: resolvedInitialPortrait
         )
         _isPortraitImmersiveStageActive = State(initialValue: initialImmersive)
     }
@@ -512,10 +533,16 @@ struct VideoDetailView: View {
     }
 
     private var placeholderCoverURL: String? {
+        let prefersPortraitVariant = showsInRoutePortraitImmersive || resolvedPortraitHint
+        if prefersPortraitVariant,
+           let mobile = activeTarget.preview.coverSource.mobileVariantURL,
+           !mobile.isEmpty {
+            return mobile
+        }
         if viewModel.matchesLoadedVideo(videoID), let pic = viewModel.videoInfo?.pic, !pic.isEmpty {
             return pic
         }
-        let preferredKind: PortraitPagingCoverSource.Kind = showsInRoutePortraitImmersive ? .mobileVariant : .desktop
+        let preferredKind: PortraitPagingCoverSource.Kind = prefersPortraitVariant ? .mobileVariant : .desktop
         let preview = activeTarget.preview.coverSource.url(preferring: preferredKind)
         if !preview.isEmpty { return preview }
         let desktopFallback = activeTarget.preview.coverSource.desktopURL
@@ -697,7 +724,8 @@ struct VideoDetailView: View {
                     coverURL: placeholderCoverURL,
                     player: player,
                     ownerLease: viewModel.playerLease,
-                    isRouteActive: isActiveVideoRoute
+                    isRouteActive: isActiveVideoRoute,
+                    inlinePlayerHeight: playerVideoHeight
                 )
             }
         }
@@ -868,6 +896,9 @@ struct VideoDetailView: View {
                 triggerImmersiveRefillIfNeeded(forceSmallPool: true)
             }
         } else {
+            if oldActive {
+                viewModel.cacheCompletedScreenData()
+            }
             if oldActive, !isWideLayout {
                 frozenDepartureImmersiveActive = isPortraitImmersiveStageActive
                 lastActivePlayerVideoHeight = pageOffsetStore.lastActivePlayerVideoHeight

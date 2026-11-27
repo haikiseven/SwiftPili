@@ -1980,4 +1980,104 @@ struct DynamicAspectAndPortraitModeTests {
         vm.setPlaybackQueue(queue)
         #expect(vm.shouldAutoLoopAtEndInPortraitStory == false)
     }
+
+    @Test("VideoDetailViewModel synchronously prehydrates full snapshot on Frame 0 and decodes list dimension hints")
+    @MainActor
+    func videoDetailSynchronousCachePrehydrationAndDimensionDecoding() throws {
+        let sessionID = AuthManager.shared.sessionGeneration
+        let targetID: VideoID = .bvid("BV1prehydrate01")
+        defer {
+            VideoDetailScreenDataCache.remove(id: targetID, accountSession: sessionID)
+        }
+
+        let infoJSON = """
+        {
+          "bvid": "BV1prehydrate01",
+          "aid": 8801,
+          "videos": 2,
+          "tid": 1,
+          "tname": "Short",
+          "copyright": 1,
+          "pic": "https://example.com/16x9.jpg",
+          "title": "Prehydrated Portrait Video",
+          "pubdate": 1700000000,
+          "ctime": 1700000000,
+          "desc": "Cached description",
+          "state": 0,
+          "duration": 42,
+          "owner": { "mid": 7788, "name": "Creator", "face": "https://example.com/face.jpg" },
+          "stat": {
+            "aid": 8801, "view": 1200, "danmaku": 15, "reply": 28,
+            "favorite": 60, "coin": 40, "share": 9, "now_rank": 0,
+            "his_rank": 0, "like": 200, "dislike": 0
+          },
+          "cid": 9901,
+          "dimension": { "width": 1080, "height": 1920, "rotate": 0 },
+          "pages": [
+            { "cid": 9901, "page": 1, "from": "vupload", "part": "P1", "duration": 20, "dimension": { "width": 1080, "height": 1920, "rotate": 0 } },
+            { "cid": 9902, "page": 2, "from": "vupload", "part": "P2", "duration": 22, "dimension": { "width": 1080, "height": 1920, "rotate": 0 } }
+          ]
+        }
+        """
+        let info = try JSONDecoder().decode(VideoInfo.self, from: Data(infoJSON.utf8))
+        let relatedCard = Self.makeVideoCard(
+            aid: 8802,
+            bvid: "BV1relatedPort2",
+            title: "Related Portrait",
+            dimension: .init(width: 1080, height: 1920, rotate: 0)
+        )
+        let snapshot = VideoDetailScreenDataSnapshot(
+            id: targetID,
+            accountSession: sessionID,
+            fetchedAt: .now,
+            info: info,
+            cid: 9902,
+            related: [relatedCard],
+            tags: .init(cid: 9902, values: []),
+            previewComments: .init(items: [], total: 28, commentsClosed: false),
+            interaction: .init(
+                isFollowingUp: true,
+                isLiked: true,
+                coinCount: 2,
+                isFavorited: true,
+                isInWatchLater: false,
+                defaultFolderId: 123
+            )
+        )
+        VideoDetailScreenDataCache.store(snapshot)
+
+        let cached = VideoDetailScreenDataCache.snapshot(for: targetID)
+        #expect(cached != nil)
+
+        let detailVM = VideoDetailViewModel(
+            prehydratedSnapshot: cached,
+            initialAspectRatioHint: cached?.info.dimension?.effectiveAspectRatio
+        )
+        #expect(detailVM.matchesLoadedVideo(targetID) == true)
+        #expect(detailVM.currentCid == 9902)
+        #expect(detailVM.relatedVideos.count == 1)
+        #expect(detailVM.commentTotal == 28)
+        #expect(detailVM.isFollowingUp == true)
+        #expect(detailVM.isLiked == true)
+        #expect(detailVM.coinCount == 2)
+        #expect(detailVM.isFavorited == true)
+        #expect(detailVM.initialScreenDataCandidate(for: targetID)?.id == targetID)
+
+        let watchLaterJSON = """
+        {
+          "aid": 5501,
+          "bvid": "BV1wlPortrait",
+          "title": "Watch Later Portrait",
+          "pic": "https://example.com/wl.jpg",
+          "duration": 35,
+          "dimension": { "width": 1080, "height": 1920, "rotate": 0 }
+        }
+        """
+        let wlItem = try JSONDecoder().decode(
+            WatchLaterResult.WatchLaterItem.self,
+            from: Data(watchLaterJSON.utf8)
+        )
+        #expect(wlItem.dimension?.isPortrait == true)
+        #expect(Self.approxEqual(wlItem.dimension?.effectiveAspectRatio ?? 0, 9.0 / 16.0))
+    }
 }

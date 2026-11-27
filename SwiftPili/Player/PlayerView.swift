@@ -1635,18 +1635,24 @@ private struct PlayerFirstFrameCoverOverlay: View {
     @State private var delayedSpinnerVisible = false
 
     private static func quantizedBudget(for size: CGSize) -> CGSize {
-        let quantum: CGFloat = 128
+        let quantum = PortraitPagingReducer.coverBoxQuantum
         return CGSize(
             width: (size.width / quantum).rounded(.up) * quantum,
             height: (size.height / quantum).rounded(.up) * quantum
         )
     }
 
+    private var usesAmbientPortraitLayers: Bool {
+        if isPortraitImmersive { return true }
+        guard let size = viewportSize, size.width > 1, size.height > 1 else { return false }
+        return size.height > size.width * 1.05
+    }
+
     var body: some View {
         ZStack {
             Color.black
             if let coverURL, !coverURL.isEmpty {
-                if isPortraitImmersive,
+                if usesAmbientPortraitLayers,
                    let pageSize = viewportSize,
                    pageSize.width > 1,
                    pageSize.height > 1 {
@@ -1655,6 +1661,9 @@ private struct PlayerFirstFrameCoverOverlay: View {
                         pageSize: pageSize,
                         resolutionBudget: Self.quantizedBudget(for: pageSize)
                     )
+                    if !isPortraitImmersive {
+                        Color.black.opacity(0.12)
+                    }
                 } else {
                     CoverImage(
                         urlString: coverURL,

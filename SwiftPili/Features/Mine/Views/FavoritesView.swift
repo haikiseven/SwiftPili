@@ -10,7 +10,9 @@ func favoriteRouteTarget(
         title: item.title,
         coverURL: item.cover ?? "",
         ownerName: item.upper?.name ?? "",
-        durationSeconds: item.duration ?? 0
+        durationSeconds: item.duration ?? 0,
+        isPortraitHint: item.dimension?.isPortrait,
+        aspectRatioHint: item.dimension?.effectiveAspectRatio
     )
 }
 

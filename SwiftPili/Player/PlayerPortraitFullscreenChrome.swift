@@ -240,6 +240,13 @@ struct PlayerPortraitFullscreenChrome: View {
                             isDraggingBar: $isDraggingHairlineBar
                         )
                         .padding(.horizontal, PlayerPortraitChromePolicy.seekBarHorizontalInset)
+                        .transition(.opacity)
+                    } else if player.mode.isSeekable {
+                        Color.clear
+                            .frame(height: 24)
+                            .padding(.horizontal, PlayerPortraitChromePolicy.seekBarHorizontalInset)
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
                     }
 
                     bottomDanmakuDock

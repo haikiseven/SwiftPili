@@ -5,6 +5,7 @@ struct CinematicBackdrop: View {
     var player: PlayerViewModel?
     var ownerLease: PlayerOwnerLease?
     var isRouteActive = false
+    var inlinePlayerHeight: CGFloat? = nil
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -136,8 +137,9 @@ struct CinematicBackdrop: View {
             )
         }
         if size.height > size.width {
-            let playerHeight = size.width * 9.0 / 16.0
-            let bleedBelow = min(136, max(108, playerHeight * 0.54))
+            let candidateHeight = (inlinePlayerHeight ?? 0).isFinite ? (inlinePlayerHeight ?? 0) : 0
+            let playerHeight = min(size.height * 0.78, max(size.width * 9.0 / 16.0, candidateHeight))
+            let bleedBelow = min(136, max(108, playerHeight * 0.36))
             let totalHeight = min(size.height, safeTop + playerHeight + bleedBelow)
             let topFrac = min(0.24, max(0.08, safeTop / totalHeight))
             let bottomFrac = min(0.76, max(topFrac + 0.28, (safeTop + playerHeight) / totalHeight))

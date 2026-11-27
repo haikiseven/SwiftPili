@@ -1551,6 +1551,7 @@ struct WatchLaterResult: Decodable, Sendable {
         let title: String
         let pic: String
         let duration: Int?
+        let dimension: VideoInfo.Dimension?
         let owner: VideoInfo.VideoOwner?
         let stat: VideoInfo.VideoStat?
         let progress: Int?
@@ -1640,6 +1641,7 @@ struct FavoriteContentResult: Decodable, Sendable {
         let intro: String?
         let page: Int?
         let duration: Int?
+        let dimension: VideoInfo.Dimension?
         let upper: Upper?
         let cntInfo: CntInfo?
         let bvid: String?
@@ -1665,7 +1667,7 @@ struct FavoriteContentResult: Decodable, Sendable {
         }
 
         enum CodingKeys: String, CodingKey {
-            case id, type, attr, title, cover, intro, page, duration, upper, bvid
+            case id, type, attr, title, cover, intro, page, duration, dimension, upper, bvid
             case cntInfo = "cnt_info"
         }
     }
@@ -4739,6 +4741,7 @@ struct SpaceArchive: Decodable, Sendable, Identifiable {
     let title: String?
     let pic: String?
     let duration: Int?
+    let dimension: VideoInfo.Dimension?
     let owner: Owner?
     let stat: Stat?
 

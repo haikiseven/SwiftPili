@@ -336,7 +336,9 @@ struct WatchLaterListView: View {
             title: item.title,
             coverURL: item.pic,
             ownerName: item.owner?.name ?? "",
-            durationSeconds: item.duration ?? 0
+            durationSeconds: item.duration ?? 0,
+            isPortraitHint: item.dimension?.isPortrait,
+            aspectRatioHint: item.dimension?.effectiveAspectRatio
         )
     }
 }
