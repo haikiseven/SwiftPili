@@ -691,6 +691,7 @@ struct DynamicAspectAndPortraitModeTests {
     // MARK: - Stage 2 Integration: Chrome & Subtitle Overlay Policies
 
     @Test("PlayerPortraitChromePolicy handles Pure View guards, interaction opacity, and burst clamping")
+    @MainActor
     func portraitChromeHelperPolicies() {
         #expect(PlayerPortraitChromePolicy.isPureViewActive(
             pureViewEnabled: true,

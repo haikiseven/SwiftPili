@@ -2481,10 +2481,14 @@ struct PlayerArchitectureTests {
             #expect(brightOut > 209, "Expected RCAS bright-edge boost > 209, got \(brightOut)")
 
             // Verify tapStep=2 rcasToNV12 matches rcasSharpen on those edge pixels.
-            let yScale = 219.0 / 255.0
-            let yOffset = 16.0 / 255.0
-            let expectedDarkY = Int((Double(darkOut) / 255.0 * yScale + yOffset) * 255.0 + 0.5)
-            let expectedBrightY = Int((Double(brightOut) / 255.0 * yScale + yOffset) * 255.0 + 0.5)
+            let yScale: Double = 219.0 / 255.0
+            let yOffset: Double = 16.0 / 255.0
+            let darkNormalized: Double = Double(darkOut) / 255.0
+            let brightNormalized: Double = Double(brightOut) / 255.0
+            let darkLuma: Double = (darkNormalized * yScale + yOffset) * 255.0 + 0.5
+            let brightLuma: Double = (brightNormalized * yScale + yOffset) * 255.0 + 0.5
+            let expectedDarkY = Int(darkLuma)
+            let expectedBrightY = Int(brightLuma)
             #expect(abs(Int(ySharpBase[row * ySharpStride + darkEdgeCol]) - expectedDarkY) <= 1)
             #expect(abs(Int(ySharpBase[row * ySharpStride + brightEdgeCol]) - expectedBrightY) <= 1)
 
