@@ -558,37 +558,7 @@ struct PlayerView: View {
             .allowsHitTesting(!isPlaybackUnavailable && !isPlaybackEnded)
             .zIndex(0)
 
-            if let error = ownerPlaybackError {
-                PlayerPlaybackErrorOverlay(
-                    message: error,
-                    unavailability: vm.unavailability,
-                    isFullscreen: isImmersiveStagePresentation,
-                    chromeInsets: chromeInsets,
-                    onRetry: { vm.retryPlayback() }
-                )
-                .zIndex(1)
-            }
-
-            ZStack {
-                if isPlaybackEnded {
-                    PlayerPlaybackEndedOverlay(
-                        isFullscreen: isImmersiveStagePresentation,
-                        isPortraitFullscreen: isPortraitImmersiveFullscreen,
-                        chromeInsets: chromeInsets,
-                        transportPlacement: transportPlacement,
-                        autoAdvance: vm.endedAutoAdvance,
-                        recommendations: resolvedEndedRecommendations,
-                        onReplay: { vm.play() },
-                        onNextEpisode: vm.endedNextEpisodeAction,
-                        onPlayAutoAdvanceNow: { vm.playEndedAutoAdvanceNow() },
-                        onCancelAutoAdvance: { vm.cancelEndedAutoAdvance() },
-                        onSelectRecommendation: resolvedOnSelectEndedRecommendation
-                    )
-                    .transition(.opacity)
-                }
-            }
-            .animation(controlAnimation, value: isPlaybackEnded)
-            .allowsHitTesting(isPlaybackEnded)
+            playbackStatusOverlays
             .zIndex(1)
 
             ZStack {
@@ -771,6 +741,44 @@ struct PlayerView: View {
                 style: .continuous
             )
         )
+    }
+
+    @ViewBuilder
+    private var playbackStatusOverlays: some View {
+        let allowsOverlayPaging = isPortraitImmersiveFullscreen && verticalPagingGestureSink != nil
+        if let error = ownerPlaybackError {
+            PlayerPlaybackErrorOverlay(
+                message: error,
+                unavailability: vm.unavailability,
+                isFullscreen: isImmersiveStagePresentation,
+                chromeInsets: chromeInsets,
+                onRetry: { vm.retryPlayback() }
+            )
+            .simultaneousGesture(portraitOverlayPagingGesture, isEnabled: allowsOverlayPaging)
+            .zIndex(1)
+        }
+
+        ZStack {
+            if isPlaybackEnded {
+                PlayerPlaybackEndedOverlay(
+                    isFullscreen: isImmersiveStagePresentation,
+                    isPortraitFullscreen: isPortraitImmersiveFullscreen,
+                    chromeInsets: chromeInsets,
+                    transportPlacement: transportPlacement,
+                    autoAdvance: vm.endedAutoAdvance,
+                    recommendations: resolvedEndedRecommendations,
+                    onReplay: { vm.play() },
+                    onNextEpisode: vm.endedNextEpisodeAction,
+                    onPlayAutoAdvanceNow: { vm.playEndedAutoAdvanceNow() },
+                    onCancelAutoAdvance: { vm.cancelEndedAutoAdvance() },
+                    onSelectRecommendation: resolvedOnSelectEndedRecommendation
+                )
+                .transition(.opacity)
+            }
+        }
+        .animation(controlAnimation, value: isPlaybackEnded)
+        .simultaneousGesture(portraitOverlayPagingGesture, isEnabled: allowsOverlayPaging && isPlaybackEnded)
+        .allowsHitTesting(isPlaybackEnded)
     }
 
     private func applyBottomOverlaysAndSheets<Content: View>(to content: Content) -> some View {
@@ -1239,6 +1247,72 @@ struct PlayerView: View {
             }
             .onEnded { _ in
                 pinchTransitionLatched = false
+            }
+    }
+
+    private var portraitOverlayPagingGesture: some Gesture {
+        DragGesture(minimumDistance: 12, coordinateSpace: .global)
+            .updating($isSurfacePressing) { _, pressing, _ in
+                pressing = true
+            }
+            .onChanged { gesture in
+                guard isOwner,
+                      surfaceLease != nil,
+                      isPortraitImmersiveFullscreen,
+                      let verticalPagingGestureSink,
+                      !pinchTransitionLatched else { return }
+                if surfaceTouchInFlight, gesture.startLocation != surfaceGlobalStartLocation {
+                    resetSurfaceTouch(reason: "stale overlay touch")
+                }
+                let dx = gesture.translation.width
+                let dy = gesture.translation.height
+                if !surfaceTouchInFlight {
+                    surfaceTouchInFlight = true
+                    surfaceGlobalStartLocation = gesture.startLocation
+                    surfaceStartLocation = CGPoint(
+                        x: gesture.startLocation.x - surfaceGlobalOrigin.x,
+                        y: gesture.startLocation.y - surfaceGlobalOrigin.y
+                    )
+                    surfaceDrag.reset()
+                    swipeSeekRejected = false
+                }
+                if swipeSeekRejected { return }
+                if verticalPagingActive {
+                    verticalPagingGestureSink.change(dy)
+                    return
+                }
+                if surfaceStartLocation.x <= Self.portraitBackEdgeRejectLimit,
+                   dx > 0, dx >= abs(dy) {
+                    swipeSeekRejected = true
+                    return
+                }
+                if abs(dy) > Self.portraitDismissEngageDistance,
+                   abs(dy) > abs(dx) * 1.15 {
+                    guard verticalPagingGestureSink.begin() else {
+                        swipeSeekRejected = true
+                        return
+                    }
+                    verticalPagingActive = true
+                    verticalPagingGestureSink.change(dy)
+                    PlayerLog.log("[PlayerGesture] portrait overlay vertical paging engaged")
+                } else if abs(dx) > Self.swipeEngageDistance,
+                          abs(dx) > abs(dy) * 1.2 {
+                    swipeSeekRejected = true
+                }
+            }
+            .onEnded { gesture in
+                defer {
+                    surfaceTouchInFlight = false
+                    swipeSeekRejected = false
+                    surfaceDrag.reset()
+                }
+                if verticalPagingActive {
+                    verticalPagingActive = false
+                    verticalPagingGestureSink?.end(
+                        gesture.translation.height,
+                        gesture.predictedEndTranslation.height
+                    )
+                }
             }
     }
 

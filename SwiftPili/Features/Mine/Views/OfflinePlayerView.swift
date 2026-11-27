@@ -461,7 +461,8 @@ struct OfflinePlayerView: View {
     private func completePagingSettlement(_ token: PortraitPagingToken) {
         let switched = PortraitPagingSettlementDispatcher.complete(
             token: token,
-            reducer: &pagingReducer,
+            getReducer: { pagingReducer },
+            setReducer: { pagingReducer = $0 },
             itemIDAtIndex: { index in
                 pagingContext.items.indices.contains(index)
                     ? pagingContext.items[index].downloadID

@@ -1849,4 +1849,135 @@ struct DynamicAspectAndPortraitModeTests {
         #expect(reducer.completeSettlement(token: settlement!.token) == nil)
         #expect(reducer.currentIndex == 0)
     }
+
+    @Test("Story paging settlement commits reducer before activate and avoids re-entrant @Observable exclusivity conflicts")
+    @MainActor
+    func storyPagingSettlementCommitsBeforeActivateWithoutExclusivityCrash() {
+        let session = PortraitImmersiveFeedSession()
+        let first = VideoRouteTarget.make(
+            bvid: "BV1storyPageA",
+            aid: 9101,
+            title: "First Story",
+            coverURL: "https://example.com/a.jpg",
+            ownerName: "Author A",
+            durationSeconds: 30,
+            isPortraitHint: true,
+            aspectRatioHint: 9.0 / 16.0
+        )!
+        session.reset(initialTarget: first)
+        session.ingestRelatedVideos([
+            Self.makeVideoCard(
+                aid: 9102,
+                bvid: "BV1storyPageB",
+                title: "Second Story",
+                dimension: .init(width: 1080, height: 1920, rotate: 0)
+            ),
+        ])
+        session.reducer.updateContainerHeight(844)
+        let dragBox = PortraitDragOffsetBox()
+
+        #expect(session.reducer.beginDrag() == true)
+        dragBox.y = session.reducer.dragOffset(for: -280)
+        var settling = session.reducer
+        let settlement = settling.endDrag(translation: -280, predictedEndTranslation: -520)
+        #expect(settlement?.kind == .switchPage(targetIndex: 1))
+        session.reducer = settling
+
+        var didReenterDuringReducerWillSet = false
+        withObservationTracking {
+            _ = session.reducer.currentIndex
+        } onChange: {
+            MainActor.assumeIsolated {
+                // Re-entrant read during PortraitImmersiveFeedSession.reducer setter willSet
+                _ = session.reducer.previousIndex
+                _ = session.reducer.nextIndex
+                didReenterDuringReducerWillSet = true
+            }
+        }
+
+        var observedNeighboursDuringDragBoxWillSet: (prev: Int?, current: Int, next: Int?)?
+        withObservationTracking {
+            _ = dragBox.y
+        } onChange: {
+            MainActor.assumeIsolated {
+                // Exact reproduction of SwiftUI AG::Graph::UpdateStack::update() triggered by
+                // PortraitDragOffsetBox.y.setter inside activate:
+                observedNeighboursDuringDragBoxWillSet = (
+                    prev: session.reducer.previousIndex,
+                    current: session.reducer.currentIndex,
+                    next: session.reducer.nextIndex
+                )
+            }
+        }
+
+        var activatedIndexSeenFromSession: Int?
+        let switched = PortraitPagingSettlementDispatcher.complete(
+            token: settlement!.token,
+            getReducer: { session.reducer },
+            setReducer: { session.reducer = $0 },
+            itemIDAtIndex: { session.entry(at: $0) },
+            handoff: { true },
+            activate: { commit, entry in
+                activatedIndexSeenFromSession = session.reducer.currentIndex
+                #expect(commit.index == 1)
+                #expect(entry.target.videoID == .bvid("BV1storyPageB"))
+                dragBox.y = 0
+            }
+        )
+
+        #expect(switched == true)
+        #expect(didReenterDuringReducerWillSet == true)
+        #expect(activatedIndexSeenFromSession == 1)
+        #expect(observedNeighboursDuringDragBoxWillSet?.prev == 0)
+        #expect(observedNeighboursDuringDragBoxWillSet?.current == 1)
+        #expect(observedNeighboursDuringDragBoxWillSet?.next == nil)
+        #expect(session.reducer.currentIndex == 1)
+        #expect(session.reducer.phase == .idle)
+        #expect(dragBox.y == 0)
+    }
+
+    @Test("Standalone Portrait Story mode auto-loops at playback end while playlist queues preserve normal progression")
+    @MainActor
+    func standalonePortraitStoryModeAutoLoopsEligibility() {
+        let vm = PlayerViewModel.shared
+        let savedInlineImmersive = vm.isInlinePortraitImmersiveActive
+        let savedQueue = vm.playbackQueue
+        let savedExternalEnded = vm.hasExternalPlaybackEndedCallback
+        let savedOnEnded = vm.onPlaybackEnded
+        let savedMode = vm.session.mode
+        defer {
+            vm.isInlinePortraitImmersiveActive = savedInlineImmersive
+            vm.setPlaybackQueue(savedQueue)
+            vm.hasExternalPlaybackEndedCallback = savedExternalEnded
+            vm.onPlaybackEnded = savedOnEnded
+            vm.session.mode = savedMode
+        }
+
+        vm.session.mode = .vod
+        vm.setPlaybackQueue(nil)
+        vm.hasExternalPlaybackEndedCallback = false
+        vm.onPlaybackEnded = nil
+        vm.isInlinePortraitImmersiveActive = true
+        #expect(vm.shouldAutoLoopAtEndInPortraitStory == true)
+
+        vm.isInlinePortraitImmersiveActive = false
+        #expect(vm.shouldAutoLoopAtEndInPortraitStory == false)
+
+        vm.isInlinePortraitImmersiveActive = true
+        vm.hasExternalPlaybackEndedCallback = true
+        vm.onPlaybackEnded = {}
+        #expect(vm.shouldAutoLoopAtEndInPortraitStory == false)
+
+        vm.hasExternalPlaybackEndedCallback = false
+        vm.onPlaybackEnded = nil
+        let queue = PlaybackQueueContext(
+            kind: .playlist(name: "Watch Later"),
+            items: [
+                Self.makeQueueItem(id: "q1", aid: 1001, cid: 2001, bvid: "BV1queueItem1", title: "Queue Item 1"),
+            ],
+            currentIndex: 0
+        )
+        vm.setPlaybackQueue(queue)
+        #expect(vm.shouldAutoLoopAtEndInPortraitStory == false)
+    }
 }

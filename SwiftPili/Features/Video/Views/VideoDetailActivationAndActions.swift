@@ -516,10 +516,12 @@ extension VideoDetailView {
     func syncImmersiveViewportReducerMetrics() {
         let stageSize = immersiveStageSize
         guard stageSize.width > 1, stageSize.height > 1 else { return }
-        immersiveFeedSession.reducer.updateContainerHeight(stageSize.height)
-        immersiveFeedSession.reducer.noteCoverResolution(width: stageSize.width, height: stageSize.height)
-        if immersiveDragOffsetBox.y != immersiveFeedSession.reducer.offset {
-            immersiveDragOffsetBox.y = immersiveFeedSession.reducer.offset
+        var next = immersiveFeedSession.reducer
+        next.updateContainerHeight(stageSize.height)
+        next.noteCoverResolution(width: stageSize.width, height: stageSize.height)
+        immersiveFeedSession.reducer = next
+        if immersiveDragOffsetBox.y != next.offset {
+            immersiveDragOffsetBox.y = next.offset
         }
     }
 
@@ -668,9 +670,11 @@ extension VideoDetailView {
     func beginImmersivePagingDrag() -> Bool {
         guard immersivePagingNeighboursReachable else { return false }
         syncImmersiveViewportReducerMetrics()
-        let began = immersiveFeedSession.reducer.beginDrag()
+        var next = immersiveFeedSession.reducer
+        let began = next.beginDrag()
+        immersiveFeedSession.reducer = next
         if began {
-            immersiveDragOffsetBox.y = immersiveFeedSession.reducer.offset
+            immersiveDragOffsetBox.y = next.offset
         }
         return began
     }
@@ -707,7 +711,8 @@ extension VideoDetailView {
     func completeImmersivePagingSettlement(_ token: PortraitPagingToken) {
         let switched = PortraitPagingSettlementDispatcher.complete(
             token: token,
-            reducer: &immersiveFeedSession.reducer,
+            getReducer: { immersiveFeedSession.reducer },
+            setReducer: { immersiveFeedSession.reducer = $0 },
             itemIDAtIndex: { index in
                 immersiveFeedSession.entry(at: index)
             },

@@ -529,26 +529,58 @@ struct PortraitPagingReducer: Equatable, Sendable {
 }
 
 enum PortraitPagingSettlementDispatcher {
+    enum Resolution<ItemID> {
+        case noop
+        case settledNonSwitch(PortraitPagingReducer)
+        case abandoned(PortraitPagingReducer)
+        case switched(PortraitPagingReducer, PortraitPagingReducer.Commit, ItemID)
+    }
+
+    static func resolve<ItemID>(
+        token: PortraitPagingToken,
+        reducer: PortraitPagingReducer,
+        itemIDAtIndex: (Int) -> ItemID?,
+        handoff: () -> Bool
+    ) -> Resolution<ItemID> {
+        var next = reducer
+        guard let settlement = next.settlement(for: token) else { return .noop }
+        guard case .switchPage(let targetIndex) = settlement.kind else {
+            _ = next.completeSettlement(token: token)
+            return .settledNonSwitch(next)
+        }
+        guard let itemID = itemIDAtIndex(targetIndex), handoff() else {
+            _ = next.abandonSettlement(token: token)
+            return .abandoned(next)
+        }
+        guard let commit = next.completeSettlement(token: token) else { return .noop }
+        return .switched(next, commit, itemID)
+    }
+
     @discardableResult
     static func complete<ItemID>(
         token: PortraitPagingToken,
-        reducer: inout PortraitPagingReducer,
+        getReducer: () -> PortraitPagingReducer,
+        setReducer: (PortraitPagingReducer) -> Void,
         itemIDAtIndex: (Int) -> ItemID?,
         handoff: () -> Bool,
         activate: (PortraitPagingReducer.Commit, ItemID) -> Void
     ) -> Bool {
-        guard let settlement = reducer.settlement(for: token) else { return false }
-        guard case .switchPage(let targetIndex) = settlement.kind else {
-            _ = reducer.completeSettlement(token: token)
+        switch resolve(
+            token: token,
+            reducer: getReducer(),
+            itemIDAtIndex: itemIDAtIndex,
+            handoff: handoff
+        ) {
+        case .noop:
             return false
-        }
-        guard let itemID = itemIDAtIndex(targetIndex), handoff() else {
-            _ = reducer.abandonSettlement(token: token)
+        case .settledNonSwitch(let updated), .abandoned(let updated):
+            setReducer(updated)
             return false
+        case .switched(let updated, let commit, let itemID):
+            setReducer(updated)
+            activate(commit, itemID)
+            return true
         }
-        guard let commit = reducer.completeSettlement(token: token) else { return false }
-        activate(commit, itemID)
-        return true
     }
 }
 
@@ -584,7 +616,19 @@ final class PortraitImmersiveFeedSession {
     typealias RecommendationFetcher = @Sendable (Int) async throws -> RecommendResult
 
     private(set) var entries: [PortraitImmersiveEntry] = []
-    var reducer = PortraitPagingReducer(itemCount: 0, initialIndex: 0)
+    @ObservationIgnored private var storedReducer = PortraitPagingReducer(itemCount: 0, initialIndex: 0)
+    var reducer: PortraitPagingReducer {
+        get {
+            access(keyPath: \.reducer)
+            return storedReducer
+        }
+        set {
+            guard newValue != storedReducer else { return }
+            withMutation(keyPath: \.reducer) {
+                storedReducer = newValue
+            }
+        }
+    }
     private(set) var isBackedByPlaybackQueue = false
     private(set) var isRefilling = false
 

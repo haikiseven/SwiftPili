@@ -590,6 +590,13 @@ extension PlayerViewModel {
         return nil
     }
 
+    var shouldAutoLoopAtEndInPortraitStory: Bool {
+        mode.isSeekable
+            && isInlinePortraitImmersiveActive
+            && activePlaylistQueue == nil
+            && !hasEndedAutoAdvanceTarget
+    }
+
     private func applyEndOfPlaybackOrder(endedGeneration: Int, endedLoadGeneration: Int) {
         guard mode.isSeekable else {
             cancelEndedAutoAdvance()
@@ -603,6 +610,14 @@ extension PlayerViewModel {
         case .playNext:
             guard hasEndedAutoAdvanceTarget else {
                 cancelEndedAutoAdvance()
+                if shouldAutoLoopAtEndInPortraitStory {
+                    PlayerLog.log("[Player] end policy: playNext in standalone Story mode — looping current video")
+                    restartForLoop()
+                    if playbackTerminalState == .ended {
+                        settleTerminalPlaybackEndPresentation()
+                    }
+                    return
+                }
                 PlayerLog.log("[Player] end policy: playNext — nothing registered, stopping at end")
                 settleTerminalPlaybackEndPresentation()
                 return
