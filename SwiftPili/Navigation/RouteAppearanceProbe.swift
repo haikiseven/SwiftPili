@@ -15,12 +15,16 @@ struct RouteActivationPlaceholderView: View {
                 Color.black
                     .overlay {
                         if let coverURL, !coverURL.isEmpty {
-                            CoverImage(
-                                urlString: coverURL,
-                                contentMode: .fit,
-                                groundColor: .black,
-                                isDecorative: true
-                            )
+                            GeometryReader { proxy in
+                                CoverImage(
+                                    urlString: coverURL,
+                                    displaySize: resolvedDisplaySize(for: proxy.size),
+                                    contentMode: .fit,
+                                    groundColor: .black,
+                                    isDecorative: true
+                                )
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            }
                         }
                     }
                     .frame(height: height)
@@ -31,5 +35,21 @@ struct RouteActivationPlaceholderView: View {
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+    }
+
+    @MainActor
+    private func resolvedDisplaySize(for proxySize: CGSize) -> CGSize {
+        let fallback = WindowMetricsFallback.currentSize
+        let resolvedWidth = (proxySize.width.isFinite && proxySize.width > 1)
+            ? proxySize.width
+            : max(fallback.width, 2)
+        let resolvedHeight: CGFloat = if proxySize.height.isFinite, proxySize.height > 1 {
+            proxySize.height
+        } else if height.isFinite, height > 1 {
+            height
+        } else {
+            max(fallback.height, 2)
+        }
+        return CGSize(width: resolvedWidth, height: resolvedHeight)
     }
 }

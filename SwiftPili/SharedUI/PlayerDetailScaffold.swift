@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 enum PlayerDetailSurfacePolicy {
     @MainActor
@@ -11,6 +12,21 @@ enum PlayerDetailSurfacePolicy {
               player.isCurrentOwner(lease) else { return false }
         return player.activeSurfaceLease?.ownerLease == lease
             && player.activeSurfaceLease?.role == .fullscreen
+    }
+
+    @MainActor
+    static func hasUsableInlineExitChrome(
+        player: PlayerViewModel,
+        lease: PlayerOwnerLease?,
+        expectedMode: PlayerMode
+    ) -> Bool {
+        guard let lease, player.isCurrentOwner(lease) else { return false }
+        return player.mode == expectedMode
+            && player.activeSurfaceLease?.ownerLease == lease
+            && player.activeSurfaceLease?.role == .inline
+            && player.error == nil
+            && player.videoPresentationFailureMessage == nil
+            && player.currentURL != nil
     }
 }
 
@@ -78,9 +94,11 @@ struct PlayerDetailContainerMetrics: Equatable, Sendable {
         if containerSize != size {
             containerSize = size
         }
-        let windowSize = WindowMetricsFallback.currentSize
-        if windowSize.width > 0, windowSize.height > 0 {
-            Self.lastMeasuredSizeForWindow = (windowSize: windowSize, detailSize: size)
+        if UIApplication.shared.applicationState == .active {
+            let windowSize = WindowMetricsFallback.currentSize
+            if windowSize.width > 0, windowSize.height > 0 {
+                Self.lastMeasuredSizeForWindow = (windowSize: windowSize, detailSize: size)
+            }
         }
         let wide = DetailSplitPolicy.usesSplit(
             isRegularWidth: isRegularWidth,
@@ -103,24 +121,50 @@ struct PlayerDetailContainerMetrics: Equatable, Sendable {
 
 struct PlayerDetailGeometryObserver: ViewModifier {
     let isFullscreenPresentationActive: Bool
+    var isActiveRoute: Bool = true
     let onSizeChange: @MainActor (CGSize) -> Void
 
     @State private var pendingSize: CGSize?
+    @Environment(\.scenePhase) private var scenePhase
+
+    @MainActor
+    private var shouldDeferGeometryUpdates: Bool {
+        (DeviceCapability.supportsOrientationLock && isFullscreenPresentationActive)
+            || !isActiveRoute
+            || UIApplication.shared.applicationState != .active
+    }
 
     func body(content: Content) -> some View {
         content
             .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
-                if DeviceCapability.supportsOrientationLock, isFullscreenPresentationActive {
+                if shouldDeferGeometryUpdates {
                     pendingSize = size
                     return
                 }
+                pendingSize = nil
                 onSizeChange(size)
             }
-            .onChange(of: isFullscreenPresentationActive) { _, active in
-                guard !active, let pending = pendingSize else { return }
-                pendingSize = nil
-                onSizeChange(pending)
+            .onChange(of: isFullscreenPresentationActive) { _, _ in
+                flushPendingSizeIfReady()
             }
+            .onChange(of: isActiveRoute) { _, _ in
+                flushPendingSizeIfReady()
+            }
+            .onChange(of: scenePhase) { _, _ in
+                flushPendingSizeIfReady()
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)
+            ) { _ in
+                flushPendingSizeIfReady()
+            }
+    }
+
+    @MainActor
+    private func flushPendingSizeIfReady() {
+        guard !shouldDeferGeometryUpdates, let pending = pendingSize else { return }
+        pendingSize = nil
+        onSizeChange(pending)
     }
 }
 
@@ -128,6 +172,7 @@ struct PlayerDetailGeometryProbes: View {
     let isWideLayout: Bool
     let restingHeight: CGFloat
     let isFullscreenPresentationActive: Bool
+    var isActiveRoute: Bool = true
     let onSizeChange: @MainActor (CGSize) -> Void
     let onKeyboardDockedChange: @MainActor (Bool) -> Void
 
@@ -138,8 +183,10 @@ struct PlayerDetailGeometryProbes: View {
                 .accessibilityHidden(true)
                 .playerDetailDeferredSize(
                     isFullscreenPresentationActive: isFullscreenPresentationActive,
+                    isActiveRoute: isActiveRoute,
                     onSizeChange: onSizeChange
                 )
+                .ignoresSafeArea(.container, edges: .all)
                 .ignoresSafeArea(.keyboard, edges: .bottom)
 
             if isWideLayout {
@@ -155,6 +202,7 @@ struct PlayerDetailGeometryProbes: View {
                     } action: { docked in
                         onKeyboardDockedChange(docked)
                     }
+                    .ignoresSafeArea(.container, edges: .all)
             }
         }
         .allowsHitTesting(false)
@@ -174,11 +222,21 @@ struct PlayerDetailInlineNavigationOverlay: View {
     var body: some View {
         if !player.isFullscreenPresentationActive, isActiveRoute {
             let showsNavigation = !hasInlineExitChrome() || player.showControls || player.playbackEnded
+            let showsTopFeather = showsNavigation && !player.showControls && !player.playbackEnded
+            let featherHeight = scrimHeight.map { min(max($0, 0), 76) } ?? 76
             ZStack(alignment: .topLeading) {
-                if showsNavigation && !player.showControls && !player.playbackEnded {
-                    PlayerControlsScrim()
-                        .frame(width: scrimWidth, height: scrimHeight)
-                        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                if !player.showControls && !player.playbackEnded {
+                    LinearGradient(
+                        colors: [.black.opacity(0.42), .clear],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(width: scrimWidth, height: featherHeight)
+                    .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                    .opacity(showsTopFeather ? 1 : 0)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+                    .animation(.easeOut(duration: 0.18), value: showsNavigation)
                 }
                 PlayerPageNavigationButtons(actions: actions)
                     .padding(.horizontal, PlayerPageNavigationButtons.inlineHorizontalPadding)
@@ -186,6 +244,7 @@ struct PlayerDetailInlineNavigationOverlay: View {
                     .opacity(showsNavigation ? 1 : 0)
                     .allowsHitTesting(showsNavigation)
                     .accessibilityHidden(!showsNavigation)
+                    .animation(.easeOut(duration: 0.18), value: showsNavigation)
             }
         }
     }
@@ -260,11 +319,13 @@ struct PlayerDetailChromeModifier<Backdrop: View>: ViewModifier {
 extension View {
     func playerDetailDeferredSize(
         isFullscreenPresentationActive: Bool,
+        isActiveRoute: Bool = true,
         onSizeChange: @escaping @MainActor (CGSize) -> Void
     ) -> some View {
         modifier(
             PlayerDetailGeometryObserver(
                 isFullscreenPresentationActive: isFullscreenPresentationActive,
+                isActiveRoute: isActiveRoute,
                 onSizeChange: onSizeChange
             )
         )
@@ -272,6 +333,7 @@ extension View {
 
     func playerDetailInlineContainerSize(
         isFullscreenPresentationActive: Bool,
+        isActiveRoute: Bool = true,
         onSizeChange: @escaping @MainActor (CGSize) -> Void
     ) -> some View {
         background {
@@ -279,6 +341,7 @@ extension View {
                 Color.clear
                     .playerDetailDeferredSize(
                         isFullscreenPresentationActive: isFullscreenPresentationActive,
+                        isActiveRoute: isActiveRoute,
                         onSizeChange: onSizeChange
                     )
             }

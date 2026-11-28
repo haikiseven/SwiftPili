@@ -46,6 +46,10 @@ enum WindowMetricsFallback {
 
     @MainActor
     static var currentBounds: CGRect {
+        if let bounds = AppWindowMetrics.resolvedBounds,
+           bounds.width > 0, bounds.height > 0 {
+            return bounds
+        }
         if let bounds = AppWindowMetrics.current?.bounds,
            bounds.width > 0, bounds.height > 0 {
             return bounds

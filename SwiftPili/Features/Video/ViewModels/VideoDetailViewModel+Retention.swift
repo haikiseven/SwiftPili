@@ -89,11 +89,20 @@ extension VideoDetailViewModel {
         let accountSession: UUID
     }
 
+    func clearInMemoryRetainedScreenData() {
+        retainedScreenData = nil
+        activeScreenCacheContext = nil
+        retireRetainedPlayback(reason: "screen-data-replaced")
+    }
+
     func invalidateRetainedScreenData() {
         if let source = currentCommentSource, let accountSession = metadataAccountSession {
             VideoDetailScreenDataCache.remove(id: source.videoID, accountSession: accountSession)
+        } else if let context = activeScreenCacheContext {
+            VideoDetailScreenDataCache.remove(id: context.id, accountSession: context.accountSession)
         }
         retainedScreenData = nil
+        activeScreenCacheContext = nil
         retireRetainedPlayback(reason: "screen-data-invalidated")
     }
 
@@ -258,13 +267,11 @@ extension VideoDetailViewModel {
 
     func initialScreenDataCandidate(for id: VideoID) -> VideoDetailScreenDataSnapshot? {
         guard VideoDetailReactivationPolicy.retainsScreenData,
-              currentCommentSource == nil,
               error == nil, unavailability == nil else { return nil }
         if let prehydrated = prehydratedScreenSnapshot, prehydrated.id == id {
             prehydratedScreenSnapshot = nil
             return prehydrated
         }
-        guard videoInfo == nil else { return nil }
         return VideoDetailScreenDataCache.snapshot(for: id)
     }
 
@@ -279,7 +286,7 @@ extension VideoDetailViewModel {
     }
 
     func initialRelatedVideos(aid: Int, cached: VideoDetailScreenDataSnapshot?) async throws -> [VideoCard] {
-        if let cached { return cached.related }
+        if let cached, cached.hasLoadedRelated { return cached.related }
         return try await VideoAPI.getRelated(aid: aid)
     }
 
@@ -289,7 +296,76 @@ extension VideoDetailViewModel {
             tagPublication = TagPublication(source: request.source, tags: tags.values)
             return
         }
-        Task { await self.loadTags(request) }
+        Task {
+            await self.loadTags(request)
+            if request.admits(), self.currentTagSource == request.source {
+                self.cacheIncrementalScreenData()
+                self.cacheCompletedScreenData()
+            }
+        }
+    }
+
+    func cacheIncrementalScreenData(fallbackCached: VideoDetailScreenDataSnapshot? = nil) {
+        guard VideoDetailReactivationPolicy.retainsScreenData,
+              let context = activeScreenCacheContext,
+              let lease = playerLease,
+              ownsCurrentLoad(context.dataRequest, lease: lease),
+              context.accountSession == AuthManager.shared.sessionGeneration,
+              metadataAccountSession == context.accountSession,
+              currentCommentSource?.videoID == context.id,
+              currentCommentSource?.aid == context.aid,
+              commentSourceGeneration == context.dataRequest,
+              let info = videoInfo, info.aid == context.aid,
+              let cid = currentCid,
+              error == nil, unavailability == nil else { return }
+        let matchingCached = fallbackCached.flatMap { cached in
+            cached.id == context.id && cached.info.aid == info.aid && cached.accountSession == context.accountSession
+                ? cached
+                : nil
+        }
+        let hasLoadedRelated = context.hasLoadedRelated || (matchingCached?.hasLoadedRelated ?? false)
+        let related: [VideoCard] = if context.hasLoadedRelated {
+            relatedVideos
+        } else {
+            matchingCached?.related ?? relatedVideos
+        }
+        let tags: VideoDetailScreenDataSnapshot.Tags? = currentTagSource.flatMap { source in
+            tagPublication.map { VideoDetailScreenDataSnapshot.Tags(cid: source.cid, values: $0.tags) }
+        } ?? matchingCached?.tags.flatMap { $0.cid == cid ? $0 : nil }
+        let previewComments: VideoDetailScreenDataSnapshot.PreviewComments? = if commentsClosed || !comments.isEmpty {
+            VideoDetailScreenDataSnapshot.PreviewComments(
+                items: Array(comments.prefix(2)),
+                total: max(commentTotal, info.stat.reply),
+                commentsClosed: commentsClosed
+            )
+        } else {
+            cachedPreviewComments ?? matchingCached?.previewComments
+        }
+        let interaction: VideoDetailScreenDataSnapshot.InteractionSnapshot? =
+            if interactionStateReceipt?.aid == info.aid || seededInteractionAid == info.aid {
+                VideoDetailScreenDataSnapshot.InteractionSnapshot(
+                    isFollowingUp: isFollowingUp,
+                    isLiked: isLiked,
+                    coinCount: coinCount,
+                    isFavorited: isFavorited,
+                    isInWatchLater: isInWatchLater,
+                    defaultFolderId: defaultFolderId
+                )
+            } else {
+                matchingCached?.interaction
+            }
+        VideoDetailScreenDataCache.store(.init(
+            id: context.id,
+            accountSession: context.accountSession,
+            fetchedAt: context.fetchedAt,
+            info: info,
+            cid: cid,
+            related: related,
+            tags: tags,
+            previewComments: previewComments,
+            interaction: interaction,
+            hasLoadedRelated: hasLoadedRelated
+        ))
     }
 
     func cacheCompletedScreenData() {
@@ -308,22 +384,23 @@ extension VideoDetailViewModel {
         } else {
             cachedPreviewComments
         }
-        let interaction: VideoDetailScreenDataSnapshot.InteractionSnapshot? = if interactionStateReceipt?.aid == info.aid {
-            VideoDetailScreenDataSnapshot.InteractionSnapshot(
-                isFollowingUp: isFollowingUp,
-                isLiked: isLiked,
-                coinCount: coinCount,
-                isFavorited: isFavorited,
-                isInWatchLater: isInWatchLater,
-                defaultFolderId: defaultFolderId
-            )
-        } else {
-            nil
-        }
+        let interaction: VideoDetailScreenDataSnapshot.InteractionSnapshot? =
+            if interactionStateReceipt?.aid == info.aid || seededInteractionAid == info.aid {
+                VideoDetailScreenDataSnapshot.InteractionSnapshot(
+                    isFollowingUp: isFollowingUp,
+                    isLiked: isLiked,
+                    coinCount: coinCount,
+                    isFavorited: isFavorited,
+                    isInWatchLater: isInWatchLater,
+                    defaultFolderId: defaultFolderId
+                )
+            } else {
+                nil
+            }
         VideoDetailScreenDataCache.store(.init(
             id: data.id, accountSession: data.accountSession, fetchedAt: data.fetchedAt,
             info: info, cid: data.cid, related: relatedVideos, tags: tags,
-            previewComments: previewComments, interaction: interaction
+            previewComments: previewComments, interaction: interaction, hasLoadedRelated: true
         ))
     }
 }

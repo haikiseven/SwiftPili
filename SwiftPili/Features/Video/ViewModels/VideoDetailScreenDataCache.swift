@@ -30,6 +30,7 @@ struct VideoDetailScreenDataSnapshot: Sendable {
     let tags: Tags?
     let previewComments: PreviewComments?
     let interaction: InteractionSnapshot?
+    let hasLoadedRelated: Bool
 
     init(
         id: VideoID,
@@ -40,7 +41,8 @@ struct VideoDetailScreenDataSnapshot: Sendable {
         related: [VideoCard],
         tags: Tags?,
         previewComments: PreviewComments? = nil,
-        interaction: InteractionSnapshot? = nil
+        interaction: InteractionSnapshot? = nil,
+        hasLoadedRelated: Bool = true
     ) {
         self.id = id
         self.accountSession = accountSession
@@ -51,6 +53,7 @@ struct VideoDetailScreenDataSnapshot: Sendable {
         self.tags = tags
         self.previewComments = previewComments
         self.interaction = interaction
+        self.hasLoadedRelated = hasLoadedRelated
     }
 
     var fitsCacheBudget: Bool {
