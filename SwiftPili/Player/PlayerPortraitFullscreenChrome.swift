@@ -18,10 +18,29 @@ enum PlayerPortraitChromePolicy {
     static let bottomDockFallbackFloor: CGFloat = 14
     static let seekBarHorizontalInset: CGFloat = 16
     static let bottomGradientBaseHeight: CGFloat = 240
+    static let seekBarHeight: CGFloat = 24
+    static let bottomSplitBottomPadding: CGFloat = 8
+    static let bottomDockTopPadding: CGFloat = 4
+    static let noDanmakuBottomFloor: CGFloat = 12
 
     static func bottomDockBottomPadding(bottomSafeArea: CGFloat) -> CGFloat {
         let safe = max(0, bottomSafeArea)
         return safe >= 20 ? safe : max(bottomDockFallbackFloor, safe)
+    }
+
+    static func metadataBottomClearance(
+        bottomSafeArea: CGFloat,
+        showsDanmakuDock: Bool
+    ) -> CGFloat {
+        let safe = max(0, bottomSafeArea)
+        let dockAreaHeight: CGFloat = if showsDanmakuDock {
+            bottomDockTopPadding
+                + bottomDockHeight
+                + bottomDockBottomPadding(bottomSafeArea: safe)
+        } else {
+            max(noDanmakuBottomFloor, safe)
+        }
+        return dockAreaHeight + seekBarHeight + bottomSplitBottomPadding
     }
 
     @MainActor
@@ -184,6 +203,11 @@ struct PlayerPortraitFullscreenChrome: View {
             && player.fullscreenDanmakuComposerPresented
     }
 
+    private var canOpenDetails: Bool {
+        (context?.hasExpandableDetails == true && context?.makeDetailsSheetView != nil)
+            || context?.onOpenDetailsSheet != nil
+    }
+
     private var showsSeekBar: Bool {
         !isPlaybackUnavailable
             && !isPlaybackEnded
@@ -243,7 +267,7 @@ struct PlayerPortraitFullscreenChrome: View {
                         .transition(.opacity)
                     } else if player.mode.isSeekable {
                         Color.clear
-                            .frame(height: 24)
+                            .frame(height: PlayerPortraitChromePolicy.seekBarHeight)
                             .padding(.horizontal, PlayerPortraitChromePolicy.seekBarHorizontalInset)
                             .allowsHitTesting(false)
                             .accessibilityHidden(true)
@@ -432,15 +456,7 @@ struct PlayerPortraitFullscreenChrome: View {
             Button {
                 player.portraitPureViewEnabled = false
             } label: {
-                Image(systemName: "eye.slash")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.88))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(.ultraThinMaterial, in: Capsule())
-                    .environment(\.colorScheme, .dark)
-                    .frame(minWidth: 44, minHeight: 44)
-                    .contentShape(Rectangle())
+                pureViewExitLabel
             }
             .buttonStyle(.plain)
             .accessibilityIdentifier("player.portrait.exitPureView")
@@ -448,6 +464,29 @@ struct PlayerPortraitFullscreenChrome: View {
         }
         .padding(.top, chromeInsets.top + 6)
         .padding(.horizontal, 16)
+    }
+
+    private var pureViewExitLabel: some View {
+        Image(systemName: "eye.slash")
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(.white.opacity(0.88))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background { pureViewExitSurface }
+            .environment(\.colorScheme, .dark)
+            .frame(minWidth: 44, minHeight: 44)
+            .contentShape(Rectangle())
+    }
+
+    private var pureViewExitSurface: some View {
+        ZStack {
+            Capsule().fill(.ultraThinMaterial)
+            Capsule().fill(Color.black.opacity(0.38))
+        }
+        .overlay {
+            Capsule()
+                .strokeBorder(.white.opacity(0.18), lineWidth: 0.5)
+        }
     }
 
     private var topFeatherBar: some View {
@@ -477,6 +516,7 @@ struct PlayerPortraitFullscreenChrome: View {
                         Text("Standard View")
                             .font(.caption.weight(.semibold))
                             .lineLimit(1)
+                            .minimumScaleFactor(0.85)
                     }
                     .foregroundStyle(.white.opacity(0.95))
                     .padding(.horizontal, 11)
@@ -547,7 +587,7 @@ struct PlayerPortraitFullscreenChrome: View {
                 Label("Switch to Standard View", systemImage: "rectangle.topthird.inset.filled")
             }
 
-            if context?.hasExpandableDetails == true, context?.makeDetailsSheetView != nil {
+            if canOpenDetails {
                 Button {
                     openDetailsSheet()
                 } label: {
@@ -691,215 +731,240 @@ struct PlayerPortraitFullscreenChrome: View {
             }
         }
         .padding(.horizontal, 16)
-        .padding(.bottom, showsSeekBar ? 8 : 12)
+        .padding(.bottom, PlayerPortraitChromePolicy.bottomSplitBottomPadding)
     }
 
     private var bottomMetadataStack: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let upName = resolvedUpName {
-                HStack(spacing: 8) {
-                    Button {
-                        context?.onTapOwner?()
-                    } label: {
-                        HStack(spacing: 7) {
-                            if let avatarURL = context?.upAvatarURL.portraitNonEmpty {
-                                AvatarImage(urlString: avatarURL, size: 28)
-                                    .overlay {
-                                        Circle()
-                                            .strokeBorder(.white.opacity(0.25), lineWidth: 0.5)
-                                    }
-                            } else {
-                                Circle()
-                                    .fill(Color.white.opacity(0.18))
-                                    .frame(width: 28, height: 28)
-                                    .overlay {
-                                        Image(systemName: "person.fill")
-                                            .font(.caption.weight(.semibold))
-                                            .foregroundStyle(.white.opacity(0.84))
-                                    }
-                                    .overlay {
-                                        Circle()
-                                            .strokeBorder(.white.opacity(0.25), lineWidth: 0.5)
-                                    }
-                            }
-
-                            Text(verbatim: "@\(upName)")
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(.white)
-                                .lineLimit(1)
-                                .shadow(color: .black.opacity(0.45), radius: 2, y: 1)
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(context?.onTapOwner == nil)
-                    .accessibilityIdentifier("player.portrait.owner")
-
-                    if context?.isFollowing == false, let toggleFollow = context?.onToggleFollow {
-                        Button {
-                            guard !followRequestInFlight else { return }
-                            Task {
-                                followRequestInFlight = true
-                                await toggleFollow()
-                                followRequestInFlight = false
-                            }
-                        } label: {
-                            Text("+ Follow")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 4)
-                                .background(Color.biliAccent, in: Capsule())
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(followRequestInFlight)
-                        .transition(.scale(scale: 0.85).combined(with: .opacity))
-                        .accessibilityIdentifier("player.portrait.follow")
-                    }
-                }
-                .animation(reduceMotion ? nil : .snappy(duration: 0.22), value: context?.isFollowing)
-            }
-
-            if let badge = context?.summaryBadgeText?.portraitNonEmpty {
-                Button {
-                    openDetailsSheet()
-                } label: {
-                    HStack(spacing: 5) {
-                        Image(systemName: "square.stack.3d.up.fill")
-                            .font(.caption2)
-                        Text(verbatim: badge)
-                            .font(.caption.weight(.semibold))
-                            .monospacedDigit()
-                        Text("Episodes")
-                            .font(.caption.weight(.medium))
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 9, weight: .bold))
-                    }
-                    .foregroundStyle(.white.opacity(0.92))
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 4)
-                    .background(Color.black.opacity(0.36), in: Capsule())
-                    .overlay {
-                        Capsule()
-                            .strokeBorder(.white.opacity(0.14), lineWidth: 0.5)
-                    }
-                    .contentShape(Capsule())
-                }
-                .buttonStyle(.plain)
-                .disabled(context?.makeDetailsSheetView == nil && context?.onOpenDetailsSheet == nil)
-                .accessibilityIdentifier("player.portrait.episodesBadge")
+                ownerIdentityRow(upName: upName)
             }
 
             if let title = resolvedTitle {
-                let canOpenDetails = context?.makeDetailsSheetView != nil || context?.onOpenDetailsSheet != nil
-                if canOpenDetails {
-                    Button {
-                        openDetailsSheet()
-                    } label: {
-                        Text(verbatim: title)
-                            .font(.subheadline.weight(.medium))
-                            .foregroundStyle(.white.opacity(0.95))
-                            .lineLimit(2)
-                            .multilineTextAlignment(.leading)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .shadow(color: .black.opacity(0.45), radius: 2, y: 1)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityIdentifier("player.portrait.title")
-                } else {
-                    Text(verbatim: title)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.white.opacity(0.95))
-                        .lineLimit(isTitleExpanded ? 4 : 2)
-                        .multilineTextAlignment(.leading)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .shadow(color: .black.opacity(0.45), radius: 2, y: 1)
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            withAnimation(reduceMotion ? nil : .snappy(duration: 0.22)) {
-                                isTitleExpanded.toggle()
-                            }
-                        }
-                        .accessibilityIdentifier("player.portrait.title")
-                }
+                titleRow(title: title)
             }
 
-            portraitSummaryEntryRow
+            portraitSummarySubRow
         }
     }
 
-    @ViewBuilder
-    private var portraitSummaryEntryRow: some View {
-        let canOpenDetails = context?.makeDetailsSheetView != nil || context?.onOpenDetailsSheet != nil
-        let descPreview = context?.descriptionPreview?.portraitNonEmpty
-        let statsSummary = context?.statsSummary?.portraitNonEmpty
-
-        if let descPreview, canOpenDetails {
+    private func ownerIdentityRow(upName: String) -> some View {
+        let displayHandle = upName.hasPrefix("@") ? upName : "@\(upName)"
+        let avatarURL = context?.upAvatarURL.portraitNonEmpty ?? ""
+        return HStack(spacing: 8) {
             Button {
-                openDetailsSheet()
+                context?.onTapOwner?()
             } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "text.alignleft")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.76))
-                    Text(verbatim: descPreview)
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.84))
+                HStack(spacing: 7) {
+                    PortraitChromeAvatarView(urlString: avatarURL, size: 28)
+                    Text(verbatim: displayHandle)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
                         .lineLimit(1)
-                        .truncationMode(.tail)
-                    Spacer(minLength: 4)
-                    HStack(spacing: 2) {
-                        Text("Description")
-                            .font(.caption2.weight(.semibold))
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 9, weight: .bold))
-                    }
-                    .foregroundStyle(.white.opacity(0.88))
-                    .fixedSize()
+                        .shadow(color: .black.opacity(0.45), radius: 2, y: 1)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(Color.black.opacity(0.32), in: Capsule())
-                .overlay {
-                    Capsule()
-                        .strokeBorder(.white.opacity(0.14), lineWidth: 0.5)
-                }
-                .contentShape(Capsule())
-            }
-            .buttonStyle(.plain)
-            .accessibilityIdentifier("player.portrait.descriptionEntry")
-        } else if canOpenDetails {
-            Button {
-                openDetailsSheet()
-            } label: {
-                HStack(spacing: 5) {
-                    if let statsSummary {
-                        Text(verbatim: statsSummary)
-                            .font(.caption)
-                            .foregroundStyle(.white.opacity(0.78))
-                            .lineLimit(1)
-                    }
-                    HStack(spacing: 2) {
-                        Text("Details")
-                            .font(.caption.weight(.semibold))
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 9, weight: .bold))
-                    }
-                    .foregroundStyle(.white.opacity(0.88))
-                    .fixedSize()
-                }
-                .shadow(color: .black.opacity(0.45), radius: 2, y: 1)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityIdentifier("player.portrait.descriptionEntry")
-        } else if let statsSummary {
-            Text(verbatim: statsSummary)
-                .font(.caption)
-                .foregroundStyle(.white.opacity(0.74))
-                .lineLimit(1)
-                .shadow(color: .black.opacity(0.45), radius: 2, y: 1)
+            .disabled(context?.onTapOwner == nil)
+            .accessibilityIdentifier("player.portrait.owner")
+
+            followSlotView
+        }
+        .frame(height: 28, alignment: .leading)
+        .animation(reduceMotion ? nil : .snappy(duration: 0.22), value: context?.isFollowing)
+    }
+
+    @ViewBuilder
+    private var followSlotView: some View {
+        let shouldReserveWidth = context?.isFollowing == nil
+            && context?.onToggleFollow != nil
+            && AuthManager.shared.isLoggedIn
+            && ((context?.upMid ?? 0) == 0 || String(context?.upMid ?? 0) != AuthManager.shared.dedeUserID)
+
+        if context?.isFollowing == false, let toggleFollow = context?.onToggleFollow {
+            Button {
+                guard !followRequestInFlight else { return }
+                Task {
+                    followRequestInFlight = true
+                    await toggleFollow()
+                    followRequestInFlight = false
+                }
+            } label: {
+                followPillLabel
+            }
+            .buttonStyle(.plain)
+            .disabled(followRequestInFlight)
+            .transition(.opacity)
+            .accessibilityIdentifier("player.portrait.follow")
+        } else if shouldReserveWidth {
+            followPillLabel
+                .hidden()
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
+    }
+
+    private var followPillLabel: some View {
+        Text("+ Follow")
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(Color.biliAccent, in: Capsule())
+    }
+
+    @ViewBuilder
+    private func titleRow(title: String) -> some View {
+        if canOpenDetails {
+            Button {
+                openDetailsSheet()
+            } label: {
+                titleLabel(title, lineLimit: 2)
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("player.portrait.title")
+        } else {
+            titleLabel(title, lineLimit: isTitleExpanded ? 4 : 2)
+                .onTapGesture {
+                    withAnimation(reduceMotion ? nil : .snappy(duration: 0.22)) {
+                        isTitleExpanded.toggle()
+                    }
+                }
+                .accessibilityIdentifier("player.portrait.title")
+        }
+    }
+
+    private func titleLabel(_ title: String, lineLimit: Int) -> some View {
+        Text(verbatim: title)
+            .font(.subheadline.weight(.medium))
+            .foregroundStyle(.white.opacity(0.95))
+            .lineLimit(lineLimit)
+            .multilineTextAlignment(.leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .shadow(color: .black.opacity(0.45), radius: 2, y: 1)
+            .contentShape(Rectangle())
+    }
+
+    private var portraitSummarySubRow: some View {
+        let badge = context?.summaryBadgeText?.portraitNonEmpty
+        let descPreview = context?.descriptionPreview?.portraitNonEmpty
+        let statsSummary = context?.statsSummary?.portraitNonEmpty
+        let hasCapsule = badge != nil || descPreview != nil || canOpenDetails
+        let accessibilityID = (badge != nil && descPreview == nil)
+            ? "player.portrait.episodesBadge"
+            : "player.portrait.descriptionEntry"
+
+        return ZStack(alignment: .leading) {
+            if hasCapsule {
+                portraitSummaryCapsuleHost(
+                    badge: badge,
+                    descPreview: descPreview,
+                    statsSummary: statsSummary,
+                    accessibilityID: accessibilityID
+                )
+                .transition(.opacity)
+            } else if let statsSummary {
+                Text(verbatim: statsSummary)
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.74))
+                    .lineLimit(1)
+                    .shadow(color: .black.opacity(0.45), radius: 2, y: 1)
+                    .transition(.opacity)
+            } else {
+                Color.clear
+                    .frame(height: 24)
+                    .accessibilityHidden(true)
+            }
+        }
+        .frame(height: 24, alignment: .leading)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: canOpenDetails)
+    }
+
+    @ViewBuilder
+    private func portraitSummaryCapsuleHost(
+        badge: String?,
+        descPreview: String?,
+        statsSummary: String?,
+        accessibilityID: String
+    ) -> some View {
+        let row = portraitSummaryCapsuleContent(
+            badge: badge,
+            descPreview: descPreview,
+            statsSummary: statsSummary
+        )
+        .padding(.horizontal, 10)
+        .frame(height: 24)
+        .background { summaryCapsuleSurface }
+        .contentShape(Capsule())
+
+        if canOpenDetails {
+            Button(action: openDetailsSheet) {
+                row
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier(accessibilityID)
+        } else {
+            row
+                .accessibilityIdentifier(accessibilityID)
+        }
+    }
+
+    private var summaryCapsuleSurface: some View {
+        Capsule()
+            .fill(Color.black.opacity(0.32))
+            .overlay {
+                Capsule()
+                    .strokeBorder(.white.opacity(0.14), lineWidth: 0.5)
+            }
+    }
+
+    private func portraitSummaryCapsuleContent(
+        badge: String?,
+        descPreview: String?,
+        statsSummary: String?
+    ) -> some View {
+        let middleText = descPreview ?? statsSummary
+        return HStack(spacing: 6) {
+            if let badge {
+                HStack(spacing: 4) {
+                    Image(systemName: "square.stack.3d.up.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                    Text(verbatim: badge)
+                        .font(.caption2.weight(.semibold))
+                        .monospacedDigit()
+                    if middleText == nil && !canOpenDetails {
+                        Text("Episodes")
+                            .font(.caption2.weight(.medium))
+                    }
+                }
+                .foregroundStyle(.white.opacity(0.92))
+                .fixedSize()
+            }
+
+            if let middleText {
+                if badge != nil {
+                    Rectangle()
+                        .fill(.white.opacity(0.22))
+                        .frame(width: 1, height: 11)
+                }
+                Text(verbatim: middleText)
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.84))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+
+            if canOpenDetails {
+                HStack(spacing: 2) {
+                    Text(badge != nil && descPreview == nil ? "Episodes" : "Details")
+                        .font(.caption2.weight(.semibold))
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .bold))
+                }
+                .foregroundStyle(.white.opacity(0.9))
+                .fixedSize()
+            }
         }
     }
 
@@ -1119,14 +1184,13 @@ struct PlayerPortraitFullscreenChrome: View {
                 }
             }
             .padding(.horizontal, PlayerPortraitChromePolicy.bottomDockHorizontalPadding)
-            .padding(.top, 4)
+            .padding(.top, PlayerPortraitChromePolicy.bottomDockTopPadding)
             .padding(.bottom, bottomPadding)
         } else {
             Color.clear
-                .frame(height: PlayerPortraitChromePolicy.bottomDockHeight)
+                .frame(height: max(PlayerPortraitChromePolicy.noDanmakuBottomFloor, chromeInsets.bottom))
                 .allowsHitTesting(false)
-                .padding(.top, 4)
-                .padding(.bottom, bottomPadding)
+                .accessibilityHidden(true)
         }
     }
 
@@ -1350,40 +1414,22 @@ private struct PortraitRailLikeButton: View {
     @AppMotion private var motion
     @State private var tapInFlight = false
     @State private var holdTask: Task<Void, Never>?
+    @State private var activePressID: UUID?
     @State private var didFireLongPress = false
+    @State private var pressCancelledByDrag = false
+    @GestureState private var isPressing = false
 
     private static let holdDurationSeconds: Double = 0.85
     private static let ringDelayMs = 150
+    private static let maxHoldDistance: CGFloat = 24
 
     var body: some View {
         let isCharging = holdProgress > 0.01
         let active = isLiked || isCharging
         let caption = count > 0 ? FormatUtils.viewCount(count) : String(localized: "Like")
 
-        VStack(spacing: 4) {
-            ZStack {
-                if isCharging {
-                    Circle()
-                        .stroke(Color.biliAccent.opacity(0.28), lineWidth: 2.2)
-                        .frame(width: 28, height: 28)
-                    Circle()
-                        .trim(from: 0, to: holdProgress)
-                        .stroke(
-                            Color.biliAccent,
-                            style: StrokeStyle(lineWidth: 2.2, lineCap: .round)
-                        )
-                        .rotationEffect(.degrees(-90))
-                        .frame(width: 28, height: 28)
-                }
-
-                Image(systemName: active ? "hand.thumbsup.fill" : "hand.thumbsup")
-                    .font(.system(size: isCharging ? 17 : 22, weight: .semibold))
-                    .foregroundStyle(active ? Color.biliAccent : .white)
-                    .scaleEffect(isCharging ? (1.0 + 0.08 * holdProgress) : 1.0)
-                    .shadow(color: .black.opacity(0.5), radius: 3, y: 1)
-            }
-            .frame(width: 30, height: 30)
-
+        let base = VStack(spacing: 4) {
+            likeIcon(isCharging: isCharging, active: active)
             Text(verbatim: caption)
                 .font(.caption2.weight(.medium))
                 .monospacedDigit()
@@ -1394,57 +1440,109 @@ private struct PortraitRailLikeButton: View {
         }
         .frame(minWidth: 44, minHeight: 44)
         .contentShape(Rectangle())
-        .onTapGesture {
-            guard !didFireLongPress, !tapInFlight, !externalActionInFlight else { return }
-            Task {
-                tapInFlight = true
-                await onTap()
-                tapInFlight = false
-            }
+        .gesture(pressHoldGesture)
+        .onChange(of: isPressing) { _, pressing in
+            handlePressStateChange(pressing: pressing)
         }
-        .onLongPressGesture(
-            minimumDuration: Self.holdDurationSeconds,
-            maximumDistance: 24,
-            perform: {
-                didFireLongPress = true
-                cancelHoldAnimation(resetInstantly: false)
-                UINotificationFeedbackGenerator().notificationOccurred(.success)
-                Task { await onTripleCombo() }
-            },
-            onPressingChanged: { pressing in
-                if pressing {
-                    didFireLongPress = false
-                    startHoldAnimation()
-                } else {
-                    cancelHoldAnimation(resetInstantly: false)
-                    if didFireLongPress {
-                        Task { @MainActor in
-                            try? await Task.sleep(for: .milliseconds(80))
-                            didFireLongPress = false
-                        }
-                    }
-                }
-            }
-        )
         .onDisappear {
             cancelHoldAnimation(resetInstantly: true)
         }
-        .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("player.portrait.like")
-        .accessibilityAddTraits(isLiked ? [.isButton, .isSelected] : .isButton)
-        .accessibilityLabel(Text("Like"))
-        .accessibilityHint(Text("Hold for Triple Combo"))
-        .accessibilityValue(Text(count, format: .number))
-        .accessibilityAction(named: Text("Triple Combo")) {
-            Task { await onTripleCombo() }
+
+        return applyAccessibility(to: base)
+    }
+
+    private func likeIcon(isCharging: Bool, active: Bool) -> some View {
+        ZStack {
+            if isCharging {
+                Circle()
+                    .stroke(Color.biliAccent.opacity(0.28), lineWidth: 2.2)
+                    .frame(width: 28, height: 28)
+                Circle()
+                    .trim(from: 0, to: holdProgress)
+                    .stroke(
+                        Color.biliAccent,
+                        style: StrokeStyle(lineWidth: 2.2, lineCap: .round)
+                    )
+                    .rotationEffect(.degrees(-90))
+                    .frame(width: 28, height: 28)
+            }
+
+            Image(systemName: active ? "hand.thumbsup.fill" : "hand.thumbsup")
+                .font(.system(size: isCharging ? 17 : 22, weight: .semibold))
+                .foregroundStyle(active ? Color.biliAccent : .white)
+                .scaleEffect(isCharging ? (1.0 + 0.08 * holdProgress) : 1.0)
+                .shadow(color: .black.opacity(0.5), radius: 3, y: 1)
+        }
+        .frame(width: 30, height: 30)
+    }
+
+    private var pressHoldGesture: some Gesture {
+        DragGesture(minimumDistance: 0)
+            .updating($isPressing) { _, pressing, _ in
+                pressing = true
+            }
+            .onChanged { value in
+                let distance = hypot(value.translation.width, value.translation.height)
+                if distance > Self.maxHoldDistance, !pressCancelledByDrag {
+                    pressCancelledByDrag = true
+                    cancelHoldAnimation(resetInstantly: false)
+                }
+            }
+            .onEnded { value in
+                let distance = hypot(value.translation.width, value.translation.height)
+                cancelHoldAnimation(resetInstantly: false)
+                guard !didFireLongPress,
+                      !pressCancelledByDrag,
+                      distance <= Self.maxHoldDistance else {
+                    return
+                }
+                triggerLikeTap()
+            }
+    }
+
+    private func applyAccessibility<Content: View>(to content: Content) -> some View {
+        content
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("player.portrait.like")
+            .accessibilityAddTraits(isLiked ? [.isButton, .isSelected] : .isButton)
+            .accessibilityLabel(Text("Like"))
+            .accessibilityHint(Text("Hold for Triple Combo"))
+            .accessibilityValue(Text(count, format: .number))
+            .accessibilityAction {
+                triggerLikeTap()
+            }
+            .accessibilityAction(named: Text("Triple Combo")) {
+                Task { await onTripleCombo() }
+            }
+    }
+
+    private func handlePressStateChange(pressing: Bool) {
+        if pressing {
+            let pressID = UUID()
+            activePressID = pressID
+            didFireLongPress = false
+            pressCancelledByDrag = false
+            startHoldAnimation(pressID: pressID)
+        } else {
+            activePressID = nil
+            cancelHoldAnimation(resetInstantly: false)
         }
     }
 
-    private func startHoldAnimation() {
+    private func triggerLikeTap() {
+        guard !tapInFlight, !externalActionInFlight else { return }
+        Task {
+            tapInFlight = true
+            await onTap()
+            tapInFlight = false
+        }
+    }
+
+    private func startHoldAnimation(pressID: UUID) {
         holdTask?.cancel()
         holdTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(Self.ringDelayMs))
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, activePressID == pressID, !pressCancelledByDrag else { return }
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             let remaining = max(0.2, Self.holdDurationSeconds - Double(Self.ringDelayMs) / 1000.0)
             let step1 = remaining * 0.35
@@ -1454,17 +1552,24 @@ private struct PortraitRailLikeButton: View {
                 holdProgress = 0.35
             }
             try? await Task.sleep(for: .milliseconds(Int((step1 * 1000).rounded())))
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, activePressID == pressID, !pressCancelledByDrag else { return }
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             withAnimation(motion.animation(normal: .linear(duration: step2))) {
                 holdProgress = 0.65
             }
             try? await Task.sleep(for: .milliseconds(Int((step2 * 1000).rounded())))
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, activePressID == pressID, !pressCancelledByDrag else { return }
             UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
             withAnimation(motion.animation(normal: .linear(duration: step3))) {
                 holdProgress = 1.0
             }
+            try? await Task.sleep(for: .milliseconds(Int((step3 * 1000).rounded())))
+            guard !Task.isCancelled, activePressID == pressID, !pressCancelledByDrag else { return }
+            didFireLongPress = true
+            activePressID = nil
+            cancelHoldAnimation(resetInstantly: false)
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            await onTripleCombo()
         }
     }
 
@@ -1549,6 +1654,8 @@ private struct PortraitHairlineSeekBar: View {
     @State private var isVisible = false
     @State private var scrubInteraction: ScrubInteraction?
     @State private var scrubBaseProgress: Double?
+    @State private var scrubStartTranslationWidth: CGFloat?
+    @State private var dragRejectedForVerticalPaging = false
     @State private var lastScrubFraction: Double?
     @GestureState private var isTouchingBar = false
 
@@ -1596,6 +1703,8 @@ private struct PortraitHairlineSeekBar: View {
             guard case .active(let source) = scrubInteraction, source != current else { return }
             scrubInteraction = .retired
             scrubBaseProgress = nil
+            scrubStartTranslationWidth = nil
+            dragRejectedForVerticalPaging = false
             lastScrubFraction = nil
             isDraggingBar = false
             gestureDisplay.cancelSeek()
@@ -1607,6 +1716,8 @@ private struct PortraitHairlineSeekBar: View {
             }
             scrubInteraction = nil
             scrubBaseProgress = nil
+            scrubStartTranslationWidth = nil
+            dragRejectedForVerticalPaging = false
             lastScrubFraction = nil
             isDraggingBar = false
         }
@@ -1642,10 +1753,7 @@ private struct PortraitHairlineSeekBar: View {
                 ForEach(chapterFractions.indices, id: \.self) { index in
                     let fraction = chapterFractions[index]
                     if fraction > 0.005, fraction < 0.995 {
-                        Circle()
-                            .fill(Color.white.opacity(isActiveScrub ? 0.85 : 0.65))
-                            .frame(width: isActiveScrub ? 3.5 : 2.5, height: isActiveScrub ? 3.5 : 2.5)
-                            .offset(x: CGFloat(fraction) * width - (isActiveScrub ? 1.75 : 1.25))
+                        chapterTick(fraction: fraction, width: width)
                     }
                 }
             }
@@ -1663,26 +1771,11 @@ private struct PortraitHairlineSeekBar: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             .contentShape(Rectangle())
-            .gesture(
-                DragGesture(minimumDistance: 8)
-                    .updating($isTouchingBar) { _, touching, _ in touching = true }
-                    .onChanged { gesture in
-                        if scrubInteraction == nil {
-                            let dx = abs(gesture.translation.width)
-                            let dy = abs(gesture.translation.height)
-                            guard dx >= dy else { return }
-                            scrubBaseProgress = clampedProgress
-                        }
-                        let base = scrubBaseProgress ?? clampedProgress
-                        let delta = Double(gesture.translation.width / width)
-                        let fraction = min(max(base + delta, 0), 1)
-                        updateScrub(fraction, chapterFractions: chapterFractions)
-                    }
-            )
+            .gesture(seekBarGesture(width: width, clampedProgress: clampedProgress, chapterFractions: chapterFractions))
             .onAppear { barWidth = width }
             .onChange(of: width) { _, newWidth in barWidth = newWidth }
         }
-        .frame(height: 24)
+        .frame(height: PlayerPortraitChromePolicy.seekBarHeight)
         .accessibilityElement(children: .ignore)
         .accessibilityIdentifier("player.portrait.seekBar")
         .accessibilityLabel(Text("Playback position"))
@@ -1700,6 +1793,73 @@ private struct PortraitHairlineSeekBar: View {
             updateScrub(next, chapterFractions: chapterFractions)
             finishScrub()
         }
+    }
+
+    private func chapterTick(fraction: Double, width: CGFloat) -> some View {
+        let tickWidth: CGFloat = isActiveScrub ? 2.5 : 2
+        let tickHeight: CGFloat = isActiveScrub ? 7 : 3.5
+        let haloWidth = tickWidth + 1.5
+        return Capsule()
+            .fill(Color.black.opacity(0.68))
+            .frame(width: haloWidth, height: tickHeight)
+            .overlay {
+                Capsule()
+                    .fill(Color.white.opacity(isActiveScrub ? 0.96 : 0.88))
+                    .frame(width: tickWidth, height: max(2, tickHeight - 1))
+            }
+            .offset(x: CGFloat(fraction) * width - haloWidth * 0.5)
+    }
+
+    private func seekBarGesture(
+        width: CGFloat,
+        clampedProgress: Double,
+        chapterFractions: [Double]
+    ) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .updating($isTouchingBar) { _, touching, _ in touching = true }
+            .onChanged { gesture in
+                guard !dragRejectedForVerticalPaging else { return }
+                if case .retired = scrubInteraction { return }
+                let dx = abs(gesture.translation.width)
+                let dy = abs(gesture.translation.height)
+                if scrubInteraction == nil {
+                    if dy >= 6, dy > dx {
+                        dragRejectedForVerticalPaging = true
+                        return
+                    }
+                    guard dx >= 6, dx >= dy else { return }
+                    scrubBaseProgress = clampedProgress
+                    scrubStartTranslationWidth = gesture.translation.width
+                }
+                let base = scrubBaseProgress ?? clampedProgress
+                let startTranslation = scrubStartTranslationWidth ?? gesture.translation.width
+                let delta = Double((gesture.translation.width - startTranslation) / width)
+                let fraction = min(max(base + delta, 0), 1)
+                updateScrub(fraction, chapterFractions: chapterFractions)
+            }
+            .onEnded { gesture in
+                if case .active = scrubInteraction {
+                    finishScrub()
+                    return
+                }
+                let isShortTap = !dragRejectedForVerticalPaging
+                    && abs(gesture.translation.width) < 6
+                    && abs(gesture.translation.height) < 6
+                scrubBaseProgress = nil
+                scrubStartTranslationWidth = nil
+                dragRejectedForVerticalPaging = false
+                lastScrubFraction = nil
+                guard isShortTap,
+                      scrubSource != nil,
+                      !gestureDisplay.isSeeking,
+                      player.duration.isFinite,
+                      player.duration > 0 else {
+                    return
+                }
+                let fraction = min(max(Double(gesture.location.x / width), 0), 1)
+                UISelectionFeedbackGenerator().selectionChanged()
+                player.seek(to: fraction * player.duration)
+            }
     }
 
     private var scrubPreviewOverlay: some View {
@@ -1809,6 +1969,8 @@ private struct PortraitHairlineSeekBar: View {
         defer {
             scrubInteraction = nil
             scrubBaseProgress = nil
+            scrubStartTranslationWidth = nil
+            dragRejectedForVerticalPaging = false
             lastScrubFraction = nil
             isDraggingBar = false
         }

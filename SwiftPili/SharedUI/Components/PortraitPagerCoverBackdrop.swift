@@ -1,19 +1,57 @@
 import SwiftUI
 
+struct PortraitChromeAvatarView: View {
+    let urlString: String
+    var size: CGFloat = 28
+
+    var body: some View {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            AvatarImage(urlString: trimmed, size: size)
+                .overlay { borderCircle }
+        } else {
+            placeholderCircle
+                .overlay { borderCircle }
+        }
+    }
+
+    private var placeholderCircle: some View {
+        Circle()
+            .fill(Color.white.opacity(0.18))
+            .frame(width: size, height: size)
+            .overlay {
+                Image(systemName: "person.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.84))
+            }
+    }
+
+    private var borderCircle: some View {
+        Circle()
+            .strokeBorder(.white.opacity(0.25), lineWidth: 0.5)
+    }
+}
+
 struct PortraitPagerCoverBackdrop: View {
     let coverSource: PortraitPagingCoverSource
     let title: String
     let ownerName: String
     let pageSize: CGSize
     let resolutionBudget: CGSize
+    var avatarURL: String = ""
+    var prefersPortraitCoverVariant: Bool = true
+    var showsDanmakuDock: Bool = true
 
-    private var coverURL: String { coverSource.url(preferring: .mobileVariant) }
+    private var coverURL: String {
+        coverSource.url(preferring: prefersPortraitCoverVariant ? .mobileVariant : .desktop)
+    }
 
     var body: some View {
         let bottomSafe = AppWindowMetrics.safeAreaInsets.bottom
-        let dockBottom = PlayerPortraitChromePolicy.bottomDockBottomPadding(bottomSafeArea: bottomSafe)
-            + PlayerPortraitChromePolicy.bottomDockHeight
-            + 36
+        let dockBottom = PlayerPortraitChromePolicy.metadataBottomClearance(
+            bottomSafeArea: bottomSafe,
+            showsDanmakuDock: showsDanmakuDock
+        )
         ZStack(alignment: .bottomLeading) {
             Color.black
             if !coverURL.isEmpty,
@@ -27,41 +65,56 @@ struct PortraitPagerCoverBackdrop: View {
                     resolutionBudget: resolutionBudget
                 )
             }
-            LinearGradient(
-                stops: [
-                    .init(color: .clear, location: 0.0),
-                    .init(color: .black.opacity(0.32), location: 0.55),
-                    .init(color: .black.opacity(0.58), location: 1.0),
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .frame(height: PlayerPortraitChromePolicy.bottomGradientBaseHeight + max(0, bottomSafe - 12))
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-            .allowsHitTesting(false)
+            bottomGradient(bottomSafe: bottomSafe)
+            bottomMetadataOverlay(dockBottom: dockBottom)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
 
-            VStack(alignment: .leading, spacing: 8) {
-                if !ownerName.isEmpty {
+    private func bottomGradient(bottomSafe: CGFloat) -> some View {
+        LinearGradient(
+            stops: [
+                .init(color: .clear, location: 0.0),
+                .init(color: .black.opacity(0.32), location: 0.55),
+                .init(color: .black.opacity(0.58), location: 1.0),
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+        .frame(height: PlayerPortraitChromePolicy.bottomGradientBaseHeight + max(0, bottomSafe - 12))
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        .allowsHitTesting(false)
+    }
+
+    private func bottomMetadataOverlay(dockBottom: CGFloat) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !ownerName.isEmpty {
+                HStack(spacing: 7) {
+                    PortraitChromeAvatarView(urlString: avatarURL, size: 28)
                     Text(verbatim: ownerName.hasPrefix("@") ? ownerName : "@\(ownerName)")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.white)
                         .lineLimit(1)
                         .shadow(color: .black.opacity(0.45), radius: 2, y: 1)
                 }
-                if !title.isEmpty {
-                    Text(verbatim: title)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.white.opacity(0.95))
-                        .lineLimit(2)
-                        .multilineTextAlignment(.leading)
-                        .shadow(color: .black.opacity(0.45), radius: 2, y: 1)
-                }
+                .frame(height: 28, alignment: .leading)
             }
-            .padding(.leading, 16)
-            .padding(.trailing, 76)
-            .padding(.bottom, dockBottom)
+            if !title.isEmpty {
+                Text(verbatim: title)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.95))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .shadow(color: .black.opacity(0.45), radius: 2, y: 1)
+            }
+            Color.clear
+                .frame(height: 24)
+                .accessibilityHidden(true)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.leading, 16)
+        .padding(.trailing, 76)
+        .padding(.bottom, dockBottom)
     }
 }
 

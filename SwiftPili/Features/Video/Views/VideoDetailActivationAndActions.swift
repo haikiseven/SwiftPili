@@ -195,17 +195,12 @@ extension VideoDetailView {
 
         let nextTarget = inlinePlaylistTarget(for: item)
         userCollapsedImmersiveVideoID = nil
-        if isPortraitImmersiveStageActive {
+        var tx = Transaction()
+        tx.disablesAnimations = true
+        withTransaction(tx) {
             activePlaylistTarget = nextTarget
-            inlineScrollOffset = 0
-            detailScrollToTopTick &+= 1
-        } else {
-            withAnimation(motion.feedbackAnimation(normal: .easeInOut(duration: 0.22))) {
-                activePlaylistTarget = nextTarget
-                inlineScrollOffset = 0
-                detailScrollToTopTick &+= 1
-            }
         }
+        resetCompactInlineScrollToTopForNewVideo()
         immersiveFeedSession.syncPlaybackQueue(player.activePlaylistQueue)
         syncImmersiveViewportReducerMetrics()
         syncPortraitFullscreenContext()
@@ -270,13 +265,10 @@ extension VideoDetailView {
             userCollapsedImmersiveVideoID = nil
             if isPortraitImmersiveStageActive {
                 activePlaylistTarget = nextTarget
-                inlineScrollOffset = 0
-                detailScrollToTopTick &+= 1
+                resetCompactInlineScrollToTopForNewVideo()
             } else {
                 withAnimation(motion.feedbackAnimation(normal: .easeInOut(duration: 0.22))) {
                     activePlaylistTarget = nextTarget
-                    inlineScrollOffset = 0
-                    detailScrollToTopTick &+= 1
                 }
             }
 
@@ -368,17 +360,12 @@ extension VideoDetailView {
 
         let nextTarget = inlinePlaylistTarget(for: activeItem)
         userCollapsedImmersiveVideoID = nil
-        if isPortraitImmersiveStageActive {
+        var tx = Transaction()
+        tx.disablesAnimations = true
+        withTransaction(tx) {
             activePlaylistTarget = nextTarget
-            inlineScrollOffset = 0
-            detailScrollToTopTick &+= 1
-        } else {
-            withAnimation(motion.feedbackAnimation(normal: .easeInOut(duration: 0.22))) {
-                activePlaylistTarget = nextTarget
-                inlineScrollOffset = 0
-                detailScrollToTopTick &+= 1
-            }
         }
+        resetCompactInlineScrollToTopForNewVideo()
         syncPortraitFullscreenContext()
         Task { @MainActor in
             guard isActiveVideoRoute, player.isCurrentOwner(lease) else { return }
@@ -440,8 +427,26 @@ extension VideoDetailView {
         }
     }
 
+    func resetCompactInlineScrollToTopForNewVideo() {
+        suppressCompactScrollWritebackUntil = CACurrentMediaTime() + 0.35
+        pageOffsetStore.offsets[0] = 0
+        var tx = Transaction()
+        tx.disablesAnimations = true
+        withTransaction(tx) {
+            inlineScrollOffset = 0
+            detailScrollToTopTick &+= 1
+        }
+    }
+
     func handleCompactDetailScroll(_ rawOffset: CGFloat) {
         let offset = rawOffset.isFinite ? rawOffset : 0
+        if CACurrentMediaTime() < suppressCompactScrollWritebackUntil {
+            if abs(offset) <= 2 {
+                suppressCompactScrollWritebackUntil = 0
+            } else {
+                return
+            }
+        }
         recordPageOffsets([0: offset])
         guard isActiveVideoRoute,
               !isWideLayout,
@@ -472,7 +477,8 @@ extension VideoDetailView {
               !isWideLayout,
               !isPortraitImmersiveStageActive,
               !commentPresentation.isPresented,
-              !player.isFullscreenPresentationActive else { return }
+              !player.isFullscreenPresentationActive,
+              CACurrentMediaTime() >= suppressCompactScrollWritebackUntil else { return }
         syncInlineScrollOffset(from: pageOffsetStore.offsets[0] ?? 0)
     }
 
@@ -576,7 +582,14 @@ extension VideoDetailView {
         ].compactMap { $0 }
         let urls: [URL] = candidateIndices.compactMap { index in
             guard let entry = immersiveFeedSession.entry(at: index) else { return nil }
-            let raw = entry.target.preview.coverSource.url(preferring: .mobileVariant)
+            let prefersPortrait: Bool = if let aspect = entry.target.preview.aspectRatioHint {
+                aspect < 0.95
+            } else {
+                entry.target.preview.isPortraitHint ?? true
+            }
+            let raw = entry.target.preview.coverSource.url(
+                preferring: prefersPortrait ? .mobileVariant : .desktop
+            )
             guard !raw.isEmpty else { return nil }
             let resized = raw.biliResized(
                 toPixel: CGSize(width: requestBox.width * scale, height: requestBox.height * scale),
@@ -663,6 +676,33 @@ extension VideoDetailView {
             if ownsPlayer {
                 player.isInlinePortraitImmersiveActive = false
             }
+        }
+        syncPortraitFullscreenContext()
+    }
+
+    func collapseToInlineCommentsFromImmersiveStage() {
+        userCollapsedImmersiveVideoID = videoID
+        player.portraitPureViewEnabled = false
+        immersiveDragOffsetBox.y = 0
+        suppressCompactScrollWritebackUntil = 0
+        inlineScrollOffset = 0
+        pageOffsetStore.offsets[0] = 0
+        let ownsPlayer: Bool = if let lease = viewModel.playerLease {
+            player.isCurrentOwner(lease)
+        } else {
+            false
+        }
+        let compact = compactBaseWidth / (16.0 / 9.0)
+        let shouldCondense = !isWideLayout && expandedInlineVideoHeight > compact + 1
+        withAnimation(motion.animation(normal: .spring(duration: 0.32, bounce: 0.04))) {
+            isPortraitImmersiveStageActive = false
+            if ownsPlayer {
+                player.isInlinePortraitImmersiveActive = false
+                if shouldCondense {
+                    player.inlineCondensed = true
+                }
+            }
+            openComments()
         }
         syncPortraitFullscreenContext()
     }
@@ -758,10 +798,9 @@ extension VideoDetailView {
         replyPresentation.anchors.sourceProvider = nil
 
         activePlaylistTarget = entry.target
-        inlineScrollOffset = 0
         userCollapsedImmersiveVideoID = nil
         isRouteTransitionSettled = true
-        detailScrollToTopTick &+= 1
+        resetCompactInlineScrollToTopForNewVideo()
         syncPortraitFullscreenContext()
 
         Task { @MainActor in
@@ -828,9 +867,56 @@ extension VideoDetailView {
         triggerImmersiveRefillIfNeeded(forceSmallPool: true)
     }
 
+    func immersiveAvatarURL(for targetVideoID: VideoID) -> String {
+        if viewModel.matchesLoadedVideo(targetVideoID),
+           let face = viewModel.videoInfo?.owner.face,
+           !face.isEmpty {
+            return face
+        }
+        let matchedCard: VideoCard? = switch targetVideoID {
+        case .bvid(let bvid):
+            viewModel.relatedVideos.first {
+                !$0.bvid.isEmpty && $0.bvid.caseInsensitiveCompare(bvid) == .orderedSame
+            }
+        case .aid(let aid):
+            viewModel.relatedVideos.first { $0.aid == aid }
+        }
+        return matchedCard?.owner.face ?? ""
+    }
+
+    private func resolvedRecommendedTarget(_ nextTarget: VideoRouteTarget) -> VideoRouteTarget {
+        guard nextTarget.preview.aspectRatioHint == nil || nextTarget.preview.isPortraitHint == nil else {
+            return nextTarget.withoutZoom
+        }
+        let matchedCard: VideoCard? = switch nextTarget.videoID {
+        case .bvid(let bvid):
+            viewModel.relatedVideos.first {
+                !$0.bvid.isEmpty && $0.bvid.caseInsensitiveCompare(bvid) == .orderedSame
+            }
+        case .aid(let aid):
+            viewModel.relatedVideos.first { $0.aid == aid }
+        }
+        guard let video = matchedCard else { return nextTarget.withoutZoom }
+        let aspectRatioHint = nextTarget.preview.aspectRatioHint ?? video.dimension?.effectiveAspectRatio
+        let isPortraitHint = nextTarget.preview.isPortraitHint ?? video.dimension?.isPortrait
+        return VideoRouteTarget(
+            videoID: nextTarget.videoID,
+            preview: PortraitPagingPreview(
+                title: nextTarget.preview.title,
+                coverSource: nextTarget.preview.coverSource,
+                ownerName: nextTarget.preview.ownerName,
+                durationSeconds: nextTarget.preview.durationSeconds,
+                isPortraitHint: isPortraitHint,
+                aspectRatioHint: aspectRatioHint
+            ),
+            zoomSourceID: nil
+        )
+    }
+
     func switchToRecommendedVideoInline(_ nextTarget: VideoRouteTarget) {
         guard isActiveVideoRoute, let lease = claimPlayerLeaseIfNeeded() else { return }
 
+        let resolvedTarget = resolvedRecommendedTarget(nextTarget)
         composer.collapse(motion: motion)
         replyPresentation.cancelPendingAction()
         replyPresentation.isPresented = false
@@ -840,12 +926,16 @@ extension VideoDetailView {
 
         isRouteTransitionSettled = true
         userCollapsedImmersiveVideoID = nil
-        activePlaylistTarget = nextTarget
-        inlineScrollOffset = 0
-        detailScrollToTopTick &+= 1
+        viewModel.initialAspectRatioHint = resolvedTarget.preview.aspectRatioHint
+        var tx = Transaction()
+        tx.disablesAnimations = true
+        withTransaction(tx) {
+            activePlaylistTarget = resolvedTarget
+        }
+        resetCompactInlineScrollToTopForNewVideo()
         player.setPlaybackQueue(nil)
         immersiveFeedSession.reset(
-            initialTarget: nextTarget,
+            initialTarget: resolvedTarget,
             preferredCid: nil,
             activeQueue: nil
         )
@@ -855,11 +945,11 @@ extension VideoDetailView {
         Task { @MainActor in
             guard isActiveVideoRoute, player.isCurrentOwner(lease) else { return }
             _ = await viewModel.load(
-                id: nextTarget.videoID,
+                id: resolvedTarget.videoID,
                 preferredCid: nil,
                 owner: screenOwner,
                 lease: lease,
-                initialAspectRatioHint: nextTarget.preview.aspectRatioHint
+                initialAspectRatioHint: resolvedTarget.preview.aspectRatioHint
             )
             guard isActiveVideoRoute, player.isCurrentOwner(lease) else { return }
             installPlaylistSelectionHandlerIfNeeded()
@@ -888,7 +978,7 @@ extension VideoDetailView {
         context.title = info?.title ?? activeTarget.preview.title
         context.upMid = info?.owner.mid ?? 0
         context.upName = info?.owner.name ?? activeTarget.preview.ownerName
-        context.upAvatarURL = info?.owner.face ?? ""
+        context.upAvatarURL = info?.owner.face ?? immersiveAvatarURL(for: videoID)
         context.isFollowing = info != nil ? viewModel.isFollowingUp : nil
         context.isLiked = info != nil ? viewModel.isLiked : false
         context.likeCount = info?.stat.like ?? 0
@@ -947,14 +1037,25 @@ extension VideoDetailView {
         }
         context.onSwipeUpToDetailComments = {
             if isPortraitImmersiveStageActive {
-                collapseFromPortraitImmersiveStage()
+                if viewModel.commentsClosed {
+                    collapseFromPortraitImmersiveStage()
+                    return
+                }
+                collapseToInlineCommentsFromImmersiveStage()
             } else {
+                if !viewModel.commentsClosed, !isWideLayout {
+                    let compact = compactBaseWidth / (16.0 / 9.0)
+                    if expandedInlineVideoHeight > compact + 1 {
+                        player.inlineCondensed = true
+                    }
+                }
                 player.requestFullscreenTransition(target: false, source: .button)
-            }
-            Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(180))
-                if !viewModel.commentsClosed {
-                    openComments()
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(180))
+                    guard isActiveVideoRoute, !player.isFullscreen else { return }
+                    if !viewModel.commentsClosed {
+                        openComments()
+                    }
                 }
             }
         }
@@ -1039,8 +1140,12 @@ extension VideoDetailView {
         context.makeCommentsSheetView = {
             AnyView(makePortraitFullscreenCommentsSheet())
         }
-        context.makeDetailsSheetView = {
-            AnyView(makePortraitFullscreenDetailsSheet())
+        if info != nil {
+            context.makeDetailsSheetView = {
+                AnyView(makePortraitFullscreenDetailsSheet())
+            }
+        } else {
+            context.makeDetailsSheetView = nil
         }
     }
 
@@ -1165,19 +1270,22 @@ struct PlaylistVideoPart: Equatable, Sendable {
     let part: String
     let duration: Int
     let isPortrait: Bool?
+    let aspectRatioHint: CGFloat?
 
     init(
         cid: Int,
         page: Int,
         part: String,
         duration: Int,
-        isPortrait: Bool? = nil
+        isPortrait: Bool? = nil,
+        aspectRatioHint: CGFloat? = nil
     ) {
         self.cid = cid
         self.page = page
         self.part = part
         self.duration = duration
         self.isPortrait = isPortrait
+        self.aspectRatioHint = aspectRatioHint
     }
 
     init(_ videoPage: VideoInfo.VideoPage) {
@@ -1186,6 +1294,7 @@ struct PlaylistVideoPart: Equatable, Sendable {
         self.part = videoPage.part
         self.duration = videoPage.duration
         self.isPortrait = videoPage.dimension?.isPortrait
+        self.aspectRatioHint = videoPage.dimension?.effectiveAspectRatio
     }
 }
 
@@ -1200,6 +1309,7 @@ struct PlaylistQueueEntry: Equatable, Sendable {
     var isPortraitHint: Bool?
     let routeTarget: VideoRouteTarget
     var pages: [PlaylistVideoPart]?
+    var aspectRatioHint: CGFloat?
 
     init(
         aid: Int,
@@ -1211,7 +1321,8 @@ struct PlaylistQueueEntry: Equatable, Sendable {
         duration: TimeInterval?,
         isPortraitHint: Bool?,
         routeTarget: VideoRouteTarget,
-        pages: [PlaylistVideoPart]? = nil
+        pages: [PlaylistVideoPart]? = nil,
+        aspectRatioHint: CGFloat? = nil
     ) {
         self.aid = aid
         self.bvid = bvid
@@ -1223,6 +1334,7 @@ struct PlaylistQueueEntry: Equatable, Sendable {
         self.isPortraitHint = isPortraitHint
         self.routeTarget = routeTarget
         self.pages = pages
+        self.aspectRatioHint = aspectRatioHint ?? routeTarget.preview.aspectRatioHint
     }
 
     var videoID: VideoID { routeTarget.videoID }
@@ -1238,7 +1350,8 @@ struct PlaylistQueueEntry: Equatable, Sendable {
             artist: artist,
             coverURL: coverURL,
             duration: duration,
-            isPortraitHint: isPortraitHint,
+            isPortraitHint: isPortraitHint ?? routeTarget.preview.isPortraitHint,
+            aspectRatioHint: aspectRatioHint ?? routeTarget.preview.aspectRatioHint,
             source: .ugc,
             originRoute: .videoDetail(routeTarget),
             originScreenRoute: .video(videoID),
@@ -1250,6 +1363,8 @@ struct PlaylistQueueEntry: Equatable, Sendable {
         if let pages, pages.count > 1 {
             let totalParts = pages.count
             return pages.map { page in
+                let partPortrait = page.isPortrait ?? isPortraitHint ?? routeTarget.preview.isPortraitHint
+                let partAspect = page.aspectRatioHint ?? aspectRatioHint ?? routeTarget.preview.aspectRatioHint
                 let pageTarget = VideoRouteTarget(
                     videoID: videoID,
                     preview: PortraitPagingPreview(
@@ -1257,7 +1372,8 @@ struct PlaylistQueueEntry: Equatable, Sendable {
                         coverURL: coverURL ?? "",
                         ownerName: artist,
                         durationSeconds: page.duration,
-                        isPortraitHint: page.isPortrait ?? isPortraitHint
+                        isPortraitHint: partPortrait,
+                        aspectRatioHint: partAspect
                     ),
                     zoomSourceID: nil
                 )
@@ -1270,7 +1386,8 @@ struct PlaylistQueueEntry: Equatable, Sendable {
                     artist: artist,
                     coverURL: coverURL,
                     duration: TimeInterval(page.duration),
-                    isPortraitHint: page.isPortrait ?? isPortraitHint,
+                    isPortraitHint: partPortrait,
+                    aspectRatioHint: partAspect,
                     source: .ugc,
                     originRoute: .videoDetail(pageTarget),
                     originScreenRoute: .video(videoID),
@@ -1289,17 +1406,20 @@ struct ResolvedPlaylistVideoMetadata: Equatable, Sendable {
     let duration: Int?
     let isPortrait: Bool?
     let pages: [PlaylistVideoPart]?
+    let aspectRatioHint: CGFloat?
 
     init(
         cid: Int,
         duration: Int?,
         isPortrait: Bool?,
-        pages: [PlaylistVideoPart]? = nil
+        pages: [PlaylistVideoPart]? = nil,
+        aspectRatioHint: CGFloat? = nil
     ) {
         self.cid = cid
         self.duration = duration
         self.isPortrait = isPortrait
         self.pages = pages
+        self.aspectRatioHint = aspectRatioHint
     }
 }
 
@@ -1345,7 +1465,8 @@ final class PlaylistQueueLauncher {
             cid: info.cid,
             duration: info.duration > 0 ? info.duration : nil,
             isPortrait: info.dimension?.isPortrait,
-            pages: info.pages?.map(PlaylistVideoPart.init)
+            pages: info.pages?.map(PlaylistVideoPart.init),
+            aspectRatioHint: info.dimension?.effectiveAspectRatio
         )
     }
 
@@ -1434,6 +1555,9 @@ final class PlaylistQueueLauncher {
         session.entries[0].pages = info.pages?.map(PlaylistVideoPart.init)
         if session.entries[0].isPortraitHint == nil {
             session.entries[0].isPortraitHint = info.dimension?.isPortrait
+        }
+        if session.entries[0].aspectRatioHint == nil {
+            session.entries[0].aspectRatioHint = info.dimension?.effectiveAspectRatio
         }
         if session.entries[0].duration == nil, info.duration > 0 {
             session.entries[0].duration = TimeInterval(info.duration)
@@ -1609,6 +1733,9 @@ final class PlaylistQueueLauncher {
         }
         if session.entries[index].isPortraitHint == nil {
             session.entries[index].isPortraitHint = resolved.isPortrait
+        }
+        if session.entries[index].aspectRatioHint == nil {
+            session.entries[index].aspectRatioHint = resolved.aspectRatioHint
         }
         activeSession = session
     }

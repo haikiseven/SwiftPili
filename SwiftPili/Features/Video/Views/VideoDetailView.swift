@@ -161,6 +161,7 @@ struct VideoDetailView: View {
     @State var presentationScreenID = UUID()
     @State var activePlaylistTarget: VideoRouteTarget?
     @State var detailScrollToTopTick = 0
+    @State var suppressCompactScrollWritebackUntil: CFTimeInterval = 0
     @State var lastActivePlayerVideoHeight: CGFloat?
     @State var lastActiveExpandedVideoHeight: CGFloat?
     @State var isRouteTransitionSettled = false
@@ -255,12 +256,17 @@ struct VideoDetailView: View {
     var activeFloatingPlaylistQueue: PlaybackQueueContext? {
         guard isActiveVideoRoute,
               !player.isFullscreen,
-              let lease = viewModel.playerLease,
-              player.isCurrentOwner(lease),
               let queue = player.activePlaylistQueue else {
             return nil
         }
-        return queue
+        if let lease = viewModel.playerLease {
+            return player.isCurrentOwner(lease) ? queue : nil
+        }
+        if let currentItem = queue.currentItem,
+           currentItem.originScreenRoute == .video(videoID) {
+            return queue
+        }
+        return player.currentOwnerLease == nil ? queue : nil
     }
 
     var containerWidth: CGFloat { containerMetrics.containerWidth }
@@ -388,7 +394,10 @@ struct VideoDetailView: View {
 
     var playerShapeIsCurrent: Bool {
         guard viewModel.matchesLoadedVideo(videoID), let aid = viewModel.videoInfo?.aid else { return false }
-        return player.ownerKey == screenOwner && player.mode == .vod && player.currentAid == aid
+        return player.ownerKey == screenOwner
+            && player.mode == .vod
+            && player.currentAid == aid
+            && (viewModel.currentCid == nil || player.currentCid == viewModel.currentCid)
     }
 
     var metadataPortraitHint: Bool {
@@ -452,11 +461,14 @@ struct VideoDetailView: View {
 
     var hasUsableInlinePlayerChrome: Bool {
         guard isActiveVideoRoute, viewModel.error == nil, viewModel.unavailability == nil,
-              player.error == nil, player.unavailability == nil,
-              player.videoPresentationFailureMessage == nil, player.currentURL != nil,
-              let lease = viewModel.playerLease else { return false }
-        return player.isCurrentOwner(lease) && player.mode == .vod
-            && player.surfaceLease(matching: lease, role: .inline) != nil
+              player.unavailability == nil else {
+            return false
+        }
+        return PlayerDetailSurfacePolicy.hasUsableInlineExitChrome(
+            player: player,
+            lease: viewModel.playerLease,
+            expectedMode: .vod
+        )
     }
 
     var presentationContext: PlayerScreenPresentationContext? {
@@ -533,7 +545,15 @@ struct VideoDetailView: View {
     }
 
     private var placeholderCoverURL: String? {
-        let prefersPortraitVariant = showsInRoutePortraitImmersive || resolvedPortraitHint
+        let prefersPortraitVariant: Bool = if showsInRoutePortraitImmersive {
+            if let aspect = effectiveInlineAspectRatio {
+                aspect < 0.95
+            } else {
+                activeTarget.preview.isPortraitHint ?? true
+            }
+        } else {
+            resolvedPortraitHint
+        }
         if prefersPortraitVariant,
            let mobile = activeTarget.preview.coverSource.mobileVariantURL,
            !mobile.isEmpty {
@@ -643,6 +663,7 @@ struct VideoDetailView: View {
                 isWideLayout: isWideLayout,
                 restingHeight: containerMetrics.restingHeight,
                 isFullscreenPresentationActive: player.isFullscreenPresentationActive,
+                isActiveRoute: isActiveVideoRoute,
                 onSizeChange: { size in
                     containerMetrics.update(size: size, isRegularWidth: sizeClass == .regular)
                 },
@@ -711,7 +732,7 @@ struct VideoDetailView: View {
         .ignoresSafeArea(.keyboard, edges: isImmersiveStage ? .all : (!isWideLayout ? .bottom : []))
         .playerDetailChrome(
             isFullscreenPresentationActive: player.isFullscreenPresentationActive,
-            isStatusBarHidden: player.isFullscreen || showsInRoutePortraitImmersive,
+            isStatusBarHidden: player.isFullscreen || rendersFullBleedImmersiveStage,
             guardsIPadTopSafeArea: !isImmersiveStage,
             preventsContentDismissal: isActiveVideoRoute,
             presentationContext: presentationContext,
@@ -818,7 +839,6 @@ struct VideoDetailView: View {
                 applyModeDPortraitFullscreenIfNeeded()
             }
             .onChange(of: videoID) { _, _ in
-                inlineScrollOffset = 0
                 userCollapsedImmersiveVideoID = nil
             }
             .onChange(of: viewModel.relatedVideos.map(\.bvid)) { _, _ in
@@ -846,8 +866,6 @@ struct VideoDetailView: View {
             }
             .onChange(of: viewModel.currentCid) { oldCid, newCid in
                 guard let oldCid, let newCid, oldCid != newCid else { return }
-                inlineScrollOffset = 0
-                detailScrollToTopTick &+= 1
                 syncPortraitFullscreenContext()
                 applyModeDPortraitFullscreenIfNeeded()
             }
@@ -1074,12 +1092,19 @@ struct VideoDetailView: View {
     @ViewBuilder
     private func immersiveNeighbourPreview(index: Int, pageSize: CGSize) -> some View {
         if let entry = immersiveFeedSession.entry(at: index) {
+            let prefersPortraitVariant: Bool = if let aspect = entry.target.preview.aspectRatioHint {
+                aspect < 0.95
+            } else {
+                entry.target.preview.isPortraitHint ?? true
+            }
             PortraitPagerCoverBackdrop(
                 coverSource: entry.target.preview.coverSource,
                 title: entry.target.preview.title,
                 ownerName: entry.target.preview.ownerName,
                 pageSize: pageSize,
-                resolutionBudget: immersiveFeedSession.reducer.coverResolutionBudget
+                resolutionBudget: immersiveFeedSession.reducer.coverResolutionBudget,
+                avatarURL: immersiveAvatarURL(for: entry.target.videoID),
+                prefersPortraitCoverVariant: prefersPortraitVariant
             )
         } else {
             Color.clear
@@ -1123,7 +1148,7 @@ struct VideoDetailView: View {
                         pageNavigationActions: playerPageNavigation,
                         inlineViewportSize: viewportSize,
                         inlineCornerRadius: effectiveCornerRadius,
-                        isInlinePortraitImmersive: showsInRoutePortraitImmersive,
+                        isInlinePortraitImmersive: rendersFullBleedImmersiveStage,
                         screenLease: viewModel.playerLease,
                         placeholderCoverURL: placeholderCoverURL,
                         showsLoadingIndicator: viewModel.error == nil && viewModel.unavailability == nil,
@@ -1247,7 +1272,9 @@ struct VideoDetailView: View {
                 handleCompactDetailScroll(offset)
             }
             .onChange(of: detailScrollToTopTick) { _, _ in
-                withAnimation(motion.animation(normal: .easeInOut(duration: 0.28))) {
+                var tx = Transaction()
+                tx.disablesAnimations = true
+                withTransaction(tx) {
                     proxy.scrollTo("video-detail-compact-top", anchor: .top)
                 }
             }

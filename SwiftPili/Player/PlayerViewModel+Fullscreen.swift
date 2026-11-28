@@ -391,10 +391,23 @@ extension PlayerViewModel {
     func beginPortraitPagingHandoff(lease: PlayerOwnerLease) -> Bool {
         guard isCurrentOwner(lease), (mode == .vod || mode == .offline) else { return false }
         hasRenderedFirstFrame = false
+        clearFreezeFrame()
+        suspendPlayback()
+        lifecycleRecovery.invalidate()
+        invalidateLifecycleReadiness()
+        playbackTerminalState = .active
+        clearNearEndStall()
+        settledSeekDisplaySample = nil
+        mediaTime = 0
+        bufferedTime = 0
+        lastDisplayUpdate = 0
+        duration = 0
+        currentURL = nil
+        currentDASHAudioURL = nil
         error = nil
         unavailability = nil
         terminalOpenFailure = false
-        suspendPlayback()
+        isBuffering = true
         return true
     }
 }

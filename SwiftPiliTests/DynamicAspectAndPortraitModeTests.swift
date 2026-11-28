@@ -2080,4 +2080,109 @@ struct DynamicAspectAndPortraitModeTests {
         #expect(wlItem.dimension?.isPortrait == true)
         #expect(Self.approxEqual(wlItem.dimension?.effectiveAspectRatio ?? 0, 9.0 / 16.0))
     }
+
+    @Test("Story chrome metadataBottomClearance, paging handoff reset, subtitle avoidance, and inline exit chrome policy")
+    @MainActor
+    func storyZeroShiftChromePagingHandoffAndSubtitleAvoidance() {
+        // 1. Verify PortraitPagerCoverBackdrop & PlayerPortraitFullscreenChrome share exact bottom clearance math
+        let clearance34 = PlayerPortraitChromePolicy.metadataBottomClearance(
+            bottomSafeArea: 34,
+            showsDanmakuDock: true
+        )
+        #expect(
+            clearance34 == PlayerPortraitChromePolicy.bottomDockTopPadding
+                + PlayerPortraitChromePolicy.bottomDockHeight
+                + 34
+                + PlayerPortraitChromePolicy.seekBarHeight
+                + PlayerPortraitChromePolicy.bottomSplitBottomPadding
+        )
+        let clearanceNoDock = PlayerPortraitChromePolicy.metadataBottomClearance(
+            bottomSafeArea: 34,
+            showsDanmakuDock: false
+        )
+        #expect(
+            clearanceNoDock == 34
+                + PlayerPortraitChromePolicy.seekBarHeight
+                + PlayerPortraitChromePolicy.bottomSplitBottomPadding
+        )
+
+        // 2. Verify Story Mode subtitle avoidance clears 232pt metadata zone & controls-aware inline/fullscreen lift
+        let storySub = PlayerSubtitleLayoutPadding.resolve(
+            isFullscreenHost: true,
+            isPlayerFullscreen: true,
+            isPortraitContent: true,
+            isPortraitImmersive: true,
+            mode: .vod,
+            portraitPureViewEnabled: false,
+            portraitChromeBottomInset: 34,
+            controlsVisible: false,
+            bottomSafeArea: 34,
+            styleBottomOffset: 0
+        )
+        #expect(storySub.avoidsPortraitAlwaysOnChrome == true)
+        #expect(storySub.bottom >= 232)
+
+        let pureViewSub = PlayerSubtitleLayoutPadding.resolve(
+            isFullscreenHost: true,
+            isPlayerFullscreen: true,
+            isPortraitContent: true,
+            isPortraitImmersive: true,
+            mode: .vod,
+            portraitPureViewEnabled: true,
+            portraitChromeBottomInset: 34,
+            controlsVisible: false,
+            bottomSafeArea: 34,
+            styleBottomOffset: 0
+        )
+        #expect(pureViewSub.avoidsPortraitAlwaysOnChrome == false)
+        #expect(pureViewSub.bottom == 70)
+
+        let fullscreenControlsSub = PlayerSubtitleLayoutPadding.resolve(
+            isFullscreenHost: true,
+            isPlayerFullscreen: true,
+            isPortraitContent: false,
+            isPortraitImmersive: false,
+            mode: .vod,
+            portraitPureViewEnabled: false,
+            portraitChromeBottomInset: 0,
+            controlsVisible: true,
+            bottomSafeArea: 21,
+            styleBottomOffset: 0
+        )
+        #expect(fullscreenControlsSub.bottom == 123)
+
+        // 3. Verify beginPortraitPagingHandoff clears stale currentURL/duration and sets isBuffering = true
+        let vm = PlayerViewModel.shared
+        let savedOwner = vm.ownerKey
+        let savedURL = vm.currentURL
+        let savedDuration = vm.duration
+        let savedBuffering = vm.isBuffering
+        defer {
+            vm.endCurrentOwnerPlayback()
+            vm.ownerKey = savedOwner
+            vm.currentURL = savedURL
+            vm.duration = savedDuration
+            vm.isBuffering = savedBuffering
+        }
+
+        let lease = vm.claimOwnerLease(owner: "vod-BV1handoff")
+        vm.currentURL = URL(string: "https://example.com/old.mp4")
+        vm.duration = 180
+        vm.isBuffering = false
+
+        vm.beginPortraitPagingHandoff(lease: lease)
+        #expect(vm.currentURL == nil)
+        #expect(vm.duration == 0)
+        #expect(vm.isBuffering == true)
+        #expect(vm.isPlaying == false)
+
+        // 4. Verify PlayerDetailSurfacePolicy.hasUsableInlineExitChrome requires non-nil currentURL
+        #expect(
+            PlayerDetailSurfacePolicy.hasUsableInlineExitChrome(
+                player: vm,
+                lease: lease,
+                expectedMode: .vod
+            ) == false
+        )
+    }
 }
