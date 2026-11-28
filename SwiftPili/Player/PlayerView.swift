@@ -437,10 +437,10 @@ struct PlayerView: View {
     }
 
     var body: some View {
-        let stage = applyBottomOverlaysAndSheets(to: playerStageCore)
-        let viewportLayered = applyViewportAndHUD(to: stage)
-        let seekObserved = applyLifecycleAndSeekObservers(to: viewportLayered)
-        return applyOwnershipAndOrientationObservers(to: seekObserved)
+        let staged = applyPanelSheetsAndListeners(to: applyStageOverlays(to: playerStageCore))
+        let hudStage = applyHUDOverlays(to: applyViewportMetrics(to: staged))
+        let seekObserved = applyLifecycleAndSeekObservers(to: hudStage)
+        return applyOrientationAndCollapseObservers(to: applyOwnershipObservers(to: seekObserved))
     }
 
     private var playerStageCore: some View {
@@ -478,7 +478,11 @@ struct PlayerView: View {
             }
 
             if isOwner, isImmersiveStagePresentation {
-                PlayerFullscreenAmbientBackdrop(player: vm)
+                PlayerFullscreenAmbientBackdrop(
+                    player: vm,
+                    isPortraitImmersive: isPortraitImmersiveFullscreen,
+                    fallbackCoverURL: resolvedPlaceholderCoverURL
+                )
             }
 
             if vm.currentURL != nil || vm.retainsRecoveryRenderContainer(owner: owner), isOwner, let surfaceLease {
@@ -536,7 +540,7 @@ struct PlayerView: View {
             .allowsHitTesting(false)
             .accessibilityHidden(true)
 
-            if isOwner, vm.isBuffering, !showsFirstFrameCover, !isPlaybackUnavailable, !isPlaybackEnded {
+            if isOwner, vm.isBuffering, !showsFirstFrameCover, !isPlaybackUnavailable, !isPlaybackEnded, !verticalAdjustActive {
                 ProgressView()
                     .controlSize(.large)
                     .tint(.white)
@@ -781,207 +785,235 @@ struct PlayerView: View {
         .allowsHitTesting(isPlaybackEnded)
     }
 
-    private func applyBottomOverlaysAndSheets<Content: View>(to content: Content) -> some View {
+    private func applyStageOverlays<Content: View>(to content: Content) -> some View {
         let isFullscreenTransitioning = surfaceRole == .fullscreen
             && PlayerFullscreenTransitionState.shared.isGeometryTransitioning
+        let resolvedContainerHeight = surfaceSize.height > 0
+            ? surfaceSize.height
+            : (allocatedInlineViewport?.height ?? 0)
         return content
             .overlay(alignment: .bottom) {
                 PlayerSubtitleOverlay(
-                player: vm,
-                isFullscreenSurface: surfaceRole == .fullscreen || isInlinePortraitImmersive,
-                portraitChromeBottomInset: isPortraitImmersiveFullscreen ? chromeInsets.bottom : 0
-            )
-            .ignoresSafeArea(.keyboard, edges: .all)
-        }
-        .overlay(alignment: .bottom) {
-            if !isPlaybackUnavailable,
-               !isPortraitImmersiveFullscreen,
-               surfaceRole == .inline || (vm.isFullscreen && !isFullscreenTransitioning) {
-                PlayerSeekStrip(
-                    player: vm, owner: owner, isCurrentOwner: isOwner, gestureDisplay: gestureDisplay,
-                    chromeInsets: chromeInsets,
-                    inlineCornerRadius: isFullscreenPresentation ? 0 : inlineCornerRadius,
-                    suppressScrubPreview: swipeSeekActive,
-                    controlAnimation: controlAnimation
+                    player: vm,
+                    isFullscreenSurface: surfaceRole == .fullscreen || isInlinePortraitImmersive,
+                    portraitChromeBottomInset: isPortraitImmersiveFullscreen ? chromeInsets.bottom : 0,
+                    isPortraitImmersive: isPortraitImmersiveFullscreen,
+                    controlsVisible: isPortraitImmersiveFullscreen
+                        ? false
+                        : (vm.showControls || isPlaybackUnavailable || isPlaybackEnded),
+                    bottomSafeArea: chromeInsets.bottom
                 )
                 .ignoresSafeArea(.keyboard, edges: .all)
             }
-        }
-        .overlay(
-            alignment: (isPortraitImmersiveFullscreen && !vm.portraitPureViewEnabled)
-                ? .topTrailing
-                : .bottomTrailing
-        ) {
-            ZStack(
+            .overlay(alignment: .bottom) {
+                if !isPlaybackUnavailable,
+                   !isPortraitImmersiveFullscreen,
+                   surfaceRole == .inline || (vm.isFullscreen && !isFullscreenTransitioning) {
+                    PlayerSeekStrip(
+                        player: vm, owner: owner, isCurrentOwner: isOwner, gestureDisplay: gestureDisplay,
+                        chromeInsets: chromeInsets,
+                        inlineCornerRadius: isFullscreenPresentation ? 0 : inlineCornerRadius,
+                        containerHeight: resolvedContainerHeight,
+                        suppressScrubPreview: swipeSeekActive,
+                        controlAnimation: controlAnimation
+                    )
+                    .ignoresSafeArea(.keyboard, edges: .all)
+                }
+            }
+            .overlay(
                 alignment: (isPortraitImmersiveFullscreen && !vm.portraitPureViewEnabled)
                     ? .topTrailing
                     : .bottomTrailing
             ) {
-                if vm.mode.usesOnlineVODServices, let seg = vm.pendingSponsorManualSegment {
-                    let placesAtPortraitTop = isPortraitImmersiveFullscreen && !vm.portraitPureViewEnabled
-                    Button {
-                        vm.skipSponsorSegment(seg)
-                    } label: {
-                        HStack(spacing: 6) {
-                            Circle()
-                                .fill(seg.category.color)
-                                .frame(width: 9, height: 9)
-                            Text(String(format: String(localized: "Skip %@"), seg.category.displayName))
-                            Image(systemName: "forward.fill")
-                        }
-                        .playerChromeCapsule(horizontal: 14, vertical: 9)
-                    }
-                    .padding(
-                        .top,
-                        placesAtPortraitTop ? (chromeInsets.top + 54) : 0
-                    )
-                    .padding(
-                        .trailing,
-                        placesAtPortraitTop
-                            ? 16
-                            : (isPortraitImmersiveFullscreen
-                                ? 20
-                                : ((isFullscreenPresentation ? 4 : 12) + chromeInsets.horizontal))
-                    )
-                    .padding(
-                        .bottom,
-                        placesAtPortraitTop
-                            ? 0
-                            : ((isPortraitImmersiveFullscreen ? 24 : (isFullscreenPresentation ? 32 : 20))
-                                + chromeInsets.bottom)
-                    )
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
-                }
+                sponsorManualSkipOverlay
             }
-            .animation(microControlAnimation, value: vm.pendingSponsorManualSegment?.uuid)
+            .scaleEffect(portraitStageScale)
+            .offset(y: portraitStageOffsetY)
             .ignoresSafeArea(.keyboard, edges: .all)
-        }
-        .scaleEffect(portraitStageScale)
-        .offset(y: portraitStageOffsetY)
-        .ignoresSafeArea(.keyboard, edges: .all)
-        .sheet(isPresented: $showSponsorBlock) {
-            SponsorBlockPanel(vm: vm)
-                .preferredColorScheme((AppearanceMode(rawValue: appearanceRaw) ?? .system).colorScheme)
-        }
-        .background {
-            Color.clear
-                .sheet(isPresented: danmakuSheetBinding) {
-                    PlayerDanmakuSettingsSheet(
-                        presentation: isImmersiveStagePresentation ? .fullscreen : .inline,
-                        onClose: { dismissDanmakuPanel() }
-                    )
-                    .preferredColorScheme((AppearanceMode(rawValue: appearanceRaw) ?? .system).colorScheme)
-                }
-        }
-        .background {
-            Color.clear
-                .sheet(isPresented: subtitleSheetBinding) {
-                    PlayerSubtitleSettingsSheet(
-                        player: vm,
-                        onClose: { dismissSubtitlePanel() }
-                    )
-                    .preferredColorScheme((AppearanceMode(rawValue: appearanceRaw) ?? .system).colorScheme)
-                }
-        }
-        .onChange(of: danmakuPanelPresented) { _, presented in
-            if presented {
-                subtitlePanelPresented = false
-                landscapeSubtitleDragOffset = .zero
-            } else {
-                landscapeDanmakuDragOffset = .zero
-            }
-            if isOwner {
-                vm.setDanmakuSettingsHold((presented && danmakuEnabled) || subtitlePanelPresented)
-            }
-        }
-        .onChange(of: subtitlePanelPresented) { _, presented in
-            if presented {
-                danmakuPanelPresented = false
-                landscapeDanmakuDragOffset = .zero
-            } else {
-                landscapeSubtitleDragOffset = .zero
-            }
-            if isOwner {
-                vm.setDanmakuSettingsHold(presented || (danmakuPanelPresented && danmakuEnabled))
-            }
-        }
     }
 
-    private func applyViewportAndHUD<Content: View>(to content: Content) -> some View {
+    private var sponsorManualSkipOverlay: some View {
+        let placesAtPortraitTop = isPortraitImmersiveFullscreen && !vm.portraitPureViewEnabled
+        let hasPortraitTopNotice = isOwner && vm.activeNoticeBanner != nil
+        let topPadding: CGFloat = placesAtPortraitTop
+            ? (chromeInsets.top + (hasPortraitTopNotice ? 102 : 54))
+            : 0
+        let trailingPadding: CGFloat = placesAtPortraitTop
+            ? 16
+            : (isPortraitImmersiveFullscreen
+                ? 20
+                : ((isFullscreenPresentation ? 4 : 12) + chromeInsets.horizontal))
+        let bottomPadding: CGFloat = if placesAtPortraitTop {
+            0
+        } else if isPortraitImmersiveFullscreen {
+            24 + chromeInsets.bottom
+        } else if vm.showControls || isPlaybackEnded {
+            (isFullscreenPresentation ? 96 : 74) + chromeInsets.bottom
+        } else {
+            (isFullscreenPresentation ? (gestureDisplay.isSeeking ? 42 : 32) : 30) + chromeInsets.bottom
+        }
+        return ZStack(alignment: placesAtPortraitTop ? .topTrailing : .bottomTrailing) {
+            if vm.mode.usesOnlineVODServices, let seg = vm.pendingSponsorManualSegment {
+                Button {
+                    vm.skipSponsorSegment(seg)
+                } label: {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(seg.category.color)
+                            .frame(width: 9, height: 9)
+                        Text(String(format: String(localized: "Skip %@"), seg.category.displayName))
+                        Image(systemName: "forward.fill")
+                    }
+                    .playerChromeCapsule(horizontal: 14, vertical: 9, minHeight: 44)
+                }
+                .padding(.top, topPadding)
+                .padding(.trailing, trailingPadding)
+                .padding(.bottom, bottomPadding)
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
+        }
+        .animation(microControlAnimation, value: vm.pendingSponsorManualSegment?.uuid)
+        .animation(controlAnimation, value: vm.showControls)
+        .animation(microControlAnimation, value: hasPortraitTopNotice)
+        .ignoresSafeArea(.keyboard, edges: .all)
+    }
+
+    private func applyPanelSheetsAndListeners<Content: View>(to content: Content) -> some View {
+        content
+            .sheet(isPresented: $showSponsorBlock) {
+                SponsorBlockPanel(vm: vm)
+                    .preferredColorScheme((AppearanceMode(rawValue: appearanceRaw) ?? .system).colorScheme)
+            }
+            .background {
+                Color.clear
+                    .sheet(isPresented: danmakuSheetBinding) {
+                        PlayerDanmakuSettingsSheet(
+                            presentation: isImmersiveStagePresentation ? .fullscreen : .inline,
+                            onClose: { dismissDanmakuPanel() }
+                        )
+                        .preferredColorScheme((AppearanceMode(rawValue: appearanceRaw) ?? .system).colorScheme)
+                    }
+            }
+            .background {
+                Color.clear
+                    .sheet(isPresented: subtitleSheetBinding) {
+                        PlayerSubtitleSettingsSheet(
+                            player: vm,
+                            onClose: { dismissSubtitlePanel() }
+                        )
+                        .preferredColorScheme((AppearanceMode(rawValue: appearanceRaw) ?? .system).colorScheme)
+                    }
+            }
+            .onChange(of: danmakuPanelPresented) { _, presented in
+                if presented {
+                    subtitlePanelPresented = false
+                    landscapeSubtitleDragOffset = .zero
+                } else {
+                    landscapeDanmakuDragOffset = .zero
+                }
+                if isOwner {
+                    vm.setDanmakuSettingsHold((presented && danmakuEnabled) || subtitlePanelPresented)
+                }
+            }
+            .onChange(of: subtitlePanelPresented) { _, presented in
+                if presented {
+                    danmakuPanelPresented = false
+                    landscapeDanmakuDragOffset = .zero
+                } else {
+                    landscapeSubtitleDragOffset = .zero
+                }
+                if isOwner {
+                    vm.setDanmakuSettingsHold(presented || (danmakuPanelPresented && danmakuEnabled))
+                }
+            }
+    }
+
+    private func applyViewportMetrics<Content: View>(to content: Content) -> some View {
         content
             .modifier(
                 PlayerViewportFrameModifier(
-                surfaceRole: surfaceRole,
-                containerAspect: containerAspect,
-                allocatedInlineViewport: allocatedInlineViewport,
-                fillsAllocatedViewport: isImmersiveStagePresentation
+                    surfaceRole: surfaceRole,
+                    containerAspect: containerAspect,
+                    allocatedInlineViewport: allocatedInlineViewport,
+                    fillsAllocatedViewport: isImmersiveStagePresentation
+                )
             )
-        )
-        .coordinateSpace(name: Self.surfaceCoordinateSpace)
-        .background { if isImmersiveStagePresentation { Color.black } }
-        .ignoresSafeArea(.keyboard, edges: .all)
-        .ignoresSafeArea(.all, edges: isImmersiveStagePresentation ? .all : [])
-        .onGeometryChange(for: CGSize.self) { $0.size } action: { newValue in
-            publishSurfaceSizeIfAllowed(newValue)
-        }
-        .onGeometryChange(for: CGPoint.self) { $0.frame(in: .global).origin } action: { origin in
-            if origin.x.isFinite, origin.y.isFinite, !verticalPagingActive, !portraitDismissDragActive {
-                surfaceGlobalOrigin = origin
-            }
-        }
-        .overlay(alignment: .top) {
-            let noticeTopPadding: CGFloat = if isPortraitImmersiveFullscreen {
-                chromeInsets.top + 56
-            } else if vm.activeNoticeBanner?.isInteractive == true, vm.showControls {
-                chromeInsets.top + (isFullscreenPresentation ? 56 : 50)
-            } else {
-                chromeInsets.top + 12
-            }
-            VStack(spacing: 6) {
-                if swipeSeekActive, (!isPortraitImmersiveFullscreen || vm.portraitPureViewEnabled) {
-                    PlayerSwipeSeekHUD(
-                        player: vm, gestureDisplay: gestureDisplay, swipeSeekBase: swipeSeekBase
-                    )
-                    .allowsHitTesting(false)
-                }
-                if vm.isHoldFastForwarding {
-                    HStack(spacing: 5) {
-                        Image(systemName: "forward.fill")
-                        Text("2x")
-                    }
-                    .playerChromeCapsule()
-                    .allowsHitTesting(false)
-                    .transition(.opacity)
-                }
-                if isOwner, let banner = vm.activeNoticeBanner {
-                    PlayerNoticeBannerView(banner: banner) {
-                        vm.triggerNoticeBannerAction()
-                    }
-                    .allowsHitTesting(banner.isInteractive)
-                    .transition(.opacity)
-                }
-            }
-            .padding(.top, noticeTopPadding)
-            .animation(microControlAnimation, value: vm.isHoldFastForwarding)
-            .animation(microControlAnimation, value: vm.activeNoticeBanner)
-            .animation(microControlAnimation, value: vm.showControls)
-            .animation(microControlAnimation, value: swipeSeekActive)
+            .coordinateSpace(name: Self.surfaceCoordinateSpace)
+            .background { if isImmersiveStagePresentation { Color.black } }
             .ignoresSafeArea(.keyboard, edges: .all)
-        }
-        .overlay(alignment: .center) {
-            ZStack {
-                if verticalAdjustActive {
-                    PlayerVerticalAdjustHUD(
-                        gestureDisplay: gestureDisplay, verticalAdjustIsVolume: verticalAdjustIsVolume
-                    )
+            .ignoresSafeArea(.all, edges: isImmersiveStagePresentation ? .all : [])
+            .onGeometryChange(for: CGSize.self) { $0.size } action: { newValue in
+                publishSurfaceSizeIfAllowed(newValue)
+            }
+            .onGeometryChange(for: CGPoint.self) { $0.frame(in: .global).origin } action: { origin in
+                if origin.x.isFinite, origin.y.isFinite, !verticalPagingActive, !portraitDismissDragActive {
+                    surfaceGlobalOrigin = origin
+                }
+            }
+    }
+
+    private func applyHUDOverlays<Content: View>(to content: Content) -> some View {
+        content
+            .overlay(alignment: .top) {
+                topHUDOverlay
+            }
+            .overlay(alignment: .center) {
+                ZStack {
+                    if verticalAdjustActive {
+                        PlayerVerticalAdjustHUD(
+                            gestureDisplay: gestureDisplay, verticalAdjustIsVolume: verticalAdjustIsVolume
+                        )
                         .transition(.opacity)
+                    }
                 }
+                .animation(microControlAnimation, value: verticalAdjustActive)
+                .ignoresSafeArea(.keyboard, edges: .all)
             }
-            .animation(microControlAnimation, value: verticalAdjustActive)
             .ignoresSafeArea(.keyboard, edges: .all)
+            .allowsHitTesting(isOwner && surfaceLease != nil)
+    }
+
+    private var noticeTopPadding: CGFloat {
+        if isPortraitImmersiveFullscreen {
+            return chromeInsets.top + 56
         }
+        if vm.showControls || isPlaybackUnavailable || isPlaybackEnded {
+            return chromeInsets.top + (isFullscreenPresentation ? 58 : 56)
+        }
+        return chromeInsets.top + (isFullscreenPresentation ? 14 : 12)
+    }
+
+    private var topHUDOverlay: some View {
+        VStack(spacing: 6) {
+            if swipeSeekActive, (!isPortraitImmersiveFullscreen || vm.portraitPureViewEnabled) {
+                PlayerSwipeSeekHUD(
+                    player: vm, gestureDisplay: gestureDisplay, swipeSeekBase: swipeSeekBase
+                )
+                .allowsHitTesting(false)
+            }
+            if vm.isHoldFastForwarding {
+                HStack(spacing: 5) {
+                    Image(systemName: "forward.fill")
+                    Text("2x")
+                }
+                .playerChromeCapsule()
+                .allowsHitTesting(false)
+                .transition(.opacity)
+            }
+            if isOwner, let banner = vm.activeNoticeBanner {
+                PlayerNoticeBannerView(banner: banner) {
+                    vm.triggerNoticeBannerAction()
+                }
+                .allowsHitTesting(banner.isInteractive)
+                .transition(.opacity)
+            }
+        }
+        .padding(.top, noticeTopPadding)
+        .animation(microControlAnimation, value: vm.isHoldFastForwarding)
+        .animation(microControlAnimation, value: vm.activeNoticeBanner)
+        .animation(microControlAnimation, value: vm.showControls)
+        .animation(microControlAnimation, value: swipeSeekActive)
         .ignoresSafeArea(.keyboard, edges: .all)
-        .allowsHitTesting(isOwner && surfaceLease != nil)
     }
 
     private func applyLifecycleAndSeekObservers<Content: View>(to content: Content) -> some View {
@@ -1073,85 +1105,89 @@ struct PlayerView: View {
         }
     }
 
-    private func applyOwnershipAndOrientationObservers<Content: View>(to content: Content) -> some View {
+    private func applyOwnershipObservers<Content: View>(to content: Content) -> some View {
         content
             .onChange(of: vm.ownerKey) { _, _ in
                 claimScreenSurfaceIfCurrent()
-            syncInlineEndedRecommendationsIfNeeded()
-        }
-        .onChange(of: vm.activeSurfaceLease) { _, _ in
-            claimScreenSurfaceIfCurrent()
-            syncInlineEndedRecommendationsIfNeeded()
-        }
-        .onChange(of: screenLease) { _, _ in
-            claimScreenSurfaceIfCurrent()
-            syncInlineEndedRecommendationsIfNeeded()
-        }
-        .onChange(of: endedRecommendations) { _, _ in
-            syncInlineEndedRecommendationsIfNeeded()
-        }
-        .onChange(of: vm.currentURL) { _, newURL in
-            guard newURL != nil,
-                  isOwner,
-                  surfaceRole == .inline,
-                  DeviceCapability.supportsOrientationLock,
-                  !vm.isFullscreen,
-                  !vm.isPortraitContent else { return }
-            let orientation = UIDevice.current.orientation
-            guard orientation.isLandscape,
-                  !FullscreenOrientationLatch.shared.shouldIgnoreDeviceOrientation(
-                      orientation,
-                      currentFullscreen: false
-                  ) else { return }
-            vm.requestFullscreenTransition(target: true, source: .deviceOrientation)
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
-            guard isOwner, DeviceCapability.supportsOrientationLock else { return }
-            let orientation = UIDevice.current.orientation
-            if vm.isPortraitContent, !AppOrientation.shared.mask.contains(.landscape) {
-                return
+                syncInlineEndedRecommendationsIfNeeded()
             }
-            guard !FullscreenOrientationLatch.shared.shouldIgnoreDeviceOrientation(
-                orientation,
-                currentFullscreen: vm.isFullscreen
-            ) else { return }
-            if orientation.isLandscape, vm.currentURL != nil, !vm.isFullscreen {
+            .onChange(of: vm.activeSurfaceLease) { _, _ in
+                claimScreenSurfaceIfCurrent()
+                syncInlineEndedRecommendationsIfNeeded()
+            }
+            .onChange(of: screenLease) { _, _ in
+                claimScreenSurfaceIfCurrent()
+                syncInlineEndedRecommendationsIfNeeded()
+            }
+            .onChange(of: endedRecommendations) { _, _ in
+                syncInlineEndedRecommendationsIfNeeded()
+            }
+    }
+
+    private func applyOrientationAndCollapseObservers<Content: View>(to content: Content) -> some View {
+        content
+            .onChange(of: vm.currentURL) { _, newURL in
+                guard newURL != nil,
+                      isOwner,
+                      surfaceRole == .inline,
+                      DeviceCapability.supportsOrientationLock,
+                      !vm.isFullscreen,
+                      !vm.isPortraitContent else { return }
+                let orientation = UIDevice.current.orientation
+                guard orientation.isLandscape,
+                      !FullscreenOrientationLatch.shared.shouldIgnoreDeviceOrientation(
+                          orientation,
+                          currentFullscreen: false
+                      ) else { return }
                 vm.requestFullscreenTransition(target: true, source: .deviceOrientation)
-            } else if orientation == .portrait, vm.isFullscreen {
-                vm.requestFullscreenTransition(target: false, source: .deviceOrientation)
             }
-        }
-        .onChange(of: verticalSizeClass) { _, newValue in
-            guard isOwner, DeviceCapability.supportsOrientationLock else { return }
-            if newValue == .regular, vm.isFullscreen, AppOrientation.shared.mask.contains(.landscape) {
-                PlayerLog.log("[Player] window rotated to portrait behind isFullscreen — reconciling")
-                vm.requestFullscreenTransition(target: false, source: .verticalSizeClass)
-            } else if newValue == .compact, !vm.isFullscreen, vm.currentURL != nil,
-                      !PlayerFullscreenTransitionState.shared.isHostActive {
-                PlayerLog.log("[Player] window rotated to landscape behind inline state — reconciling")
-                vm.requestFullscreenTransition(target: true, source: .verticalSizeClass)
+            .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
+                guard isOwner, DeviceCapability.supportsOrientationLock else { return }
+                let orientation = UIDevice.current.orientation
+                if vm.isPortraitContent, !AppOrientation.shared.mask.contains(.landscape) {
+                    return
+                }
+                guard !FullscreenOrientationLatch.shared.shouldIgnoreDeviceOrientation(
+                    orientation,
+                    currentFullscreen: vm.isFullscreen
+                ) else { return }
+                if orientation.isLandscape, vm.currentURL != nil, !vm.isFullscreen {
+                    vm.requestFullscreenTransition(target: true, source: .deviceOrientation)
+                } else if orientation == .portrait, vm.isFullscreen {
+                    vm.requestFullscreenTransition(target: false, source: .deviceOrientation)
+                }
             }
-        }
-        .onChange(of: vm.isFullscreen) { _, _ in
-            resetSurfaceTouch(reason: "fullscreen changed")
-            dismissDanmakuPanel()
-            portraitVerticalDragOffset = 0
-            portraitDismissDragActive = false
-            pinchTransitionLatched = false
-            isDraggingHairlineBar = false
-            gestureDisplay.cancelSeek()
-        }
-        .onChange(of: isInlinePortraitImmersive) { _, _ in
-            resetSurfaceTouch(reason: "inline portrait immersive changed")
-            dismissDanmakuPanel()
-            portraitVerticalDragOffset = 0
-            portraitDismissDragActive = false
-            isDraggingHairlineBar = false
-            gestureDisplay.cancelSeek()
-        }
-        .opacity(isInlineViewportCollapsed ? 0 : 1)
-        .allowsHitTesting(!isInlineViewportCollapsed)
-        .accessibilityHidden(isInlineViewportCollapsed)
+            .onChange(of: verticalSizeClass) { _, newValue in
+                guard isOwner, DeviceCapability.supportsOrientationLock else { return }
+                if newValue == .regular, vm.isFullscreen, AppOrientation.shared.mask.contains(.landscape) {
+                    PlayerLog.log("[Player] window rotated to portrait behind isFullscreen — reconciling")
+                    vm.requestFullscreenTransition(target: false, source: .verticalSizeClass)
+                } else if newValue == .compact, !vm.isFullscreen, vm.currentURL != nil,
+                          !PlayerFullscreenTransitionState.shared.isHostActive {
+                    PlayerLog.log("[Player] window rotated to landscape behind inline state — reconciling")
+                    vm.requestFullscreenTransition(target: true, source: .verticalSizeClass)
+                }
+            }
+            .onChange(of: vm.isFullscreen) { _, _ in
+                resetSurfaceTouch(reason: "fullscreen changed")
+                dismissDanmakuPanel()
+                portraitVerticalDragOffset = 0
+                portraitDismissDragActive = false
+                pinchTransitionLatched = false
+                isDraggingHairlineBar = false
+                gestureDisplay.cancelSeek()
+            }
+            .onChange(of: isInlinePortraitImmersive) { _, _ in
+                resetSurfaceTouch(reason: "inline portrait immersive changed")
+                dismissDanmakuPanel()
+                portraitVerticalDragOffset = 0
+                portraitDismissDragActive = false
+                isDraggingHairlineBar = false
+                gestureDisplay.cancelSeek()
+            }
+            .opacity(isInlineViewportCollapsed ? 0 : 1)
+            .allowsHitTesting(!isInlineViewportCollapsed)
+            .accessibilityHidden(isInlineViewportCollapsed)
     }
 
     // MARK: - Unified Surface Gesture (tap / hold-2x / swipe-seek)
@@ -1818,7 +1854,7 @@ private struct PlayerPlaybackEndedOverlay: View {
         guard transportPlacement == .playerBottomEdge else {
             return chromeInsets.bottom + 16
         }
-        return isFullscreen ? (chromeInsets.bottom + 92) : (chromeInsets.bottom + 78)
+        return isFullscreen ? (chromeInsets.bottom + 102) : (chromeInsets.bottom + 84)
     }
 
     private var horizontalInset: CGFloat {

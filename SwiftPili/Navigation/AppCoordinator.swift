@@ -242,12 +242,18 @@ final class AppCoordinator {
         tabStacks[tab] = stack
     }
 
-    private func setSidebarRowStack(_ stack: [Route], for row: SidebarDestination) {
+    private func setSidebarRowStack(
+        _ stack: [Route],
+        for row: SidebarDestination,
+        parkBeforeWrite: Bool = true
+    ) {
         let old = sidebarRowStacks[row.id] ?? []
         if layoutMigrationDepth == 0, selectedSidebarRow?.id == row.id, stack.count < old.count {
             videoNavigationAdmission.cancel()
         }
-        let departedOwner = selectedSidebarRow?.id == row.id && stack.count < old.count
+        let departedOwner = parkBeforeWrite
+            && selectedSidebarRow?.id == row.id
+            && stack.count < old.count
             ? routePlayer?.parkOutgoingRouteStill()
             : nil
         sidebarRowStacks[row.id] = stack
@@ -425,8 +431,17 @@ final class AppCoordinator {
                let row = SidebarDestination.myContent.first(where: { $0.id == sidebarID }),
                selectedSidebarRow != row,
                !sidebarRowStack(for: row).isEmpty {
-                let rowStack = SidebarDestination.folded(row, rowStack: sidebarRowStack(for: row))
-                if PlayerScreenRoute(route: rowStack.last) == session.originScreenRoute {
+                let rowStack = sidebarRowStack(for: row)
+                if let index = rowStack.lastIndex(where: {
+                    PlayerScreenRoute(route: $0) == session.originScreenRoute
+                }) {
+                    if index < rowStack.count - 1 {
+                        setSidebarRowStack(
+                            Array(rowStack.prefix(through: index)),
+                            for: row,
+                            parkBeforeWrite: false
+                        )
+                    }
                     selectedSidebarRow = row
                     selectedTab = row.parentTab
                     return
@@ -434,11 +449,22 @@ final class AppCoordinator {
             }
             if selectedSidebarRow != nil || selectedTab != position.tab {
                 let tabStack = stack(for: position.tab)
-                if PlayerScreenRoute(route: tabStack.last) == session.originScreenRoute {
+                if let index = tabStack.lastIndex(where: {
+                    PlayerScreenRoute(route: $0) == session.originScreenRoute
+                }) {
+                    if index < tabStack.count - 1 {
+                        setStack(
+                            Array(tabStack.prefix(through: index)),
+                            for: position.tab,
+                            parkBeforeWrite: false
+                        )
+                    }
+                    if selectedTab != position.tab {
+                        selectedTab = position.tab
+                    }
                     if selectedSidebarRow != nil {
                         selectedSidebarRow = nil
                     }
-                    selectedTab = position.tab
                     return
                 }
             }
@@ -449,7 +475,11 @@ final class AppCoordinator {
             if let index = current.lastIndex(where: {
                 PlayerScreenRoute(route: $0) == session.originScreenRoute
             }), index < current.count - 1 {
-                setSidebarRowStack(Array(current.prefix(through: index)), for: row)
+                setSidebarRowStack(
+                    Array(current.prefix(through: index)),
+                    for: row,
+                    parkBeforeWrite: false
+                )
                 return
             }
         } else {

@@ -62,9 +62,12 @@ struct OfflinePlayerView: View {
         )
     }
     private var hasInlineExitChrome: Bool {
-        guard let ownerLease, player.isCurrentOwner(ownerLease), player.mode == .offline else { return false }
-        return isActiveOfflineRoute && item != nil && assetValid && player.error == nil
-            && player.surfaceLease(matching: ownerLease, role: .inline) != nil
+        guard isActiveOfflineRoute, item != nil, assetValid else { return false }
+        return PlayerDetailSurfacePolicy.hasUsableInlineExitChrome(
+            player: player,
+            lease: ownerLease,
+            expectedMode: .offline
+        )
     }
     private var currentAsset: OfflinePlaybackAsset? {
         guard let item else { return nil }
@@ -565,7 +568,7 @@ extension OfflinePlayerView {
                         pageNavigationActions: playerPageNavigation,
                         inlineViewportSize: size,
                         inlineCornerRadius: cornerRadius,
-                        isInlinePortraitImmersive: showsInRouteOfflineImmersive,
+                        isInlinePortraitImmersive: isImmersiveStage,
                         screenLease: ownerLease,
                         placeholderCoverURL: item.coverURL
                     )
@@ -727,7 +730,13 @@ extension OfflinePlayerView {
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                             .ignoresSafeArea(.container, edges: .all)
                             .animation(
-                                (!isImmersiveStage && !player.isFullscreenPresentationActive && !player.isFullscreen)
+                                (!isImmersiveStage
+                                    && DetailDepartureHeightFreezePolicy.allowsInlineHeightAnimation(
+                                        isActiveRoute: isActiveOfflineRoute,
+                                        isWideLayout: isSplitLayout,
+                                        isFullscreenPresentationActive: player.isFullscreenPresentationActive,
+                                        isFullscreen: player.isFullscreen
+                                    ))
                                     ? motion.animation(normal: .snappy(duration: 0.22))
                                     : nil,
                                 value: resolvedOfflineAspectRatioKey
@@ -735,19 +744,6 @@ extension OfflinePlayerView {
                         }
                     }
                     .ignoresSafeArea(.keyboard, edges: isImmersiveStage ? .all : [])
-                    .guardIPadTopSafeArea(when: !isImmersiveStage)
-                    .background {
-                        if isImmersiveStage {
-                            Color.black.ignoresSafeArea()
-                        } else {
-                            CinematicBackdrop(
-                                coverURL: item.coverURL,
-                                player: player,
-                                ownerLease: ownerLease,
-                                isRouteActive: isActiveOfflineRoute
-                            )
-                        }
-                    }
                 } else {
                     ZStack(alignment: .topLeading) {
                         ContentUnavailableView {
@@ -773,34 +769,30 @@ extension OfflinePlayerView {
                             .padding(.horizontal, PlayerPageNavigationButtons.inlineHorizontalPadding)
                             .padding(.top, PlayerPageNavigationButtons.topPadding)
                     }
-                    .guardIPadTopSafeArea(when: true)
-                    .background {
-                        PlayerAmbientPolicy.groundColor
-                            .ignoresSafeArea()
-                    }
                 }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .playerDetailInlineContainerSize(
-            isFullscreenPresentationActive: player.isFullscreenPresentationActive
+            isFullscreenPresentationActive: player.isFullscreenPresentationActive,
+            isActiveRoute: isActiveOfflineRoute
         ) { size in
             if inlineContainerSize != size { inlineContainerSize = size }
         }
         .playerDetailDeferredSize(
-            isFullscreenPresentationActive: player.isFullscreenPresentationActive
+            isFullscreenPresentationActive: player.isFullscreenPresentationActive,
+            isActiveRoute: isActiveOfflineRoute
         ) { size in
             if containerWidth != size.width { containerWidth = size.width }
         }
         .playerDetailChrome(
             isFullscreenPresentationActive: player.isFullscreenPresentationActive,
-            isStatusBarHidden: player.isFullscreen || showsInRouteOfflineImmersive,
-            guardsIPadTopSafeArea: nil,
+            isStatusBarHidden: player.isFullscreen || isImmersiveStage,
+            guardsIPadTopSafeArea: !isImmersiveStage,
             presentationContext: presentationContext,
             coordinator: coordinator
         ) {
-            (isImmersiveStage ? Color.black : PlayerAmbientPolicy.groundColor)
-                .ignoresSafeArea()
+            offlineBackdrop(isImmersiveStage: isImmersiveStage)
         }
         .onChange(of: isActiveOfflineRoute, initial: true) { oldActive, active in
             if active {
@@ -875,6 +867,24 @@ extension OfflinePlayerView {
         .onDisappear {
             guard scenePhase == .active else { return }
             releaseOwnerLease()
+        }
+    }
+
+    @ViewBuilder
+    private func offlineBackdrop(isImmersiveStage: Bool) -> some View {
+        if let item, assetValid {
+            if isImmersiveStage {
+                Color.black.ignoresSafeArea()
+            } else {
+                CinematicBackdrop(
+                    coverURL: item.coverURL,
+                    player: player,
+                    ownerLease: ownerLease,
+                    isRouteActive: isActiveOfflineRoute
+                )
+            }
+        } else {
+            PlayerAmbientPolicy.groundColor.ignoresSafeArea()
         }
     }
 }

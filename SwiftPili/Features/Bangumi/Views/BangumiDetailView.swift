@@ -76,11 +76,12 @@ struct BangumiDetailView: View {
     }
 
     private var hasInlineExitChrome: Bool {
-        guard isActiveBangumiRoute, viewModel.error == nil,
-              player.error == nil, player.unavailability == nil,
-              let lease = viewModel.playerLease else { return false }
-        return player.isCurrentOwner(lease) && player.mode == .vod
-            && player.surfaceLease(matching: lease, role: .inline) != nil
+        guard isActiveBangumiRoute, viewModel.error == nil else { return false }
+        return PlayerDetailSurfacePolicy.hasUsableInlineExitChrome(
+            player: player,
+            lease: viewModel.playerLease,
+            expectedMode: .vod
+        )
     }
 
     private var placeholderCoverURL: String? {
@@ -107,9 +108,12 @@ struct BangumiDetailView: View {
     }
 
     private var inlineAspectAnimation: Animation? {
-        guard !isWideLayout,
-              !player.isFullscreenPresentationActive,
-              !player.isFullscreen else { return nil }
+        guard DetailDepartureHeightFreezePolicy.allowsInlineHeightAnimation(
+            isActiveRoute: isActiveBangumiRoute,
+            isWideLayout: isWideLayout,
+            isFullscreenPresentationActive: player.isFullscreenPresentationActive,
+            isFullscreen: player.isFullscreen
+        ) else { return nil }
         return motion.animation(normal: .snappy(duration: 0.22))
     }
 
@@ -232,6 +236,7 @@ struct BangumiDetailView: View {
                 isWideLayout: isWideLayout,
                 restingHeight: containerMetrics.restingHeight,
                 isFullscreenPresentationActive: player.isFullscreenPresentationActive,
+                isActiveRoute: isActiveBangumiRoute,
                 onSizeChange: { size in
                     containerMetrics.update(size: size, isRegularWidth: sizeClass == .regular)
                 },

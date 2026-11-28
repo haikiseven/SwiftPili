@@ -123,7 +123,7 @@ struct PlayerTopControlBar: View {
                         Image(systemName: "chevron.down")
                             .font(.system(size: 10, weight: .semibold))
                     }
-                    .playerChromeCapsule()
+                    .playerChromeCapsule(minHeight: 44)
                 }
                 .accessibilityLabel(Text("Video quality \(label)"))
             }
@@ -133,6 +133,8 @@ struct PlayerTopControlBar: View {
                 presentationReceipt: presentationReceipt, fullscreenHostIdentity: fullscreenHostIdentity,
                 onOpenSubtitleSettings: { toggleSubtitleSettingsPanel() }
             )
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
 
             if !player.mode.supportsPlaybackRate {
                 liveSleepTimerMenu

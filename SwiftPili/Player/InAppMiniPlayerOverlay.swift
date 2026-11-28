@@ -36,7 +36,10 @@ struct InAppMiniPlayerOverlay: View {
         let session = activeSession
         GeometryReader { proxy in
             if let session, let player = PlayerViewModel.existingShared {
-                let isPortrait = player.chrome.isPortraitContent
+                let isPortrait = DetailPlayerGeometry.isPortraitAspect(
+                    player.chrome.videoAspectRatio,
+                    fallback: session.isPortrait || player.chrome.isPortraitContent
+                )
                 let cardSize = InAppMiniPlayerLayoutPolicy.cardSize(
                     isPortrait: isPortrait,
                     isPad: DeviceCapability.supportsPadDetailSplit,
@@ -187,7 +190,8 @@ struct InAppMiniPlayerOverlay: View {
                     safeArea: safeArea,
                     topBarClearance: topBarClearance,
                     bottomBarClearance: bottomBarClearance,
-                    horizontalMargin: horizontalMargin
+                    horizontalMargin: horizontalMargin,
+                    snapsHorizontallyToCorners: true
                 )
                 switch action {
                 case .dismiss(let direction):
@@ -292,15 +296,8 @@ private struct MiniPlayerFloatingCard: View {
 
             if let coverURL = session.coverURL, !coverURL.isEmpty,
                (!player.session.hasRenderedFirstFrame || player.backend.isPiPActive) {
-                CoverImage(
-                    urlString: coverURL,
-                    displaySize: cardSize,
-                    contentMode: .fill,
-                    groundColor: .black,
-                    isDecorative: true,
-                    fillsOfferedBox: true
-                )
-                .allowsHitTesting(false)
+                miniPlayerCover(coverURL: coverURL)
+                    .allowsHitTesting(false)
             }
 
             if player.session.currentURL != nil, let surfaceLease {
@@ -341,9 +338,11 @@ private struct MiniPlayerFloatingCard: View {
 
             // Corner controls overlay.
             VStack(spacing: 0) {
-                HStack(alignment: .top, spacing: 6) {
+                HStack(alignment: .top, spacing: 0) {
                     if session.mode == .live {
                         MiniPlayerLivePill()
+                            .padding(.top, 6)
+                            .padding(.leading, 6)
                             .allowsHitTesting(false)
                     }
                     Spacer(minLength: 0)
@@ -355,17 +354,16 @@ private struct MiniPlayerFloatingCard: View {
                         action: onTapClose
                     )
                 }
-                .padding(.top, 6)
-                .padding(.horizontal, 6)
 
                 Spacer(minLength: 0)
 
-                HStack(alignment: .bottom) {
+                HStack(alignment: .bottom, spacing: 0) {
                     Spacer(minLength: 0)
-                    MiniPlayerPlayPauseButton(player: player)
+                    MiniPlayerPlayPauseButton(
+                        player: player,
+                        bottomInset: session.mode.isSeekable ? 8 : 6
+                    )
                 }
-                .padding(.bottom, session.mode.isSeekable ? 8 : 6)
-                .padding(.trailing, 6)
             }
 
             if session.mode.isSeekable {
@@ -405,6 +403,26 @@ private struct MiniPlayerFloatingCard: View {
         )
         .accessibilityHint(Text("Double tap to return to player"))
     }
+
+    @ViewBuilder
+    private func miniPlayerCover(coverURL: String) -> some View {
+        if cardSize.height > cardSize.width {
+            PortraitPagerCoverLayers(
+                coverURL: coverURL,
+                pageSize: cardSize,
+                resolutionBudget: cardSize
+            )
+        } else {
+            CoverImage(
+                urlString: coverURL,
+                displaySize: cardSize,
+                contentMode: .fill,
+                groundColor: .black,
+                isDecorative: true,
+                fillsOfferedBox: true
+            )
+        }
+    }
 }
 
 private struct MiniPlayerControlButton: View {
@@ -416,21 +434,30 @@ private struct MiniPlayerControlButton: View {
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: systemImage)
-                .font(.system(size: iconSize, weight: .bold))
-                .foregroundStyle(.white)
-                .frame(width: diameter, height: diameter)
-                .appGlass(in: Circle(), interactive: true)
-                .environment(\.colorScheme, .dark)
-                .contentShape(Circle())
+            iconCircle
+                .padding(.top, 6)
+                .padding(.trailing, 6)
+                .frame(width: 44, height: 44, alignment: .topTrailing)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.appControl)
+        .contentShape(.interaction, Rectangle())
         .accessibilityLabel(accessibilityLabel)
+    }
+
+    private var iconCircle: some View {
+        Image(systemName: systemImage)
+            .font(.system(size: iconSize, weight: .bold))
+            .foregroundStyle(.white)
+            .frame(width: diameter, height: diameter)
+            .appGlass(in: Circle(), interactive: true)
+            .environment(\.colorScheme, .dark)
     }
 }
 
 private struct MiniPlayerPlayPauseButton: View {
     let player: PlayerViewModel
+    let bottomInset: CGFloat
 
     var body: some View {
         let isPlaying = player.session.isPlaying
@@ -439,17 +466,25 @@ private struct MiniPlayerPlayPauseButton: View {
             generator.impactOccurred()
             player.togglePlayPause()
         } label: {
-            Image(systemName: isPlaying ? "pause.fill" : "play.fill")
-                .font(.system(size: 11.5, weight: .bold))
-                .foregroundStyle(.white)
-                .contentTransition(.symbolEffect(.replace))
-                .frame(width: 28, height: 28)
-                .appGlass(in: Circle(), interactive: true)
-                .environment(\.colorScheme, .dark)
-                .contentShape(Circle())
+            iconCircle(isPlaying: isPlaying)
+                .padding(.bottom, bottomInset)
+                .padding(.trailing, 6)
+                .frame(width: 44, height: 44, alignment: .bottomTrailing)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.appControl)
+        .contentShape(.interaction, Rectangle())
         .accessibilityLabel(isPlaying ? Text("Pause") : Text("Play"))
+    }
+
+    private func iconCircle(isPlaying: Bool) -> some View {
+        Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+            .font(.system(size: 11.5, weight: .bold))
+            .foregroundStyle(.white)
+            .contentTransition(.symbolEffect(.replace))
+            .frame(width: 28, height: 28)
+            .appGlass(in: Circle(), interactive: true)
+            .environment(\.colorScheme, .dark)
     }
 }
 
@@ -490,7 +525,8 @@ private struct MiniPlayerProgressBar: View {
     var body: some View {
         let duration = player.clock.duration
         if duration > 0 {
-            let progress = min(max(player.clock.mediaTime / duration, 0), 1)
+            let displayTime = player.resolvedDisplayTime(mediaTime: player.clock.mediaTime)
+            let progress = min(max(displayTime / duration, 0), 1)
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Rectangle()

@@ -7,19 +7,24 @@ struct PlayerSeekStrip: View {
     let gestureDisplay: PlayerGestureDisplay
     let chromeInsets: PlayerChromeInsets
     var inlineCornerRadius: CGFloat = 0
+    var containerHeight: CGFloat = 0
     var suppressScrubPreview = false
     let controlAnimation: Animation?
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.displayScale) private var displayScale
     @State private var stripWidth: CGFloat = 0
+    @State private var scrubBubbleHeight: CGFloat = 0
     @State private var isVisible = false
     @State private var scrubInteraction: ScrubInteraction?
     @State private var cachedSponsorSegments: [SeekBarSegment] = []
     private var isOwner: Bool { isCurrentOwner && player.ownerKey == owner }
 
+    private var isStripVisible: Bool {
+        !player.isFullscreen || player.showControls || gestureDisplay.isSeeking
+    }
+
     var body: some View {
-        if isOwner, player.mode.isSeekable, player.currentURL != nil,
-           !player.isFullscreen || player.showControls || gestureDisplay.isSeeking {
+        if isOwner, player.mode.isSeekable, player.currentURL != nil {
             let interval = samplingInterval(
                 sceneIsActive: scenePhase == .active, isVisible: isVisible,
                 width: stripWidth, displayScale: displayScale
@@ -42,7 +47,7 @@ struct PlayerSeekStrip: View {
                 )
             }
             .overlay(alignment: .bottomLeading) {
-                if gestureDisplay.isSeeking, !suppressScrubPreview, stripWidth > 0 {
+                if gestureDisplay.isSeeking, !suppressScrubPreview, stripWidth > 0, isStripVisible {
                     scrubPreviewOverlay
                 }
             }
@@ -69,18 +74,17 @@ struct PlayerSeekStrip: View {
             }
             .padding(
                 .horizontal,
-                player.isFullscreen
-                    ? ((player.showControls || gestureDisplay.isSeeking) ? chromeInsets.horizontal : 0)
-                    : inlineCornerRadius
+                player.isFullscreen ? chromeInsets.horizontal : inlineCornerRadius
             )
             .padding(
                 .bottom,
-                player.isFullscreen && (player.showControls || gestureDisplay.isSeeking)
-                    ? chromeInsets.bottom + 14 : 0
+                player.isFullscreen ? (chromeInsets.bottom + 14) : 0
             )
-            .animation(controlAnimation, value: player.showControls)
+            .opacity(isStripVisible ? 1 : 0)
+            .allowsHitTesting(isStripVisible)
+            .accessibilityHidden(!isStripVisible)
+            .animation(controlAnimation, value: isStripVisible)
             .animation(controlAnimation, value: gestureDisplay.isSeeking)
-            .transition(.opacity)
         }
     }
 
@@ -92,10 +96,33 @@ struct PlayerSeekStrip: View {
         let minCenter = min(halfWidth + 4, stripWidth * 0.5)
         let maxCenter = max(minCenter, stripWidth - halfWidth - 4)
         let clampedCenter = min(max(fraction * stripWidth, minCenter), maxCenter)
-        let previewOffsetY: CGFloat = player.isFullscreen
-            ? -92
-            : (player.showControls ? -72 : -34)
+        let isCompactInline = !player.isFullscreen && containerHeight > 0 && containerHeight < 250
+        let hasPreviewImage = PlayerStoryboardPreviewLoader.shared.previewImage != nil
+        let compactScale: CGFloat = (isCompactInline && hasPreviewImage) ? 0.84 : 1.0
+        let desiredOffsetY: CGFloat = if player.isFullscreen {
+            -92
+        } else if isCompactInline {
+            player.showControls ? -56 : -30
+        } else {
+            player.showControls ? -72 : -34
+        }
+        let previewOffsetY: CGFloat = {
+            guard containerHeight > 0 else { return desiredOffsetY }
+            let seekBottom = player.isFullscreen ? (chromeInsets.bottom + 14) : 0
+            let topClearance = chromeInsets.top + (player.showControls ? 58 : 10)
+            let availableFromSeekBottom = max(0, containerHeight - seekBottom - topClearance)
+            let fallbackHeight: CGFloat = hasPreviewImage ? (player.isFullscreen ? 128 : 100) : 34
+            let effectiveHeight = (scrubBubbleHeight > 0 ? scrubBubbleHeight : fallbackHeight) * compactScale
+            let maxUpwardTravel = max(28, availableFromSeekBottom - effectiveHeight)
+            return max(desiredOffsetY, -maxUpwardTravel)
+        }()
         return PlayerScrubPreviewBubble(player: player, seekTime: gestureDisplay.seekValue)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                if abs(scrubBubbleHeight - height) > 0.5 {
+                    scrubBubbleHeight = height
+                }
+            }
+            .scaleEffect(compactScale, anchor: .bottom)
             .frame(width: halfWidth * 2, alignment: .center)
             .offset(x: clampedCenter - halfWidth, y: previewOffsetY)
             .allowsHitTesting(false)

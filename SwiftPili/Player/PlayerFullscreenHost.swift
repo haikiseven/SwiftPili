@@ -169,6 +169,10 @@ final class PlayerFullscreenHostController: UIViewController, PlayerPresentation
         isViewLoaded && view.window != nil && !stageContainerView.isHidden && stageContainerView.alpha > 0.01
     }
 
+    func usesFadeOutLeave(to snapshot: PlayerFullscreenStageGeometry.InlineSnapshot?) -> Bool {
+        prefersReducedMotion || resolvedInlineTarget(snapshot: snapshot, in: view.bounds.size) == nil
+    }
+
     init(
         receipt: PlayerPresentationReceipt,
         presenter: PlayerFullscreenHostCoordinator,

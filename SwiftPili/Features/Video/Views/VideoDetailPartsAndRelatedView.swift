@@ -283,24 +283,38 @@ struct VideoDetailPartsSelectorView: View {
             DetailSectionHeader("Parts", count: pages.count)
                 .padding(.horizontal, horizontalInset)
 
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(pages, id: \.cid) { page in
-                        let selected = page.cid == (pickedPartCid ?? model.currentCid)
-                        PlaybackEntryChip(
-                            label: "P\(page.page)",
-                            detail: FormatUtils.duration(page.duration),
-                            title: page.part,
-                            isSelected: selected,
-                            indicator: partIndicator
-                        ) {
-                            guard !selected else { return }
-                            partPicks &+= 1
-                            pickPart(page)
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(pages, id: \.cid) { page in
+                            let selected = page.cid == (pickedPartCid ?? model.currentCid)
+                            PlaybackEntryChip(
+                                label: "P\(page.page)",
+                                detail: FormatUtils.duration(page.duration),
+                                title: page.part,
+                                isSelected: selected,
+                                indicator: partIndicator
+                            ) {
+                                guard !selected else { return }
+                                partPicks &+= 1
+                                pickPart(page)
+                            }
+                            .id(page.cid)
                         }
                     }
+                    .padding(.horizontal, horizontalInset)
                 }
-                .padding(.horizontal, horizontalInset)
+                .onAppear {
+                    if let cid = pickedPartCid ?? model.currentCid {
+                        proxy.scrollTo(cid, anchor: .center)
+                    }
+                }
+                .onChange(of: model.currentCid) { _, cid in
+                    guard let cid else { return }
+                    withAnimation(motion.feedbackAnimation(normal: .snappy(duration: 0.24))) {
+                        proxy.scrollTo(cid, anchor: .center)
+                    }
+                }
             }
         }
         .padding(.bottom, 6)
@@ -308,22 +322,16 @@ struct VideoDetailPartsSelectorView: View {
     }
 
     private func pickPart(_ page: VideoInfo.VideoPage) {
-        let start = {
-            guard pickedPartCid == page.cid else { return }
-            Task {
-                await model.switchPage(page)
-                if pickedPartCid == page.cid { pickedPartCid = nil }
+        if let animation = motion.animation(normal: .snappy(duration: 0.24)) {
+            withAnimation(animation) {
+                pickedPartCid = page.cid
             }
-        }
-        guard let animation = motion.animation(normal: .snappy(duration: 0.24)) else {
+        } else {
             pickedPartCid = page.cid
-            start()
-            return
         }
-        withAnimation(animation, completionCriteria: .logicallyComplete) {
-            pickedPartCid = page.cid
-        } completion: {
-            start()
+        Task {
+            await model.switchPage(page)
+            if pickedPartCid == page.cid { pickedPartCid = nil }
         }
     }
 }
@@ -342,6 +350,18 @@ struct VideoDetailUGCSeasonSectionView: View {
         season.allEpisodes
     }
 
+    private var activeEpisodeScrollID: String? {
+        let activeCid = model.currentCid
+        let matched = allEpisodes.first(where: {
+            $0.aid == info.aid && (activeCid == nil || $0.cid == activeCid)
+        }) ?? allEpisodes.first(where: { $0.aid == info.aid })
+        return matched.map(Self.episodeScrollID(for:))
+    }
+
+    private static func episodeScrollID(for episode: VideoInfo.UGCSeason.Episode) -> String {
+        "\(episode.id)-\(episode.cid)"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             headerRow
@@ -351,7 +371,8 @@ struct VideoDetailUGCSeasonSectionView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         ForEach(Array(allEpisodes.enumerated()), id: \.offset) { index, episode in
-                            let selected = episode.aid == info.aid
+                            let episodeScrollID = Self.episodeScrollID(for: episode)
+                            let selected = episodeScrollID == activeEpisodeScrollID
                             PlaybackEntryChip(
                                 label: "EP\(index + 1)",
                                 detail: episode.durationSeconds.map(FormatUtils.duration),
@@ -360,16 +381,20 @@ struct VideoDetailUGCSeasonSectionView: View {
                             ) {
                                 openEpisode(episode)
                             }
-                            .id(episode.aid)
+                            .id(episodeScrollID)
                         }
                     }
                     .padding(.horizontal, horizontalInset)
                 }
                 .onAppear {
-                    proxy.scrollTo(info.aid, anchor: .center)
+                    if let activeEpisodeScrollID {
+                        proxy.scrollTo(activeEpisodeScrollID, anchor: .center)
+                    }
                 }
-                .onChange(of: info.aid) { _, aid in
-                    proxy.scrollTo(aid, anchor: .center)
+                .onChange(of: activeEpisodeScrollID) { _, scrollID in
+                    if let scrollID {
+                        proxy.scrollTo(scrollID, anchor: .center)
+                    }
                 }
             }
         }
@@ -378,6 +403,7 @@ struct VideoDetailUGCSeasonSectionView: View {
             VideoDetailUGCSeasonSheet(
                 season: season,
                 currentAid: info.aid,
+                currentCid: model.currentCid,
                 fallbackOwnerName: info.owner.name
             ) { episode in
                 openEpisode(episode)
@@ -444,6 +470,7 @@ struct VideoDetailUGCSeasonSectionView: View {
 private struct VideoDetailUGCSeasonSheet: View {
     let season: VideoInfo.UGCSeason
     let currentAid: Int
+    var currentCid: Int? = nil
     let fallbackOwnerName: String
     let onSelectEpisode: (VideoInfo.UGCSeason.Episode) -> Void
 
@@ -458,18 +485,36 @@ private struct VideoDetailUGCSeasonSheet: View {
         sections.first(where: { $0.id == selectedSectionID })?.episodes ?? season.allEpisodes
     }
 
+    private var activeEpisodeScrollID: String? {
+        let matched = activeEpisodes.first(where: {
+            $0.aid == currentAid && (currentCid == nil || $0.cid == currentCid)
+        }) ?? activeEpisodes.first(where: { $0.aid == currentAid })
+        return matched.map(Self.episodeScrollID(for:))
+    }
+
+    private static func episodeScrollID(for episode: VideoInfo.UGCSeason.Episode) -> String {
+        "\(episode.id)-\(episode.cid)"
+    }
+
     init(
         season: VideoInfo.UGCSeason,
         currentAid: Int,
+        currentCid: Int? = nil,
         fallbackOwnerName: String,
         onSelectEpisode: @escaping (VideoInfo.UGCSeason.Episode) -> Void
     ) {
         self.season = season
         self.currentAid = currentAid
+        self.currentCid = currentCid
         self.fallbackOwnerName = fallbackOwnerName
         self.onSelectEpisode = onSelectEpisode
         let nonEmpty = (season.sections ?? []).filter { !($0.episodes ?? []).isEmpty }
         let containing = nonEmpty.first { section in
+            let episodes = section.episodes ?? []
+            return episodes.contains {
+                $0.aid == currentAid && (currentCid == nil || $0.cid == currentCid)
+            }
+        } ?? nonEmpty.first { section in
             (section.episodes ?? []).contains { $0.aid == currentAid }
         }
         _selectedSectionID = State(initialValue: containing?.id ?? nonEmpty.first?.id ?? 0)
@@ -485,15 +530,19 @@ private struct VideoDetailUGCSeasonSheet: View {
 
                 ScrollViewReader { proxy in
                     List(Array(activeEpisodes.enumerated()), id: \.offset) { index, episode in
-                        episodeRow(episode, index: index + 1)
-                            .id(episode.aid)
+                        let episodeScrollID = Self.episodeScrollID(for: episode)
+                        let isCurrent = episodeScrollID == activeEpisodeScrollID
+                        episodeRow(episode, index: index + 1, isCurrent: isCurrent)
+                            .id(episodeScrollID)
                             .listRowBackground(
-                                episode.aid == currentAid ? Color.biliAccent.opacity(0.10) : nil
+                                isCurrent ? Color.biliAccent.opacity(0.10) : nil
                             )
                     }
                     .listStyle(.plain)
                     .onAppear {
-                        proxy.scrollTo(currentAid, anchor: .center)
+                        if let activeEpisodeScrollID {
+                            proxy.scrollTo(activeEpisodeScrollID, anchor: .center)
+                        }
                     }
                 }
             }
@@ -535,9 +584,12 @@ private struct VideoDetailUGCSeasonSheet: View {
         }
     }
 
-    private func episodeRow(_ episode: VideoInfo.UGCSeason.Episode, index: Int) -> some View {
-        let isCurrent = episode.aid == currentAid
-        return Button {
+    private func episodeRow(
+        _ episode: VideoInfo.UGCSeason.Episode,
+        index: Int,
+        isCurrent: Bool
+    ) -> some View {
+        Button {
             dismiss()
             onSelectEpisode(episode)
         } label: {
@@ -644,6 +696,59 @@ struct VideoDetailHotCommentsPreviewView: View {
     }
 }
 
+struct VideoDetailRelatedSkeletonCard: View {
+    private var aspectRatio: CGFloat {
+        CoverPresentationStore.shared.presentation.aspect.ratio
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            RoundedRectangle(cornerRadius: VideoCardMetrics.cornerRadius, style: .continuous)
+                .fill(AppFill.inset.opacity(0.65))
+                .aspectRatio(aspectRatio, contentMode: .fit)
+            footerSkeleton
+        }
+    }
+
+    private var footerSkeleton: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(verbatim: "Placeholder\nTitle")
+                .appFont(.cardTitle)
+                .fontWeight(.medium)
+                .lineLimit(2, reservesSpace: true)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .hidden()
+                .overlay(alignment: .topLeading) { titleCapsules }
+            Text(verbatim: "Placeholder")
+                .appFont(.cardMeta)
+                .lineLimit(1)
+                .hidden()
+                .overlay(alignment: .leading) { metaCapsule }
+        }
+        .padding(.horizontal, 2)
+        .padding(.top, 6)
+    }
+
+    private var titleCapsules: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Capsule()
+                .fill(AppFill.inset.opacity(0.8))
+                .frame(maxWidth: .infinity)
+                .frame(height: 13)
+            Capsule()
+                .fill(AppFill.inset.opacity(0.8))
+                .frame(width: 112, height: 13)
+        }
+        .padding(.top, 2)
+    }
+
+    private var metaCapsule: some View {
+        Capsule()
+            .fill(AppFill.nested)
+            .frame(width: 84, height: 11)
+    }
+}
+
 struct VideoDetailRelatedSectionView: View {
     private enum DisplayState: Equatable {
         case empty
@@ -657,11 +762,12 @@ struct VideoDetailRelatedSectionView: View {
     let horizontalInset: CGFloat
     let isCompact: Bool
     var isTransitionSettled: Bool = true
+    var isLoadingRelated: Bool = false
 
     var body: some View {
         let videos = model.relatedVideos
         let displayState: DisplayState = if videos.isEmpty {
-            .empty
+            isLoadingRelated ? .placeholder : .empty
         } else if DetailDepartureHeightFreezePolicy.shouldDeferRelatedGrid(
             isCompact: isCompact,
             hasVideos: !videos.isEmpty,
@@ -676,8 +782,13 @@ struct VideoDetailRelatedSectionView: View {
             case .empty:
                 EmptyView()
             case .placeholder:
-                relatedVideosPlaceholderGrid
-                    .transition(.opacity)
+                if isCompact {
+                    relatedVideosPlaceholderGrid
+                        .transition(.opacity)
+                } else {
+                    relatedVideosPlaceholderShelf
+                        .transition(.opacity)
+                }
             case .content:
                 if isCompact {
                     relatedVideosGrid(videos)
@@ -699,28 +810,37 @@ struct VideoDetailRelatedSectionView: View {
         return VStack(alignment: .leading, spacing: 12) {
             DetailSectionHeader("Related")
                 .padding(.horizontal, horizontalInset)
-            VStack(spacing: 12) {
-                ForEach(0..<2, id: \.self) { _ in
-                    HStack(alignment: .top, spacing: 12) {
-                        ForEach(0..<columnCount, id: \.self) { _ in
-                            VStack(alignment: .leading, spacing: 6) {
-                                RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
-                                    .fill(AppFill.inset.opacity(0.65))
-                                    .aspectRatio(16 / 9, contentMode: .fit)
-                                Capsule()
-                                    .fill(AppFill.inset.opacity(0.8))
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: 12)
-                                Capsule()
-                                    .fill(AppFill.nested)
-                                    .frame(width: 96, height: 10)
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
+            LazyVGrid(
+                columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: columnCount),
+                spacing: 12
+            ) {
+                ForEach(0..<(columnCount * 2), id: \.self) { _ in
+                    VideoDetailRelatedSkeletonCard()
                 }
             }
             .padding(.horizontal, horizontalInset)
+        }
+        .padding(.top, 4)
+        .accessibilityHidden(true)
+    }
+
+    private var relatedVideosPlaceholderShelf: some View {
+        let cardWidth = columnWidth >= VideoDetailLayoutMetrics.compactCapsuleMinimumWidth
+            ? VideoDetailLayoutMetrics.shelfCardWidth
+            : VideoDetailLayoutMetrics.phoneShelfCardWidth
+        return VStack(alignment: .leading, spacing: 12) {
+            DetailSectionHeader("Related")
+                .padding(.horizontal, horizontalInset)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 16) {
+                    ForEach(0..<4, id: \.self) { _ in
+                        VideoDetailRelatedSkeletonCard()
+                            .frame(width: cardWidth)
+                    }
+                }
+                .padding(.horizontal, horizontalInset)
+            }
+            .scrollDisabled(true)
         }
         .padding(.top, 4)
         .accessibilityHidden(true)

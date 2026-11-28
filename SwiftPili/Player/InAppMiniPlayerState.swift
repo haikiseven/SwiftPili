@@ -353,7 +353,8 @@ enum InAppMiniPlayerLayoutPolicy {
         safeArea: EdgeInsets,
         topBarClearance: CGFloat,
         bottomBarClearance: CGFloat,
-        horizontalMargin: CGFloat
+        horizontalMargin: CGFloat,
+        snapsHorizontallyToCorners: Bool = false
     ) -> ReleaseAction {
         let bounds = safeCenterBounds(
             cardSize: cardSize,
@@ -433,6 +434,17 @@ enum InAppMiniPlayerLayoutPolicy {
             }
         }
 
+        if snapsHorizontallyToCorners {
+            switch bestEdge {
+            case .top:
+                return .snap(progress < 0.5 ? .topLeading : .topTrailing)
+            case .bottom:
+                return .snap(progress < 0.5 ? .bottomLeading : .bottomTrailing)
+            case .leading, .trailing:
+                break
+            }
+        }
+
         return .snap(MiniPlayerDockPosition(edge: bestEdge, progress: progress))
     }
 }
@@ -491,14 +503,47 @@ extension Route {
         }
     }
 
-    var miniPlayerPreviewCoverURL: String? {
+    var miniPlayerIsPortraitHint: Bool? {
         switch self {
         case .videoDetail(let target):
-            let url = target.preview.coverSource.url(preferring: .desktop)
+            return target.preview.isPortraitHint
+        case .offlinePager(let context, _):
+            if context.items.indices.contains(context.initialIndex) {
+                return context.items[context.initialIndex].preview.isPortraitHint
+            }
+            return nil
+        default:
+            return nil
+        }
+    }
+
+    var miniPlayerMobileVariantCoverURL: String? {
+        switch self {
+        case .videoDetail(let target):
+            return target.preview.coverSource.mobileVariantURL
+        case .offlinePager(let context, _):
+            if context.items.indices.contains(context.initialIndex) {
+                return context.items[context.initialIndex].preview.coverSource.mobileVariantURL
+            }
+            return nil
+        default:
+            return nil
+        }
+    }
+
+    var miniPlayerPreviewCoverURL: String? {
+        miniPlayerPreviewCoverURL(preferringMobile: false)
+    }
+
+    func miniPlayerPreviewCoverURL(preferringMobile: Bool) -> String? {
+        let preferred: PortraitPagingCoverSource.Kind = preferringMobile ? .mobileVariant : .desktop
+        switch self {
+        case .videoDetail(let target):
+            let url = target.preview.coverSource.url(preferring: preferred)
             return url.isEmpty ? nil : url
         case .offlinePager(let context, _):
             if context.items.indices.contains(context.initialIndex) {
-                let url = context.items[context.initialIndex].preview.coverSource.url(preferring: .desktop)
+                let url = context.items[context.initialIndex].preview.coverSource.url(preferring: preferred)
                 return url.isEmpty ? nil : url
             }
             return nil
@@ -545,7 +590,22 @@ extension PlayerViewModel {
         retireFullscreenPresentation()
         let originRoute = (departingRoute ?? Route.fallback(for: destination.route)).withoutZoom
         let title = nowPlayingMeta?.title ?? departingRoute?.miniPlayerPreviewTitle ?? ""
-        let cover = nowPlayingMeta?.cover ?? ambientCoverURL ?? departingRoute?.miniPlayerPreviewCoverURL
+        let sessionIsPortrait = DetailPlayerGeometry.isPortraitAspect(
+            videoAspectRatio,
+            fallback: isPortraitContent
+                || (portraitPropagation.apiHint ?? false)
+                || (departingRoute?.miniPlayerIsPortraitHint ?? false)
+        )
+        let cover: String? = if sessionIsPortrait {
+            departingRoute?.miniPlayerMobileVariantCoverURL
+                ?? nowPlayingMeta?.cover
+                ?? ambientCoverURL
+                ?? departingRoute?.miniPlayerPreviewCoverURL(preferringMobile: true)
+        } else {
+            nowPlayingMeta?.cover
+                ?? ambientCoverURL
+                ?? departingRoute?.miniPlayerPreviewCoverURL(preferringMobile: false)
+        }
         let session = InAppMiniPlayerSession(
             originRoute: originRoute,
             originScreenRoute: destination.route,
@@ -554,14 +614,14 @@ extension PlayerViewModel {
             title: title,
             coverURL: cover,
             mode: mode,
-            isPortrait: isPortraitContent
+            isPortrait: sessionIsPortrait
         )
         miniPlayer.activate(session)
         suspendDanmakuVisibleWork()
         _ = prepareSurfaceHandoff(ownerLease: ownerLease, to: .miniPlayer)
         PlayerLog.log(
             "[MiniPlayer] activated owner=\(ownerLease.owner) " +
-            "mode=\(mode) portrait=\(isPortraitContent ? 1 : 0)"
+            "mode=\(mode) portrait=\(sessionIsPortrait ? 1 : 0)"
         )
         return true
     }

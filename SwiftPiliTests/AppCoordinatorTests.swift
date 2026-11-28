@@ -275,4 +275,37 @@ struct AppCoordinatorTests {
         #expect(coordinator.isActivePlayerRoute(.offline(.single("dl-offline-1"))))
         #expect(!coordinator.isActivePlayerRoute(.live(21452505)))
     }
+
+    @Test("restoreFromMiniPlayer pops buried cross-tab and sidebar routes instead of pushing duplicate detail screens")
+    func restoreFromMiniPlayerBuriedCrossTabAndSidebar() {
+        let (coordinator, _) = makeCoordinator()
+        let video = VideoRouteTarget(videoID: .bvid("BV1buried777"))
+
+        // Tab A (.home): push videoDetail, then push userSpace on top of it, then switch to Tab B (.mine).
+        #expect(coordinator.navigateToVideo(video))
+        coordinator.settleVideoNavigation(video.videoID)
+        let originPos = coordinator.playerRoutePosition(for: .videoDetail(video))
+        coordinator.navigate(to: .userSpace(9988))
+        #expect(coordinator.stack(for: .home) == [.videoDetail(video), .userSpace(9988)])
+
+        coordinator.selectedTab = .mine
+        coordinator.navigate(to: .history)
+
+        let session = InAppMiniPlayerSession(
+            originRoute: .videoDetail(video),
+            originScreenRoute: .video(video.videoID),
+            originPosition: originPos,
+            ownerLease: PlayerOwnerLease(owner: "vod-buried", generation: 1),
+            title: "Buried Video",
+            coverURL: nil,
+            mode: .vod,
+            isPortrait: true
+        )
+
+        coordinator.restoreFromMiniPlayer(session)
+        #expect(coordinator.selectedTab == .home)
+        #expect(coordinator.stack(for: .home) == [.videoDetail(video)])
+        #expect(coordinator.stack(for: .mine) == [.history])
+        #expect(coordinator.isActivePlayerRoute(.video(video.videoID)))
+    }
 }

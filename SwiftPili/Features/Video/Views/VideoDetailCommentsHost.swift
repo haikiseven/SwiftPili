@@ -658,7 +658,7 @@ struct PortraitFullscreenCommentsSheet: View {
     ) -> some View {
         VStack(spacing: 0) {
             CommentThreadHeader(
-                isWideLayout: false,
+                isWideLayout: true,
                 anchors: replyPresentation.anchors,
                 onBack: closeCommentThread,
                 onClose: { dismiss() }

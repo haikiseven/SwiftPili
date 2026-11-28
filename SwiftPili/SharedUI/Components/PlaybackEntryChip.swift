@@ -26,11 +26,15 @@ struct PlaybackEntryChip<Badge: View>: View {
                     Text(label)
                         .appFont(.controlLabel)
                         .fontWeight(.semibold)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                     if let detail {
                         Text(detail)
                             .appFont(.messageMeta)
                             .monospacedDigit()
                             .foregroundStyle(Color.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                     }
                     badge()
                 }
@@ -38,6 +42,7 @@ struct PlaybackEntryChip<Badge: View>: View {
                     .appFont(.messageMeta)
                     .foregroundStyle(isSelected ? AnyShapeStyle(.biliAccent) : AnyShapeStyle(.secondary))
                     .lineLimit(1)
+                    .truncationMode(.tail)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)

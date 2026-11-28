@@ -5,10 +5,11 @@ struct PlayerControlsScrim: View {
         LinearGradient(
             stops: [
                 .init(color: .black.opacity(0.46), location: 0),
-                .init(color: .black.opacity(0.12), location: 0.12),
-                .init(color: .clear, location: 0.28),
-                .init(color: .clear, location: 0.72),
-                .init(color: .black.opacity(0.4), location: 1),
+                .init(color: .black.opacity(0.12), location: 0.14),
+                .init(color: .clear, location: 0.30),
+                .init(color: .clear, location: 0.64),
+                .init(color: .black.opacity(0.14), location: 0.80),
+                .init(color: .black.opacity(0.44), location: 1),
             ],
             startPoint: .top,
             endPoint: .bottom
@@ -58,7 +59,6 @@ struct PlayerControlsOverlay: View {
                     )
                 }
             }
-            .padding(.top, player.isFullscreen ? 8 : 0)
             .padding(.bottom, player.isFullscreen ? 8 : 0)
         }
         .ignoresSafeArea(.keyboard, edges: .all)

@@ -12,6 +12,10 @@ enum PlayerAmbientPolicy {
         isIncreasedContrast ? 0.22 : 0.34
     }
 
+    static func storyImmersiveOpacity(isIncreasedContrast: Bool) -> Double {
+        isIncreasedContrast ? 0.68 : 0.92
+    }
+
     static func isEligible(
         mode: PlayerMode,
         isEnabled: Bool,
@@ -57,6 +61,7 @@ enum PlayerAmbientPolicy {
 
 struct PlayerAmbientBackdrop: View {
     let source: PlayerAmbientSource
+    var isPortraitImmersive = false
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var contrast
     @State private var isAppForeground = UIApplication.shared.applicationState != .background
@@ -64,6 +69,21 @@ struct PlayerAmbientBackdrop: View {
     var body: some View {
         GeometryReader { proxy in
             let size = proxy.size
+            let effectiveOpacity = isPortraitImmersive
+                ? PlayerAmbientPolicy.storyImmersiveOpacity(isIncreasedContrast: contrast == .increased)
+                : PlayerAmbientPolicy.unifiedOpacity(isIncreasedContrast: contrast == .increased)
+            let maskStops: [Gradient.Stop] = isPortraitImmersive
+                ? [
+                    .init(color: .white, location: 0.0),
+                    .init(color: .white.opacity(0.96), location: 0.75),
+                    .init(color: .white.opacity(0.86), location: 1.0)
+                ]
+                : [
+                    .init(color: .white, location: 0.0),
+                    .init(color: .white.opacity(0.92), location: 0.68),
+                    .init(color: .white.opacity(0.58), location: 0.92),
+                    .init(color: .white.opacity(0.32), location: 1.0)
+                ]
             ZStack {
                 PlayerAmbientPolicy.groundColor
                 if isAppForeground, !reduceTransparency {
@@ -84,18 +104,13 @@ struct PlayerAmbientBackdrop: View {
                     }
                     .mask(
                         RadialGradient(
-                            stops: [
-                                .init(color: .white, location: 0.0),
-                                .init(color: .white.opacity(0.92), location: 0.68),
-                                .init(color: .white.opacity(0.58), location: 0.92),
-                                .init(color: .white.opacity(0.32), location: 1.0)
-                            ],
+                            stops: maskStops,
                             center: .center,
                             startRadius: 16,
                             endRadius: max(size.width, size.height) * 0.66
                         )
                     )
-                    .opacity(PlayerAmbientPolicy.unifiedOpacity(isIncreasedContrast: contrast == .increased))
+                    .opacity(effectiveOpacity)
                 }
             }
             .frame(width: size.width, height: size.height)
@@ -117,10 +132,15 @@ struct PlayerAmbientBackdrop: View {
 
 struct PlayerFullscreenAmbientBackdrop: View {
     let player: PlayerViewModel
+    var isPortraitImmersive = false
+    var fallbackCoverURL: String? = nil
 
     var body: some View {
         if let source = sourceForDisplay {
-            PlayerAmbientBackdrop(source: source)
+            PlayerAmbientBackdrop(
+                source: source,
+                isPortraitImmersive: isPortraitImmersive
+            )
         }
     }
 
@@ -129,7 +149,9 @@ struct PlayerFullscreenAmbientBackdrop: View {
               player.isAmbientVideoLoaded(for: lease),
               player.ambientModeEnabled,
               ExperimentalSettingsPolicy.isAllowed(.ambient),
-              (player.mode == .vod || player.mode == .live) else { return nil }
+              (player.mode == .vod
+                || player.mode == .live
+                || (isPortraitImmersive && player.mode == .offline)) else { return nil }
         if let source = player.ambientSource,
            PlayerAmbientPolicy.isEligible(
                mode: player.mode,
@@ -138,9 +160,10 @@ struct PlayerFullscreenAmbientBackdrop: View {
            ) {
             return source
         }
+        let cover = player.ambientCoverURL ?? fallbackCoverURL
         return PlayerAmbientSource(
-            artwork: PlayerAmbientArtwork(url: player.ambientCoverURL ?? "ambient://live-frame"),
-            fallbackCover: player.ambientCoverURL
+            artwork: PlayerAmbientArtwork(url: cover ?? "ambient://live-frame"),
+            fallbackCover: cover
         )
     }
 }

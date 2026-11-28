@@ -169,7 +169,8 @@ struct VideoDetailColumnView: View {
                             columnWidth: columnWidth,
                             horizontalInset: horizontalInset,
                             isCompact: isCompact,
-                            isTransitionSettled: isTransitionSettled
+                            isTransitionSettled: isTransitionSettled,
+                            isLoadingRelated: model.isLoading && model.relatedVideos.isEmpty
                         )
                     }
                     .transition(metadataRevealTransition)
@@ -390,9 +391,9 @@ private struct VideoDetailLoadingSkeletonView: View {
             }
 
             if isCompact {
-                RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
+                RoundedRectangle(cornerRadius: AppRadius.panel, style: .continuous)
                     .fill(AppFill.inset.opacity(0.65))
-                    .frame(height: 68)
+                    .frame(height: 128)
                     .padding(.horizontal, horizontalInset)
                     .modifier(VideoDetailSkeletonPulse())
             }
@@ -407,9 +408,15 @@ private struct VideoDetailLoadingSkeletonView: View {
     @ViewBuilder
     private var relatedSkeleton: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Capsule()
-                .fill(AppFill.inset)
-                .frame(width: 72, height: 15)
+            Text("Related")
+                .appFont(.sectionTitle)
+                .fontWeight(.semibold)
+                .hidden()
+                .overlay(alignment: .leading) {
+                    Capsule()
+                        .fill(AppFill.inset)
+                        .frame(width: 72, height: 15)
+                }
                 .padding(.horizontal, horizontalInset)
 
             if isCompact {
@@ -419,7 +426,7 @@ private struct VideoDetailLoadingSkeletonView: View {
                     spacing: 12
                 ) {
                     ForEach(0..<(columnCount * 2), id: \.self) { _ in
-                        skeletonCard
+                        VideoDetailRelatedSkeletonCard()
                     }
                 }
                 .padding(.horizontal, horizontalInset)
@@ -430,7 +437,7 @@ private struct VideoDetailLoadingSkeletonView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(alignment: .top, spacing: 16) {
                         ForEach(0..<4, id: \.self) { _ in
-                            skeletonCard
+                            VideoDetailRelatedSkeletonCard()
                                 .frame(width: cardWidth)
                         }
                     }
@@ -440,21 +447,6 @@ private struct VideoDetailLoadingSkeletonView: View {
             }
         }
         .padding(.top, 4)
-    }
-
-    private var skeletonCard: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
-                .fill(AppFill.inset.opacity(0.65))
-                .aspectRatio(16 / 9, contentMode: .fit)
-            Capsule()
-                .fill(AppFill.inset.opacity(0.8))
-                .frame(maxWidth: .infinity)
-                .frame(height: 12)
-            Capsule()
-                .fill(AppFill.nested)
-                .frame(width: 96, height: 10)
-        }
     }
 }
 
@@ -519,9 +511,11 @@ struct VideoDetailStatsLineView: View {
                     Text("\(online) watching")
                 }
             }
-            Spacer()
+            Spacer(minLength: 4)
             Text(FormatUtils.timeAgo(from: info.pubdate))
         }
+        .lineLimit(1)
+        .truncationMode(.tail)
         .appFont(.screenStat)
         .foregroundStyle(.secondary)
     }

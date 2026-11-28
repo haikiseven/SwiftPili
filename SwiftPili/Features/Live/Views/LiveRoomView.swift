@@ -170,7 +170,8 @@ struct LiveRoomView: View {
             }
         }
         .playerDetailInlineContainerSize(
-            isFullscreenPresentationActive: player.isFullscreenPresentationActive
+            isFullscreenPresentationActive: player.isFullscreenPresentationActive,
+            isActiveRoute: isActiveLiveRoute
         ) { size in
             if inlineContainerSize != size { inlineContainerSize = size }
         }
@@ -393,9 +394,12 @@ struct LiveRoomView: View {
         let liveAspectKey = (playerShapeIsCurrent ? DetailPlayerGeometry.normalizedAspect(player.videoAspectRatio) : nil)
             .map { Int(($0 * 100).rounded()) }
         let liveAspectAnimation: Animation? = (!isImmersive
-            && !usesWideCompanionLayout
-            && !player.isFullscreenPresentationActive
-            && !player.isFullscreen)
+            && DetailDepartureHeightFreezePolicy.allowsInlineHeightAnimation(
+                isActiveRoute: isActiveLiveRoute,
+                isWideLayout: usesWideCompanionLayout,
+                isFullscreenPresentationActive: player.isFullscreenPresentationActive,
+                isFullscreen: player.isFullscreen
+            ))
             ? motion.animation(normal: .snappy(duration: 0.22))
             : nil
         return ScrollView(needsOuterScroll ? .vertical : []) {

@@ -189,6 +189,7 @@ struct SubtitleTranslationHostBridge: View {
 
 struct PlayerSubtitleLayoutPadding: Equatable, Sendable {
     static let portraitAvoidanceBaseBottom: CGFloat = 158
+    static let storyMetadataAvoidanceBaseBottom: CGFloat = 232
 
     let avoidsPortraitAlwaysOnChrome: Bool
     let leading: CGFloat
@@ -221,12 +222,55 @@ struct PlayerSubtitleLayoutPadding: Equatable, Sendable {
             bottom: bottom
         )
     }
+
+    static func resolve(
+        isFullscreenHost: Bool,
+        isPlayerFullscreen: Bool,
+        isPortraitContent: Bool,
+        isPortraitImmersive: Bool,
+        mode: PlayerMode,
+        portraitPureViewEnabled: Bool,
+        portraitChromeBottomInset: CGFloat,
+        controlsVisible: Bool,
+        bottomSafeArea: CGFloat,
+        styleBottomOffset: Double
+    ) -> Self {
+        let avoids = isFullscreenHost
+            && isPortraitImmersive
+            && mode != .live
+            && !portraitPureViewEnabled
+        let baseBottom: CGFloat
+        if avoids {
+            let portraitExtraSafeArea = max(0, portraitChromeBottomInset - PlayerChromeInsets.fullscreenBottomFloor)
+            baseBottom = Self.storyMetadataAvoidanceBaseBottom + portraitExtraSafeArea
+        } else if isPortraitImmersive && portraitPureViewEnabled {
+            let effectiveBottomSafe = max(bottomSafeArea, portraitChromeBottomInset)
+            baseBottom = max(52, effectiveBottomSafe + 36)
+        } else if isPlayerFullscreen {
+            baseBottom = controlsVisible
+                ? ((mode.isSeekable ? 102 : 96) + bottomSafeArea)
+                : max(28, bottomSafeArea + 18)
+        } else {
+            baseBottom = controlsVisible
+                ? ((mode.isSeekable ? 86 : 74) + bottomSafeArea)
+                : (28 + bottomSafeArea)
+        }
+        return Self(
+            avoidsPortraitAlwaysOnChrome: avoids,
+            leading: avoids ? 20 : 24,
+            trailing: avoids ? 64 : 24,
+            bottom: max(0, baseBottom + CGFloat(styleBottomOffset))
+        )
+    }
 }
 
 struct PlayerSubtitleOverlay: View {
     let player: PlayerViewModel
     var isFullscreenSurface: Bool? = nil
     var portraitChromeBottomInset: CGFloat = 0
+    var isPortraitImmersive: Bool? = nil
+    var controlsVisible: Bool? = nil
+    var bottomSafeArea: CGFloat? = nil
     private let stylePreferences = SubtitleStylePreferences.shared
 
     var body: some View {
@@ -236,13 +280,21 @@ struct PlayerSubtitleOverlay: View {
         let hasSecondary = secondary.map { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? false
         let isFullscreenHost = isFullscreenSurface ?? player.isFullscreen
         let isImmersivePresentation = player.isFullscreen || isFullscreenHost
+        let effectivePortraitImmersive = isPortraitImmersive
+            ?? (isFullscreenHost && (player.isPortraitContent || portraitChromeBottomInset > 0) && player.mode != .live)
+        let effectiveControlsVisible = controlsVisible
+            ?? (effectivePortraitImmersive ? false : player.showControls)
+        let effectiveBottomSafeArea = bottomSafeArea ?? portraitChromeBottomInset
         let padding = PlayerSubtitleLayoutPadding.resolve(
             isFullscreenHost: isFullscreenHost,
             isPlayerFullscreen: isImmersivePresentation,
             isPortraitContent: player.isPortraitContent || portraitChromeBottomInset > 0,
+            isPortraitImmersive: effectivePortraitImmersive,
             mode: player.mode,
             portraitPureViewEnabled: player.portraitPureViewEnabled,
             portraitChromeBottomInset: portraitChromeBottomInset,
+            controlsVisible: effectiveControlsVisible,
+            bottomSafeArea: effectiveBottomSafeArea,
             styleBottomOffset: stylePreferences.bottomOffset
         )
 
@@ -259,7 +311,7 @@ struct PlayerSubtitleOverlay: View {
                 .padding(.leading, padding.leading)
                 .padding(.trailing, padding.trailing)
                 .padding(.bottom, padding.bottom)
-                .animation(.easeInOut(duration: 0.2), value: padding.avoidsPortraitAlwaysOnChrome)
+                .animation(.easeInOut(duration: 0.2), value: padding)
             }
 
             if player.hasAnyActiveSubtitle || player.isAutoTranslationEnabled {

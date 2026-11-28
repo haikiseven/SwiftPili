@@ -63,7 +63,10 @@ private struct DanmakuNoticeToast: ViewModifier {
                             reduceTransparency: reduceTransparency
                         )
                         .environment(\.colorScheme, .dark)
+                        .padding(.horizontal, AppSpacing.l)
+                        .offset(y: -76)
                         .allowsHitTesting(false)
+                        .transition(.opacity)
                 }
             }
             .task(id: notice) {

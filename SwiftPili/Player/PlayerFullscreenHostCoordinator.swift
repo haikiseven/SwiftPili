@@ -472,8 +472,15 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
         guard accepts(controller),
               awaitingEnterAttachment,
               handoffWaitGeneration == generation else { return }
+        let currentReceipt = receipt
         cancelHandoffWaits()
-        controller.clearTransitionCover()
+        if let currentReceipt,
+           PlayerViewModel.shared.hasUsableRenderAttachment(
+               forRole: .fullscreen,
+               ownerLease: currentReceipt.context.ownerLease
+           ) {
+            controller.clearTransitionCover()
+        }
         guard phase == .entering, PlayerViewModel.shared.isFullscreen else {
             reconcile()
             return
@@ -509,6 +516,17 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
         }
         activeAnimationPhase = .leaving
         let snapshot = PlayerViewModel.shared.inlineStageSnapshot
+        if controller.usesFadeOutLeave(to: snapshot),
+           let receipt,
+           PlayerViewModel.shared.isCurrentOwner(receipt.context.ownerLease),
+           PlayerViewModel.shared.activeSurfaceLease?.role == .fullscreen {
+            if controller.isStageVisuallyVisible,
+               !controller.hasTransitionCover,
+               let cover = PlayerViewModel.shared.captureFullscreenTransitionCover() {
+                controller.installTransitionCover(cover)
+            }
+            _ = PlayerViewModel.shared.handoffSurfaceSlot(ownerLease: receipt.context.ownerLease, to: .inline)
+        }
         controller.animateLeave(to: snapshot) { [weak self, weak controller] completed in
             guard let self, let controller, self.accepts(controller) else { return }
             if self.activeAnimationPhase == .leaving {
@@ -537,20 +555,34 @@ final class PlayerFullscreenHostCoordinator: UIViewController, PlayerFullscreenP
 
         if accepts(controller),
            let receipt,
-           controller.isStageVisuallyVisible,
-           PlayerViewModel.shared.isCurrentOwner(receipt.context.ownerLease),
-           PlayerViewModel.shared.activeSurfaceLease?.role == .fullscreen {
-            if !controller.hasTransitionCover,
-               let cover = PlayerViewModel.shared.captureFullscreenTransitionCover() {
-                controller.installTransitionCover(cover)
+           controller.isViewLoaded,
+           controller.view.window != nil,
+           PlayerViewModel.shared.isCurrentOwner(receipt.context.ownerLease) {
+            let isFullscreenSlot = PlayerViewModel.shared.activeSurfaceLease?.role == .fullscreen
+            let expectsInlineAttachment = PlayerViewModel.shared.currentURL != nil
+                || PlayerViewModel.shared.retainsRecoveryRenderContainer(owner: receipt.context.ownerLease.owner)
+            let needsInlineReattach = isFullscreenSlot
+                || (expectsInlineAttachment
+                    && !PlayerViewModel.shared.hasUsableRenderAttachment(
+                        forRole: .inline,
+                        ownerLease: receipt.context.ownerLease
+                    ))
+            if needsInlineReattach {
+                if controller.isStageVisuallyVisible,
+                   !controller.hasTransitionCover,
+                   let cover = PlayerViewModel.shared.captureFullscreenTransitionCover() {
+                    controller.installTransitionCover(cover)
+                }
+                if isFullscreenSlot {
+                    _ = PlayerViewModel.shared.handoffSurfaceSlot(ownerLease: receipt.context.ownerLease, to: .inline)
+                }
+                beginInlineReattachWait(
+                    for: controller,
+                    ownerLease: receipt.context.ownerLease,
+                    source: source
+                )
+                return
             }
-            _ = PlayerViewModel.shared.handoffSurfaceSlot(ownerLease: receipt.context.ownerLease, to: .inline)
-            beginInlineReattachWait(
-                for: controller,
-                ownerLease: receipt.context.ownerLease,
-                source: source
-            )
-            return
         }
 
         cancelHandoffWaits()

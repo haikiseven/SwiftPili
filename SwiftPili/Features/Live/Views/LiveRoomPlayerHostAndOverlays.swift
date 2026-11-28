@@ -138,11 +138,15 @@ struct LiveRoomInlineNavigationOverlay: View {
     let actions: PlayerPageNavigationActions
 
     private var hasInlineExitChrome: Bool {
-        guard isActiveLiveRoute, !isRoomOffline, viewModel.streamUnavailable == nil,
-              viewModel.error == nil, player.error == nil,
-              let lease = viewModel.playerOwnerLease else { return false }
-        return player.isCurrentOwner(lease) && player.mode == .live
-            && player.surfaceLease(matching: lease, role: .inline) != nil
+        guard isActiveLiveRoute, !isRoomOffline,
+              viewModel.streamUnavailable == nil, viewModel.error == nil else {
+            return false
+        }
+        return PlayerDetailSurfacePolicy.hasUsableInlineExitChrome(
+            player: player,
+            lease: viewModel.playerOwnerLease,
+            expectedMode: .live
+        )
     }
 
     var body: some View {

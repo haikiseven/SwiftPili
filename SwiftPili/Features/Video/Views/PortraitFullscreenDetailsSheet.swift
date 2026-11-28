@@ -21,7 +21,7 @@ struct PortraitFullscreenDetailsSheet: View {
     @State private var followRequestInFlight = false
     @State private var showDescriptionActions = false
     @State private var selectedMusic: MusicDestination?
-    @State private var sheetContentWidth: CGFloat = 390
+    @State private var sheetContentWidth: CGFloat = WindowMetricsFallback.currentWidth
 
     var body: some View {
         NavigationStack {
@@ -106,7 +106,11 @@ struct PortraitFullscreenDetailsSheet: View {
                 }
 
                 if !activeChapters.isEmpty {
-                    chaptersStrip(chapters: activeChapters, player: player)
+                    PortraitDetailsChapterSectionView(
+                        chapters: activeChapters,
+                        player: player,
+                        onDismiss: { dismiss() }
+                    )
                 }
 
                 if let pages = info.pages, pages.count > 1 {
@@ -242,6 +246,7 @@ struct PortraitFullscreenDetailsSheet: View {
                     (following ? Text("Following") : Text("+ Follow"))
                         .appFont(.controlLabel)
                         .fontWeight(.semibold)
+                        .lineLimit(1)
                         .foregroundStyle(following ? AnyShapeStyle(.secondary) : AnyShapeStyle(.white))
                         .padding(.horizontal, 14)
                         .padding(.vertical, 6)
@@ -255,6 +260,18 @@ struct PortraitFullscreenDetailsSheet: View {
                 }
                 .buttonStyle(.appControl)
                 .disabled(followRequestInFlight)
+            } else if AuthManager.shared.isLoggedIn,
+                      info.owner.mid > 0,
+                      String(info.owner.mid) != AuthManager.shared.dedeUserID {
+                Text("+ Follow")
+                    .appFont(.controlLabel)
+                    .fontWeight(.semibold)
+                    .lineLimit(1)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                    .hidden()
+                    .background(Color(.tertiarySystemFill).opacity(0.55), in: Capsule())
+                    .accessibilityHidden(true)
             }
         }
         .padding(.horizontal, 12)
@@ -263,60 +280,6 @@ struct PortraitFullscreenDetailsSheet: View {
             AppFill.inset,
             in: RoundedRectangle(cornerRadius: AppRadius.card, style: .continuous)
         )
-    }
-
-    private func chaptersStrip(
-        chapters: [VideoChapter],
-        player: PlayerViewModel
-    ) -> some View {
-        let activeChapterID = player.chapter(at: player.displayTime)?.id
-        return VStack(alignment: .leading, spacing: 8) {
-            DetailSectionHeader("Chapters", count: chapters.count)
-                .padding(.horizontal, 16)
-
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(chapters) { chapter in
-                        let isCurrent = chapter.id == activeChapterID
-                        Button {
-                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                            player.seek(to: chapter.from)
-                            if !player.isPlaying {
-                                player.play()
-                            }
-                            dismiss()
-                        } label: {
-                            HStack(spacing: 6) {
-                                Text(verbatim: FormatUtils.duration(Int(chapter.from)))
-                                    .font(.caption2.monospacedDigit().weight(.semibold))
-                                    .foregroundStyle(isCurrent ? Color.biliAccent : .secondary)
-                                Text(verbatim: chapter.title)
-                                    .font(.caption.weight(isCurrent ? .semibold : .medium))
-                                    .foregroundStyle(isCurrent ? Color.biliAccent : .primary)
-                                    .lineLimit(1)
-                            }
-                            .padding(.horizontal, 11)
-                            .padding(.vertical, 7)
-                            .background(
-                                isCurrent ? Color.biliAccent.opacity(0.14) : AppFill.inset,
-                                in: RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous)
-                            )
-                            .overlay {
-                                if isCurrent {
-                                    RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous)
-                                        .strokeBorder(Color.biliAccent.opacity(0.45), lineWidth: 1)
-                                }
-                            }
-                            .contentShape(
-                                RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous)
-                            )
-                        }
-                        .buttonStyle(.appControl)
-                    }
-                }
-                .padding(.horizontal, 16)
-            }
-        }
     }
 
     private func jointCreatorsStrip(staff: [VideoInfo.StaffMember]) -> some View {
@@ -638,6 +601,84 @@ struct PortraitFullscreenDetailsSheet: View {
     private func dismissAndNavigate(to route: Route) {
         dismiss()
         onNavigateRoute(route)
+    }
+}
+
+private struct PortraitDetailsChapterSectionView: View {
+    let chapters: [VideoChapter]
+    let player: PlayerViewModel
+    let onDismiss: @MainActor () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            DetailSectionHeader("Chapters", count: chapters.count)
+                .padding(.horizontal, 16)
+
+            PortraitDetailsChapterChipRow(
+                chapters: chapters,
+                player: player,
+                onDismiss: onDismiss
+            )
+        }
+    }
+}
+
+private struct PortraitDetailsChapterChipRow: View {
+    let chapters: [VideoChapter]
+    let player: PlayerViewModel
+    let onDismiss: @MainActor () -> Void
+
+    var body: some View {
+        let activeChapterID = player.chapter(at: player.displayTime)?.id
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(chapters) { chapter in
+                    PortraitDetailsChapterChip(
+                        chapter: chapter,
+                        isCurrent: chapter.id == activeChapterID
+                    ) {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        player.seek(to: chapter.from)
+                        if !player.isPlaying {
+                            player.play()
+                        }
+                        onDismiss()
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+        }
+    }
+}
+
+private struct PortraitDetailsChapterChip: View {
+    let chapter: VideoChapter
+    let isCurrent: Bool
+    let action: @MainActor () -> Void
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: AppRadius.control, style: .continuous)
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Text(verbatim: FormatUtils.duration(Int(chapter.from)))
+                    .font(.caption2.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(isCurrent ? Color.biliAccent : .secondary)
+                Text(verbatim: chapter.title)
+                    .font(.caption.weight(isCurrent ? .semibold : .medium))
+                    .foregroundStyle(isCurrent ? Color.biliAccent : .primary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 11)
+            .padding(.vertical, 7)
+            .background(isCurrent ? Color.biliAccent.opacity(0.14) : AppFill.inset, in: shape)
+            .overlay {
+                if isCurrent {
+                    shape.strokeBorder(Color.biliAccent.opacity(0.45), lineWidth: 1)
+                }
+            }
+            .contentShape(shape)
+        }
+        .buttonStyle(.appControl)
     }
 }
 

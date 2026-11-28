@@ -138,7 +138,16 @@ struct PlayerBottomControlBar: View {
             }
         }
         .padding(.horizontal, (player.isFullscreen ? 0 : 12) + chromeInsets.horizontal)
-        .padding(.bottom, (player.isFullscreen ? 20 : 14) + chromeInsets.bottom)
+        .padding(.bottom, bottomPadding)
         .padding(.top, player.isFullscreen ? 0 : 2)
+    }
+
+    private var bottomPadding: CGFloat {
+        let base: CGFloat = if player.isFullscreen {
+            player.mode.isSeekable ? 32 : 20
+        } else {
+            player.mode.isSeekable ? 26 : 14
+        }
+        return base + chromeInsets.bottom
     }
 }
