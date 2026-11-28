@@ -987,7 +987,7 @@ extension VideoDetailView {
         context.canGiveTwoCoins = info != nil ? ((viewModel.maxCoins - viewModel.coinCount) >= 2) : true
         context.isFavorited = info != nil ? viewModel.isFavorited : false
         context.favoriteCount = info?.stat.favorite ?? 0
-        context.replyCount = info?.stat.reply ?? 0
+        context.replyCount = info != nil ? max(viewModel.commentTotal, info?.stat.reply ?? 0) : 0
         context.shareCount = info?.stat.share ?? 0
         context.commentsClosed = info != nil ? viewModel.commentsClosed : false
         context.bvid = info?.bvid ?? ""

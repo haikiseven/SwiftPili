@@ -29,6 +29,7 @@ struct CommentReplyZoomContainer<Root: View, Destination: View>: UIViewControlle
         controller.setNavigationBarHidden(true, animated: false)
         controller.view.backgroundColor = .clear
         controller.view.clipsToBounds = true
+        controller.allowsInteractivePop = ownsKeyboardSafeArea
         controller.delegate = context.coordinator
         controller.onAppearance = { [weak coordinator = context.coordinator] in coordinator?.reconcile() }
         return controller
@@ -89,6 +90,7 @@ struct CommentReplyZoomContainer<Root: View, Destination: View>: UIViewControlle
             self.reducesMotion = configuration.reducesMotion
             self.ownsKeyboardSafeArea = configuration.ownsKeyboardSafeArea
             self.onDismissed = configuration.onDismissed
+            (navigation as? CommentReplyNavigationController)?.allowsInteractivePop = configuration.ownsKeyboardSafeArea
             destinationContent = destination
             let style: UIUserInterfaceStyle = root.values.colorScheme == .dark ? .dark : .light
             self.destination?.overrideUserInterfaceStyle = style
@@ -167,9 +169,21 @@ struct CommentReplyZoomContainer<Root: View, Destination: View>: UIViewControlle
             options.dimmingColor = .clear
             let origin = CommentZoomTouchOrigin(anchors: anchors)
             controller.view.addGestureRecognizer(origin)
-            options.interactiveDismissShouldBegin = { [weak self, weak origin] context in
-                guard let self, !self.reducesMotion, origin?.permitsDismissal == true else { return false }
-                return context.velocity.dy > abs(context.velocity.dx)
+            options.interactiveDismissShouldBegin = { [weak self, weak origin, weak controller] context in
+                guard let self, !self.reducesMotion else { return false }
+                if origin?.permitsDismissal == true, context.velocity.dy > abs(context.velocity.dx) {
+                    return true
+                }
+                guard let view = controller?.viewIfLoaded, view.bounds.width > 0 else { return false }
+                let isRTL = view.effectiveUserInterfaceLayoutDirection == .rightToLeft
+                let edgeThreshold: CGFloat = 36
+                let isLeadingEdge = isRTL
+                    ? context.location.x >= view.bounds.width - edgeThreshold
+                    : context.location.x <= edgeThreshold
+                let isLeadingSwipe = isRTL
+                    ? -context.velocity.dx > abs(context.velocity.dy)
+                    : context.velocity.dx > abs(context.velocity.dy)
+                return isLeadingEdge && isLeadingSwipe
             }
             if !reducesMotion, let sourceController = root, let source = anchors.transitionSource,
                source.isDescendant(of: sourceController.view) {
@@ -348,12 +362,75 @@ struct CommentReplyZoomConfiguration {
 }
 
 @MainActor
-private final class CommentReplyNavigationController: UINavigationController {
+private final class CommentReplyNavigationController: UINavigationController, UIGestureRecognizerDelegate {
     var onAppearance: (() -> Void)?
+    var allowsInteractivePop = false
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        interactivePopGestureRecognizer?.isEnabled = true
+        interactivePopGestureRecognizer?.delegate = self
+        if #available(iOS 26.0, *), let contentPop = interactiveContentPopGestureRecognizer {
+            contentPop.isEnabled = true
+            contentPop.delegate = self
+        }
+    }
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         onAppearance?()
+    }
+
+    private var canBeginInteractivePop: Bool {
+        allowsInteractivePop
+            && viewControllers.count > 1
+            && transitionCoordinator == nil
+            && topViewController?.preferredTransition == nil
+    }
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        if gestureRecognizer === interactivePopGestureRecognizer {
+            return canBeginInteractivePop
+        }
+        if #available(iOS 26.0, *), gestureRecognizer === interactiveContentPopGestureRecognizer {
+            guard canBeginInteractivePop, let pan = gestureRecognizer as? UIPanGestureRecognizer else {
+                return false
+            }
+            return isLeadingEdgeHorizontalSwipe(pan)
+        }
+        return true
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        if gestureRecognizer === interactivePopGestureRecognizer {
+            if #available(iOS 26.0, *), otherGestureRecognizer === interactiveContentPopGestureRecognizer {
+                return true
+            }
+            return otherGestureRecognizer.view is UIScrollView
+        }
+        if #available(iOS 26.0, *), gestureRecognizer === interactiveContentPopGestureRecognizer {
+            return otherGestureRecognizer.view is UIScrollView
+        }
+        return false
+    }
+
+    private func isLeadingEdgeHorizontalSwipe(_ pan: UIPanGestureRecognizer) -> Bool {
+        guard let targetView = pan.view ?? view, targetView.bounds.width > 0 else { return false }
+        let isRTL = targetView.effectiveUserInterfaceLayoutDirection == .rightToLeft
+        let translation = pan.translation(in: targetView)
+        let velocity = pan.velocity(in: targetView)
+        let startX = pan.location(in: targetView).x - translation.x
+        let edgeThreshold: CGFloat = 40
+        let isLeadingEdge = isRTL
+            ? startX >= targetView.bounds.width - edgeThreshold
+            : startX <= edgeThreshold
+        let isLeadingDirection = isRTL
+            ? velocity.x < -abs(velocity.y)
+            : velocity.x > abs(velocity.y)
+        return isLeadingEdge && isLeadingDirection
     }
 }
 

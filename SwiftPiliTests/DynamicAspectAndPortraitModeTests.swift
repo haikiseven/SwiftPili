@@ -2184,5 +2184,23 @@ struct DynamicAspectAndPortraitModeTests {
                 expectedMode: .vod
             ) == false
         )
+
+        // 5. Verify Story PortraitFullscreenCommentsSheet 70% default detent & row action callbacks
+        #expect(Self.approxEqual(PortraitFullscreenCommentsSheet.defaultCompactHeightFraction, 0.70))
+        var tappedMid: Int?
+        var countChanged = false
+        let actions = VideoDetailCommentRowActions(
+            isRouteActive: { true },
+            currentVideoID: { .bvid("BV1commentSheet") },
+            reply: { _ in },
+            openThread: { _ in },
+            previewImages: { _ in },
+            onAvatarTap: { tappedMid = $0 },
+            onCommentCountChanged: { countChanged = true }
+        )
+        actions.onAvatarTap?(12345)
+        actions.onCommentCountChanged?()
+        #expect(tappedMid == 12345)
+        #expect(countChanged == true)
     }
 }

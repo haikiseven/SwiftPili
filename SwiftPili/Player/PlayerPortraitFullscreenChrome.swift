@@ -219,6 +219,10 @@ struct PlayerPortraitFullscreenChrome: View {
     }
 
     var body: some View {
+        return applySheetAndLifecycleModifiers(to: baseChrome)
+    }
+
+    private var baseChrome: some View {
         ZStack {
             if !isPureView && !isPlaybackUnavailable && !isPlaybackEnded {
                 legibilityGradients
@@ -284,139 +288,173 @@ struct PlayerPortraitFullscreenChrome: View {
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: isPureView)
         .ignoresSafeArea(.keyboard, edges: .all)
         .overlay(alignment: .bottom) {
-            if mountsInlineDanmakuComposer {
-                ZStack(alignment: .bottom) {
-                    Color.white.opacity(0.001)
-                        .ignoresSafeArea()
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            AppWindowMetrics.current?.endEditing(true)
-                            dismissInlineImmersiveDanmakuComposer(clearDraft: false)
-                        }
-                        .gesture(
-                            DragGesture(minimumDistance: 6)
-                                .onEnded { _ in
-                                    AppWindowMetrics.current?.endEditing(true)
-                                    dismissInlineImmersiveDanmakuComposer(clearDraft: false)
-                                }
-                        )
-
-                    FullscreenDanmakuComposer(
-                        draft: $inlineDanmakuDraft,
-                        notice: nil,
-                        isSending: inlineDanmakuSend.isSending,
-                        keyboardFrame: inlineKeyboardFrame,
-                        onSubmit: submitInlineImmersiveDanmaku,
-                        onClose: {
-                            AppWindowMetrics.current?.endEditing(true)
-                            dismissInlineImmersiveDanmakuComposer(clearDraft: true)
-                        },
-                        onFocusLost: inlineImmersiveDanmakuFocusLost
-                    )
-                }
-            }
+            inlineImmersiveDanmakuComposerOverlay
         }
         .danmakuNoticeToast($inlineDanmakuNotice)
-        .confirmationDialog("Coin this video", isPresented: $showCoinDialog, titleVisibility: .visible) {
-            Button("Give 1 Coin") { giveCoin(1) }
-            Button("Give 2 Coins") { giveCoin(2) }
+    }
+
+    @ViewBuilder
+    private var inlineImmersiveDanmakuComposerOverlay: some View {
+        if mountsInlineDanmakuComposer {
+            ZStack(alignment: .bottom) {
+                Color.white.opacity(0.001)
+                    .ignoresSafeArea()
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        AppWindowMetrics.current?.endEditing(true)
+                        dismissInlineImmersiveDanmakuComposer(clearDraft: false)
+                    }
+                    .gesture(
+                        DragGesture(minimumDistance: 6)
+                            .onEnded { _ in
+                                AppWindowMetrics.current?.endEditing(true)
+                                dismissInlineImmersiveDanmakuComposer(clearDraft: false)
+                            }
+                    )
+
+                FullscreenDanmakuComposer(
+                    draft: $inlineDanmakuDraft,
+                    notice: nil,
+                    isSending: inlineDanmakuSend.isSending,
+                    keyboardFrame: inlineKeyboardFrame,
+                    onSubmit: submitInlineImmersiveDanmaku,
+                    onClose: {
+                        AppWindowMetrics.current?.endEditing(true)
+                        dismissInlineImmersiveDanmakuComposer(clearDraft: true)
+                    },
+                    onFocusLost: inlineImmersiveDanmakuFocusLost
+                )
+            }
         }
-        .sheet(isPresented: $showPlaylistSheet) {
-            PlayerPlaylistDrawerSheet(player: player)
+    }
+
+    private func applySheetAndLifecycleModifiers<Content: View>(to content: Content) -> some View {
+        let withPrimarySheets = applyPrimarySheets(to: content)
+        let withSecondarySheets = applySecondarySheets(to: withPrimarySheets)
+        return applyLifecycleObservers(to: withSecondarySheets)
+    }
+
+    private func applyPrimarySheets<Content: View>(to content: Content) -> some View {
+        content
+            .confirmationDialog("Coin this video", isPresented: $showCoinDialog, titleVisibility: .visible) {
+                Button("Give 1 Coin") { giveCoin(1) }
+                Button("Give 2 Coins") { giveCoin(2) }
+            }
+            .sheet(isPresented: $showPlaylistSheet) {
+                PlayerPlaylistDrawerSheet(player: player)
+                    .preferredColorScheme(preferredSheetColorScheme)
+            }
+            .sheet(isPresented: $showDetailsSheet) {
+                if let makeDetails = context?.makeDetailsSheetView {
+                    makeDetails()
+                        .preferredColorScheme(preferredSheetColorScheme)
+                }
+            }
+            .sheet(isPresented: $showFavoriteSheet) {
+                FavoriteFolderSheet(
+                    folders: favoriteSheetFolders,
+                    selection: favoriteSheetInitialSelection
+                ) { selected in
+                    guard let commit = context?.onCommitFavoriteFolders else { return }
+                    Task {
+                        favoriteRequestInFlight = true
+                        await commit(selected)
+                        favoriteRequestInFlight = false
+                    }
+                }
                 .preferredColorScheme(preferredSheetColorScheme)
-        }
-        .sheet(isPresented: $showDetailsSheet) {
-            if let makeDetails = context?.makeDetailsSheetView {
-                makeDetails()
-                    .preferredColorScheme(preferredSheetColorScheme)
             }
-        }
-        .sheet(isPresented: $showFavoriteSheet) {
-            FavoriteFolderSheet(
-                folders: favoriteSheetFolders,
-                selection: favoriteSheetInitialSelection
-            ) { selected in
-                guard let commit = context?.onCommitFavoriteFolders else { return }
-                Task {
-                    favoriteRequestInFlight = true
-                    await commit(selected)
-                    favoriteRequestInFlight = false
+    }
+
+    private func applySecondarySheets<Content: View>(to content: Content) -> some View {
+        content
+            .sheet(isPresented: $showCommentsSheet) {
+                if let makeComments = context?.makeCommentsSheetView {
+                    makeComments()
+                        .preferredColorScheme(preferredSheetColorScheme)
                 }
             }
-            .preferredColorScheme(preferredSheetColorScheme)
-        }
-        .sheet(isPresented: $showCommentsSheet) {
-            if let makeComments = context?.makeCommentsSheetView {
-                makeComments()
-                    .preferredColorScheme(preferredSheetColorScheme)
-            }
-        }
-        .sheet(isPresented: $showShareSheet) {
-            if let makeShare = context?.makeShareSheetView {
-                makeShare()
-                    .preferredColorScheme(preferredSheetColorScheme)
-            }
-        }
-        .sheet(isPresented: $showChapterSheet) {
-            PlayerChapterSheet(
-                chapters: player.videoChapters,
-                currentTime: player.displayTime
-            ) { chapter in
-                player.seek(to: chapter.from)
-                if !player.isPlaying {
-                    player.play()
+            .sheet(isPresented: $showShareSheet) {
+                if let makeShare = context?.makeShareSheetView {
+                    makeShare()
+                        .preferredColorScheme(preferredSheetColorScheme)
                 }
             }
-            .preferredColorScheme(preferredSheetColorScheme)
-        }
-        .sheet(item: $enhancementPresentation) { request in
-            PlayerVideoEnhancementSheet(
-                player: player,
-                canEdit: { canEditEnhancement(request) },
-                onClose: { closeEnhancement(request) }
-            )
-            .preferredColorScheme(preferredSheetColorScheme)
-        }
-        .modifier(LiveKeyboardFrameTracker(frame: $inlineKeyboardFrame))
-        .onChange(of: resolvedTitle) { _, _ in
-            isTitleExpanded = false
-        }
-        .onChange(of: player.loadGeneration) { _, _ in
-            guard context?.isInRouteImmersiveStage == true else { return }
-            dismissInlineImmersiveDanmakuComposer(clearDraft: true)
-        }
-        .onChange(of: context?.isInRouteImmersiveStage ?? false) { _, active in
-            if !active {
+            .sheet(isPresented: $showChapterSheet) {
+                PlayerChapterSheet(
+                    chapters: player.videoChapters,
+                    currentTime: player.displayTime
+                ) { chapter in
+                    player.seek(to: chapter.from)
+                    if !player.isPlaying {
+                        player.play()
+                    }
+                }
+                .preferredColorScheme(preferredSheetColorScheme)
+            }
+            .sheet(item: $enhancementPresentation) { request in
+                PlayerVideoEnhancementSheet(
+                    player: player,
+                    canEdit: { canEditEnhancement(request) },
+                    onClose: { closeEnhancement(request) }
+                )
+                .preferredColorScheme(preferredSheetColorScheme)
+            }
+            .modifier(LiveKeyboardFrameTracker(frame: $inlineKeyboardFrame))
+    }
+
+    private func applyLifecycleObservers<Content: View>(to content: Content) -> some View {
+        content
+            .onChange(of: resolvedTitle) { _, _ in
+                isTitleExpanded = false
+            }
+            .onChange(of: context?.ownerLease) { _, _ in
+                resetVideoScopedSheets()
+            }
+            .onChange(of: player.loadGeneration) { _, _ in
+                guard context?.isInRouteImmersiveStage == true else { return }
                 dismissInlineImmersiveDanmakuComposer(clearDraft: true)
-                inlineKeyboardFrame = nil
             }
-        }
-        .onChange(of: player.videoChapters.isEmpty) { _, isEmpty in
-            if isEmpty { showChapterSheet = false }
-        }
-        .onChange(of: enhancementPresentation.map(canEditEnhancement), initial: true) { _, _ in
-            if let request = enhancementPresentation, !canEditEnhancement(request) {
-                closeEnhancement(request)
+            .onChange(of: context?.isInRouteImmersiveStage ?? false) { _, active in
+                if !active {
+                    dismissInlineImmersiveDanmakuComposer(clearDraft: true)
+                    inlineKeyboardFrame = nil
+                }
             }
-        }
-        .onChange(of: danmakuEnabled) { _, enabled in
-            if !enabled {
-                danmakuPanelPresented = false
-                player.setDanmakuSettingsHold(false)
+            .onChange(of: player.videoChapters.isEmpty) { _, isEmpty in
+                if isEmpty { showChapterSheet = false }
+            }
+            .onChange(of: enhancementPresentation.map(canEditEnhancement), initial: true) { _, _ in
+                if let request = enhancementPresentation, !canEditEnhancement(request) {
+                    closeEnhancement(request)
+                }
+            }
+            .onChange(of: danmakuEnabled) { _, enabled in
+                if !enabled {
+                    danmakuPanelPresented = false
+                    player.setDanmakuSettingsHold(false)
+                    if context?.isInRouteImmersiveStage == true {
+                        dismissInlineImmersiveDanmakuComposer(clearDraft: true)
+                    }
+                }
+            }
+            .onDisappear {
+                isDraggingHairlineBar = false
+                tripleHoldProgress = 0
                 if context?.isInRouteImmersiveStage == true {
                     dismissInlineImmersiveDanmakuComposer(clearDraft: true)
                 }
+                inlineDanmakuNotice = nil
+                inlineKeyboardFrame = nil
             }
-        }
-        .onDisappear {
-            isDraggingHairlineBar = false
-            tripleHoldProgress = 0
-            if context?.isInRouteImmersiveStage == true {
-                dismissInlineImmersiveDanmakuComposer(clearDraft: true)
-            }
-            inlineDanmakuNotice = nil
-            inlineKeyboardFrame = nil
-        }
+    }
+
+    private func resetVideoScopedSheets() {
+        showCommentsSheet = false
+        showDetailsSheet = false
+        showFavoriteSheet = false
+        showShareSheet = false
+        showChapterSheet = false
     }
 
     // MARK: - Zone 1: Subtle Top & Bottom Legibility Gradients

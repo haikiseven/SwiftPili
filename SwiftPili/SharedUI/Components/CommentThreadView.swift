@@ -26,6 +26,7 @@ struct CommentThreadView: View {
     var upMid: Int?
     var isStandalonePage = true
     var onAvatarTap: ((Int) -> Void)?
+    var onComposerExpansionChanged: ((Bool) -> Void)? = nil
 
     @State private var thread = CommentThreadStore()
 
@@ -125,7 +126,7 @@ struct CommentThreadView: View {
             headerSpacing: 8,
             horizontalInset: AppSpacing.l,
             topInset: AppSpacing.l,
-            bottomClearance: composerVisible ? 88 : AppSpacing.l,
+            bottomClearance: composerVisible ? (isStandalonePage ? 88 : 112) : AppSpacing.l,
             ignoresBottomSafeArea: true,
             keyboardDismissMode: .onDrag,
             thresholdOffset: 4,
@@ -159,6 +160,18 @@ struct CommentThreadView: View {
             highlightClearTask = nil
         }
         .imagePreview(item: $previewImages)
+        .onChange(of: isComposerExpanded) { _, expanded in
+            onComposerExpansionChanged?(expanded)
+        }
+    }
+
+    private var ignoresComposerContainerBottomSafeArea: Bool {
+        guard !isStandalonePage, sizeClass != .regular else { return false }
+        if DeviceCapability.supportsPadFormSheetPresentation,
+           AppWindowMetrics.current?.traitCollection.horizontalSizeClass == .regular {
+            return false
+        }
+        return true
     }
 
     private func threadComposer(composer: ComposerCapture) -> some View {
@@ -182,7 +195,8 @@ struct CommentThreadView: View {
             onSend: { sendReply(from: composer) },
             uploadScope: composerUploadScope(for: composer),
             isInteractionCurrent: { composerCanInteract(composer) },
-            expansion: $isComposerExpanded
+            expansion: $isComposerExpanded,
+            ignoresContainerBottomSafeArea: ignoresComposerContainerBottomSafeArea
         )
     }
 
@@ -267,6 +281,7 @@ struct CommentThreadView: View {
 
     private func beginReply(to target: CommentResult.CommentItem?, from captured: ComposerCapture) {
         guard composerCanInteract(captured) else { return }
+        onComposerExpansionChanged?(true)
         if isComposerExpanded {
             withAnimation(motion.animation(normal: CollapsibleComposer.composerExpandAnimation)) {
                 captured.store.beginReply(to: target, in: captured.source)

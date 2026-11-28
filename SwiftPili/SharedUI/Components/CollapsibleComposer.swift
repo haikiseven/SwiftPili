@@ -97,6 +97,7 @@ struct CollapsibleComposer: View {
 
     var expansion: Binding<Bool>?
     var observedExpansion: Binding<Bool>?
+    var ignoresContainerBottomSafeArea = false
 
     @State private var isLocallyExpanded = false
 
@@ -109,6 +110,7 @@ struct CollapsibleComposer: View {
             isExpanded: isExpanded,
             hasDraft: hasDraft,
             sourceIdentity: uploadScope.map { AnyHashable($0.context.sourceIdentity) },
+            ignoresContainerBottomSafeArea: ignoresContainerBottomSafeArea,
             onExpand: {
                 guard isInteractionCurrent() else { return }
                 expand()

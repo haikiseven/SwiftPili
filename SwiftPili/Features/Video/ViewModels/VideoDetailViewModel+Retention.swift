@@ -255,6 +255,17 @@ extension VideoDetailViewModel {
                 await sponsorBlock.load(videoID: info.bvid, cid: data.cid)
             }
         }
+        if !commentsClosed, !commentsReadyForNavigation, !isLoadingComments,
+           let commentRequest = prepareCommentRequest(purpose: .initial, from: currentCommentSource) {
+            Task { [weak self] in
+                guard let self else { return }
+                guard self.ownsRetainedPlayback(request) else {
+                    self.finishCommentRequest(commentRequest, succeeded: false)
+                    return
+                }
+                await self.performCommentRequest(commentRequest)
+            }
+        }
     }
 }
 

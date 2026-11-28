@@ -393,7 +393,10 @@ extension VideoDetailView {
             openThread: { target in
                 openCommentThread(target)
             },
-            previewImages: { item in previewImages = item }
+            previewImages: { item in previewImages = item },
+            onCommentCountChanged: {
+                syncPortraitFullscreenContext()
+            }
         )
     }
 
@@ -524,12 +527,21 @@ extension VideoDetailView {
             },
             onCommentPosted: {
                 syncPortraitFullscreenContext()
+            },
+            onCommentCountChanged: {
+                syncPortraitFullscreenContext()
+            },
+            onRetryUnavailable: {
+                Task { await activateIfNeeded(settlesNavigationAdmission: false) }
             }
         )
     }
 }
 
 struct PortraitFullscreenCommentsSheet: View {
+    static let defaultCompactHeightFraction: CGFloat = 0.70
+    static let defaultCompactDetent: PresentationDetent = .fraction(defaultCompactHeightFraction)
+
     @AppMotion private var motion
     @Environment(\.dismiss) private var dismiss
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
@@ -540,6 +552,8 @@ struct PortraitFullscreenCommentsSheet: View {
     let isRouteActive: @MainActor () -> Bool
     let onNavigateRoute: @MainActor (Route) -> Void
     let onCommentPosted: @MainActor () -> Void
+    var onCommentCountChanged: (@MainActor () -> Void)? = nil
+    var onRetryUnavailable: (@MainActor () -> Void)? = nil
 
     @State private var commentPresentation = CommentZoomPresentation()
     @State private var replyPresentation = CommentZoomPresentation()
@@ -549,7 +563,7 @@ struct PortraitFullscreenCommentsSheet: View {
     @State private var highlightedCommentRpid: Int?
     @State private var previewImages: ImagePreviewItem?
     @State private var commentLinkLifetime = ContentLinkLifetime()
-    @State private var selectedDetent: PresentationDetent = .medium
+    @State private var selectedDetent: PresentationDetent = Self.defaultCompactDetent
 
     private var isComposerEligible: Bool {
         AuthManager.shared.isLoggedIn && !model.commentsClosed
@@ -566,29 +580,14 @@ struct PortraitFullscreenCommentsSheet: View {
 
     var body: some View {
         adaptiveDetentPresentation(
-            NavigationStack {
-                ObservedModel(model) { observedModel in
-                    replyRegion(model: observedModel) {
-                        ZStack(alignment: .top) {
-                            commentList(model: observedModel)
-                                .allowsHitTesting(showThread == nil)
-                                .accessibilityHidden(showThread != nil)
-                            VideoDetailComposerDismissScrim(
-                                composer: composer,
-                                isActive: showThread == nil
-                            )
-                        }
-                        .overlay(alignment: .bottom) {
-                            feedbackAndComposer(model: observedModel)
-                        }
-                    }
+            ObservedModel(model) { observedModel in
+                replyRegion(model: observedModel) {
+                    rootCommentsContent(model: observedModel)
                 }
-                .navigationTitle("Comments")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("Done") { dismiss() }
-                    }
+                .background {
+                    CommentZoomContentSurface()
+                        .ignoresSafeArea(.container, edges: .bottom)
+                        .ignoresSafeArea(.keyboard, edges: .bottom)
                 }
             }
             .environment(coordinator)
@@ -597,29 +596,48 @@ struct PortraitFullscreenCommentsSheet: View {
         )
         .onAppear {
             commentPresentation.isPresented = true
+            triggerInitialCommentRecoveryIfNeeded()
         }
         .onChange(of: composer.isExpanded) { _, expanded in
-            guard expanded, !usesRegularPadFormSheet, selectedDetent != .large else { return }
-            withAnimation(motion.animation(normal: .snappy(duration: 0.25))) {
-                selectedDetent = .large
-            }
+            promoteSheetToLargeIfNeeded(forComposerExpanded: expanded)
         }
         .onChange(of: model.currentCommentSource) { _, source in
-            composer.collapseImmediatelyIfSourceCleared(source)
-            if let showThread,
-               showThread.type != 1
-                || showThread.oid != source?.aid
-                || composer.replyCommentSource != source {
-                replyPresentation.cancelPendingAction()
-                replyPresentation.isPresented = false
-                self.showThread = nil
-                composer.replyCommentSource = nil
-                replyPresentation.anchors.sourceProvider = nil
-            }
+            handleCommentSourceChange(source)
+        }
+        .onChange(of: model.commentTotal) { _, _ in
+            onCommentCountChanged?()
+        }
+        .onChange(of: PlayerViewModel.shared.pendingSeekTarget) { _, target in
+            handleObservedSeekTargetChange(target)
         }
         .onDisappear {
             commentPresentation.isPresented = false
             composer.collapse(motion: motion)
+        }
+    }
+
+    private func rootCommentsContent(model observedModel: VideoDetailViewModel) -> some View {
+        ZStack(alignment: .top) {
+            VStack(spacing: 0) {
+                portraitCommentSheetHeader(model: observedModel)
+                commentList(model: observedModel)
+                    .modifier(PortraitCommentsSheetLinkHandoff { url, context in
+                        openSheetURL(url, context: context)
+                    })
+                    .contentLinks(isCurrent: {
+                        isRouteActive() && observedModel.hasCommentSource(for: requestedVideoID)
+                    })
+                    .ignoresSafeArea(.container, edges: .bottom)
+            }
+            .allowsHitTesting(showThread == nil)
+            .accessibilityHidden(showThread != nil)
+            VideoDetailComposerDismissScrim(
+                composer: composer,
+                isActive: showThread == nil
+            )
+        }
+        .overlay(alignment: .bottom) {
+            feedbackAndComposer(model: observedModel)
         }
     }
 
@@ -630,9 +648,121 @@ struct PortraitFullscreenCommentsSheet: View {
                 .appAdaptiveSheet(padSizing: .form)
         } else {
             content
-                .presentationDetents([.medium, .large], selection: $selectedDetent)
-                .presentationDragIndicator(.visible)
+                .presentationDetents([Self.defaultCompactDetent, .large], selection: $selectedDetent)
+                .presentationDragIndicator(.hidden)
+                .presentationCornerRadius(24)
         }
+    }
+
+    private func promoteSheetToLargeIfNeeded(forComposerExpanded expanded: Bool) {
+        guard expanded, !usesRegularPadFormSheet, selectedDetent != .large else { return }
+        selectedDetent = .large
+    }
+
+    private func triggerInitialCommentRecoveryIfNeeded() {
+        guard model.videoInfo != nil,
+              !model.commentsClosed,
+              model.comments.isEmpty,
+              !model.isLoadingComments,
+              !model.commentsAwaitingInitialResponse,
+              !model.commentsReadyForNavigation,
+              model.hasCommentSource(for: requestedVideoID),
+              let req = model.prepareCommentRequest(purpose: .initial, from: model.currentCommentSource) else {
+            return
+        }
+        Task { await model.performCommentRequest(req) }
+    }
+
+    private func handleCommentSourceChange(_ source: VideoDetailViewModel.CommentSource?) {
+        composer.collapseImmediatelyIfSourceCleared(source)
+        if let showThread,
+           showThread.type != 1
+            || showThread.oid != source?.aid
+            || composer.replyCommentSource != source {
+            replyPresentation.cancelPendingAction()
+            replyPresentation.isPresented = false
+            self.showThread = nil
+            composer.replyCommentSource = nil
+            replyPresentation.anchors.sourceProvider = nil
+        }
+    }
+
+    private func handleObservedSeekTargetChange(_ target: TimeInterval?) {
+        let player = PlayerViewModel.shared
+        guard target != nil,
+              commentPresentation.isPresented,
+              player.mode.isSeekable,
+              player.currentURL != nil,
+              player.hasRenderedFirstFrame,
+              player.lastSeekRequest != nil else { return }
+        revealVideoAfterTimestampSeek()
+    }
+
+    private func revealVideoAfterTimestampSeek() {
+        composer.collapse(motion: motion)
+        AppWindowMetrics.current?.endEditing(true)
+        guard !usesRegularPadFormSheet, selectedDetent != Self.defaultCompactDetent else { return }
+        withAnimation(motion.animation(normal: .snappy(duration: 0.25))) {
+            selectedDetent = Self.defaultCompactDetent
+        }
+    }
+
+    private func portraitCommentSheetHeader(model: VideoDetailViewModel) -> some View {
+        let count = model.videoInfo != nil ? max(model.commentTotal, model.videoInfo?.stat.reply ?? 0) : 0
+        let source = model.currentCommentSource
+        return VStack(spacing: 0) {
+            if !usesRegularPadFormSheet {
+                Capsule()
+                    .fill(.secondary.opacity(0.6))
+                    .frame(width: 36, height: 5)
+                    .padding(.top, 8)
+                    .padding(.bottom, 4)
+                    .accessibilityHidden(true)
+            }
+            HStack(alignment: .center, spacing: 8) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("Comments")
+                        .appFont(.sectionTitle)
+                        .fontWeight(.semibold)
+                    if count > 0 {
+                        Text(FormatUtils.viewCount(count))
+                            .font(.caption)
+                            .fontWeight(.medium)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                }
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                if model.videoInfo != nil && !model.commentsClosed {
+                    CommentSortBar(selection: model.commentSort) { sort in
+                        guard model.hasCommentSource(for: requestedVideoID),
+                              model.currentCommentSource == source,
+                              let request = model.prepareCommentSort(sort, from: source) else { return }
+                        Task { await model.performCommentRequest(request) }
+                    }
+                    .background(
+                        CommentZoomRegion(anchors: commentPresentation.anchors, role: .sortControl)
+                            .padding(-4)
+                    )
+                }
+                CommentHeaderCircleButton(
+                    systemName: "xmark",
+                    accessibilityLabel: "Close comments",
+                    anchors: commentPresentation.anchors,
+                    role: .closeControl,
+                    action: { dismiss() }
+                )
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, usesRegularPadFormSheet ? 10 : 0)
+            .padding(.bottom, 6)
+            Divider()
+                .opacity(0.35)
+        }
+        .frame(minHeight: 54)
+        .contentShape(Rectangle())
+        .background(CommentZoomRegion(anchors: commentPresentation.anchors, role: .header))
     }
 
     private func replyRegion<Main: View>(
@@ -658,7 +788,7 @@ struct PortraitFullscreenCommentsSheet: View {
     ) -> some View {
         VStack(spacing: 0) {
             CommentThreadHeader(
-                isWideLayout: true,
+                isWideLayout: usesRegularPadFormSheet,
                 anchors: replyPresentation.anchors,
                 onBack: closeCommentThread,
                 onClose: { dismiss() }
@@ -672,11 +802,14 @@ struct PortraitFullscreenCommentsSheet: View {
                 isStandalonePage: false,
                 onAvatarTap: { mid in
                     navigateFromSheet(to: .userSpace(mid))
+                },
+                onComposerExpansionChanged: { expanded in
+                    promoteSheetToLargeIfNeeded(forComposerExpanded: expanded)
                 }
             )
             .id(target.id)
-            .modifier(CommentThreadLinkHandoff { url, context in
-                openCommentThreadURL(url, context: context)
+            .modifier(PortraitCommentsSheetLinkHandoff { url, context in
+                openSheetURL(url, context: context)
             })
             .contentLinks(isCurrent: {
                 isRouteActive() && replyPresentation.isPresented && showThread?.id == target.id
@@ -689,14 +822,15 @@ struct PortraitFullscreenCommentsSheet: View {
     private func commentList(model: VideoDetailViewModel) -> some View {
         let source = model.currentCommentSource
         let eligible = AuthManager.shared.isLoggedIn && !model.commentsClosed
-        let headerView: AnyView? = model.videoInfo != nil ? AnyView(commentHeader(model: model)) : nil
-        let headerFingerprint = model.videoInfo.map { info in
-            VideoCommentHeaderFingerprint(
-                replyCount: info.stat.reply,
-                commentsClosed: model.commentsClosed,
-                commentSort: model.commentSort,
-                sourceAid: source?.aid,
-                sourceGeneration: source?.generation
+        let bottomClearance: CGFloat = usesRegularPadFormSheet
+            ? (eligible ? 120 : 32)
+            : (eligible ? 120 : 0) + AppWindowMetrics.safeAreaInsets.bottom + VideoDetailLayoutMetrics.contentBottomPadding
+        let unavailableMessage = (model.videoInfo == nil && !model.isLoading) ? model.error : nil
+        let unavailableFingerprint = unavailableMessage.map { message in
+            VideoUnavailableFingerprint(
+                message: message,
+                symbolName: model.unavailability?.symbolName ?? "exclamationmark.triangle",
+                isRetryable: model.unavailability?.isRetryable ?? true
             )
         }
         return VideoDetailCommentList(
@@ -704,15 +838,21 @@ struct PortraitFullscreenCommentsSheet: View {
             requestedID: requestedVideoID,
             highlightedRpid: highlightedCommentRpid,
             scrollToRpid: commentTargetRpid,
-            headerView: headerView,
-            headerFingerprint: headerFingerprint,
-            showsInitialVideoSkeletons: false,
+            headerView: nil,
+            headerFingerprint: nil,
+            showsInitialVideoSkeletons: true,
             closedTopPadding: 40,
-            bottomClearance: eligible ? 120 : 32,
+            bottomClearance: bottomClearance,
             showsScrollIndicators: true,
             actions: rowActions,
-            unavailableView: nil,
-            unavailableFingerprint: nil,
+            unavailableView: unavailableMessage.map { message in
+                AnyView(VideoDetailUnavailableStateView(
+                    message: message,
+                    unavailability: model.unavailability,
+                    onRetry: { onRetryUnavailable?() }
+                ))
+            },
+            unavailableFingerprint: unavailableFingerprint,
             onRefresh: {
                 guard model.hasCommentSource(for: requestedVideoID),
                       let request = model.prepareCommentRefresh(from: source) else { return false }
@@ -729,28 +869,6 @@ struct PortraitFullscreenCommentsSheet: View {
             highlightedCommentRpid = nil
             commentTargetRpid = nil
         }
-    }
-
-    private func commentHeader(model: VideoDetailViewModel) -> some View {
-        let source = model.currentCommentSource
-        return HStack(spacing: 6) {
-            if let count = model.videoInfo?.stat.reply, count > 0 {
-                Text(FormatUtils.viewCount(count))
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-            }
-            Spacer(minLength: 8)
-            if !model.commentsClosed {
-                CommentSortBar(selection: model.commentSort) { sort in
-                    guard model.hasCommentSource(for: requestedVideoID),
-                          model.currentCommentSource == source,
-                          let request = model.prepareCommentSort(sort, from: source) else { return }
-                    Task { await model.performCommentRequest(request) }
-                }
-            }
-        }
-        .padding(.vertical, 4)
     }
 
     private func feedbackAndComposer(model: VideoDetailViewModel) -> some View {
@@ -780,6 +898,7 @@ struct PortraitFullscreenCommentsSheet: View {
                         guard sourceIsCurrent(),
                               let source = postedModel.currentCommentSource else { return }
                         onCommentPosted()
+                        onCommentCountChanged?()
                         if let target {
                             let root = postedModel.comments.first(where: { $0.rpid == target.rpid }) ?? target
                             openCommentThread(CommentThreadTarget(
@@ -799,6 +918,7 @@ struct PortraitFullscreenCommentsSheet: View {
             isRouteActive: isRouteActive,
             currentVideoID: { requestedVideoID },
             reply: { target in
+                promoteSheetToLargeIfNeeded(forComposerExpanded: true)
                 composer.beginReply(
                     to: target,
                     aid: model.videoInfo?.aid ?? 0,
@@ -808,7 +928,13 @@ struct PortraitFullscreenCommentsSheet: View {
             openThread: { target in
                 openCommentThread(target)
             },
-            previewImages: { item in previewImages = item }
+            previewImages: { item in previewImages = item },
+            onAvatarTap: { mid in
+                navigateFromSheet(to: .userSpace(mid))
+            },
+            onCommentCountChanged: {
+                onCommentCountChanged?()
+            }
         )
     }
 
@@ -838,10 +964,15 @@ struct PortraitFullscreenCommentsSheet: View {
         replyPresentation.anchors.sourceProvider = nil
     }
 
-    private func openCommentThreadURL(
+    private func openSheetURL(
         _ url: URL,
-        context: ContentLinkContext
+        context: ContentLinkContext?
     ) -> OpenURLAction.Result {
+        if EmoteText.seekSeconds(from: url) != nil {
+            EmoteText.handleSeekURL(url)
+            revealVideoAfterTimestampSeek()
+            return .handled
+        }
         guard let origin = coordinator.contentLinkOrigin(context) else { return .discarded }
         coordinator.contentLinks.open(url, context: origin) { route in
             origin.beforeNavigate()
@@ -852,6 +983,7 @@ struct PortraitFullscreenCommentsSheet: View {
 
     private func navigateFromSheet(to route: Route) {
         composer.collapse(motion: motion)
+        AppWindowMetrics.current?.endEditing(true)
         dismiss()
         onNavigateRoute(route)
     }
@@ -868,6 +1000,24 @@ private struct CommentThreadLinkHandoff: ViewModifier {
             .environment(\.openURL, OpenURLAction { url in
                 if BiliURLParser.handlesContent(url) {
                     guard let context else { return .discarded }
+                    return open(url, context)
+                }
+                upstream(url)
+                return .handled
+            })
+    }
+}
+
+private struct PortraitCommentsSheetLinkHandoff: ViewModifier {
+    @Environment(\.contentLinkContext) private var context
+    @Environment(\.openURL) private var upstream
+    let open: @MainActor (URL, ContentLinkContext?) -> OpenURLAction.Result
+
+    func body(content: Content) -> some View {
+        content
+            .environment(\.contentLinkDefersToParent, true)
+            .environment(\.openURL, OpenURLAction { url in
+                if EmoteText.seekSeconds(from: url) != nil || BiliURLParser.handlesContent(url) {
                     return open(url, context)
                 }
                 upstream(url)

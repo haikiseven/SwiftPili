@@ -6,6 +6,8 @@ struct VideoDetailCommentRowActions {
     let reply: (CommentResult.CommentItem) -> Void
     let openThread: (CommentThreadTarget) -> Void
     let previewImages: (ImagePreviewItem) -> Void
+    var onAvatarTap: ((Int) -> Void)? = nil
+    var onCommentCountChanged: (() -> Void)? = nil
 }
 
 struct VideoCommentHeaderFingerprint: Hashable, Sendable {
@@ -317,9 +319,16 @@ private struct VideoDetailCommentRow: View, Equatable {
                 guard actionIsCurrent() else { return }
                 actions.previewImages(item)
             },
+            onAvatarTap: actions.onAvatarTap.map { tap in
+                { mid in
+                    guard actionIsCurrent() else { return }
+                    tap(mid)
+                }
+            },
             onDelete: {
                 guard sourceIsCurrent() else { return }
                 model.removeComment(rpid: comment.rpid)
+                actions.onCommentCountChanged?()
                 model.showToast(String(localized: "Comment deleted"), style: .success)
             }
         )

@@ -36,8 +36,10 @@ struct CommentComposerMorphContainer<ExpandedComposer: View>: View {
     @State private var latestMeasuredSize: CGSize?
     @State private var hasMeasuredComposer = false
     @State private var windowIsLandscapeIPad = false
+    @State private var isHostedInModalSheet = false
     @State private var trackedKeyboardFrame: CGRect?
     @Namespace private var glassNamespace
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @AppMotion private var motion
 
@@ -95,17 +97,47 @@ struct CommentComposerMorphContainer<ExpandedComposer: View>: View {
         max(measuredComposerSize.height, CommentComposerLauncher.diameter)
     }
 
-    private var showsInlineExpanded: Bool { presentedExpanded && !windowIsLandscapeIPad }
+    private var usesDockedComposer: Bool {
+        windowIsLandscapeIPad && horizontalSizeClass == .regular && !isHostedInModalSheet
+    }
 
-    private var isDockedExpanded: Bool { presentedExpanded && windowIsLandscapeIPad }
+    private var showsInlineExpanded: Bool { presentedExpanded && !usesDockedComposer }
+
+    private var isDockedExpanded: Bool { presentedExpanded && usesDockedComposer }
 
     var body: some View {
+        morphStage
+            .iPadLandscapeWindowProbe($windowIsLandscapeIPad)
+            .background {
+                ComposerModalSheetProbe(isHostedInSheet: $isHostedInModalSheet)
+                    .frame(width: 0, height: 0)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+            .modifier(LiveKeyboardFrameTracker(frame: $trackedKeyboardFrame))
+            .animation(
+                motion.animation(
+                    normal: trackedKeyboardFrame != nil
+                        ? KeyboardAnimation.panelExpand
+                        : KeyboardAnimation.panelCollapse
+                ),
+                value: effectiveBottomPadding
+            )
+            .onChange(of: isExpanded) { _, expanded in
+                handleExpansionChange(expanded)
+            }
+            .onChange(of: sourceIdentity) { _, _ in
+                resetForSourceChange()
+            }
+    }
+
+    private var morphStage: some View {
         morphBackdrop
             .opacity(isDockedExpanded ? 0 : 1)
             .allowsHitTesting(!isDockedExpanded)
             .accessibilityHidden(isDockedExpanded)
             .overlay(alignment: .bottom) {
-                if windowIsLandscapeIPad {
+                if usesDockedComposer {
                     Color.clear.frame(height: 0)
                 } else {
                     warmComposerLayer
@@ -116,18 +148,6 @@ struct CommentComposerMorphContainer<ExpandedComposer: View>: View {
                     dockedComposer
                 }
                 .frame(width: 0, height: 0)
-            }
-            .iPadLandscapeWindowProbe($windowIsLandscapeIPad)
-            .modifier(LiveKeyboardFrameTracker(frame: $trackedKeyboardFrame))
-            .animation(
-                motion.animation(normal: .easeOut(duration: 0.2)),
-                value: effectiveBottomPadding
-            )
-            .onChange(of: isExpanded) { _, expanded in
-                handleExpansionChange(expanded)
-            }
-            .onChange(of: sourceIdentity) { _, _ in
-                resetForSourceChange()
             }
     }
 
@@ -402,6 +422,70 @@ struct CommentComposerLauncher: View {
 
     static func accessibilityTitle(hasDraft: Bool) -> Text {
         hasDraft ? Text("Continue editing comment draft") : Text("Write a comment")
+    }
+}
+
+private struct ComposerModalSheetProbe: UIViewRepresentable {
+    @Binding var isHostedInSheet: Bool
+
+    func makeUIView(context: Context) -> ProbeView {
+        let view = ProbeView()
+        view.isUserInteractionEnabled = false
+        view.backgroundColor = .clear
+        view.isAccessibilityElement = false
+        view.accessibilityElementsHidden = true
+        view.onChange = { value in
+            if isHostedInSheet != value { isHostedInSheet = value }
+        }
+        return view
+    }
+
+    func updateUIView(_ view: ProbeView, context: Context) {
+        view.onChange = { value in
+            if isHostedInSheet != value { isHostedInSheet = value }
+        }
+        view.evaluate()
+    }
+
+    @MainActor
+    final class ProbeView: UIView {
+        var onChange: (@MainActor (Bool) -> Void)?
+        private var lastReported: Bool?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            evaluate()
+        }
+
+        func evaluate() {
+            guard window != nil else { return }
+            let value = Self.detectModalSheet(from: self)
+            guard value != lastReported else { return }
+            lastReported = value
+            scheduleMainRunloopTurn { [weak self] in
+                self?.onChange?(value)
+            }
+        }
+
+        private static func detectModalSheet(from view: UIView) -> Bool {
+            var responder: UIResponder? = view
+            while let current = responder {
+                if let vc = current as? UIViewController {
+                    var cursor: UIViewController? = vc
+                    while let candidate = cursor {
+                        if candidate.presentingViewController != nil,
+                           candidate.modalPresentationStyle != .fullScreen,
+                           candidate.modalPresentationStyle != .overFullScreen {
+                            return true
+                        }
+                        cursor = candidate.parent
+                    }
+                    return false
+                }
+                responder = current.next
+            }
+            return false
+        }
     }
 }
 
